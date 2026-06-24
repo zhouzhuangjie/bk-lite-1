@@ -1314,7 +1314,9 @@ def test_discover_controller_version_preserves_existing_version_when_command_ret
 
     monkeypatch.setattr(version_discovery.Executor, "execute_local", lambda self, command, timeout=10, shell=None: "   ")
 
-    _discover_controller_version(node, latest_versions_map={})
+    all_controllers = [controller]
+    controllers_map = {(controller.os, controller.cpu_architecture): controller}
+    _discover_controller_version(node, latest_versions_map={}, controllers_map=controllers_map, all_controllers=all_controllers)
 
     version_record.refresh_from_db()
     assert version_record.version == "1.0.0"
@@ -1366,6 +1368,8 @@ def test_discover_controller_version_reuses_existing_unknown_record_after_succes
 
     monkeypatch.setattr(version_discovery.Executor, "execute_local", lambda self, command, timeout=10, shell=None: "1.0.0")
 
+    all_controllers = [controller]
+    controllers_map = {(controller.os, controller.cpu_architecture): controller}
     _discover_controller_version(
         node,
         latest_versions_map={
@@ -1375,6 +1379,8 @@ def test_discover_controller_version_reuses_existing_unknown_record_after_succes
                 }
             }
         },
+        controllers_map=controllers_map,
+        all_controllers=all_controllers,
     )
 
     version_record.refresh_from_db()

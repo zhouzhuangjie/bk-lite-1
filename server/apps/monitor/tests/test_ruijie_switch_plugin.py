@@ -34,8 +34,8 @@ import yaml
 
 SERVER_ROOT = Path(__file__).resolve().parents[3]
 PLUGINS = SERVER_ROOT / "apps" / "monitor" / "support-files" / "plugins" / "Telegraf"
-RUIJIE_DIR = PLUGINS / "snmp_ruijie" / "switch"
-CISCO_DIR = PLUGINS / "snmp_cisco" / "switch"
+RUIJIE_DIR = PLUGINS / "snmp" / "switch_ruijie"
+CISCO_DIR = PLUGINS / "snmp" / "switch_cisco"
 LANGUAGE_DIR = SERVER_ROOT / "apps" / "monitor" / "language"
 WEB_ROOT = SERVER_ROOT.parents[0] / "web"
 
@@ -47,9 +47,8 @@ PLUGIN_NAME = "Switch Ruijie SNMP"
 OBJECT_NAME = "Switch"
 
 SUPPORTED_SCALAR_UNITS = {
-    # volts 是 unit_converter 真实支持的标量单位(STANDALONE_UNITS),
-    # 交换机电压指标 device_voltage_volts 即用此单位,补入避免误报。
-    "byteps", "bytes", "counts", "cps", "percent", "celsius", "s", "short", "none", "volts",
+    "byteps", "bytes", "counts", "cps", "percent", "celsius", "s", "short", "none",
+    "volts",
 }
 INTERFACE_METRICS = ("interface_ifHCInOctets", "interface_ifHCOutOctets")
 MEMORY_METRICS = ("device_memory_total", "device_memory_used", "device_memory_usage")
@@ -101,9 +100,9 @@ def languages():
 # directory / cross-file identity
 # --------------------------------------------------------------------------- #
 @pytest.mark.unit
-def test_plugin_lives_under_correct_dir():
-    assert RUIJIE_DIR.parent.name == COLLECT_TYPE
-    assert RUIJIE_DIR.name == INSTANCE_TYPE
+def test_plugin_lives_under_correct_dir(metrics):
+    assert metrics["collect_type"] == COLLECT_TYPE  # 身份来自 metrics.json,不依赖目录(#3590 解耦)
+    assert RUIJIE_DIR.parent.name == "snmp"  # 扁平布局:厂商目录直接在 snmp/ 下
 
 
 @pytest.mark.unit
