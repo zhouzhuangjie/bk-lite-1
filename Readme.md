@@ -64,6 +64,24 @@ Blueking Lite 是一个 **AI First** 的**轻量版**运维产品，具有部署
 - 🐳 [安装部署](deploy/docker-compose/Readme.md)
 - 📚 [接口文档](docs/overview/api_doc.md)
 
+## 🧪 测试覆盖率
+
+![coverage](https://img.shields.io/badge/coverage-74.6%25-green)
+![tests](https://img.shields.io/badge/tests-passing-brightgreen)
+![modules≥75%](https://img.shields.io/badge/modules%20%E2%89%A575%25-13%2F14-blue)
+![fake tests](https://img.shields.io/badge/fake%20tests-0-brightgreen)
+![infra](https://img.shields.io/badge/tested%20on-real%20PG%2FRedis%2FMinIO%2FFalkorDB%2FNATS-informational)
+
+| 模块 | 覆盖率 | 模块 | 覆盖率 |
+|------|-------:|------|-------:|
+| rpc | 100.0% | log | 84.3% |
+| base | 99.3% | operation_analysis | 81.2% |
+| job_mgmt | 95.0% | core | 78.2% |
+| console_mgmt | 89.7% | mlops | 76.3% |
+| alerts | 83.2% | system_mgmt | 75.4% |
+| monitor | 75.4% | node_mgmt | 75.0% |
+| cmdb | 79.4% | opspilot | 62.8% |
+
 ## 🛣️ 路线图
 
 - 📋 [版本日志](docs/changelog/release.md)
