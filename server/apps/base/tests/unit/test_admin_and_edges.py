@@ -1,9 +1,9 @@
 """base.admin 与 user_api_secret viewset/serializer 边界补缺。
 
-- UserAPISecretAdmin.save_model：obj 无 api_secret 时自动生成 64 位 hex；已有则不覆盖；
-- UserAPISecretViewSet.get_queryset：未认证 / team cookie 非整数 -> 空 queryset；
-- UserAPISecretSerializer.get_api_secret_preview：空 secret -> 空串。
-只 mock super().save_model（admin 父类落库边界）与 request；不连真实 DB 写库的部分用 monkeypatch。
+- UserAPISecretAdmin.save_model：空 secret 时生成明文再哈希落库；已哈希值幂等保留；明文会被哈希
+- UserAPISecretViewSet.get_queryset：未认证 / team cookie 非整数 -> 空 queryset
+- UserAPISecretSerializer.get_api_secret_preview：委托模型，空 secret -> 空串，非空 -> 统一掩码
+只 mock super().save_model（admin 父类落库边界）与 request。
 """
 import pydantic.root_model  # noqa
 
@@ -24,22 +24,34 @@ class TestUserAPISecretAdminSaveModel:
     def _admin(self):
         return UserAPISecretAdmin(UserAPISecret, AdminSite())
 
-    def test_无secret时自动生成64位hex(self):
+    def test_无secret时自动生成并哈希存储(self):
         admin = self._admin()
         obj = UserAPISecret(username="u", domain="domain.com", api_secret="", team=0)
         with patch("apps.base.admin.admin.ModelAdmin.save_model") as super_save:
             admin.save_model(MagicMock(), obj, MagicMock(), change=False)
             super_save.assert_called_once()
-        assert len(obj.api_secret) == 64
-        int(obj.api_secret, 16)  # 必须是合法 hex
+        assert UserAPISecret.is_hashed_api_secret(obj.api_secret)
+        digest = obj.api_secret[len(UserAPISecret.HASH_PREFIX) :]
+        assert len(digest) == 64
+        int(digest, 16)
 
-    def test_已有secret时不覆盖(self):
+    def test_已哈希secret保存时保持不变(self):
+        admin = self._admin()
+        hashed = UserAPISecret.hash_api_secret("keep-me")
+        obj = UserAPISecret(username="u", domain="domain.com", api_secret=hashed, team=0)
+        with patch("apps.base.admin.admin.ModelAdmin.save_model") as super_save:
+            admin.save_model(MagicMock(), obj, MagicMock(), change=True)
+            super_save.assert_called_once()
+        assert obj.api_secret == hashed
+
+    def test_明文secret保存时被哈希(self):
         admin = self._admin()
         obj = UserAPISecret(username="u", domain="domain.com", api_secret="EXISTING", team=0)
         with patch("apps.base.admin.admin.ModelAdmin.save_model") as super_save:
             admin.save_model(MagicMock(), obj, MagicMock(), change=True)
             super_save.assert_called_once()
-        assert obj.api_secret == "EXISTING"
+        assert obj.api_secret != "EXISTING"
+        assert obj.api_secret == UserAPISecret.hash_api_secret("EXISTING")
 
 
 class TestViewSetGetQueryset:
@@ -48,14 +60,9 @@ class TestViewSetGetQueryset:
         vs.request = request
         return vs
 
-    def test_无request返回none(self):
+    def test_无request返回空queryset(self):
         vs = UserAPISecretViewSet()
-        # 不设置 request 属性
-        assert vs.get_queryset().count() == 0 if hasattr(vs, "request") else True
-        # 显式覆盖：无 request 属性
-        vs2 = UserAPISecretViewSet()
-        qs = vs2.get_queryset()
-        assert list(qs) == []
+        assert list(vs.get_queryset()) == []
 
     def test_未认证用户返回空queryset(self):
         request = MagicMock()
@@ -75,17 +82,16 @@ class TestViewSetGetQueryset:
 
 class TestApiSecretPreviewEmpty:
     def test_空secret预览为空串(self):
-        instance = MagicMock()
-        instance.api_secret = ""
+        instance = UserAPISecret(username="u", domain="domain.com", api_secret="", team=0)
         request = MagicMock()
         request.user.group_list = []
         ser = UserAPISecretSerializer(context={"request": request})
         assert ser.get_api_secret_preview(instance) == ""
 
-    def test_有secret返回前四位加掩码(self):
-        instance = MagicMock()
-        instance.api_secret = "abcd1234ef"
+    def test_有secret返回统一掩码不泄露明文(self):
+        instance = UserAPISecret(username="u", domain="domain.com", api_secret="abcd1234ef", team=0)
         request = MagicMock()
         request.user.group_list = []
         ser = UserAPISecretSerializer(context={"request": request})
-        assert ser.get_api_secret_preview(instance) == "abcd********"
+        assert ser.get_api_secret_preview(instance) == "********"
+        assert "abcd" not in ser.get_api_secret_preview(instance)

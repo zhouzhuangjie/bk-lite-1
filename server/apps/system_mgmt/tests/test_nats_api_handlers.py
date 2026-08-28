@@ -211,11 +211,23 @@ def test_get_group_users_scoped_no_scope_returns_empty():
 # create_guest_role / create_default_rule
 # ---------------------------------------------------------------------------
 def test_create_guest_role_creates_groups_and_roles():
+    from apps.system_mgmt.guest_menus import CMDB_MENUS, MONITOR_MENUS, OPSPILOT_GUEST_MENUS
+
+    Menu.objects.create(app="opspilot", name=OPSPILOT_GUEST_MENUS[0], display_name="g1", order=1, menu_type="t")
+    Menu.objects.create(app="cmdb", name=CMDB_MENUS[0], display_name="g2", order=1, menu_type="t")
+    Menu.objects.create(app="monitor", name=MONITOR_MENUS[0], display_name="g3", order=1, menu_type="t")
+    Menu.objects.create(app="opspilot", name="secret-admin-only", display_name="secret", order=99, menu_type="t")
+
     result = nats_api.create_guest_role()
     assert result["result"] is True
     assert Group.objects.filter(name="Guest", parent_id=0).exists()
     assert Group.objects.filter(name="OpsPilotGuest", parent_id=0).exists()
-    assert Role.objects.filter(name="guest", app="opspilot").exists()
+
+    opspilot_guest = Role.objects.get(name="guest", app="opspilot")
+    allowed_ids = set(Menu.objects.filter(app="opspilot", name=OPSPILOT_GUEST_MENUS[0]).values_list("id", flat=True))
+    secret_ids = set(Menu.objects.filter(name="secret-admin-only").values_list("id", flat=True))
+    assert allowed_ids.issubset(set(opspilot_guest.menu_list))
+    assert secret_ids.isdisjoint(set(opspilot_guest.menu_list))
 
 
 def test_create_default_rule_creates_rule():

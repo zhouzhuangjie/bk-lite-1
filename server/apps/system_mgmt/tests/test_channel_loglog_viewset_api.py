@@ -158,3 +158,43 @@ def test_user_login_log_export_excel(super_client):
     resp = super_client.post(f"{V}/user_login_log/export_excel/", {"selected_ids": []}, format="json")
     assert resp.status_code == 200
     assert "spreadsheetml" in resp["Content-Type"]
+
+
+def test_user_login_log_export_excel_by_selected_ids(super_client):
+    from apps.system_mgmt.models import User as SmUser
+
+    SmUser.objects.create(
+        username="keep", password="x", display_name="K", email="keep@x.com",
+        domain="domain.com", group_list=[1],
+    )
+    SmUser.objects.create(
+        username="drop", password="x", display_name="D", email="drop@x.com",
+        domain="domain.com", group_list=[1],
+    )
+    kept = UserLoginLog.objects.create(
+        username="keep", domain="domain.com", source_ip="10.0.0.1", status=UserLoginLog.STATUS_SUCCESS
+    )
+    UserLoginLog.objects.create(
+        username="drop", domain="domain.com", source_ip="10.0.0.2", status=UserLoginLog.STATUS_FAILED
+    )
+    resp = super_client.post(f"{V}/user_login_log/export_excel/", {"selected_ids": [kept.id]}, format="json")
+    assert resp.status_code == 200
+    from zipfile import ZipFile
+    from io import BytesIO
+
+    with ZipFile(BytesIO(resp.content)) as zf:
+        sheet = zf.read("xl/sharedStrings.xml") if "xl/sharedStrings.xml" in zf.namelist() else zf.read("xl/worksheets/sheet1.xml")
+    assert b"keep" in sheet
+    assert b"drop" not in sheet
+
+
+def test_user_login_log_export_excel_rejects_invalid_filters(super_client):
+    resp = super_client.post(
+        f"{V}/user_login_log/export_excel/",
+        {"login_time_start": "not-a-datetime"},
+        format="json",
+    )
+    assert resp.status_code == 400
+    payload = resp.json()
+    data = payload.get("data") or payload
+    assert data.get("result") is False or payload.get("result") is False
