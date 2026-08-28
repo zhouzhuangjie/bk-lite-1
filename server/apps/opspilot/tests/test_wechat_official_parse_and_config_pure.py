@@ -25,6 +25,7 @@ def test_parse_message_empty_text_and_event():
     assert msg.content == "hello"
     assert msg.source == "u1"
     assert msg.target == "gh"
+    assert msg.type == "text"
     event_xml = (
         "<xml><ToUserName>gh</ToUserName><FromUserName>u1</FromUserName>"
         "<CreateTime>1</CreateTime><MsgType>event</MsgType><Event>subscribe</Event></xml>"
@@ -32,6 +33,8 @@ def test_parse_message_empty_text_and_event():
     event = WechatOfficialChatFlowUtils.parse_message(event_xml)
     assert event.event == "subscribe"
     assert event.source == "u1"
+    assert event.target == "gh"
+    assert event.type == "event"
 
 
 def test_get_wechat_official_node_config_missing_and_required():

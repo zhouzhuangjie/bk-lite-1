@@ -72,16 +72,16 @@ def test_chat_flow_celery_task_requires_online_bot_and_workflow():
         patch.object(tasks, "_run_in_native_thread", side_effect=_run_inline),
         patch("apps.opspilot.tasks.create_chat_flow_engine") as create_engine,
     ):
-        tasks.chat_flow_celery_task(999999, "n1", "hi")
+        assert tasks.chat_flow_celery_task(999999, "n1", "hi") is None
         create_engine.assert_not_called()
 
         bot = Bot.objects.create(name="flow-bot", team=[1], online=False)
-        tasks.chat_flow_celery_task(bot.id, "n1", "hi")
+        assert tasks.chat_flow_celery_task(bot.id, "n1", "hi") is None
         create_engine.assert_not_called()
 
         bot.online = True
         bot.save()
-        tasks.chat_flow_celery_task(bot.id, "n1", "hi")
+        assert tasks.chat_flow_celery_task(bot.id, "n1", "hi") is None
         create_engine.assert_not_called()
 
         BotWorkFlow.objects.create(bot=bot, flow_json={"nodes": []})

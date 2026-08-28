@@ -45,7 +45,9 @@ def test_install_controller_marks_running_and_dispatches():
 
 
 def test_install_controller_for_node_early_returns():
-    with patch.object(installer_tasks, "install_controller_on_nodes") as remote:
+    with patch.object(installer_tasks, "install_controller_on_nodes") as remote, patch.object(
+        installer_tasks, "_dispatch_or_finalize_controller_task"
+    ) as dispatch:
         assert installer_tasks.install_controller_for_node(999999, 1) is None
         region = _region()
         task = ControllerTask.objects.create(cloud_region=region, type="install", status="running", package_version_id=1)
@@ -67,6 +69,7 @@ def test_install_controller_for_node_early_returns():
         node.save()
         assert installer_tasks.install_controller_for_node(node.id, attempt=1) is None
         remote.assert_not_called()
+        dispatch.assert_not_called()
 
 
 def test_install_controller_for_node_missing_package_records_error():
@@ -90,7 +93,8 @@ def test_install_controller_for_node_missing_package_records_error():
         installer_tasks.install_controller_for_node(node.id, attempt=1)
     node.refresh_from_db()
     steps = (node.result or {}).get("steps") or []
-    assert any("Package version not found" in (s.get("message") or "") for s in steps)
+    assert steps[-1]["message"] == "Package version not found"
+    assert steps[-1]["status"] == InstallerConstants.STEP_STATUS_ERROR
     dispatch.assert_called()
 
 

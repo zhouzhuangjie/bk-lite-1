@@ -63,7 +63,7 @@ def test_dataset_list_create_retrieve_destroy(superuser, suffix, prefix, model_m
         factory.post("/", {"name": f"ds-new-{suffix}", "description": "", "team": [1]}, format="json"),
         superuser,
     )
-    assert created.status_code in (status.HTTP_201_CREATED, status.HTTP_200_OK)
+    assert created.status_code == status.HTTP_201_CREATED
     assert Dataset.objects.filter(name=f"ds-new-{suffix}").exists()
 
     updated = _call(
@@ -72,12 +72,13 @@ def test_dataset_list_create_retrieve_destroy(superuser, suffix, prefix, model_m
         superuser,
         pk=ds.id,
     )
-    assert updated.status_code in (status.HTTP_200_OK, status.HTTP_202_ACCEPTED)
+    assert updated.status_code == status.HTTP_200_OK
     ds.refresh_from_db()
     assert ds.name == "ds-renamed"
 
     deleted = _call(vs.as_view({"delete": "destroy"}), factory.delete("/x/"), superuser, pk=ds.id)
-    assert deleted.status_code in (status.HTTP_204_NO_CONTENT, status.HTTP_200_OK)
+    # as_view 直调不经 CustomRenderer，DRF destroy 成功仍是 204
+    assert deleted.status_code == status.HTTP_204_NO_CONTENT
     assert not Dataset.objects.filter(id=ds.id).exists()
 
 
@@ -146,3 +147,20 @@ def test_release_download_missing_file(superuser, suffix, model_module, basename
     vs = getattr(mod, f"{basename}DatasetReleaseViewSet")
     resp = _call(vs.as_view({"get": "download"}), factory.get("/x/download/"), superuser, pk=rel.id)
     assert resp.status_code == status.HTTP_404_NOT_FOUND
+
+
+def test_image_classification_train_data_destroy_returns_500_on_error(superuser):
+    from unittest.mock import patch
+
+    Dataset = _model("image_classification", "ImageClassification", "Dataset")
+    TrainData = _model("image_classification", "ImageClassification", "TrainData")
+    ds = Dataset.objects.create(name="ds-del-err", description="", team=[1])
+    td = TrainData.objects.create(name="td-err", dataset=ds, metadata={})
+    mod = _view_module("image_classification")
+    vs = getattr(mod, "ImageClassificationTrainDataViewSet")
+    with patch("apps.mlops.views.image_classification.ModelViewSet.destroy", side_effect=RuntimeError("minio down")):
+        resp = _call(vs.as_view({"delete": "destroy"}), factory.delete("/x/"), superuser, pk=td.id)
+    assert resp.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+    assert "删除失败" in str(resp.data)
+    assert "minio down" in str(resp.data)
+    assert TrainData.objects.filter(id=td.id).exists()

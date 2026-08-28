@@ -120,3 +120,73 @@ def test_resolve_sse_execute_method_requires_streaming_executor():
         method, error = engine._resolve_sse_execute_method({}, agent, agent, False)
     assert method is sse_executor.sse_execute
     assert error is None
+
+
+def test_raise_if_interrupted_noop_then_finalize_and_raise():
+    engine = _engine([{"id": "n1", "type": "openai", "data": {}}])
+    with patch.object(engine, "_check_interrupt_requested", return_value=False):
+        assert engine._raise_if_interrupted({"last_message": "hi"}, "openai") is None
+    with (
+        patch.object(engine, "_check_interrupt_requested", return_value=True),
+        patch.object(engine, "_finalize_interrupted_execution") as finalize,
+        pytest.raises(InterruptedError, match="执行已中断"),
+    ):
+        engine._raise_if_interrupted({"last_message": "hi"}, "openai")
+    finalize.assert_called_once()
+    assert finalize.call_args.args[0] == {"last_message": "hi"}
+    assert finalize.call_args.args[1]["interrupted"] is True
+    assert finalize.call_args.args[2] == "openai"
+
+
+def test_prepare_sse_execution_rejects_non_streaming_flow():
+    engine = _engine([{"id": "n1", "type": "http", "data": {"label": "请求"}}])
+    engine.validate_flow = lambda: []
+    with (
+        patch.object(engine, "_record_conversation_history"),
+        patch.object(engine, "_ensure_execution_result_started"),
+        patch.object(engine, "_raise_if_interrupted"),
+        patch.object(engine, "_record_execution_result") as record,
+        patch.object(engine, "_create_error_response", return_value="sse-unsupported"),
+    ):
+        result = engine._prepare_sse_execution({"user_id": "u1", "last_message": "hi", "entry_type": "restful", "node_id": "n1"})
+    start_node, last_node, user_id, entry_type, session_id, node_id, is_agui, is_openai, error = result
+    assert start_node is None
+    assert last_node is None
+    assert user_id == "u1"
+    assert entry_type == "restful"
+    assert session_id == ""
+    assert node_id == "n1"
+    assert is_agui is False
+    assert is_openai is False
+    assert error == "sse-unsupported"
+    record.assert_called_once()
+    assert record.call_args.args[1] == {"success": False, "error": "当前流程不支持SSE"}
+    assert record.call_args.args[2] is False
+
+
+def test_resolve_sse_target_agent_intent_routing_failure():
+    nodes = [
+        {"id": "s", "type": "openai", "data": {}},
+        {"id": "i", "type": "intent_classification", "data": {}},
+        {"id": "a", "type": "agents", "data": {}},
+    ]
+    engine = _engine(nodes)
+    intent_node = nodes[1]
+    with (
+        patch.object(engine, "_find_target_agent_node", return_value=(None, [intent_node])),
+        patch.object(engine, "set_start_node_variable", side_effect=lambda data, _node: data),
+        patch.object(engine, "_execute_prerequisite_nodes", return_value={"intent_result": "billing", "last_message": "hi"}),
+        patch.object(engine, "_find_agent_by_intent", return_value=None) as find_agent,
+        patch.object(engine, "_record_execution_result") as record,
+        patch.object(engine, "_create_error_response", return_value="no-agent"),
+    ):
+        agent, final_input, error = engine._resolve_sse_target_agent(
+            {"last_message": "hi"}, nodes[0], nodes[2], False, True
+        )
+    assert agent is None
+    assert error == "no-agent"
+    assert final_input["intent_result"] == "billing"
+    find_agent.assert_called_once_with("i", "billing")
+    record.assert_called_once()
+    assert record.call_args.args[1]["error"] == "未找到可执行的agents节点（意图路由失败）"
+    assert record.call_args.args[2] is False

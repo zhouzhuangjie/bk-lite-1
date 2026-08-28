@@ -33,7 +33,7 @@ def test_list_postgres_databases_formats_size():
     with patch.object(res, "execute_readonly_query", return_value=rows):
         out = json.loads(res.list_postgres_databases.invoke({"config": CONFIG}))
     assert out["total_databases"] == 1
-    assert "KB" in out["databases"][0]["size"] or "B" in out["databases"][0]["size"]
+    assert out["databases"][0]["size"] == "2.00 KB"
 
 
 def test_check_unused_indexes_sums_wasted_space():
@@ -44,7 +44,7 @@ def test_check_unused_indexes_sums_wasted_space():
         out = json.loads(opt.check_unused_indexes.invoke({"size_threshold_mb": 1, "config": CONFIG}))
     assert out["unused_index_count"] == 1
     assert out["total_wasted_bytes"] == 1024 * 1024
-    assert "删除" in out["recommendations"][0] or "节省" in out["recommendations"][0]
+    assert out["recommendations"][0] == "考虑删除1个未使用的索引,可节省1.00 MB"
     with patch.object(opt, "execute_readonly_query", return_value=[]):
         empty = json.loads(opt.check_unused_indexes.invoke({"config": CONFIG}))
     assert empty["unused_index_count"] == 0

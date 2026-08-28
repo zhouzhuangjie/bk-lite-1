@@ -31,3 +31,53 @@ def test_update_instance_config_rejects_mismatched_instance(monkeypatch):
             {"id": "child-1", "content": {}, "env_config": {}},
             {"id": "base-1", "content": {}, "env_config": {}},
         )
+
+
+def test_update_instance_config_converts_yaml_toml_and_delegates(monkeypatch):
+    from unittest.mock import patch
+
+    base = MagicMock(id="base-1", monitor_instance_id="inst-a")
+    child = MagicMock(id="child-1", monitor_instance_id="inst-a")
+    monkeypatch.setattr(
+        InstanceConfigService,
+        "_get_authorized_collect_configs",
+        lambda ids, actor, require_operate=True: [base, child],
+    )
+    node_mgmt = MagicMock()
+    with (
+        patch("apps.monitor.services.node_mgmt.NodeMgmt", return_value=node_mgmt),
+        patch("apps.monitor.services.node_mgmt.ConfigFormat.json_to_yaml", return_value="yaml-out") as to_yaml,
+        patch("apps.monitor.services.node_mgmt.ConfigFormat.json_to_toml", return_value="toml-out") as to_toml,
+    ):
+        InstanceConfigService.update_instance_config(
+            {"id": "child-1", "content": {"k": 1}, "env_config": {"e": 1}},
+            {"id": "base-1", "content": {"b": 2}, "env_config": {"e": 2}},
+        )
+    to_yaml.assert_called_once_with({"b": 2})
+    to_toml.assert_called_once_with({"k": 1})
+    node_mgmt.update_config_content.assert_called_once_with("base-1", "yaml-out", {"e": 2})
+    node_mgmt.update_child_config_content.assert_called_once_with("child-1", "toml-out", {"e": 1})
+
+
+def test_update_instance_config_skips_missing_child(monkeypatch):
+    from unittest.mock import patch
+
+    base = MagicMock(id="base-1", monitor_instance_id="inst-a")
+    monkeypatch.setattr(
+        InstanceConfigService,
+        "_get_authorized_collect_configs",
+        lambda ids, actor, require_operate=True: [base],
+    )
+    node_mgmt = MagicMock()
+    with (
+        patch("apps.monitor.services.node_mgmt.NodeMgmt", return_value=node_mgmt),
+        patch("apps.monitor.services.node_mgmt.ConfigFormat.json_to_yaml", return_value="yaml-out"),
+        patch("apps.monitor.services.node_mgmt.ConfigFormat.json_to_toml") as to_toml,
+    ):
+        InstanceConfigService.update_instance_config(
+            {"id": "child-missing", "content": {"k": 1}},
+            {"id": "base-1", "content": {"b": 2}},
+        )
+    node_mgmt.update_config_content.assert_called_once_with("base-1", "yaml-out", None)
+    to_toml.assert_not_called()
+    node_mgmt.update_child_config_content.assert_not_called()

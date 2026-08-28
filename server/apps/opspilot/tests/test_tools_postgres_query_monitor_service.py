@@ -23,10 +23,10 @@ def test_prepare_context_and_formatters():
     ctx = pg_utils.prepare_context(CONFIG)
     assert ctx["database"] == "app"
     assert pg_utils.format_size(None) == "0 B"
-    assert "KB" in pg_utils.format_size(2048)
+    assert pg_utils.format_size(2048) == "2.00 KB"
     assert pg_utils.format_duration(None) == "0ms"
-    assert pg_utils.format_duration(12).endswith("ms")
-    assert pg_utils.format_duration(2500).endswith("s")
+    assert pg_utils.format_duration(12) == "12.00ms"
+    assert pg_utils.format_duration(2500) == "2.50s"
     assert pg_utils.calculate_percentage(1, 0) == 0
     assert pg_utils.calculate_percentage(1, 4) == 25.0
 
@@ -80,7 +80,7 @@ def test_database_metrics_computes_rollback_ratio():
     assert out["total_databases"] == 1
     db = out["databases"][0]
     assert db["rollback_ratio"] == 10.0
-    assert db["temporary_size"].endswith("KB") or "B" in db["temporary_size"]
+    assert db["temporary_size"] == "2.00 KB"
     assert db["stats_reset"] == "Never"
 
 
@@ -109,7 +109,7 @@ def test_top_queries_formats_duration_and_missing_extension():
     with _patch(tracing_mod, rows):
         out = json.loads(tracing_mod.get_top_queries.invoke({"order_by": "calls", "config": CONFIG}))
     assert out["total_queries"] == 1
-    assert "ms" in out["queries"][0]["mean_time_formatted"] or "s" in out["queries"][0]["mean_time_formatted"]
+    assert out["queries"][0]["mean_time_formatted"] == "15.00ms"
     with patch.object(tracing_mod, "execute_readonly_query", side_effect=RuntimeError("relation pg_stat_statements does not exist")):
         err = json.loads(tracing_mod.get_top_queries.invoke({"config": CONFIG}))
     assert "pg_stat_statements" in err["error"]

@@ -66,7 +66,7 @@ class TestInitUserSetGroupNameRequired:
         )
         body = json.loads(resp.content)
         assert body["result"] is False
-        assert "group_name" in body.get("message", "").lower() or body["result"] is False
+        assert body["message"] == "group_name is required"
 
     def test_group_name为空字符串返回400(self):
         """group_name 存在但为空字符串，也属于无效值，应返回 400。"""
@@ -119,7 +119,7 @@ class TestInitUserSetGuards:
         resp = init_user_set(req)
         body = json.loads(resp.content)
         assert body["result"] is False
-        assert "JSON" in body["message"] or "json" in body["message"].lower()
+        assert body["message"] == "Invalid JSON format"
 
     def test_not_first_login_when_multiple_groups(self):
         req = _make_request({"group_name": "x"}, group_list=[{"id": 1, "name": "OpsPilotGuest"}, {"id": 2, "name": "other"}])
