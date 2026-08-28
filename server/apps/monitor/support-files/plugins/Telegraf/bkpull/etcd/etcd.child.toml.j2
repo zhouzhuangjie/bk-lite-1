@@ -4,8 +4,8 @@
         "{{ server_url }}",
     ]
     interval = "{{ interval }}s"
-    timeout = "30s"
-    response_timeout = "30s"
+    timeout = "{{ interval }}s"
+    response_timeout = "{{ interval }}s"
     {% if tls_ca %}
     tls_ca = "{{ tls_ca }}"
     {% endif %}
@@ -15,7 +15,7 @@
     {% if tls_key %}
     tls_key = "{{ tls_key }}"
     {% endif %}
-    insecure_skip_verify = {{ insecure_skip_verify | default(false) | lower }}
+    insecure_skip_verify = {{ insecure_skip_verify | default(false, true) | lower }}
     [inputs.prometheus.tags]
         instance_id = "{{ instance_id }}"
         instance_type = "{{ instance_type }}"

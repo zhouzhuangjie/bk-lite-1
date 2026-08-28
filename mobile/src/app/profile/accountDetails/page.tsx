@@ -1,13 +1,15 @@
 'use client';
 import React, { useState, useEffect } from 'react';
-import { useRouter } from 'next/navigation';
-import { Form, Input, Button, Toast, Picker, SpinLoading } from 'antd-mobile';
+import { Form, Input, Button, Toast, Picker } from 'antd-mobile';
 import { LeftOutline } from 'antd-mobile-icons';
 import { useTranslation } from '@/utils/i18n';
 import { useAuth } from '@/context/auth';
 import { useLocale } from '@/context/locale';
 import { timezoneOptions, languageOptions } from '@/constants/userPicker';
 import { getUserInfo, updateUserInfo } from '@/api/user';
+import MobileSafeHeader from '@/components/mobile-safe-header';
+import { useMobileBack } from '@/navigation/mobile-back';
+import { MobileSkeleton } from '@/components/mobile-feedback';
 
 
 
@@ -15,7 +17,7 @@ export default function AccountDetailsPage() {
     const { t } = useTranslation();
     const { updateUserInfo: updateStoredUserInfo } = useAuth();
     const { setLocale } = useLocale();
-    const router = useRouter();
+    const handleBack = useMobileBack({ fallbackHref: '/profile' });
     const [form] = Form.useForm();
     const [loading, setLoading] = useState(false);
     const [originalData, setOriginalData] = useState<Record<string, any>>({});
@@ -58,7 +60,6 @@ export default function AccountDetailsPage() {
         const locale = newLocale ?? currentLocale;
         const hasChanges =
             currentValues.display_name !== originalData.display_name ||
-            currentValues.email !== originalData.email ||
             tz !== originalData.timezone ||
             locale !== originalData.locale;
         setIsModified(hasChanges);
@@ -71,7 +72,6 @@ export default function AccountDetailsPage() {
             const formValues = form.getFieldsValue();
             const saveData = {
                 display_name: formValues.display_name,
-                email: formValues.email,
                 timezone: currentTimezone,
                 locale: currentLocale,
             };
@@ -94,6 +94,10 @@ export default function AccountDetailsPage() {
                 setLocale(saveData.locale);
             }
 
+            if (saveData.timezone !== originalData.timezone) {
+                await updateStoredUserInfo({ timezone: saveData.timezone });
+            }
+
             Toast.show({
                 content: t('account.saveSuccess'),
                 icon: 'success',
@@ -112,8 +116,13 @@ export default function AccountDetailsPage() {
 
     return (
         <div className="flex flex-col h-full bg-[var(--color-background-body)]">
-            <div className="flex items-center justify-center px-4 py-3 bg-[var(--color-bg)]">
-                <button onClick={() => router.back()} className="absolute left-4">
+            <MobileSafeHeader contentClassName="relative flex items-center justify-center px-14">
+                <button
+                    type="button"
+                    aria-label={t('common.back')}
+                    onClick={handleBack}
+                    className="absolute left-2 flex min-h-11 min-w-11 items-center justify-center rounded-lg active:bg-[var(--color-fill-2)]"
+                >
                     <LeftOutline fontSize={24} className="text-[var(--color-text-1)]" />
                 </button>
                 <h1 className="text-lg font-medium text-[var(--color-text-1)]">
@@ -131,11 +140,9 @@ export default function AccountDetailsPage() {
                         {t('common.save')}
                     </Button>
                 </span>
-            </div>
+            </MobileSafeHeader>
             {loading ? (
-                <div className="flex-1 flex items-center justify-center">
-                    <SpinLoading color="primary" style={{ '--size': '32px' }} />
-                </div>
+                <MobileSkeleton label={t('common.loading')} variant="detail" rows={5} />
             ) : <div className="flex-1 overflow-y-auto px-4 pt-4">
                 {/* 基本信息卡片 */}
                 <div className="mb-4 bg-[var(--color-bg)] rounded-2xl shadow-sm">
@@ -182,7 +189,7 @@ export default function AccountDetailsPage() {
                             />
                         </Form.Item>
 
-                        {/* 邮箱 - 可编辑必填 */}
+                        {/* 邮箱 - 移动端暂不提供验证码闭环，避免直接提交后端被拒绝 */}
                         <Form.Item
                             name="email"
                             label={
@@ -199,6 +206,8 @@ export default function AccountDetailsPage() {
                             <Input
                                 placeholder={t('account.enterEmail')}
                                 type="email"
+                                disabled
+                                readOnly
                                 style={{
                                     '--font-size': '14px',
                                     '--text-align': 'right',

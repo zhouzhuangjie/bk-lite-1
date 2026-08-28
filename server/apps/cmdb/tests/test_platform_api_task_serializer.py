@@ -1,0 +1,253 @@
+from types import SimpleNamespace
+
+import pytest
+
+from apps.cmdb.constants.constants import CollectDriverTypes, CollectPluginTypes
+from apps.cmdb.models.collect_model import CollectModels
+from apps.cmdb.serializers.collect_serializer import CollectModelSerializer
+
+
+@pytest.fixture(autouse=True)
+def _stub_auth_serializer_dependencies(monkeypatch):
+    class _UserQuery:
+        @staticmethod
+        def values(*args):
+            return []
+
+    class _UserManager:
+        @staticmethod
+        def all():
+            return _UserQuery()
+
+    monkeypatch.setattr("apps.core.utils.serializers.User.objects", _UserManager())
+    monkeypatch.setattr(
+        "apps.core.utils.serializers.get_permission_rules",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        CollectModelSerializer.Meta,
+        "validators",
+        [],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "apps.cmdb.serializers.collect_serializer.InstanceManage.query_entity_by_uuids",
+        lambda uuids: [
+            {
+                "inst_uuid": inst_uuid,
+                "model_id": "sangforhci",
+                "inst_name": "platform-target",
+                "ip_addr": "10.0.0.8",
+            }
+            for inst_uuid in uuids
+        ],
+    )
+    monkeypatch.setattr(
+        "apps.cmdb.serializers.collect_serializer.CmdbRulesFormatUtil.format_user_groups_permissions",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        "apps.cmdb.serializers.collect_serializer.InstanceManage._has_topology_view_permission",
+        lambda *args, **kwargs: True,
+    )
+
+
+def _serializer(model_id, credential, *, timeout=60):
+    request = SimpleNamespace(user=SimpleNamespace(group_list=[]), COOKIES={})
+    return CollectModelSerializer(
+        data={
+            "name": f"{model_id}-collect",
+            "task_type": CollectPluginTypes.CLOUD,
+            "driver_type": CollectDriverTypes.PROTOCOL,
+            "model_id": model_id,
+            "access_point": [{"id": 1}],
+            "instances": [
+                {
+                    "inst_uuid": "63e4a531-b6bb-43cc-9eae-8eb8a09f795e",
+                    "model_id": model_id,
+                    "inst_name": f"{model_id}-target",
+                    "ip_addr": "10.0.0.8",
+                }
+            ],
+            "cycle_value_type": "cycle",
+            "cycle_value": "5",
+            "scan_cycle": "5",
+            "timeout": timeout,
+            "team": [1],
+            "params": {},
+            "credential": [credential],
+        },
+        context={"request": request},
+    )
+
+
+@pytest.mark.parametrize(
+    "model_id,port",
+    [("fusioninsight", 443), ("storage", 8088), ("sangforhci", 443)],
+)
+def test_platform_api_accepts_username_password_and_tls(model_id, port):
+    serializer = _serializer(
+        model_id,
+        {
+            "username": " collector ",
+            "password": "secret",
+            "port": port,
+            "verify_tls": True,
+        },
+    )
+
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_data["credential"][0]["username"] == "collector"
+
+
+def test_platform_api_converts_legacy_aksk_to_username_password():
+    serializer = _serializer(
+        "fusioninsight",
+        {
+            "credential_id": "cred-legacy",
+            "accessKey": "legacy-user",
+            "accessSecret": "legacy-secret",
+            "port": 9443,
+            "verify_tls": False,
+        },
+    )
+
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_data["credential"] == [
+        {
+            "credential_id": "cred-legacy",
+            "username": "legacy-user",
+            "password": "legacy-secret",
+            "port": 9443,
+            "verify_tls": False,
+        }
+    ]
+
+
+def test_platform_api_create_rejects_masked_password():
+    serializer = _serializer(
+        "storage",
+        {
+            "username": "readonly",
+            "password": "******",
+            "port": 8088,
+            "verify_tls": True,
+        },
+    )
+
+    assert serializer.is_valid() is False
+    assert "password" in serializer.errors["credential"]
+
+
+def test_fusioninsight_decrypts_legacy_encrypted_access_key():
+    task = CollectModels(
+        model_id="fusioninsight",
+        driver_type=CollectDriverTypes.PROTOCOL,
+        credential=[
+            {
+                "accessKey": CollectModels.encrypt_password("legacy-user"),
+                "accessSecret": CollectModels.encrypt_password("legacy-secret"),
+            }
+        ],
+    )
+
+    assert task.decrypt_credentials == [
+        {
+            "accessKey": "legacy-user",
+            "accessSecret": "legacy-secret",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [
+        {"username": "", "password": "secret", "port": 443, "verify_tls": True},
+        {"username": "user", "password": "", "port": 443, "verify_tls": True},
+        {"username": "user", "password": "secret", "port": 0, "verify_tls": True},
+        {"username": "user", "password": "secret", "port": 443, "verify_tls": "false"},
+        {
+            "username": "user",
+            "password": "secret",
+            "port": 443,
+            "verify_tls": True,
+            "unexpected": "wrong-contract",
+        },
+    ],
+)
+def test_platform_api_rejects_invalid_or_cloud_aksk_contract(credential):
+    serializer = _serializer("fusioninsight", credential)
+
+    assert serializer.is_valid() is False
+    assert "credential" in serializer.errors
+
+
+@pytest.mark.parametrize(
+    "task_model_id,selected_model_id",
+    [
+        ("sangforscp", "sangforhci"),
+        ("sangforhci", "sangforscp"),
+    ],
+)
+def test_sangfor_task_rejects_cross_product_platform_instance(
+    monkeypatch,
+    task_model_id,
+    selected_model_id,
+):
+    monkeypatch.setattr(
+        "apps.cmdb.serializers.collect_serializer.InstanceManage.query_entity_by_uuids",
+        lambda uuids: [
+            {
+                "inst_uuid": inst_uuid,
+                "model_id": selected_model_id,
+                "inst_name": "wrong-product-target",
+                "endpoint": "https://192.0.2.10",
+            }
+            for inst_uuid in uuids
+        ],
+    )
+    serializer = _serializer(
+        task_model_id,
+        {
+            "username": "collector",
+            "password": "secret",
+            "port": 443,
+            "verify_tls": True,
+        },
+    )
+
+    assert serializer.is_valid() is False
+    assert serializer.errors["instances"][0] == "采集任务与平台实例模型不匹配"
+
+
+@pytest.mark.parametrize("timeout", [0, 86401])
+def test_collection_timeout_rejects_values_outside_runtime_contract(timeout):
+    serializer = _serializer(
+        "sangforhci",
+        {
+            "username": "collector",
+            "password": "secret",
+            "port": 443,
+            "verify_tls": True,
+        },
+        timeout=timeout,
+    )
+
+    assert serializer.is_valid() is False
+    assert "timeout" in serializer.errors
+
+
+def test_sangfor_collection_accepts_3000_second_task_budget():
+    serializer = _serializer(
+        "sangforhci",
+        {
+            "username": "collector",
+            "password": "secret",
+            "port": 443,
+            "verify_tls": True,
+        },
+        timeout=3000,
+    )
+
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_data["timeout"] == 3000

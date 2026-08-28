@@ -7,22 +7,26 @@ import {
   Input,
   Switch,
   Empty,
-  Tag,
-  Select,
   Button,
   Tooltip,
-  Radio,
 } from 'antd';
 import {
   HolderOutlined,
   SettingOutlined,
 } from '@ant-design/icons';
-import FilterOptionsModal from './filterOptionsModal';
+import { ParamInputConfigEditor } from '@/app/ops-analysis/components/paramInputConfigEditor';
+import { ParamInputControl } from '@/app/ops-analysis/components/paramInputControl';
 import GroupTreeSelect from '@/components/group-tree-select';
+import { normalizeInputConfig } from '@/app/ops-analysis/utils/paramInputConfigUtils';
+import {
+  coerceValueForMultiple,
+  isMultipleSelectInputConfig,
+  migrateParamItemsFromStringList,
+} from '@/app/ops-analysis/utils/stringParamMultipleMigrate';
 import dayjs from 'dayjs';
 import TimeSelector from '@/components/time-selector';
+import DateRangeSelector from '@/app/ops-analysis/components/dateRangeSelector';
 import {
-  isOptionInputMode,
   normalizeUnifiedFilterInputMode,
   sanitizeUnifiedFilterDefinition,
 } from '@/app/ops-analysis/utils/widgetDataTransform';
@@ -45,14 +49,20 @@ import {
 import { CSS } from '@dnd-kit/utilities';
 import { useTranslation } from '@/utils/i18n';
 import useUnsavedConfirm from '@/hooks/useUnsavedConfirm';
+import { hasInvalidDateRangeDefinitions } from '@/app/ops-analysis/utils/unifiedFilterState';
 import type {
   UnifiedFilterDefinition,
   FilterValue,
   TimeRangeValue,
   LayoutItem,
-  FilterOption,
 } from '@/app/ops-analysis/types/dashBoard';
-import type { ParamItem, DatasourceItem } from '@/app/ops-analysis/types/dataSource';
+import type { DateRangeValue } from '@/app/ops-analysis/types/dateRange';
+import type {
+  DatasourceItem,
+  InputControlConfig,
+  ParamItem,
+} from '@/app/ops-analysis/types/dataSource';
+import { isBindableDataSourceParamType } from '@/app/ops-analysis/utils/dataSourceParamContract';
 
 interface UnifiedFilterConfigModalProps {
   open: boolean;
@@ -69,11 +79,18 @@ interface SortableRowProps extends React.HTMLAttributes<HTMLTableRowElement> {
 
 interface ScannedParam {
   key: string;
-  type: 'string' | 'timeRange';
+  type: 'string' | 'timeRange' | 'dateRange';
   componentCount: number;
   sampleAlias: string;
   sampleDefaultValue: FilterValue;
+  sampleInputConfig?: InputControlConfig;
 }
+
+const coerceDefaultValueForInputConfig = (
+  defaultValue: FilterValue | undefined,
+  inputConfig: InputControlConfig,
+): FilterValue | null =>
+  coerceValueForMultiple(defaultValue, isMultipleSelectInputConfig(inputConfig));
 
 const SortableRow: React.FC<SortableRowProps> = (props) => {
   const {
@@ -150,10 +167,12 @@ const scanFilterParams = (
   dataSources.forEach((ds) => {
     if (!usedDataSourceIds.has(ds.id)) return;
 
-    const params = Array.isArray(ds.params) ? ds.params : [];
+    const params = migrateParamItemsFromStringList(
+      Array.isArray(ds.params) ? ds.params : [],
+    ).params;
     params.forEach((param: ParamItem) => {
       if (param.filterType !== 'filter') return;
-      if (param.type !== 'string' && param.type !== 'timeRange') return;
+      if (!isBindableDataSourceParamType(param.type)) return;
 
       const compositeKey = `${param.name}__${param.type}`;
       const existing = paramMap.get(compositeKey);
@@ -163,10 +182,11 @@ const scanFilterParams = (
       } else {
         paramMap.set(compositeKey, {
           key: param.name,
-          type: param.type as 'string' | 'timeRange',
+          type: param.type,
           componentCount: 1,
           sampleAlias: param.alias_name || param.name,
           sampleDefaultValue: (param.value as FilterValue) ?? null,
+          sampleInputConfig: param.inputConfig,
         });
       }
     });
@@ -186,17 +206,10 @@ const UnifiedFilterConfigModal: React.FC<UnifiedFilterConfigModalProps> = ({
   const { t } = useTranslation();
   const guardClose = useUnsavedConfirm();
   const [definitions, setDefinitions] = useState<UnifiedFilterDefinition[]>([]);
-  const [optionsModalOpen, setOptionsModalOpen] = useState(false);
+  const [inputConfigModalOpen, setInputConfigModalOpen] = useState(false);
   const [editingFilterId, setEditingFilterId] = useState<string | null>(null);
   const hasInitializedRef = useRef(false);
   const initialSnapshotRef = useRef<string>('');
-
-  const filterTypeOptions = [
-    { label: t('dashboard.string'), value: 'input' },
-    { label: t('dashboard.inputModeSelect'), value: 'select' },
-    { label: t('dashboard.inputModeRadio'), value: 'radio' },
-    { label: t('dashboard.inputModeOrganization'), value: 'organization' },
-  ];
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -209,6 +222,42 @@ const UnifiedFilterConfigModal: React.FC<UnifiedFilterConfigModalProps> = ({
     () => scanFilterParams(layoutItems, dataSources),
     [layoutItems, dataSources],
   );
+
+  const getFilterInputConfig = (
+    definition?: UnifiedFilterDefinition,
+  ): InputControlConfig | undefined => {
+    if (!definition) return undefined;
+    const normalized = normalizeInputConfig(definition);
+    const inputMode = normalizeUnifiedFilterInputMode(definition.inputMode);
+    if (normalized) {
+      if (inputMode === 'select' || inputMode === 'radio') {
+        if (normalized.control === 'input') {
+          return {
+            control: inputMode,
+            optionsSource: {
+              type: 'static',
+              staticItems: [],
+            },
+          };
+        }
+        if (normalized.control === inputMode) {
+          return normalized;
+        }
+        return { ...normalized, control: inputMode };
+      }
+      return normalized;
+    }
+    if (inputMode === 'select' || inputMode === 'radio') {
+      return {
+        control: inputMode,
+        optionsSource: {
+          type: 'static',
+          staticItems: [],
+        },
+      };
+    }
+    return { control: 'input' };
+  };
 
   useEffect(() => {
     if (!open) {
@@ -239,6 +288,8 @@ const UnifiedFilterConfigModal: React.FC<UnifiedFilterConfigModalProps> = ({
         defaultValue: param.sampleDefaultValue,
         order: initialDefinitions.length + index,
         enabled: true,
+        inputConfig: param.sampleInputConfig,
+        inputMode: param.sampleInputConfig?.control,
       };
     });
 
@@ -263,23 +314,6 @@ const UnifiedFilterConfigModal: React.FC<UnifiedFilterConfigModalProps> = ({
     );
   };
 
-  const handleInputModeChange = (
-    id: string,
-    inputMode: UnifiedFilterDefinition['inputMode'],
-  ) => {
-    setDefinitions(
-      definitions.map((definition) => {
-        if (definition.id !== id) return definition;
-        return sanitizeUnifiedFilterDefinition({
-          ...definition,
-          inputMode,
-          defaultValue: null,
-          options: isOptionInputMode(inputMode) ? definition.options : undefined,
-        });
-      }),
-    );
-  };
-
   const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event;
     if (!over || active.id === over.id) return;
@@ -294,41 +328,41 @@ const UnifiedFilterConfigModal: React.FC<UnifiedFilterConfigModalProps> = ({
   };
 
   const handleConfirm = () => {
+    if (hasInvalidDateRangeDefinitions(definitions)) return;
     onConfirm(definitions.map(sanitizeUnifiedFilterDefinition));
     onCancel();
   };
 
-  const handleOpenOptionsModal = (filterId: string) => {
+  const handleOpenInputConfigModal = (filterId: string) => {
     setEditingFilterId(filterId);
-    setOptionsModalOpen(true);
+    setInputConfigModalOpen(true);
   };
 
-  const handleOptionsConfirm = (options: FilterOption[]) => {
-    if (editingFilterId) {
-      const optionValues = options.map((item) => item.value);
-      setDefinitions(
-        definitions.map((d) =>
-          d.id === editingFilterId
-            ? sanitizeUnifiedFilterDefinition({
-              ...d,
-              options,
-              defaultValue:
-                 typeof d.defaultValue === 'string' && !optionValues.includes(d.defaultValue)
-                   ? null
-                   : d.defaultValue,
-            })
-            : d
-        )
-      );
-    }
+  const handleInputConfigConfirm = (inputConfig: InputControlConfig) => {
+    if (!editingFilterId) return;
+    setDefinitions(
+      definitions.map((definition) =>
+        definition.id === editingFilterId
+          ? sanitizeUnifiedFilterDefinition({
+            ...definition,
+            inputConfig,
+            inputMode: inputConfig.control,
+            options: undefined,
+            defaultValue: coerceDefaultValueForInputConfig(
+              definition.defaultValue,
+              inputConfig,
+            ),
+          })
+          : definition,
+      ),
+    );
     setEditingFilterId(null);
-    setOptionsModalOpen(false);
+    setInputConfigModalOpen(false);
   };
 
-  const getEditingFilterOptions = (): FilterOption[] => {
-    if (!editingFilterId) return [];
-    const filter = definitions.find((d) => d.id === editingFilterId);
-    return filter?.options || [];
+  const getEditingFilterInputConfig = (): InputControlConfig | undefined => {
+    if (!editingFilterId) return undefined;
+    return getFilterInputConfig(definitions.find((d) => d.id === editingFilterId));
   };
 
   const columns = [
@@ -364,27 +398,25 @@ const UnifiedFilterConfigModal: React.FC<UnifiedFilterConfigModalProps> = ({
       width: 160,
       render: (_: unknown, record: UnifiedFilterDefinition) => {
         if (record.type === 'timeRange') {
-          return (
-            <Tag color="blue" style={{ marginRight: 0 }}>
-              {t('dashboard.timeRange')}
-            </Tag>
-          );
+          return <span>{t('dashboard.timeRange')}</span>;
         }
 
-        const currentMode = normalizeUnifiedFilterInputMode(record.inputMode);
+        if (record.type === 'dateRange') {
+          return <span>{t('dashboard.dateRange')}</span>;
+        }
 
         return (
-          <div className="flex items-center gap-2">
-            <Select
-              size="small"
-              value={currentMode}
-              options={filterTypeOptions}
-              style={{ width: 120 }}
-              onChange={(val) => handleInputModeChange(
-                record.id,
-                val as UnifiedFilterDefinition['inputMode'],
-              )}
-            />
+          <div className="flex w-full items-center justify-between">
+            <span>{t('dashboard.string')}</span>
+            <Tooltip title={t('dashboard.configOptions')}>
+              <Button
+                type="text"
+                size="small"
+                icon={<SettingOutlined />}
+                className="shrink-0 text-[var(--color-text-3)] hover:text-[var(--color-text-2)]"
+                onClick={() => handleOpenInputConfigModal(record.id)}
+              />
+            </Tooltip>
           </div>
         );
       },
@@ -436,55 +468,69 @@ const UnifiedFilterConfigModal: React.FC<UnifiedFilterConfigModalProps> = ({
           );
         }
 
-        const currentMode = normalizeUnifiedFilterInputMode(record.inputMode);
-
-        if (currentMode === 'select') {
+        if (record.type === 'dateRange') {
           return (
-            <div className="flex items-center gap-2">
-              <Select
-                value={(typeof value === 'string' || typeof value === 'number') ? value : undefined}
-                onChange={(nextValue) => handleFieldChange(record.id, 'defaultValue', nextValue ?? null)}
-                placeholder={record.options?.length ? t('common.selectTip') : t('dashboard.configOptionsFirst')}
-                allowClear
-                disabled={!record.options?.length}
-                options={record.options}
-                className="flex-1"
-              />
-              <Tooltip title={t('dashboard.configOptions')}>
-                <Button
-                  type="text"
-                  size="small"
-                  icon={<SettingOutlined />}
-                  className="shrink-0 text-[var(--color-text-2)] hover:text-[var(--color-primary)]"
-                  onClick={() => handleOpenOptionsModal(record.id)}
-                />
-              </Tooltip>
-            </div>
+            <DateRangeSelector
+              value={value as DateRangeValue | null | undefined}
+              onChange={(nextValue) =>
+                handleFieldChange(record.id, 'defaultValue', nextValue)
+              }
+            />
           );
         }
 
-        if (currentMode === 'radio') {
+        const currentMode = normalizeUnifiedFilterInputMode(record.inputMode);
+
+        if (currentMode !== 'organization') {
+          const inputConfig = getFilterInputConfig(record);
+          const isMultiple = Boolean(
+            inputConfig && inputConfig.control !== 'input' && inputConfig.multiple,
+          );
+          const controlValue = Array.isArray(value)
+            ? value
+            : (typeof value === 'string' || typeof value === 'number')
+              ? value
+              : undefined;
+          const fallbackInput = (
+            <Input
+              value={Array.isArray(value)
+                ? value.map(String).join(', ')
+                : (typeof value === 'string' || typeof value === 'number') ? String(value) : ''}
+              onChange={(e) =>
+                handleFieldChange(
+                  record.id,
+                  'defaultValue',
+                  e.target.value || null,
+                )
+              }
+              placeholder={t('common.inputTip')}
+              allowClear
+            />
+          );
+
           return (
-            <div className="flex items-center gap-2">
-              <Radio.Group
-                value={(typeof value === 'string' || typeof value === 'number') ? value : undefined}
-                onChange={(e) => handleFieldChange(record.id, 'defaultValue', e.target.value ?? null)}
-                disabled={!record.options?.length}
-                options={record.options}
-                optionType="button"
-                buttonStyle="outline"
-                className="flex-1"
-              />
-              <Tooltip title={t('dashboard.configOptions')}>
-                <Button
-                  type="text"
-                  size="small"
-                  icon={<SettingOutlined />}
-                  className="shrink-0 text-[var(--color-text-2)] hover:text-[var(--color-primary)]"
-                  onClick={() => handleOpenOptionsModal(record.id)}
-                />
-              </Tooltip>
-            </div>
+            <ParamInputControl
+              inputConfig={inputConfig}
+              fallback={fallbackInput}
+              value={controlValue}
+              onChange={(nextValue) => {
+                if (isMultiple) {
+                  if (Array.isArray(nextValue)) {
+                    handleFieldChange(record.id, 'defaultValue', nextValue);
+                    return;
+                  }
+                  if (typeof nextValue === 'string' || typeof nextValue === 'number') {
+                    handleFieldChange(record.id, 'defaultValue', [nextValue]);
+                    return;
+                  }
+                  handleFieldChange(record.id, 'defaultValue', null);
+                  return;
+                }
+                handleFieldChange(record.id, 'defaultValue', nextValue ?? null);
+              }}
+              placeholder={record.name}
+              style={{ minWidth: 160 }}
+            />
           );
         }
 
@@ -577,14 +623,15 @@ const UnifiedFilterConfigModal: React.FC<UnifiedFilterConfigModalProps> = ({
           />
         </SortableContext>
       </DndContext>
-      <FilterOptionsModal
-        open={optionsModalOpen}
-        options={getEditingFilterOptions()}
+      <ParamInputConfigEditor
+        key={editingFilterId ?? 'closed'}
+        open={inputConfigModalOpen}
+        value={getEditingFilterInputConfig()}
+        onConfirm={handleInputConfigConfirm}
         onCancel={() => {
-          setOptionsModalOpen(false);
+          setInputConfigModalOpen(false);
           setEditingFilterId(null);
         }}
-        onConfirm={handleOptionsConfirm}
       />
     </Modal>
   );

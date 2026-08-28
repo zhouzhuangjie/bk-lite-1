@@ -31,6 +31,20 @@ class ConfigFileVersionStatus(object):
     )
 
 
+class ConfigFileContentStatus(object):
+    PENDING = "pending"
+    READY = "ready"
+    DELETE_PENDING = "delete_pending"
+    ERROR = "error"
+
+    CHOICES = (
+        (PENDING, "待发布"),
+        (READY, "可用"),
+        (DELETE_PENDING, "待删除"),
+        (ERROR, "处理失败"),
+    )
+
+
 class ConfigFileVersion(models.Model):
     collect_task = models.ForeignKey(
         CollectModels,
@@ -40,7 +54,8 @@ class ConfigFileVersion(models.Model):
         related_name="config_file_versions",
         help_text="关联的采集任务（手动创建时为空）",
     )
-    instance_id = models.CharField(max_length=128, help_text="主机实例 ID")
+    instance_id = models.CharField(max_length=128, help_text="主机实例图 ID（过渡期保留）")
+    instance_uuid = models.UUIDField(null=True, blank=True, db_index=True, help_text="主机实例 UUID")
     model_id = models.CharField(max_length=64, help_text="模型 ID")
     version = models.CharField(max_length=32, help_text="版本号（采集时间戳）")
     file_path = models.CharField(max_length=512, help_text="采集时的文件绝对路径")
@@ -56,6 +71,16 @@ class ConfigFileVersion(models.Model):
     file_size = models.PositiveIntegerField(default=0, help_text="文件大小（字节）")
     status = models.CharField(max_length=32, choices=ConfigFileVersionStatus.CHOICES, help_text="采集结果状态")
     error_message = models.TextField(blank=True, default="", help_text="失败原因描述")
+    content_status = models.CharField(
+        max_length=32,
+        choices=ConfigFileContentStatus.CHOICES,
+        default=ConfigFileContentStatus.PENDING,
+        help_text="配置正文跨存储生命周期状态",
+    )
+    temp_content_key = models.CharField(max_length=512, blank=True, default="", help_text="待发布的临时对象键")
+    content_error = models.TextField(blank=True, default="", help_text="正文发布或删除失败摘要")
+    content_attempt_count = models.PositiveIntegerField(default=0, help_text="正文生命周期处理尝试次数")
+    content_updated_at = models.DateTimeField(auto_now=True, help_text="正文生命周期状态更新时间")
     created_at = models.DateTimeField(auto_now_add=True, help_text="记录创建时间")
 
     class Meta:
@@ -63,6 +88,16 @@ class ConfigFileVersion(models.Model):
         verbose_name_plural = "配置文件版本"
         ordering = ["-created_at"]
         index_together = [("instance_id", "file_path"), ("collect_task_id",)]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["collect_task", "instance_id", "version"],
+                name="uniq_cfg_ver_task_inst_version",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["content_status", "content_updated_at"], name="cfg_content_state_idx"),
+            models.Index(fields=["instance_uuid", "file_path"], name="cmdb_cfg_uuid_path_idx"),
+        ]
 
     @property
     def content_key(self) -> str:
@@ -87,8 +122,3 @@ class ConfigFileVersion(models.Model):
                 return gzip.decompress(raw_content)
             except OSError:
                 return raw_content
-
-    def delete(self, using=None, keep_parents=False):
-        if self.content:
-            self.content.delete(save=False)
-        return super().delete(using=using, keep_parents=keep_parents)

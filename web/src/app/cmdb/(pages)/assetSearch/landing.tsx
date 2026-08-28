@@ -5,7 +5,6 @@ import {
   AppstoreOutlined,
   ArrowRightOutlined,
   ClearOutlined,
-  MoreOutlined,
   ReloadOutlined,
   SearchOutlined,
   StarFilled,
@@ -15,7 +14,6 @@ import {
   Button,
   Card,
   Checkbox,
-  Dropdown,
   Empty,
   Input,
   List,
@@ -26,7 +24,6 @@ import {
   Tooltip,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
-import type { MenuProps } from 'antd';
 
 import { useTranslation } from '@/utils/i18n';
 import {
@@ -34,7 +31,11 @@ import {
   type ChangeOperationTone,
 } from '@/app/cmdb/utils/assetSearchDisplay';
 import type { RecentChangeFilter } from '@/app/cmdb/utils/assetSearchLandingData';
+import CompactEmptyState from '@/components/compact-empty-state';
 import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
+import MoreActionsDropdown from '@/components/more-actions-dropdown';
+import type { MoreActionsDropdownItem } from '@/components/more-actions-dropdown';
+import ModelIcon from '@/app/cmdb/components/model-icon';
 import assetSearchStyle from './index.module.scss';
 
 export interface QuickTagItem {
@@ -57,14 +58,13 @@ export interface RecentChangeItem {
 
 export interface FollowedAssetViewItem {
   key: string;
-  inst_id: string | number;
+  inst_uuid: string;
   model_id: string;
   model_name: string;
   inst_name: string;
   classification_id?: string;
   icn?: string;
   organization?: string;
-  icon?: string;
   followed?: boolean;
 }
 
@@ -75,7 +75,7 @@ export interface CategoryEntryItem {
   count: number;
   target_model_id?: string;
   target_classification_id?: string;
-  icon?: string;
+  target_icn?: string;
 }
 
 export interface AssetSearchLandingProps {
@@ -172,26 +172,18 @@ const AssetSearchLanding: React.FC<AssetSearchLandingProps> = ({
     { label: t('AssetSearch.changeFilters.highRisk'), value: 'highRisk' },
   ];
 
-  const getFollowedAssetMenu = (item: FollowedAssetViewItem): MenuProps => ({
-    items: [
-      {
-        key: 'detail',
-        label: t('AssetSearch.viewDetail'),
-      },
-      {
-        key: 'toggleFollow',
-        label: item.followed === false ? t('AssetSearch.follow') : t('AssetSearch.unfollow'),
-      },
-    ],
-    onClick: ({ key, domEvent }) => {
-      domEvent.stopPropagation();
-      if (key === 'detail') {
-        onOpenAsset(item);
-        return;
-      }
-      onToggleFollow(item);
+  const getFollowedAssetItems = (item: FollowedAssetViewItem): MoreActionsDropdownItem[] => [
+    {
+      key: 'detail',
+      label: t('AssetSearch.viewDetail'),
+      onClick: () => onOpenAsset(item),
     },
-  });
+    {
+      key: 'toggleFollow',
+      label: item.followed === false ? t('AssetSearch.follow') : t('AssetSearch.unfollow'),
+      onClick: () => onToggleFollow(item),
+    },
+  ];
 
   React.useEffect(() => {
     if (recentChangeListRef.current) {
@@ -452,24 +444,27 @@ const AssetSearchLanding: React.FC<AssetSearchLandingProps> = ({
                       }}
                     />
                   </Tooltip>,
-                  <Dropdown
+                  <MoreActionsDropdown
                     key="more"
-                    trigger={['click']}
-                    menu={getFollowedAssetMenu(item)}
-                  >
-                    <Button
-                      type="text"
-                      size="small"
-                      icon={<MoreOutlined />}
-                      onClick={(event) => event.stopPropagation()}
-                    />
-                  </Dropdown>,
+                    items={getFollowedAssetItems(item)}
+                    stopPropagation
+                  />,
                 ]}
                 onClick={() => onOpenAsset(item)}
               >
                 <div className={assetSearchStyle.followedAssetRow}>
                   <span className={assetSearchStyle.assetIcon}>
-                    {item.icon ? <img src={item.icon} alt="" /> : <AppstoreOutlined />}
+                    {item.model_id ? (
+                      <ModelIcon
+                        icon={item.icn}
+                        modelId={item.model_id}
+                        alt=""
+                        width={32}
+                        height={32}
+                      />
+                    ) : (
+                      <AppstoreOutlined />
+                    )}
                   </span>
                   <span className={assetSearchStyle.followedAssetIdentity}>
                     <span className={assetSearchStyle.followedAssetName}>
@@ -506,7 +501,17 @@ const AssetSearchLanding: React.FC<AssetSearchLandingProps> = ({
                 onClick={() => onOpenCategory(item)}
               >
                 <span className={assetSearchStyle.categoryIcon}>
-                  {item.icon ? <img src={item.icon} alt="" /> : <AppstoreOutlined />}
+                  {item.target_model_id ? (
+                    <ModelIcon
+                      icon={item.target_icn}
+                      modelId={item.target_model_id}
+                      alt=""
+                      width={36}
+                      height={36}
+                    />
+                  ) : (
+                    <AppstoreOutlined />
+                  )}
                 </span>
                 <span>
                   <strong>{item.title}</strong>
@@ -517,7 +522,7 @@ const AssetSearchLanding: React.FC<AssetSearchLandingProps> = ({
             ))}
           </div>
         ) : (
-          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} />
+          <CompactEmptyState description={t('common.noData')} />
         )}
       </Card>
     </div>

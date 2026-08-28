@@ -42,8 +42,10 @@ interface ModelAssociation {
   asst_id: string;
   src_id: number;
   src_model_id: string;
+  src_model_name?: string;
   dst_id: number;
   dst_model_id: string;
+  dst_model_name?: string;
 }
 
 const SideMenu: React.FC<SideMenuProps> = ({
@@ -55,6 +57,7 @@ const SideMenu: React.FC<SideMenuProps> = ({
   onBackButtonClick,
 }) => {
   const ASSET_NAME = 'asset_relationships';
+  const IP_VIEW_NAME = 'asset_ip_view';
 
   const { getModelAssociations } = useModelApi();
 
@@ -62,13 +65,13 @@ const SideMenu: React.FC<SideMenuProps> = ({
   const searchParams = useSearchParams();
   const router = useRouter();
   const modelId = searchParams.get('model_id');
-  const { setSelectedAssoId, assoInstances, assoTypes, modelList } =
+  const { setSelectedAssoId, assoInstances, assoTypes } =
     useRelationships();
   const [allAssociations, setAllAssociations] = useState<ModelAssociation[]>(
     []
   );
 
-  // 左侧快捷入口：网络拓扑 / 机房视图 / 机柜视图，直达关联关系页对应子视图（缩短操作路径）
+  // 左侧快捷入口：网络拓扑 / 应用拓扑 / 机房视图 / 机柜视图，直达关联关系页对应子视图（缩短操作路径）
   const { getTopoThemes } = useInstanceApi();
   const { t } = useTranslation();
   const [themes, setThemes] = useState<string[]>([]);
@@ -95,6 +98,9 @@ const SideMenu: React.FC<SideMenuProps> = ({
     const list: { tab: string; title: string; icon: React.ReactNode }[] = [];
     if (themes.includes('network')) {
       list.push({ tab: 'network', title: t('Model.networkTopo'), icon: <ApartmentOutlined /> });
+    }
+    if (themes.includes('app_overview')) {
+      list.push({ tab: 'appOverview', title: t('Model.applicationResourceOverview'), icon: <ApartmentOutlined /> });
     }
     if (modelId === 'server_room') {
       list.push({ tab: 'roomView', title: t('Model.roomLayout'), icon: <AppstoreOutlined /> });
@@ -166,13 +172,9 @@ const SideMenu: React.FC<SideMenuProps> = ({
         }
 
         const text =
-          modelList.find(
-            (model) =>
-              model.model_id ===
-              (item.dst_model_id === modelId
-                ? item.src_model_id
-                : item.dst_model_id)
-          )?.model_name || '--';
+          item.dst_model_id === modelId
+            ? item.src_model_name || item.src_model_id
+            : item.dst_model_name || item.dst_model_id;
 
         acc.get(title)?.push({
           model_asst_id: item.model_asst_id,
@@ -187,7 +189,7 @@ const SideMenu: React.FC<SideMenuProps> = ({
       const dedupedMap = new Map<string, ListItem>();
 
       children.forEach((child: ListItem) => {
-        const dedupKey = child.text;
+        const dedupKey = child.model_asst_id;
         const existing = dedupedMap.get(dedupKey);
 
         if (!existing) {
@@ -208,7 +210,19 @@ const SideMenu: React.FC<SideMenuProps> = ({
         children: Array.from(dedupedMap.values()),
       };
     });
-  }, [assoInstances, assoTypes, allAssociations, modelList]);
+  }, [assoInstances, assoTypes, allAssociations]);
+
+  const orderedMenuItems = useMemo(() => {
+    const items = [...menuItems];
+    const ipViewIndex = items.findIndex((item) => item.name === IP_VIEW_NAME);
+    const relationIndex = items.findIndex((item) => item.name === ASSET_NAME);
+    if (ipViewIndex === -1 || relationIndex === -1 || ipViewIndex < relationIndex) {
+      return items;
+    }
+    const [ipViewItem] = items.splice(ipViewIndex, 1);
+    items.splice(relationIndex, 0, ipViewItem);
+    return items;
+  }, [menuItems]);
 
   return (
     <aside
@@ -225,7 +239,7 @@ const SideMenu: React.FC<SideMenuProps> = ({
         className={`flex flex-1 overflow-hidden relative rounded-md ${sideMenuStyle.nav}`}
       >
         <ul className="p-3 flex-1">
-          {menuItems.map((item) => (
+          {orderedMenuItems.map((item) => (
             <React.Fragment key={item.url}>
               {item.name === ASSET_NAME && shortcuts.map((s) => {
                 const active = isActive(item.url) && currentTab === s.tab;
@@ -249,15 +263,14 @@ const SideMenu: React.FC<SideMenuProps> = ({
               <li
                 className={`rounded-md mb-1 ${isActive(item.url) ? sideMenuStyle.active : ''}`}
               >
-                <Link legacyBehavior href={buildUrlWithParams(item.url)}>
-                  <a
-                    className={`group flex items-center h-9 rounded-md py-2 text-sm font-normal px-3`}
-                  >
-                    {item.icon && (
-                      <Icon type={item.icon} className="text-xl pr-1.5" />
-                    )}
-                    {item.title}
-                  </a>
+                <Link
+                  href={buildUrlWithParams(item.url)}
+                  className="group flex items-center h-9 rounded-md py-2 text-sm font-normal px-3"
+                >
+                  {item.icon && (
+                    <Icon type={item.icon} className="text-xl pr-1.5" />
+                  )}
+                  {item.title}
                 </Link>
               </li>
               {item.name === ASSET_NAME && !!relationData?.length && (

@@ -28,11 +28,15 @@ import { useCommon } from '@/app/log/context/common';
 import { useAssetMenuItems } from '@/app/log/hooks/integration/common/other';
 import { showGroupName } from '@/app/log/utils/common';
 import EditConfig from './updateConfig';
+import EditK8sConfig from './updateK8sConfig';
 import EditInstance from './editInstance';
 import Permission from '@/components/permission';
 import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
 import type { TableProps, MenuProps } from 'antd';
 import TreeSelector from '@/app/log/components/tree-selector';
+import { useRouter, useSearchParams } from 'next/navigation';
+import LogExtractorDrawer from './logExtractorDrawer';
+import { consumeExtractorCreateSample } from './logExtractorLogic';
 const { confirm } = Modal;
 
 type TableRowSelection<T extends object = object> =
@@ -44,14 +48,18 @@ const Asset = () => {
     getInstanceList,
     deleteLogInstance,
     getCollectTypes,
-    getDisplayCategoryEnum
+    getDisplayCategoryEnum,
+    getLogExtractors
   } = useLogApi();
   const { t } = useTranslation();
+  const router = useRouter();
+  const searchParams = useSearchParams();
   const commonContext = useCommon();
   const authList = useRef(commonContext?.authOrganizations || []);
   const organizationList: Organization[] = authList.current;
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const configRef = useRef<ModalRef>(null);
+  const k8sConfigRef = useRef<ModalRef>(null);
   const instanceRef = useRef<ModalRef>(null);
   const instanceAbortControllerRef = useRef<AbortController | null>(null);
   const instanceRequestIdRef = useRef<number>(0);
@@ -75,6 +83,16 @@ const Asset = () => {
   const [collectTypeMap, setCollectTypeMap] = useState<Record<number, string>>(
     {}
   );
+  const [extractorInstance, setExtractorInstance] = useState<{
+    id: string;
+    name: string;
+    canOperate: boolean;
+  } | null>(null);
+  const [extractorAutoCreate, setExtractorAutoCreate] = useState(false);
+  const [extractorInitialSample, setExtractorInitialSample] = useState<
+    Record<string, unknown> | null
+  >(null);
+  const extractorQueryHandled = useRef<string | null>(null);
 
   const handleAssetMenuClick: MenuProps['onClick'] = (e) => {
     openInstanceModal(
@@ -133,7 +151,7 @@ const Asset = () => {
       title: t('common.action'),
       key: 'action',
       dataIndex: 'action',
-      width: 240,
+      width: 340,
       fixed: 'right',
       render: (_, record) => (
         <>
@@ -146,15 +164,13 @@ const Asset = () => {
             </Button>
           </Permission>
           <Permission requiredPermissions={['Edit']}>
-            {record.collect_type__name !== 'kubernetes' && (
-              <Button
-                className="ml-[10px]"
-                type="link"
-                onClick={() => openConfigModal(record)}
-              >
-                {t('log.integration.updateConfigration')}
-              </Button>
-            )}
+            <Button
+              className="ml-[10px]"
+              type="link"
+              onClick={() => openConfigModal(record)}
+            >
+              {t('log.integration.updateConfigration')}
+            </Button>
           </Permission>
           <Button
             className="ml-[10px]"
@@ -162,6 +178,21 @@ const Asset = () => {
             onClick={() => viewLog(record)}
           >
             {t('log.integration.viewLogs')}
+          </Button>
+          <Button
+            className="ml-[10px]"
+            type="link"
+            onClick={() =>
+              setExtractorInstance({
+                id: String(record.id),
+                name: String(record.name || record.id),
+                canOperate:
+                  Array.isArray(record.permission) &&
+                  record.permission.includes('Operate')
+              })
+            }
+          >
+            {t('log.extractor.title')}
           </Button>
           <Permission requiredPermissions={['Delete']}>
             <Popconfirm
@@ -224,6 +255,57 @@ const Asset = () => {
     searchText,
     objectId
   ]);
+
+  useEffect(() => {
+    const extractorId = searchParams.get('extractor');
+    if (!extractorId || isLoading) return;
+    const matched = tableData.find((row) => String(row.id) === extractorId);
+    if (extractorQueryHandled.current === extractorId) {
+      if (!matched) return;
+      setExtractorInstance((current) => {
+        if (!current || current.id !== extractorId) return current;
+        return {
+          ...current,
+          name: String(matched.name || extractorId)
+        };
+      });
+      return;
+    }
+    extractorQueryHandled.current = extractorId;
+    let cancelled = false;
+    (async () => {
+      try {
+        const list = await getLogExtractors({ collect_instance: extractorId });
+        if (cancelled) return;
+        const canOperate = list.can_operate === true;
+        const shouldCreate = searchParams.get('create') === '1';
+        if (shouldCreate && !canOperate) {
+          message.error(t('log.extractor.instanceUnavailable'));
+        }
+        setExtractorInstance({
+          id: extractorId,
+          name: String(matched?.name || extractorId),
+          canOperate
+        });
+        setExtractorAutoCreate(shouldCreate && canOperate);
+        setExtractorInitialSample(
+          shouldCreate
+            ? consumeExtractorCreateSample({
+                kind: 'instance',
+                id: extractorId
+              })
+            : null
+        );
+      } catch {
+        if (!cancelled) {
+          message.error(t('log.extractor.instanceUnavailable'));
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [isLoading, searchParams, tableData]);
 
   const viewLog = (row: TableDataItem) => {
     const queryString = new URLSearchParams([
@@ -361,8 +443,10 @@ const Asset = () => {
     setFrequence(val);
   };
 
-  const openConfigModal = (row = {}) => {
-    configRef.current?.showModal({
+  const openConfigModal = (row: TableDataItem = {}) => {
+    const targetRef =
+      row.collect_type__name === 'kubernetes' ? k8sConfigRef : configRef;
+    targetRef.current?.showModal({
       title: t('log.integration.updateConfigration'),
       type: 'edit',
       form: {
@@ -399,7 +483,7 @@ const Asset = () => {
       const params = {
         page: pagination.current,
         page_size: pagination.pageSize,
-        collect_type_id: objectId === 'all' ? '' : objectId,
+        collect_type_id: objectId === 'all' ? '' : String(objectId),
         name: type === 'clear' ? '' : searchText
       };
       const data = await getInstanceList(params, {
@@ -517,10 +601,26 @@ const Asset = () => {
           rowSelection={rowSelection}
         ></CustomTable>
         <EditConfig ref={configRef} onSuccess={() => getAssetInsts()} />
+        <EditK8sConfig ref={k8sConfigRef} onSuccess={() => getAssetInsts()} />
         <EditInstance
           ref={instanceRef}
           organizationList={organizationList}
           onSuccess={() => getAssetInsts()}
+        />
+        <LogExtractorDrawer
+          instance={extractorInstance}
+          open={Boolean(extractorInstance)}
+          autoCreate={extractorAutoCreate}
+          initialSample={extractorInitialSample}
+          onClose={() => {
+            setExtractorInstance(null);
+            setExtractorAutoCreate(false);
+            setExtractorInitialSample(null);
+            extractorQueryHandled.current = null;
+            if (searchParams.get('extractor')) {
+              router.replace('/log/integration/receive');
+            }
+          }}
         />
       </div>
     </div>

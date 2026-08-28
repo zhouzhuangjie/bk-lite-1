@@ -1,4 +1,8 @@
+import shlex
+
 from asgiref.sync import async_to_sync
+from django.db import transaction
+from django.db.models import Q
 
 from apps.core.exceptions.base_app_exception import BaseAppException
 from apps.core.utils.crypto.aes_crypto import AESCryptor
@@ -9,8 +13,10 @@ from apps.node_mgmt.models import Node, PackageVersion, SidecarEnv
 from apps.node_mgmt.models.installer import CollectorTask, CollectorTaskNode, ControllerTask, ControllerTaskNode
 from apps.node_mgmt.services.install_token import InstallTokenService
 from apps.node_mgmt.services.installer_session import InstallerSessionService
+from apps.node_mgmt.services.node_identity import assert_cloud_ips_available
 from apps.node_mgmt.services.package import PackageService
 from apps.node_mgmt.utils.architecture import normalize_cpu_architecture
+from apps.node_mgmt.utils.permission import normalize_orgs
 from apps.node_mgmt.utils.s3 import download_file_by_s3
 from apps.node_mgmt.utils.task_result_schema import normalize_task_result_for_read
 
@@ -18,6 +24,42 @@ from apps.node_mgmt.utils.task_result_schema import normalize_task_result_for_re
 class InstallerService:
     AUTO_INSTALL_MODE = "auto"
     MANUAL_INSTALL_MODE = "manual"
+
+    @staticmethod
+    def validate_controller_package_os(package_version_id: int, target_os: str) -> PackageVersion | None:
+        if target_os not in {NodeConstants.WINDOWS_OS, NodeConstants.LINUX_OS}:
+            raise BaseAppException(f"Unsupported operating system: {target_os}")
+        package_obj = PackageVersion.objects.filter(id=package_version_id).first()
+        if not package_obj:
+            # Preserve the existing not-found handling at the task boundary; this
+            # guard is specifically responsible for rejecting an existing package
+            # that would route the batch through the wrong operating-system path.
+            return None
+        if package_obj.os != target_os:
+            raise BaseAppException(
+                f"Controller package operating system mismatch: package={package_obj.os}, target={target_os}"
+            )
+        return package_obj
+
+    @staticmethod
+    def requires_manual_recovery(result) -> bool:
+        if not isinstance(result, dict):
+            return False
+        failure = result.get("failure")
+        if isinstance(failure, dict) and failure.get("type") == "manual_recovery_required":
+            return True
+        for step in result.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            details = step.get("details")
+            if not isinstance(details, dict):
+                continue
+            step_failure = details.get("failure")
+            if details.get("error_type") == "manual_recovery_required" or (
+                isinstance(step_failure, dict) and step_failure.get("type") == "manual_recovery_required"
+            ):
+                return True
+        return False
 
     @staticmethod
     def normalize_required_cpu_architecture(os_name: str, cpu_architecture: str) -> str:
@@ -86,6 +128,10 @@ class InstallerService:
         node_name,
         install_mode=MANUAL_INSTALL_MODE,
         cpu_architecture: str = "",
+        task_node_id: int | None = None,
+        execution_id: str = "",
+        execution_attempt: int | None = None,
+        execution_deadline_unix: int | None = None,
     ):
         """
         获取安装命令（生成包含临时 token 的 curl 命令）
@@ -124,6 +170,11 @@ class InstallerService:
             organizations=organizations,
             node_name=node_name,
             cpu_architecture=normalized_arch,
+            install_mode=install_mode,
+            task_node_id=task_node_id,
+            execution_id=execution_id,
+            execution_attempt=execution_attempt,
+            execution_deadline_unix=execution_deadline_unix,
         )
 
         # 根据操作系统生成不同的安装命令
@@ -139,14 +190,32 @@ class InstallerService:
         return install_command
 
     @staticmethod
-    def install_controller(cloud_region_id, work_node, package_version_id, nodes, cpu_architecture: str):
+    @transaction.atomic
+    def install_controller(
+        cloud_region_id,
+        work_node,
+        package_version_id,
+        nodes,
+        cpu_architecture: str,
+        created_by: str = "",
+        domain: str = "domain.com",
+    ):
         """安装控制器"""
+        node_operating_systems = {node.get("os") or NodeConstants.LINUX_OS for node in nodes}
+        if len(node_operating_systems) != 1:
+            raise BaseAppException("A controller installation batch must use one operating system")
+        InstallerService.validate_controller_package_os(package_version_id, node_operating_systems.pop())
+        assert_cloud_ips_available(cloud_region_id, nodes)
         task_obj = ControllerTask.objects.create(
             cloud_region_id=cloud_region_id,
             work_node=work_node,
             package_version_id=package_version_id,
             type="install",
             status="waiting",
+            created_by=created_by,
+            updated_by=created_by,
+            domain=domain,
+            updated_by_domain=domain,
         )
         creates = []
         aes_obj = AESCryptor()
@@ -165,6 +234,7 @@ class InstallerService:
             creates.append(
                 ControllerTaskNode(
                     task_id=task_obj.id,
+                    node_id=node.get("node_id", ""),
                     ip=node["ip"],
                     node_name=node["node_name"],
                     os=node["os"],
@@ -175,6 +245,9 @@ class InstallerService:
                     password=password,
                     private_key=private_key,
                     passphrase=passphrase,
+                    winrm_scheme=node.get("winrm_scheme", "https"),
+                    winrm_transport=node.get("winrm_transport", "ntlm"),
+                    winrm_cert_validation=node.get("winrm_cert_validation", False),
                     status="waiting",
                 )
             )
@@ -199,13 +272,24 @@ class InstallerService:
         return result
 
     @staticmethod
-    def uninstall_controller(cloud_region_id, work_node, nodes):
+    @transaction.atomic
+    def uninstall_controller(
+        cloud_region_id,
+        work_node,
+        nodes,
+        created_by: str = "",
+        domain: str = "domain.com",
+    ):
         """卸载控制器"""
         task_obj = ControllerTask.objects.create(
             cloud_region_id=cloud_region_id,
             work_node=work_node,
             type="uninstall",
             status="waiting",
+            created_by=created_by,
+            updated_by=created_by,
+            domain=domain,
+            updated_by_domain=domain,
         )
         creates = []
         aes_obj = AESCryptor()
@@ -220,14 +304,20 @@ class InstallerService:
             creates.append(
                 ControllerTaskNode(
                     task_id=task_obj.id,
+                    node_id=node.get("node_id", ""),
                     ip=node["ip"],
+                    node_name=node.get("node_name", ""),
                     os=node["os"],
                     cpu_architecture=node.get("cpu_architecture", ""),
+                    organizations=node.get("organizations", []),
                     port=node["port"],
                     username=node["username"],
                     password=password,
                     private_key=private_key,
                     passphrase=passphrase,
+                    winrm_scheme=node.get("winrm_scheme", "https"),
+                    winrm_transport=node.get("winrm_transport", "ntlm"),
+                    winrm_cert_validation=node.get("winrm_cert_validation", False),
                     status="waiting",
                 )
             )
@@ -235,14 +325,111 @@ class InstallerService:
         return task_obj.id
 
     @staticmethod
-    def install_controller_nodes(task_id):
+    def get_authorized_controller_task_nodes(task_id, authorized_nodes=None, scope=None):
+        task_nodes = ControllerTaskNode.objects.filter(task_id=task_id).select_related("task").order_by("id")
+        if authorized_nodes is None:
+            return list(task_nodes)
+
+        authorized_ids = {str(node_id) for node_id in authorized_nodes.values_list("id", flat=True)}
+        linked_nodes = list(task_nodes.filter(node_id__in=authorized_ids))
+        if scope is None:
+            return linked_nodes
+
+        snapshot_node_ids = {
+            str(node_id)
+            for node_id in task_nodes.values_list("node_id", flat=True)
+            if node_id
+        }
+        existing_node_ids = {
+            str(node_id)
+            for node_id in Node.objects.filter(id__in=snapshot_node_ids).values_list("id", flat=True)
+        }
+        data_team_ids = set(scope.data_team_ids)
+        historical_nodes = []
+        for item in task_nodes:
+            if item.node_id and str(item.node_id) in existing_node_ids:
+                continue
+            snapshot_organizations = normalize_orgs(item.organizations)
+            is_legacy_empty_snapshot = item.organizations in (None, [])
+            # Empty-org historical rows stay visible to task owners (via
+            # get_authorized_controller_task_node_queryset) and superusers so
+            # uninstall progress does not blank out after Node.delete().
+            if snapshot_organizations & data_team_ids:
+                historical_nodes.append(item)
+            elif is_legacy_empty_snapshot and getattr(scope, "is_superuser", False):
+                historical_nodes.append(item)
+            elif is_legacy_empty_snapshot and getattr(scope, "username", None):
+                historical_nodes.append(item)
+        return sorted([*linked_nodes, *historical_nodes], key=lambda item: item.id)
+
+    @staticmethod
+    def get_authorized_controller_task_node_queryset(
+        task_id,
+        authorized_nodes=None,
+        scope=None,
+        request_user=None,
+    ):
+        """返回可重试的任务节点，同时满足数据范围与历史任务归属。"""
+        scoped_task_nodes = InstallerService.get_authorized_controller_task_nodes(
+            task_id,
+            authorized_nodes=authorized_nodes,
+            scope=scope,
+        )
+        scoped_ids = [task_node.id for task_node in scoped_task_nodes]
+        task_nodes = ControllerTaskNode.objects.filter(id__in=scoped_ids).select_related("task").order_by("id")
+        if getattr(request_user, "is_superuser", False):
+            return task_nodes
+
+        username = getattr(request_user, "username", "") if request_user is not None else ""
+        domain = getattr(request_user, "domain", "") if request_user is not None else ""
+        snapshot_node_ids = {str(task_node.node_id) for task_node in scoped_task_nodes if task_node.node_id}
+        existing_node_ids = {
+            str(node_id)
+            for node_id in Node.objects.filter(id__in=snapshot_node_ids).values_list("id", flat=True)
+        }
+        historical_task_node_ids = [
+            task_node.id
+            for task_node in scoped_task_nodes
+            if not task_node.node_id or str(task_node.node_id) not in existing_node_ids
+        ]
+        historical_node_filter = Q(pk__in=historical_task_node_ids)
+        historical_owner_filter = Q(pk__in=[])
+        if username and domain:
+            historical_owner_filter = historical_node_filter & Q(task__created_by=username, task__domain=domain)
+        return task_nodes.filter(~historical_node_filter | historical_owner_filter)
+
+    @staticmethod
+    def install_controller_nodes(task_id, authorized_nodes=None, scope=None):
         """获取控制器安装节点信息"""
-        task_nodes = ControllerTaskNode.objects.filter(task_id=task_id)
+        if scope is None or not all(hasattr(scope, field) for field in ("username", "domain", "is_superuser")):
+            task_nodes = InstallerService.get_authorized_controller_task_nodes(
+                task_id,
+                authorized_nodes=authorized_nodes,
+                scope=scope,
+            )
+        else:
+            task_nodes = InstallerService.get_authorized_controller_task_node_queryset(
+                task_id,
+                authorized_nodes=authorized_nodes,
+                scope=scope,
+                request_user=scope,
+            )
+
         result = []
         for task_node in task_nodes:
+            task_result = (task_node.result or {}).copy()
+            if task_node.connectivity_observed_at:
+                task_result[InstallerConstants.CONNECTIVITY_OBSERVED_KEY] = True
+                task_result[InstallerConstants.CONNECTIVITY_OBSERVED_NODE_ID_KEY] = (
+                    task_node.connectivity_observed_node_id
+                )
+                task_result[InstallerConstants.CONNECTIVITY_OBSERVED_AT_KEY] = (
+                    task_node.connectivity_observed_at.isoformat()
+                )
             result.append(
                 dict(
                     task_node_id=task_node.id,
+                    node_id=task_node.node_id,
                     ip=task_node.ip,
                     os=task_node.os,
                     cpu_architecture=task_node.cpu_architecture,
@@ -250,8 +437,11 @@ class InstallerService:
                     organizations=task_node.organizations,
                     username=task_node.username,
                     port=task_node.port,
+                    winrm_scheme=task_node.winrm_scheme,
+                    winrm_transport=task_node.winrm_transport,
+                    winrm_cert_validation=task_node.winrm_cert_validation,
                     status=task_node.status,
-                    result=normalize_task_result_for_read(task_node.result),
+                    result=normalize_task_result_for_read(task_result),
                 )
             )
         return result
@@ -306,27 +496,50 @@ class InstallerService:
 
     @staticmethod
     def get_linux_bootstrap_command(token: str, install_mode: str = MANUAL_INSTALL_MODE) -> str:
-        session = InstallerSessionService.build_session_config(token)
-        installer = session["installer"]
-        install_dir = session["install_dir"]
+        token_data = InstallTokenService.inspect_token_data(token)
+        session = InstallerSessionService.build_session_config(token, token_data=token_data)
         server_url = session["server_url"].replace("/api/v1/node_mgmt/open_api/node", "")
         bootstrap_url = f"{server_url}/api/v1/node_mgmt/open_api/installer/linux_bootstrap?token={token}"
-        command = f"curl -sSLk {bootstrap_url} | bash -s -- --install-dir '{install_dir}' --installer-name '{installer['filename']}'"
+        quoted_bootstrap_url = shlex.quote(bootstrap_url)
+
+        shell_detection = (
+            'if command -v sh >/dev/null 2>&1; then bootstrap_shell="$(command -v sh)"; '
+            'elif command -v bash >/dev/null 2>&1; then bootstrap_shell="$(command -v bash)"; '
+            "else echo 'Error: controller installation requires sh or bash' >&2; exit 1; fi; "
+        )
 
         if install_mode == InstallerService.AUTO_INSTALL_MODE:
-            return (
+            privilege_detection = (
                 'if [ "$(id -u)" -eq 0 ]; then '
-                f"{command}; "
+                "bootstrap_privilege=root; "
                 "elif command -v sudo >/dev/null 2>&1; then "
-                f"if sudo -n bash -c true >/dev/null 2>&1; then {command.replace('| bash', '| sudo -n bash')}; "
+                'if sudo -n "$bootstrap_shell" -c true >/dev/null 2>&1; then bootstrap_privilege=sudo_non_interactive; '
                 "else echo 'Error: automatic installation requires root or passwordless sudo for the current user'; exit 1; fi; "
-                "else echo 'Error: root or sudo is required to install controller'; exit 1; fi"
+                "else echo 'Error: root or sudo is required to install controller'; exit 1; fi; "
+            )
+        else:
+            privilege_detection = (
+                'if [ "$(id -u)" -eq 0 ]; then '
+                "bootstrap_privilege=root; "
+                "elif command -v sudo >/dev/null 2>&1; then bootstrap_privilege=sudo_interactive; "
+                "else echo 'Error: root or sudo is required to install controller'; exit 1; fi; "
             )
 
-        return (
-            'if [ "$(id -u)" -eq 0 ]; then '
-            f"{command}; "
-            "elif command -v sudo >/dev/null 2>&1; then "
-            f"{command.replace('| bash', '| sudo bash')}; "
-            "else echo 'Error: root or sudo is required to install controller'; exit 1; fi"
+        command = (
+            f"{shell_detection}{privilege_detection}"
+            'umask 077; bootstrap_file="$(mktemp)" || exit 1; '
+            'cleanup_bootstrap() { rm -f "$bootstrap_file"; }; '
+            "trap cleanup_bootstrap 0; trap 'exit 1' 1 2 15; "
+            f'curl -fsSLk {quoted_bootstrap_url} -o "$bootstrap_file" || exit 1; '
+            "bootstrap_status=0; "
+            'if [ "$bootstrap_privilege" = root ]; then "$bootstrap_shell" "$bootstrap_file" || bootstrap_status=$?; '
+            'elif [ "$bootstrap_privilege" = sudo_non_interactive ]; then '
+            'sudo -n "$bootstrap_shell" "$bootstrap_file" || bootstrap_status=$?; '
+            'else sudo "$bootstrap_shell" "$bootstrap_file" || bootstrap_status=$?; fi; '
+            'exit "$bootstrap_status"'
         )
+        if install_mode == InstallerService.MANUAL_INSTALL_MODE:
+            # 手动命令会直接粘贴到用户当前的登录 Shell 中执行。使用子 Shell
+            # 隔离内部 exit，既保留安装退出码，也不结束用户的登录会话。
+            return f"( {command} )"
+        return command

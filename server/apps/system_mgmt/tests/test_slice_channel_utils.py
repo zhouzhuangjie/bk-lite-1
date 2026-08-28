@@ -1,5 +1,4 @@
 import pydantic.root_model  # noqa
-
 import pytest
 
 from apps.system_mgmt.models import Channel
@@ -7,6 +6,19 @@ from apps.system_mgmt.models.channel import ChannelChoices
 from apps.system_mgmt.utils import channel_utils
 
 pytestmark = pytest.mark.django_db
+
+
+@pytest.fixture(autouse=True)
+def _use_public_dns_for_webhook(mocker):
+    """通道单测：公网 DNS + 空白名单，官方 IM 域名默认可通。"""
+    from apps.core.utils.ssrf_validator import SSRFValidator
+
+    mocker.patch(
+        "socket.getaddrinfo",
+        return_value=[(2, 1, 6, "", ("93.184.216.34", 443))],
+    )
+    mocker.patch.object(SSRFValidator, "_get_allowed_networks", return_value=[])
+    mocker.patch.object(SSRFValidator, "_get_allowed_domains", return_value=set())
 
 
 # ----------------------- is_valid_webhook_url (纯函数) -----------------------
@@ -19,9 +31,8 @@ pytestmark = pytest.mark.django_db
         ("https://open.feishu.cn/open-apis/bot/v2/hook/xxx", True),
         ("http://oapi.dingtalk.com/robot/send?access_token=t", True),
         ("https://open.larksuite.com/hook", True),
-        # 不在白名单
-        ("https://evil.com/hook", False),
-        ("https://qyapi.weixin.qq.com.evil.com/x", False),
+        # 公网任意域名默认通
+        ("https://evil.com/hook", True),
         # 协议非法
         ("ftp://qyapi.weixin.qq.com/x", False),
         ("file:///etc/passwd", False),
@@ -32,8 +43,6 @@ pytestmark = pytest.mark.django_db
         ("https://qyapi.weixin.qq.com\\@evil.com/x", False),
         # 含 userinfo @
         ("https://user@evil.com/x", False),
-        # 编码绕过 hostname
-        ("https://qyapi%2eweixin.qq.com/x", False),
     ],
 )
 def test_is_valid_webhook_url(url, expected):
@@ -90,8 +99,9 @@ def test_send_by_wecom_bot_bot_key拼出url(mocker):
     assert "key=thekey" in post.call_args[0][0]
 
 
-def test_send_by_wecom_bot_非法域名被ssrf拦截(mocker):
-    ch = _make_channel(ChannelChoices.ENTERPRISE_WECHAT_BOT, {"webhook_url": "https://evil.com/x"})
+def test_send_by_wecom_bot_内网纯ip被ssrf拦截(mocker):
+    # 公网域名默认通；拦截场景改为未白名单的内网纯 IP（与飞书单测一致）
+    ch = _make_channel(ChannelChoices.ENTERPRISE_WECHAT_BOT, {"webhook_url": "http://127.0.0.1/x"})
     post = mocker.patch("apps.system_mgmt.utils.channel_utils.requests.post")
 
     result = channel_utils.send_by_wecom_bot(ch, "hi", [])
@@ -263,6 +273,56 @@ def test_send_email_to_user_成功(mocker):
     fake_server.quit.assert_called_once()
 
 
+def test_send_email_to_user_关闭认证时跳过login(mocker):
+    config = {
+        "mail_sender": "from@x.com",
+        "smtp_server": "smtp.x.com",
+        "port": 25,
+        "smtp_auth_enabled": False,
+        "smtp_user": "",
+        "smtp_pwd": "",
+    }
+    fake_server = mocker.Mock()
+    mocker.patch("apps.system_mgmt.utils.channel_utils.smtplib.SMTP", return_value=fake_server)
+
+    result = channel_utils.send_email_to_user(config, "<b>hi</b>", ["a@x.com"], "主题")
+
+    assert result == {"result": True, "message": "Successfully sent email"}
+    fake_server.login.assert_not_called()
+    fake_server.send_message.assert_called_once()
+
+
+def test_send_personalized_email_关闭认证时跳过login(mocker):
+    ch = _make_channel(
+        ChannelChoices.EMAIL,
+        {
+            "mail_sender": "from@x.com",
+            "smtp_server": "smtp.x.com",
+            "port": 25,
+            "smtp_auth_enabled": False,
+            "smtp_user": "",
+            "smtp_pwd": "",
+        },
+    )
+    fake_server = mocker.Mock()
+    mocker.patch("apps.system_mgmt.utils.channel_utils.smtplib.SMTP", return_value=fake_server)
+
+    results = channel_utils.send_personalized_email_messages(
+        ch,
+        [{"key": "u1", "receiver": "a@x.com", "title": "t", "content": "<b>x</b>"}],
+    )
+
+    assert results == {"u1": {"result": True}}
+    fake_server.login.assert_not_called()
+    fake_server.send_message.assert_called_once()
+
+
+def test_is_smtp_auth_enabled_缺省为启用():
+    assert channel_utils.is_smtp_auth_enabled({}) is True
+    assert channel_utils.is_smtp_auth_enabled({"smtp_auth_enabled": True}) is True
+    assert channel_utils.is_smtp_auth_enabled({"smtp_auth_enabled": False}) is False
+
+
 def test_send_email_to_user_ssl与tls与附件(mocker):
     config = {
         "mail_sender": "from@x.com",
@@ -334,6 +394,7 @@ def test_send_nats_message_成功透传payload(mocker):
     args, kwargs = req.call_args
     assert args == ("ns", "trigger_workflow_by_nats")
     assert kwargs["_timeout"] == 30
+    assert "_raw" not in kwargs
     assert kwargs["bot_id"] == 7 and kwargs["node_id"] == "n1"
     assert kwargs["content"] == "x"
 

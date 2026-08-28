@@ -1,25 +1,108 @@
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use tauri::{command, AppHandle, Emitter, State};
-use futures_util::StreamExt;
+use std::time::Duration;
+use tauri::{command, ipc::Channel, AppHandle, Manager, State};
 use tokio::sync::oneshot;
 
 /// 每个活跃 SSE 流的取消发送端，keyed by stream_id
 pub struct StreamRegistry(pub Mutex<HashMap<String, oneshot::Sender<()>>>);
 
-/// 校验请求 URL 的 host 是否在环境变量 TAURI_ALLOWED_HOSTS 所配置的白名单内。
+/// 每个活跃非流式请求的取消发送端，keyed by request_id。
+#[derive(Default)]
+pub struct RequestRegistry(Mutex<HashMap<String, RequestCancellation>>);
+
+struct RequestCancellation {
+    owner_id: uuid::Uuid,
+    sender: oneshot::Sender<()>,
+}
+
+#[derive(Default)]
+struct Utf8ChunkDecoder {
+    pending: Vec<u8>,
+}
+
+impl Utf8ChunkDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Result<String, String> {
+        self.pending.extend_from_slice(chunk);
+        match std::str::from_utf8(&self.pending) {
+            Ok(text) => {
+                let decoded = text.to_owned();
+                self.pending.clear();
+                Ok(decoded)
+            }
+            Err(error) if error.error_len().is_none() => {
+                let valid_up_to = error.valid_up_to();
+                let decoded = std::str::from_utf8(&self.pending[..valid_up_to])
+                    .map_err(|decode_error| decode_error.to_string())?
+                    .to_owned();
+                self.pending.drain(..valid_up_to);
+                Ok(decoded)
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn finish(&mut self) -> Result<String, String> {
+        if self.pending.is_empty() {
+            return Ok(String::new());
+        }
+
+        let decoded = std::str::from_utf8(&self.pending)
+            .map_err(|error| error.to_string())?
+            .to_owned();
+        self.pending.clear();
+        Ok(decoded)
+    }
+}
+
+const COMPILED_ALLOWED_HOSTS: Option<&str> = option_env!("TAURI_ALLOWED_HOSTS");
+
+fn configured_allowed_hosts() -> String {
+    std::env::var("TAURI_ALLOWED_HOSTS")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| COMPILED_ALLOWED_HOSTS.map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// 校验请求 URL 的 host 是否在指定白名单内。
 ///
 /// 白名单格式：逗号分隔的 host[:port] 列表，例如
 ///   `TAURI_ALLOWED_HOSTS=bklite.example.com,api.internal.example.com:8443`
-///
-/// 若环境变量未设置，则默认只允许 127.0.0.1 和 localhost（开发模式兜底），
-/// 并在 warn 日志中提示生产环境应显式配置。
-fn is_allowed_host(url: &str) -> bool {
+fn is_allowed_host_with_allowlist(url: &str, allowed_hosts: &str) -> bool {
     let parsed = match url::Url::parse(url) {
         Ok(u) => u,
         Err(_) => return false,
     };
+
+    let (is_loopback, is_local_network_ip) = match parsed.host() {
+        Some(url::Host::Ipv4(address)) => (
+            address.is_loopback(),
+            address.is_private() || address.is_link_local(),
+        ),
+        Some(url::Host::Ipv6(address)) => (
+            address.is_loopback(),
+            address.is_unique_local() || address.is_unicast_link_local(),
+        ),
+        Some(url::Host::Domain(domain)) => (domain.eq_ignore_ascii_case("localhost"), false),
+        None => return false,
+    };
+
+    let scheme_allowed_without_explicit_allowlist =
+        parsed.scheme() == "https" || (parsed.scheme() == "http" && is_loopback);
+    let scheme_allowed_with_explicit_allowlist = parsed.scheme() == "https"
+        || (parsed.scheme() == "http" && (is_loopback || is_local_network_ip));
+
+    let explicit_allowlist_configured = !allowed_hosts.trim().is_empty();
+    if explicit_allowlist_configured {
+        if !scheme_allowed_with_explicit_allowlist {
+            return false;
+        }
+    } else if !scheme_allowed_without_explicit_allowlist {
+        return false;
+    }
 
     let host = match parsed.host_str() {
         Some(h) => h.to_lowercase(),
@@ -33,17 +116,11 @@ fn is_allowed_host(url: &str) -> bool {
         None => host.clone(),
     };
 
-    let allowed_hosts_env = std::env::var("TAURI_ALLOWED_HOSTS").unwrap_or_default();
-
-    if allowed_hosts_env.trim().is_empty() {
-        // 未配置白名单时，仅放行本地开发地址
-        log::warn!(
-            "[Tauri-Proxy] TAURI_ALLOWED_HOSTS 未配置，生产环境请显式设置允许的后端域名。当前仅放行 127.0.0.1/::1/localhost。"
-        );
-        return host == "127.0.0.1" || host == "::1" || host == "localhost";
+    if !explicit_allowlist_configured {
+        return is_loopback;
     }
 
-    for entry in allowed_hosts_env.split(',') {
+    for entry in allowed_hosts.split(',') {
         let entry = entry.trim().to_lowercase();
         if entry.is_empty() {
             continue;
@@ -54,6 +131,22 @@ fn is_allowed_host(url: &str) -> bool {
     }
 
     false
+}
+
+fn is_allowed_host(url: &str) -> bool {
+    let allowed_hosts = configured_allowed_hosts();
+    if allowed_hosts.is_empty() {
+        log::warn!("[Tauri-Proxy] 未配置 API host 白名单，当前仅放行 127.0.0.1/::1/localhost。");
+    }
+    is_allowed_host_with_allowlist(url, &allowed_hosts)
+}
+
+fn build_http_client(user_agent: &str) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .user_agent(user_agent)
+        .connect_timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
 }
 
 fn is_sensitive_header(name: &str) -> bool {
@@ -89,23 +182,16 @@ pub struct ApiRequest {
     pub method: String,
     pub headers: Option<HashMap<String, String>>,
     pub body: Option<String>,
+    #[serde(default, rename = "requestId", alias = "request_id")]
+    pub request_id: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct StreamChunk {
-    pub stream_id: String,
-    pub data: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct StreamEnd {
-    pub stream_id: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct StreamError {
-    pub stream_id: String,
-    pub error: String,
+#[derive(Debug, Serialize, Clone)]
+#[serde(tag = "event", rename_all = "camelCase")]
+pub enum StreamEvent {
+    Chunk { data: String },
+    End,
+    Error { error: String, status: Option<u16> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -121,8 +207,7 @@ pub struct ApiError {
     pub status: Option<u16>,
 }
 
-#[command]
-pub async fn api_proxy(request: ApiRequest) -> Result<ApiResponse, ApiError> {
+async fn execute_api_proxy(request: ApiRequest) -> Result<ApiResponse, ApiError> {
     // URL 白名单校验：防止注入脚本通过 IPC 发起任意域的 SSRF 请求
     if !is_allowed_host(&request.url) {
         log::warn!("[Tauri-API] 拒绝非白名单 URL: {}", request.url);
@@ -135,16 +220,18 @@ pub async fn api_proxy(request: ApiRequest) -> Result<ApiResponse, ApiError> {
     let start_time = std::time::Instant::now();
     let request_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
 
-    log::info!("🚀 [Tauri-API-{}] START: {} {}", request_id, request.method, request.url);
+    log::info!(
+        "🚀 [Tauri-API-{}] START: {} {}",
+        request_id,
+        request.method,
+        request.url
+    );
 
     // 创建 HTTP 客户端
-    let client = reqwest::Client::builder()
-        .user_agent("Tauri-API-Proxy/1.0")
-        .build()
-        .map_err(|e| ApiError {
-            message: format!("Failed to create HTTP client: {}", e),
-            status: None,
-        })?;
+    let client = build_http_client("Tauri-API-Proxy/1.0").map_err(|e| ApiError {
+        message: format!("Failed to create HTTP client: {}", e),
+        status: None,
+    })?;
 
     // 构建请求
     let mut req_builder = match request.method.to_uppercase().as_str() {
@@ -155,11 +242,14 @@ pub async fn api_proxy(request: ApiRequest) -> Result<ApiResponse, ApiError> {
         "PATCH" => client.patch(&request.url),
         "HEAD" => client.head(&request.url),
         "OPTIONS" => client.request(reqwest::Method::OPTIONS, &request.url),
-        _ => return Err(ApiError {
-            message: format!("Unsupported HTTP method: {}", request.method),
-            status: None,
-        }),
+        _ => {
+            return Err(ApiError {
+                message: format!("Unsupported HTTP method: {}", request.method),
+                status: None,
+            })
+        }
     };
+    req_builder = req_builder.timeout(Duration::from_secs(60));
 
     // 添加 Tauri 标识头
     req_builder = req_builder.header("X-Tauri-Proxy", "true");
@@ -179,7 +269,11 @@ pub async fn api_proxy(request: ApiRequest) -> Result<ApiResponse, ApiError> {
 
     // 添加请求体
     if let Some(body) = &request.body {
-        log::info!("📤 [Tauri-API-{}] Body length: {} bytes", request_id, body.len());
+        log::info!(
+            "📤 [Tauri-API-{}] Body length: {} bytes",
+            request_id,
+            body.len()
+        );
         req_builder = req_builder.body(body.clone());
     }
 
@@ -188,9 +282,14 @@ pub async fn api_proxy(request: ApiRequest) -> Result<ApiResponse, ApiError> {
         Ok(response) => {
             let status = response.status().as_u16();
             let elapsed = start_time.elapsed();
-            
-            log::info!("📥 [Tauri-API-{}] Response: {} in {:?}", request_id, status, elapsed);
-            
+
+            log::info!(
+                "📥 [Tauri-API-{}] Response: {} in {:?}",
+                request_id,
+                status,
+                elapsed
+            );
+
             // 获取响应头
             let mut headers = HashMap::new();
             for (key, value) in response.headers() {
@@ -202,12 +301,19 @@ pub async fn api_proxy(request: ApiRequest) -> Result<ApiResponse, ApiError> {
             // 添加 Tauri 代理标识头
             headers.insert("X-Tauri-Proxied".to_string(), "true".to_string());
             headers.insert("X-Tauri-Request-ID".to_string(), request_id.clone());
-            headers.insert("X-Tauri-Elapsed-Ms".to_string(), elapsed.as_millis().to_string());
+            headers.insert(
+                "X-Tauri-Elapsed-Ms".to_string(),
+                elapsed.as_millis().to_string(),
+            );
 
             // 获取响应体
             match response.text().await {
                 Ok(body) => {
-                    log::info!("✅ [Tauri-API-{}] SUCCESS: {} bytes received", request_id, body.len());
+                    log::info!(
+                        "✅ [Tauri-API-{}] SUCCESS: {} bytes received",
+                        request_id,
+                        body.len()
+                    );
                     Ok(ApiResponse {
                         status,
                         headers,
@@ -215,7 +321,11 @@ pub async fn api_proxy(request: ApiRequest) -> Result<ApiResponse, ApiError> {
                     })
                 }
                 Err(err) => {
-                    log::error!("❌ [Tauri-API-{}] Failed to read response body: {}", request_id, err);
+                    log::error!(
+                        "❌ [Tauri-API-{}] Failed to read response body: {}",
+                        request_id,
+                        err
+                    );
                     Err(ApiError {
                         message: format!("Failed to read response body: {}", err),
                         status: Some(status),
@@ -225,13 +335,94 @@ pub async fn api_proxy(request: ApiRequest) -> Result<ApiResponse, ApiError> {
         }
         Err(err) => {
             let elapsed = start_time.elapsed();
-            log::error!("❌ [Tauri-API-{}] HTTP request failed after {:?}: {}", request_id, elapsed, err);
+            log::error!(
+                "❌ [Tauri-API-{}] HTTP request failed after {:?}: {}",
+                request_id,
+                elapsed,
+                err
+            );
             Err(ApiError {
                 message: format!("HTTP request failed: {}", err),
                 status: None,
             })
         }
     }
+}
+
+#[command]
+pub async fn api_proxy(
+    registry: State<'_, RequestRegistry>,
+    request: ApiRequest,
+) -> Result<ApiResponse, ApiError> {
+    execute_registered_api_proxy(&registry, request, None).await
+}
+
+#[command]
+pub async fn api_proxy_cancellable(
+    registry: State<'_, RequestRegistry>,
+    request: ApiRequest,
+    on_registered: Channel<bool>,
+) -> Result<ApiResponse, ApiError> {
+    execute_registered_api_proxy(&registry, request, Some(on_registered)).await
+}
+
+async fn execute_registered_api_proxy(
+    registry: &RequestRegistry,
+    request: ApiRequest,
+    on_registered: Option<Channel<bool>>,
+) -> Result<ApiResponse, ApiError> {
+    let Some(request_id) = request.request_id.clone() else {
+        return execute_api_proxy(request).await;
+    };
+    if request_id.is_empty()
+        || request_id.len() > 128
+        || !request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(ApiError {
+            message: "Invalid request ID".to_string(),
+            status: None,
+        });
+    }
+
+    let owner_id = uuid::Uuid::new_v4();
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    {
+        let mut active_requests = registry.0.lock().unwrap_or_else(|error| error.into_inner());
+        if active_requests.contains_key(&request_id) {
+            return Err(ApiError {
+                message: "Duplicate active request ID".to_string(),
+                status: None,
+            });
+        }
+        active_requests.insert(
+            request_id.clone(),
+            RequestCancellation {
+                owner_id,
+                sender: cancel_tx,
+            },
+        );
+    }
+    if let Some(on_registered) = on_registered {
+        if let Err(error) = on_registered.send(true) {
+            remove_registered_request_if_owned(registry, &request_id, owner_id);
+            return Err(ApiError {
+                message: format!("Failed to acknowledge request registration: {error}"),
+                status: None,
+            });
+        }
+    }
+
+    let result = tokio::select! {
+        result = execute_api_proxy(request) => result,
+        _ = cancel_rx => Err(ApiError {
+            message: "Request cancelled".to_string(),
+            status: None,
+        }),
+    };
+    remove_registered_request_if_owned(registry, &request_id, owner_id);
+    result
 }
 
 #[command]
@@ -246,9 +437,10 @@ pub async fn simple_api_proxy(
         method,
         headers,
         body,
+        request_id: None,
     };
 
-    match api_proxy(request).await {
+    match execute_api_proxy(request).await {
         Ok(response) => Ok(response.body),
         Err(error) => Err(error.message),
     }
@@ -261,6 +453,7 @@ pub async fn api_stream_proxy(
     app: AppHandle,
     registry: State<'_, StreamRegistry>,
     request: ApiRequest,
+    on_event: Channel<StreamEvent>,
 ) -> Result<String, ApiError> {
     // URL 白名单校验：与 api_proxy 保持一致
     if !is_allowed_host(&request.url) {
@@ -274,16 +467,18 @@ pub async fn api_stream_proxy(
     let stream_id = uuid::Uuid::new_v4().to_string();
     let request_id = stream_id[..8].to_string();
 
-    log::info!("🌊 [Tauri-Stream-{}] START: {} {}", request_id, request.method, request.url);
+    log::info!(
+        "🌊 [Tauri-Stream-{}] START: {} {}",
+        request_id,
+        request.method,
+        request.url
+    );
 
     // 创建 HTTP 客户端
-    let client = reqwest::Client::builder()
-        .user_agent("Tauri-Stream-Proxy/1.0")
-        .build()
-        .map_err(|e| ApiError {
-            message: format!("Failed to create HTTP client: {}", e),
-            status: None,
-        })?;
+    let client = build_http_client("Tauri-Stream-Proxy/1.0").map_err(|e| ApiError {
+        message: format!("Failed to create HTTP client: {}", e),
+        status: None,
+    })?;
 
     // 构建请求
     let mut req_builder = match request.method.to_uppercase().as_str() {
@@ -292,10 +487,12 @@ pub async fn api_stream_proxy(
         "PUT" => client.put(&request.url),
         "DELETE" => client.delete(&request.url),
         "PATCH" => client.patch(&request.url),
-        _ => return Err(ApiError {
-            message: format!("Unsupported HTTP method: {}", request.method),
-            status: None,
-        }),
+        _ => {
+            return Err(ApiError {
+                message: format!("Unsupported HTTP method: {}", request.method),
+                status: None,
+            })
+        }
     };
 
     // 添加请求头
@@ -319,33 +516,50 @@ pub async fn api_stream_proxy(
 
     let stream_id_clone = stream_id.clone();
     let app_clone = app.clone();
+    let on_event_clone = on_event.clone();
 
     // 在后台任务中处理流式响应
     tauri::async_runtime::spawn(async move {
-        match req_builder.send().await {
+        let response_result = tokio::select! {
+            biased;
+            _ = &mut cancel_rx => {
+                log::info!("🛑 [Tauri-Stream-{}] Cancelled before response headers", request_id);
+                app_clone.state::<StreamRegistry>().0.lock().unwrap_or_else(|e| e.into_inner()).remove(&stream_id_clone);
+                return;
+            }
+            result = req_builder.send() => result,
+        };
+
+        match response_result {
             Ok(response) => {
                 let status = response.status().as_u16();
-                
+
                 if status >= 400 {
                     let error_msg = format!("HTTP Error: {}", status);
                     log::error!("❌ [Tauri-Stream-{}] {}", request_id, error_msg);
-                    let _ = app_clone.emit("stream-error", StreamError {
-                        stream_id: stream_id_clone.clone(),
+                    let _ = on_event_clone.send(StreamEvent::Error {
                         error: error_msg,
+                        status: Some(status),
                     });
                     // 清理注册表后退出
                     let reg = app_clone.state::<StreamRegistry>();
-                    reg.0.lock().unwrap_or_else(|e| e.into_inner()).remove(&stream_id_clone);
+                    reg.0
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&stream_id_clone);
                     return;
                 }
 
-                log::info!("📥 [Tauri-Stream-{}] Response status: {}", request_id, status);
+                log::info!(
+                    "📥 [Tauri-Stream-{}] Response status: {}",
+                    request_id,
+                    status
+                );
 
                 // 流式读取响应体
                 let mut stream = response.bytes_stream();
-                let mut buffer = String::new();
+                let mut decoder = Utf8ChunkDecoder::default();
                 let mut chunk_count = 0;
-                let mut pending_data_prefix = false; // 标记是否有待处理的 data: 前缀
                 let mut cancelled = false;
 
                 loop {
@@ -367,176 +581,130 @@ pub async fn api_stream_proxy(
                     match chunk_result {
                         Ok(chunk) => {
                             chunk_count += 1;
-                            
-                            // 将字节转换为字符串
-                            match String::from_utf8(chunk.to_vec()) {
+                            match decoder.push(&chunk) {
                                 Ok(text) => {
-                                    buffer.push_str(&text);
-                                    
-                                    // 按行分割处理 SSE 数据
-                                    let lines_vec: Vec<String> = buffer.lines().map(|s| s.to_string()).collect();
-                                    
-                                    // 如果最后没有换行符，保留最后一行到buffer
-                                    let remaining = if !buffer.ends_with('\n') && !lines_vec.is_empty() {
-                                        lines_vec.last().unwrap().clone()
-                                    } else {
-                                        String::new()
-                                    };
-                                    
-                                    let lines_to_process = if !remaining.is_empty() {
-                                        &lines_vec[..lines_vec.len() - 1]
-                                    } else {
-                                        &lines_vec[..]
-                                    };
-                                    
-                                    buffer = remaining;
-                                    
-                                    // 处理完整的行，合并多行 SSE 格式
-                                    let mut i = 0;
-                                    while i < lines_to_process.len() {
-                                        let line = &lines_to_process[i];
-                                        let trimmed = line.trim();
-                                        
-                                        // 跳过空行和注释
-                                        if trimmed.is_empty() || trimmed.starts_with(':') {
-                                            i += 1;
-                                            continue;
+                                    if !text.is_empty() {
+                                        if let Err(error) =
+                                            on_event_clone.send(StreamEvent::Chunk { data: text })
+                                        {
+                                            log::error!(
+                                                "❌ [Tauri-Stream-{}] Failed to send chunk: {}",
+                                                request_id,
+                                                error
+                                            );
+                                            cancelled = true;
+                                            break;
                                         }
-                                        
-                                        // 检测到 data: 前缀
-                                        if trimmed == "data:" || trimmed.starts_with("data:") {
-                                            let formatted_line = if trimmed == "data:" {
-                                                // data: 单独一行，需要合并下一行的 JSON 内容
-                                                if i + 1 < lines_to_process.len() {
-                                                    let next_line = lines_to_process[i + 1].trim();
-                                                    if next_line.starts_with('{') || next_line.starts_with('[') {
-                                                        i += 1; // 跳过下一行，因为已经合并了
-                                                        format!("data: {}", next_line)
-                                                    } else {
-                                                        format!("data: {}", next_line)
-                                                    }
-                                                } else {
-                                                    // 没有下一行了，设置标记等待
-                                                    pending_data_prefix = true;
-                                                    i += 1;
-                                                    continue;
-                                                }
-                                            } else if let Some(json_part) = trimmed.strip_prefix("data:") {
-                                                // data: 和 JSON 在同一行
-                                                let json_trimmed = json_part.trim();
-                                                if json_trimmed.is_empty() {
-                                                    // data: 后面是空的，等待下一行
-                                                    pending_data_prefix = true;
-                                                    i += 1;
-                                                    continue;
-                                                } else {
-                                                    format!("data: {}", json_trimmed)
-                                                }
-                                            } else {
-                                                line.clone()
-                                            };
-                                            
-                                            log::debug!("📤 [Tauri-Stream-{}] Sending: {}", 
-                                                request_id, 
-                                                if formatted_line.len() > 100 { 
-                                                    format!("{}...", &formatted_line[..100]) 
-                                                } else { 
-                                                    formatted_line.clone() 
-                                                });
-                                            
-                                            // 发送数据块事件（SSE 格式，包含换行符）
-                                            if let Err(e) = app_clone.emit("stream-chunk", StreamChunk {
-                                                stream_id: stream_id_clone.clone(),
-                                                data: format!("{}\n", formatted_line),
-                                            }) {
-                                                log::error!("❌ [Tauri-Stream-{}] Failed to emit chunk: {}", request_id, e);
-                                                break;
-                                            }
-                                        } else if pending_data_prefix && (trimmed.starts_with('{') || trimmed.starts_with('[')) {
-                                            // 这是 data: 后面的 JSON 内容
-                                            let formatted_line = format!("data: {}", trimmed);
-                                            pending_data_prefix = false;
-                                            
-                                            log::debug!("📤 [Tauri-Stream-{}] Sending (merged): {}", 
-                                                request_id, 
-                                                if formatted_line.len() > 100 { 
-                                                    format!("{}...", &formatted_line[..100]) 
-                                                } else { 
-                                                    formatted_line.clone() 
-                                                });
-                                            
-                                            if let Err(e) = app_clone.emit("stream-chunk", StreamChunk {
-                                                stream_id: stream_id_clone.clone(),
-                                                data: format!("{}\n", formatted_line),
-                                            }) {
-                                                log::error!("❌ [Tauri-Stream-{}] Failed to emit chunk: {}", request_id, e);
-                                                break;
-                                            }
-                                        }
-                                        
-                                        i += 1;
                                     }
                                 }
                                 Err(e) => {
-                                    log::error!("❌ [Tauri-Stream-{}] UTF-8 decode error: {}", request_id, e);
-                                    let _ = app_clone.emit("stream-error", StreamError {
-                                        stream_id: stream_id_clone.clone(),
+                                    log::error!(
+                                        "❌ [Tauri-Stream-{}] UTF-8 decode error: {}",
+                                        request_id,
+                                        e
+                                    );
+                                    let _ = on_event_clone.send(StreamEvent::Error {
                                         error: format!("UTF-8 decode error: {}", e),
+                                        status: None,
                                     });
-                                    app_clone.state::<StreamRegistry>().0.lock().unwrap_or_else(|e| e.into_inner()).remove(&stream_id_clone);
+                                    app_clone
+                                        .state::<StreamRegistry>()
+                                        .0
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .remove(&stream_id_clone);
                                     return;
                                 }
                             }
                         }
                         Err(e) => {
-                            log::error!("❌ [Tauri-Stream-{}] Stream read error: {}", request_id, e);
-                            let _ = app_clone.emit("stream-error", StreamError {
-                                stream_id: stream_id_clone.clone(),
+                            log::error!(
+                                "❌ [Tauri-Stream-{}] Stream read error: {}",
+                                request_id,
+                                e
+                            );
+                            let _ = on_event_clone.send(StreamEvent::Error {
                                 error: format!("Stream read error: {}", e),
+                                status: None,
                             });
-                            app_clone.state::<StreamRegistry>().0.lock().unwrap_or_else(|e| e.into_inner()).remove(&stream_id_clone);
+                            app_clone
+                                .state::<StreamRegistry>()
+                                .0
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&stream_id_clone);
                             return;
                         }
                     }
                 }
 
-                // 处理剩余的 buffer（仅在非取消情况下）
-                if !cancelled && !buffer.trim().is_empty() {
-                    let trimmed = buffer.trim();
-                    // 确保数据行包含 data: 前缀
-                    let formatted = if trimmed.starts_with("data:") {
-                        buffer.clone()
-                    } else if trimmed.starts_with('{') || trimmed.starts_with('[') {
-                        format!("data: {}", trimmed)
-                    } else {
-                        buffer.clone()
-                    };
-
-                    let _ = app_clone.emit("stream-chunk", StreamChunk {
-                        stream_id: stream_id_clone.clone(),
-                        data: format!("{}\n", formatted),
-                    });
+                if !cancelled {
+                    match decoder.finish() {
+                        Ok(text) if !text.is_empty() => {
+                            if let Err(error) =
+                                on_event_clone.send(StreamEvent::Chunk { data: text })
+                            {
+                                log::error!(
+                                    "❌ [Tauri-Stream-{}] Failed to send final chunk: {}",
+                                    request_id,
+                                    error
+                                );
+                                cancelled = true;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            log::error!(
+                                "❌ [Tauri-Stream-{}] Incomplete UTF-8 response: {}",
+                                request_id,
+                                error
+                            );
+                            let _ = on_event_clone.send(StreamEvent::Error {
+                                error: format!("Incomplete UTF-8 response: {}", error),
+                                status: None,
+                            });
+                            cancelled = true;
+                        }
+                    }
                 }
 
                 // 从注册表中移除
-                app_clone.state::<StreamRegistry>().0.lock().unwrap_or_else(|e| e.into_inner()).remove(&stream_id_clone);
+                app_clone
+                    .state::<StreamRegistry>()
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&stream_id_clone);
 
                 if cancelled {
-                    log::info!("🛑 [Tauri-Stream-{}] Task exiting after cancellation", request_id);
+                    log::info!(
+                        "🛑 [Tauri-Stream-{}] Task exiting after cancellation",
+                        request_id
+                    );
                 } else {
-                    log::info!("✅ [Tauri-Stream-{}] COMPLETED: {} chunks received", request_id, chunk_count);
-                    // 发送流结束事件（仅在非取消情况下）
-                    let _ = app_clone.emit("stream-end", StreamEnd {
-                        stream_id: stream_id_clone,
-                    });
+                    log::info!(
+                        "✅ [Tauri-Stream-{}] COMPLETED: {} chunks received",
+                        request_id,
+                        chunk_count
+                    );
+                    let _ = on_event_clone.send(StreamEvent::End);
                 }
             }
             Err(err) => {
-                log::error!("❌ [Tauri-Stream-{}] HTTP request failed: {}", request_id, err);
-                app_clone.state::<StreamRegistry>().0.lock().unwrap_or_else(|e| e.into_inner()).remove(&stream_id_clone);
-                let _ = app_clone.emit("stream-error", StreamError {
-                    stream_id: stream_id_clone,
+                log::error!(
+                    "❌ [Tauri-Stream-{}] HTTP request failed: {}",
+                    request_id,
+                    err
+                );
+                app_clone
+                    .state::<StreamRegistry>()
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&stream_id_clone);
+                let _ = on_event_clone.send(StreamEvent::Error {
                     error: format!("HTTP request failed: {}", err),
+                    status: None,
                 });
             }
         }
@@ -552,111 +720,544 @@ pub async fn cancel_stream(
     registry: State<'_, StreamRegistry>,
     stream_id: String,
 ) -> Result<(), String> {
-    let mut map = registry.0.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(tx) = map.remove(&stream_id) {
-        let _ = tx.send(());
-        log::info!("🛑 [cancel_stream] Cancelled stream: {}", &stream_id[..8.min(stream_id.len())]);
-    } else {
-        log::warn!("⚠️ [cancel_stream] Stream not found (already ended?): {}", &stream_id[..8.min(stream_id.len())]);
+    if cancel_registered_stream(&registry, &stream_id) {
+        log::info!(
+            "🛑 [cancel_stream] Cancelled stream: {}",
+            &stream_id[..8.min(stream_id.len())]
+        );
     }
     Ok(())
 }
 
+/// 幂等取消一个正在进行的非流式请求。
+#[command]
+pub async fn cancel_request(
+    registry: State<'_, RequestRegistry>,
+    request_id: String,
+) -> Result<(), String> {
+    if cancel_registered_request(&registry, &request_id) {
+        log::info!(
+            "🛑 [cancel_request] Cancelled request: {}",
+            &request_id[..8.min(request_id.len())]
+        );
+    }
+    Ok(())
+}
+
+fn cancel_registered_request(registry: &RequestRegistry, request_id: &str) -> bool {
+    let cancellation = registry
+        .0
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(request_id);
+    match cancellation {
+        Some(cancellation) => {
+            let _ = cancellation.sender.send(());
+            true
+        }
+        None => false,
+    }
+}
+
+fn remove_registered_request_if_owned(
+    registry: &RequestRegistry,
+    request_id: &str,
+    owner_id: uuid::Uuid,
+) {
+    let mut active_requests = registry.0.lock().unwrap_or_else(|error| error.into_inner());
+    if active_requests
+        .get(request_id)
+        .is_some_and(|cancellation| cancellation.owner_id == owner_id)
+    {
+        active_requests.remove(request_id);
+    }
+}
+
+fn cancel_registered_stream(registry: &StreamRegistry, stream_id: &str) -> bool {
+    let sender = registry
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(stream_id);
+    match sender {
+        Some(sender) => {
+            let _ = sender.send(());
+            true
+        }
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_allowed_host, redact_headers_for_log};
-    use std::{collections::HashMap, env};
+    use super::{
+        build_http_client, cancel_registered_request, cancel_registered_stream,
+        execute_registered_api_proxy, is_allowed_host_with_allowlist,
+        redact_headers_for_log, remove_registered_request_if_owned, ApiRequest,
+        RequestCancellation, RequestRegistry, StreamEvent, StreamRegistry, Utf8ChunkDecoder,
+    };
+    use std::{
+        collections::HashMap,
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{mpsc, Mutex},
+        thread,
+        time::Duration,
+    };
+    use tokio::sync::oneshot;
 
-    /// 辅助：在测试中临时设置 / 清除环境变量（串行执行，避免并发干扰）
-    fn with_env<F: FnOnce()>(key: &str, val: Option<&str>, f: F) {
-        let old = env::var(key).ok();
-        match val {
-            Some(v) => env::set_var(key, v),
-            None => env::remove_var(key),
+    fn spawn_one_shot_http_server(response: &'static str) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind one-shot test server");
+        let address = listener.local_addr().expect("read one-shot test address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept one-shot test request");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            stream
+                .write_all(response.as_bytes())
+                .expect("write one-shot test response");
+        });
+        (format!("http://{address}/test"), server)
+    }
+
+    #[test]
+    fn test_utf8_chunk_decoder_preserves_code_points_split_across_network_chunks() {
+        let bytes = "data: {\"text\":\"你好\"}\n".as_bytes();
+        let split_at = bytes
+            .windows("你".len())
+            .position(|window| window == "你".as_bytes())
+            .expect("find multibyte character")
+            + 1;
+        let mut decoder = Utf8ChunkDecoder::default();
+
+        let first = decoder
+            .push(&bytes[..split_at])
+            .expect("decode valid prefix");
+        let second = decoder
+            .push(&bytes[split_at..])
+            .expect("decode carried suffix");
+        let final_text = decoder.finish().expect("finish decoder");
+
+        assert_eq!(
+            format!("{first}{second}{final_text}"),
+            "data: {\"text\":\"你好\"}\n"
+        );
+    }
+
+    #[test]
+    fn test_stream_error_serializes_for_the_tauri_channel_contract() {
+        let event = StreamEvent::Error {
+            error: "HTTP Error: 401".to_string(),
+            status: Some(401),
+        };
+
+        assert_eq!(
+            serde_json::to_value(event).expect("serialize stream event"),
+            serde_json::json!({
+                "event": "error",
+                "error": "HTTP Error: 401",
+                "status": 401,
+            }),
+        );
+    }
+
+    #[test]
+    fn test_cancel_registered_stream_removes_and_notifies_active_stream() {
+        let registry = StreamRegistry(Mutex::new(HashMap::new()));
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        registry
+            .0
+            .lock()
+            .expect("lock stream registry")
+            .insert("stream-active".to_string(), cancel_tx);
+
+        assert!(cancel_registered_stream(&registry, "stream-active"));
+        assert!(registry.0.lock().expect("lock stream registry").is_empty());
+        cancel_rx
+            .try_recv()
+            .expect("receive cancellation signal without waiting");
+    }
+
+    #[test]
+    fn test_cancel_registered_stream_is_idempotent_after_cleanup() {
+        let registry = StreamRegistry(Mutex::new(HashMap::new()));
+
+        assert!(!cancel_registered_stream(&registry, "stream-finished"));
+        assert!(!cancel_registered_stream(&registry, "stream-finished"));
+        assert!(registry.0.lock().expect("lock stream registry").is_empty());
+    }
+
+    #[test]
+    fn test_request_cleanup_only_removes_the_registration_owned_by_that_execution() {
+        let registry = RequestRegistry::default();
+        let owner_id = uuid::Uuid::new_v4();
+        let replacement_owner_id = uuid::Uuid::new_v4();
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        registry
+            .0
+            .lock()
+            .expect("lock request registry")
+            .insert(
+                "request-reused".to_string(),
+                RequestCancellation {
+                    owner_id: replacement_owner_id,
+                    sender: cancel_tx,
+                },
+            );
+
+        remove_registered_request_if_owned(&registry, "request-reused", owner_id);
+
+        assert!(cancel_registered_request(&registry, "request-reused"));
+        cancel_rx
+            .try_recv()
+            .expect("replacement registration remains cancellable");
+        assert!(!cancel_registered_request(&registry, "request-reused"));
+    }
+
+    #[tokio::test]
+    async fn test_registered_api_request_rejects_unsafe_request_ids_without_registering() {
+        let registry = RequestRegistry::default();
+        let request = ApiRequest {
+            url: "http://127.0.0.1:1/unused".to_string(),
+            method: "GET".to_string(),
+            headers: None,
+            body: None,
+            request_id: Some("你你你".to_string()),
+        };
+
+        let error = execute_registered_api_proxy(&registry, request, None)
+            .await
+            .expect_err("unsafe request ID is rejected");
+
+        assert_eq!(error.message, "Invalid request ID");
+        assert!(registry.0.lock().expect("lock request registry").is_empty());
+    }
+
+    #[test]
+    fn test_api_request_accepts_camel_case_and_legacy_snake_case_request_ids() {
+        for (field, request_id) in [
+            ("requestId", "request-camel"),
+            ("request_id", "request-snake"),
+        ] {
+            let mut value = serde_json::json!({
+                "url": "http://127.0.0.1:1/unused",
+                "method": "GET"
+            });
+            value[field] = serde_json::json!(request_id);
+
+            let request: ApiRequest = serde_json::from_value(value).expect("deserialize request");
+
+            assert_eq!(request.request_id.as_deref(), Some(request_id));
         }
-        f();
-        match old {
-            Some(v) => env::set_var(key, v),
-            None => env::remove_var(key),
-        }
+    }
+
+    #[tokio::test]
+    async fn test_registered_api_request_completion_cleans_before_late_cancel() {
+        let (url, server) = spawn_one_shot_http_server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let registry = RequestRegistry::default();
+        let request_id = "request-completed";
+        let response = execute_registered_api_proxy(
+            &registry,
+            ApiRequest {
+                url,
+                method: "GET".to_string(),
+                headers: None,
+                body: None,
+                request_id: Some(request_id.to_string()),
+            },
+            None,
+        )
+        .await
+        .expect("complete registered request");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "ok");
+        assert!(!cancel_registered_request(&registry, request_id));
+        server.join().expect("join one-shot test server");
+    }
+
+    #[tokio::test]
+    async fn test_registered_api_request_preserves_unauthorized_response_and_cleans_up() {
+        let (url, server) = spawn_one_shot_http_server(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\nConnection: close\r\n\r\nunauthorized",
+        );
+        let registry = RequestRegistry::default();
+        let response = execute_registered_api_proxy(
+            &registry,
+            ApiRequest {
+                url,
+                method: "GET".to_string(),
+                headers: None,
+                body: None,
+                request_id: Some("request-401".to_string()),
+            },
+            None,
+        )
+        .await
+        .expect("return unauthorized response");
+
+        assert_eq!(response.status, 401);
+        assert_eq!(response.body, "unauthorized");
+        assert!(registry.0.lock().expect("lock request registry").is_empty());
+        server.join().expect("join one-shot test server");
+    }
+
+    #[tokio::test]
+    async fn test_registered_api_request_cancellation_stops_waiting_for_the_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind cancellation test server");
+        let address = listener.local_addr().expect("read cancellation test address");
+        let (request_received_tx, request_received_rx) = mpsc::channel();
+        let (release_server_tx, release_server_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept cancellation test request");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            request_received_tx
+                .send(())
+                .expect("signal request received by server");
+            release_server_rx.recv().expect("release cancellation test server");
+        });
+        let registry = RequestRegistry::default();
+        let request_id = "request-cancellable".to_string();
+        let request = ApiRequest {
+            url: format!("http://{address}/slow"),
+            method: "GET".to_string(),
+            headers: None,
+            body: None,
+            request_id: Some(request_id.clone()),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            async {
+                let (result, ()) = tokio::join!(
+                    execute_registered_api_proxy(&registry, request, None),
+                    async {
+                tokio::task::spawn_blocking(move || {
+                    request_received_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("request reaches server before cancellation")
+                })
+                .await
+                .expect("join request receipt waiter");
+                assert!(cancel_registered_request(&registry, &request_id));
+                    }
+                );
+                result
+            },
+        )
+        .await
+        .expect("cancellation completes without waiting for the server");
+
+        assert_eq!(result.expect_err("request is cancelled").message, "Request cancelled");
+        assert!(registry.0.lock().expect("lock request registry").is_empty());
+        release_server_tx.send(()).expect("release cancellation test server");
+        server.join().expect("join cancellation test server");
+    }
+
+    #[tokio::test]
+    async fn test_registered_api_request_cancellation_stops_reading_the_response_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind body cancellation server");
+        let address = listener.local_addr().expect("read body cancellation server address");
+        let (headers_sent_tx, headers_sent_rx) = mpsc::channel();
+        let (release_body_tx, release_body_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept body cancellation request");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
+                .expect("write response headers");
+            headers_sent_tx.send(()).expect("signal response headers sent");
+            release_body_rx.recv().expect("release body cancellation server");
+        });
+        let registry = RequestRegistry::default();
+        let request_id = "request-body-cancellable".to_string();
+        let request = ApiRequest {
+            url: format!("http://{address}/slow-body"),
+            method: "GET".to_string(),
+            headers: None,
+            body: None,
+            request_id: Some(request_id.clone()),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            async {
+                let (result, ()) = tokio::join!(
+                    execute_registered_api_proxy(&registry, request, None),
+                    async {
+                tokio::task::spawn_blocking(move || {
+                    headers_sent_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("response headers arrive before body cancellation")
+                })
+                .await
+                .expect("join response header waiter");
+                assert!(cancel_registered_request(&registry, &request_id));
+                    }
+                );
+                result
+            },
+        )
+        .await
+        .expect("body cancellation completes without waiting for the server");
+
+        assert_eq!(result.expect_err("body read is cancelled").message, "Request cancelled");
+        assert!(registry.0.lock().expect("lock request registry").is_empty());
+        release_body_tx.send(()).expect("release body cancellation server");
+        server.join().expect("join body cancellation server");
     }
 
     // --- 未配置白名单（默认只放行 localhost/127.0.0.1）---
 
     #[test]
     fn test_no_env_allows_localhost() {
-        with_env("TAURI_ALLOWED_HOSTS", None, || {
-            assert!(is_allowed_host("http://127.0.0.1:8011/api"));
-            assert!(is_allowed_host("http://localhost:3001/dev"));
-            assert!(is_allowed_host("http://[::1]:8011/api"));
-        });
+        assert!(is_allowed_host_with_allowlist(
+            "http://127.0.0.1:8011/api",
+            ""
+        ));
+        assert!(is_allowed_host_with_allowlist(
+            "http://localhost:3001/dev",
+            ""
+        ));
+        assert!(is_allowed_host_with_allowlist("http://[::1]:8011/api", ""));
     }
 
     #[test]
     fn test_no_env_blocks_external() {
-        with_env("TAURI_ALLOWED_HOSTS", None, || {
-            // 关键测试：revert 白名单校验逻辑后此断言应失败
-            assert!(!is_allowed_host("http://169.254.169.254/latest/meta-data/"));
-            assert!(!is_allowed_host("https://evil.example.com/exfil"));
-            assert!(!is_allowed_host("http://internal-svc/secret"));
-        });
+        assert!(!is_allowed_host_with_allowlist(
+            "http://169.254.169.254/latest/meta-data/",
+            "",
+        ));
+        assert!(!is_allowed_host_with_allowlist(
+            "https://evil.example.com/exfil",
+            ""
+        ));
+        assert!(!is_allowed_host_with_allowlist(
+            "http://internal-svc/secret",
+            ""
+        ));
     }
 
     // --- 已配置白名单 ---
 
     #[test]
     fn test_env_allows_listed_host() {
-        with_env(
-            "TAURI_ALLOWED_HOSTS",
-            Some("bklite.example.com,api.internal.corp:8443"),
-            || {
-                assert!(is_allowed_host("https://bklite.example.com/api/v1/"));
-                assert!(is_allowed_host("https://api.internal.corp:8443/stream"));
-            },
-        );
+        let allowlist = "bklite.example.com,api.internal.corp:8443";
+        assert!(is_allowed_host_with_allowlist(
+            "https://bklite.example.com/api/v1/",
+            allowlist,
+        ));
+        assert!(is_allowed_host_with_allowlist(
+            "https://api.internal.corp:8443/stream",
+            allowlist,
+        ));
     }
 
     #[test]
     fn test_env_blocks_unlisted_host() {
-        with_env(
-            "TAURI_ALLOWED_HOSTS",
-            Some("bklite.example.com"),
-            || {
-                // SSRF 靶标：不在白名单内应被拒绝
-                assert!(!is_allowed_host("http://169.254.169.254/"));
-                assert!(!is_allowed_host("https://other-domain.example.com/"));
-            },
-        );
+        assert!(!is_allowed_host_with_allowlist(
+            "http://169.254.169.254/",
+            "bklite.example.com",
+        ));
+        assert!(!is_allowed_host_with_allowlist(
+            "https://other-domain.example.com/",
+            "bklite.example.com",
+        ));
+    }
+
+    #[test]
+    fn test_public_http_is_rejected_even_when_host_is_allowlisted() {
+        assert!(!is_allowed_host_with_allowlist(
+            "http://bklite.example.com/api/v1/",
+            "bklite.example.com",
+        ));
+        assert!(is_allowed_host_with_allowlist(
+            "https://bklite.example.com/api/v1/",
+            "bklite.example.com",
+        ));
+        assert!(is_allowed_host_with_allowlist(
+            "http://127.0.0.1:8011/api/v1/",
+            "127.0.0.1:8011",
+        ));
+    }
+
+    #[test]
+    fn test_env_allows_explicit_local_network_http_hosts() {
+        assert!(is_allowed_host_with_allowlist(
+            "http://192.168.1.10:3001/api/proxy/core/api/get_domain_list",
+            "192.168.1.10:3001",
+        ));
+        assert!(is_allowed_host_with_allowlist(
+            "http://169.254.10.20:3001/api/proxy/core/api/get_domain_list",
+            "169.254.10.20:3001",
+        ));
+        assert!(!is_allowed_host_with_allowlist(
+            "http://169.254.169.254/latest/meta-data/",
+            "192.168.1.10:3001",
+        ));
     }
 
     #[test]
     fn test_env_host_port_distinction() {
-        // host:port 条目不应放行同 host 的其它端口
-        with_env(
-            "TAURI_ALLOWED_HOSTS",
-            Some("api.corp.com:8443"),
-            || {
-                assert!(is_allowed_host("https://api.corp.com:8443/ok"));
-                // 不同端口不在白名单
-                assert!(!is_allowed_host("https://api.corp.com:9999/bad"));
-                // 纯 host（无端口）不在白名单
-                assert!(!is_allowed_host("https://api.corp.com/bad"));
-            },
-        );
+        let allowlist = "api.corp.com:8443";
+        assert!(is_allowed_host_with_allowlist(
+            "https://api.corp.com:8443/ok",
+            allowlist,
+        ));
+        assert!(!is_allowed_host_with_allowlist(
+            "https://api.corp.com:9999/bad",
+            allowlist,
+        ));
+        assert!(!is_allowed_host_with_allowlist(
+            "https://api.corp.com/bad",
+            allowlist,
+        ));
     }
 
     #[test]
     fn test_invalid_url_rejected() {
-        with_env("TAURI_ALLOWED_HOSTS", Some("bklite.example.com"), || {
-            assert!(!is_allowed_host("not-a-url"));
-            assert!(!is_allowed_host(""));
+        assert!(!is_allowed_host_with_allowlist(
+            "not-a-url",
+            "bklite.example.com"
+        ));
+        assert!(!is_allowed_host_with_allowlist("", "bklite.example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_http_client_does_not_follow_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind redirect test server");
+        let address = listener.local_addr().expect("read redirect test address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept redirect test request");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/blocked\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("write redirect response");
         });
+
+        let response = build_http_client("Tauri-Redirect-Test/1.0")
+            .expect("build test client")
+            .get(format!("http://{address}/start"))
+            .send()
+            .await
+            .expect("return first response without following redirect");
+
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        server.join().expect("join redirect test server");
     }
 
     #[test]
     fn test_redact_headers_for_log_masks_sensitive_headers_case_insensitively() {
         let mut headers = HashMap::new();
-        headers.insert("Authorization".to_string(), "Bearer secret-token".to_string());
+        headers.insert(
+            "Authorization".to_string(),
+            "Bearer secret-token".to_string(),
+        );
         headers.insert("cookie".to_string(), "sessionid=secret".to_string());
         headers.insert("Set-Cookie".to_string(), "refresh=secret".to_string());
         headers.insert("X-Api-Key".to_string(), "api-key-secret".to_string());
@@ -664,15 +1265,30 @@ mod tests {
 
         let redacted = redact_headers_for_log(&headers);
 
-        assert_eq!(redacted.get("Authorization").map(String::as_str), Some("<redacted>"));
-        assert_eq!(redacted.get("cookie").map(String::as_str), Some("<redacted>"));
-        assert_eq!(redacted.get("Set-Cookie").map(String::as_str), Some("<redacted>"));
-        assert_eq!(redacted.get("X-Api-Key").map(String::as_str), Some("<redacted>"));
+        assert_eq!(
+            redacted.get("Authorization").map(String::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            redacted.get("cookie").map(String::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            redacted.get("Set-Cookie").map(String::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            redacted.get("X-Api-Key").map(String::as_str),
+            Some("<redacted>")
+        );
         assert_eq!(
             redacted.get("Content-Type").map(String::as_str),
             Some("application/json")
         );
 
-        assert_eq!(headers.get("Authorization").map(String::as_str), Some("Bearer secret-token"));
+        assert_eq!(
+            headers.get("Authorization").map(String::as_str),
+            Some("Bearer secret-token")
+        );
     }
 }

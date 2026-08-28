@@ -23,6 +23,23 @@ error:
   username_empty: 用户名不能为空
   otp_empty: 用户名或 OTP 验证码不能为空
 
+# 内置应用展示名（Console 卡片 / 左上角应用列表）
+app_name:
+  monitor: 监控中心
+  log: 日志中心
+  cmdb: CMDB
+  alarm: 告警中心
+  job: 作业管理
+  ops-analysis: 运营分析
+  ops-console: 控制台
+  system-manager: 系统管理
+  node: 节点管理
+  opspilot: OpsPilot
+  mlops: MLOps
+  patch: 补丁管理
+  apm: APM
+  playground: Playground
+
 # 应用描述 (内置应用)
 app:
   ops-analysis: 整合运维数据，通过仪表盘、画布方式多维度分析挖掘潜在风险与优化空间，为决策提供数据支撑，助力提升运维质量与业务连续性。
@@ -37,6 +54,7 @@ app:
   node: 用于集中管理各个云区域下的节点，为各个节点安装各类探针，以便进行监控数据、配置信息、日志等信息的采集
   ops-console: 统一运维控制台，用于管理和监控所有运维活动
   job: 快速创建并执行作业，统一管理脚本执行、文件分发和定时任务
+  patch: 集中管理系统补丁，支持补丁扫描、安装与补丁库维护，帮助持续降低安全风险。
 
 # 标签翻译 (内置应用标签)
 tag:
@@ -88,3 +106,7 @@ tag:
   script_management: 脚本管理
   file_distribution: 文件分发
   scheduled_task: 定时任务
+  # patch
+  patch_scan: 补丁扫描
+  patch_install: 补丁安装
+  patch_library: 补丁库

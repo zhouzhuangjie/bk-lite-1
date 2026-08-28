@@ -13,6 +13,7 @@ from apps.core.utils.viewset_utils import AuthViewSet
 from apps.job_mgmt.constants import ExecutionStatus, JobType
 from apps.job_mgmt.models import JobExecution, Playbook, ScheduledTask, Script, Target
 from apps.job_mgmt.serializers.dashboard import DashboardStatsSerializer, DashboardTrendSerializer
+from apps.job_mgmt.utils.i18n import job_message
 
 # 统计时间范围常量
 DEFAULT_RANGE_DAYS = 7  # days 默认值（近一周）
@@ -194,11 +195,14 @@ class DashboardViewSet(AuthViewSet):
             }
         )
 
+    @HasPermission("job_record-View")
     @action(detail=False, methods=["get"])
     def stats(self, request):
         """获取Dashboard统计数据（资产与执行计数）"""
+        team_filter = self._get_team_filter(request)
+
         # 平均执行时长：仅统计 started_at/finished_at 都有的已完成执行
-        execution_stats = JobExecution.objects.aggregate(
+        execution_stats = JobExecution.objects.filter(team_filter).aggregate(
             total=Count("id"),
             success=Count("id", filter=Q(status=ExecutionStatus.SUCCESS)),
             failed=Count("id", filter=Q(status=ExecutionStatus.FAILED)),
@@ -209,46 +213,54 @@ class DashboardViewSet(AuthViewSet):
         avg_duration_seconds = _duration_to_seconds(execution_stats["avg_duration"])
 
         data = {
-            "target_total": Target.objects.count(),
-            "script_total": Script.objects.count(),
-            "playbook_total": Playbook.objects.count(),
+            "target_total": Target.objects.filter(team_filter).count(),
+            "script_total": Script.objects.filter(team_filter).count(),
+            "playbook_total": Playbook.objects.filter(team_filter).count(),
             "execution_total": execution_stats["total"],
             "execution_success": execution_stats["success"],
             "execution_failed": execution_stats["failed"],
             "execution_running": execution_stats["running"],
             "execution_pending": execution_stats["pending"],
-            "scheduled_task_total": ScheduledTask.objects.count(),
-            "scheduled_task_enabled": ScheduledTask.objects.filter(is_enabled=True).count(),
+            "scheduled_task_total": ScheduledTask.objects.filter(team_filter).count(),
+            "scheduled_task_enabled": ScheduledTask.objects.filter(team_filter, is_enabled=True).count(),
             "avg_duration_seconds": avg_duration_seconds,
         }
 
         serializer = DashboardStatsSerializer(data)
         return Response(serializer.data)
 
+    @HasPermission("job_record-View")
     @action(detail=False, methods=["get"])
     def job_type_distribution(self, request):
         """获取作业类型分布"""
-        distribution = JobExecution.objects.values("job_type").annotate(count=Count("id")).order_by("-count")
+        team_filter = self._get_team_filter(request)
+        distribution = JobExecution.objects.filter(team_filter).values("job_type").annotate(count=Count("id")).order_by("-count")
         job_type_names = dict(JobType.CHOICES)
 
         result = [
             {
                 "job_type": item["job_type"],
-                "job_type_display": job_type_names.get(item["job_type"], item["job_type"]),
+                "job_type_display": job_message(
+                    request,
+                    f"choice.job_type.{item['job_type']}",
+                    job_type_names.get(item["job_type"], item["job_type"]),
+                ),
                 "count": item["count"],
             }
             for item in distribution
         ]
         return Response(result)
 
+    @HasPermission("job_record-View")
     @action(detail=False, methods=["get"])
     def execution_status_distribution(self, request):
         """获取执行状态分布（按 days 或自定义 start_date/end_date 闭区间）"""
         start_date, end_date, error = _resolve_date_range(request)
         if error:
             return Response({"error": error}, status=status.HTTP_400_BAD_REQUEST)
+        team_filter = self._get_team_filter(request)
         distribution = (
-            JobExecution.objects.filter(created_at__date__gte=start_date, created_at__date__lte=end_date)
+            JobExecution.objects.filter(team_filter, created_at__date__gte=start_date, created_at__date__lte=end_date)
             .values("status")
             .annotate(count=Count("id"))
             .order_by("-count")

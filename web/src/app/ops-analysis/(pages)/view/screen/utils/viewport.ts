@@ -4,6 +4,10 @@ import type {
   ScreenViewSets,
 } from '@/app/ops-analysis/types/screen';
 import { normalizeStoredFilterDefinitions } from '@/app/ops-analysis/utils/unifiedFilterState';
+import {
+  DEFAULT_SCREEN_THEME_ID,
+  resolveScreenThemeId,
+} from './screenTheme';
 
 export interface ScreenViewportPreset {
   key: string;
@@ -16,7 +20,7 @@ export const DEFAULT_SCREEN_VIEWPORT: ScreenViewportConfig = {
   width: 1920,
   height: 1080,
   background: { type: 'builtIn', key: 'tech-grid' },
-  theme: 'screen-tech-blue',
+  theme: DEFAULT_SCREEN_THEME_ID,
 };
 
 export const DEFAULT_SCREEN_DECORATIONS: ScreenDecorationsConfig = {
@@ -31,13 +35,6 @@ const cloneViewport = (
   ...viewport,
   background: viewport.background ? { ...viewport.background } : undefined,
 });
-
-export const DEFAULT_SCREEN_VIEW_SETS: ScreenViewSets = {
-  viewport: cloneViewport(DEFAULT_SCREEN_VIEWPORT),
-  items: [],
-  decorations: { ...DEFAULT_SCREEN_DECORATIONS },
-  filters: [],
-};
 
 export const SCREEN_VIEWPORT_PRESETS: ScreenViewportPreset[] = [
   { key: '1920x1080', label: '1920 × 1080', width: 1920, height: 1080 },
@@ -93,7 +90,7 @@ export const normalizeScreenViewSets = (value: unknown): ScreenViewSets => {
       background: DEFAULT_SCREEN_VIEWPORT.background
         ? { ...DEFAULT_SCREEN_VIEWPORT.background }
         : undefined,
-      theme: DEFAULT_SCREEN_VIEWPORT.theme,
+      theme: resolveScreenThemeId(viewport.theme),
     },
     items: Array.isArray(source.items) ? source.items : [],
     decorations,
@@ -110,6 +107,7 @@ export const updateScreenViewport = (
     ...viewSets.viewport,
     width: viewport.width,
     height: viewport.height,
+    theme: resolveScreenThemeId(viewport.theme ?? viewSets.viewport.theme),
   },
   items: [...viewSets.items],
   decorations: { ...viewSets.decorations },

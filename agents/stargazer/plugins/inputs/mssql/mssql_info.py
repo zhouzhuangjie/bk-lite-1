@@ -4,11 +4,11 @@ MSSQL Server Information Collector
 
 A standalone script to gather information about MSSQL servers.
 """
-import pyodbc
-from sanic.log import logger
-from typing import Dict, Any
+from typing import Any, Dict
 
+import aioodbc
 from core.decorator import timer
+from sanic.log import logger
 
 
 class MSSQLInfo:
@@ -29,12 +29,12 @@ class MSSQLInfo:
         self.user = kwargs.get("user")
         self.password = kwargs.get("password")
         self.database = kwargs.get("database")
-        self.timeout = int(kwargs.get("timeout", 5))
+        self.timeout = 5  # 连接超时硬编码；表单 timeout 由框架作单对象预算
         self.info: Dict[str, Any] = {}
         self.connection = None
         self.cursor = None
 
-    def _connect(self):
+    async def _connect(self):
         """Establish MSSQL connection."""
         try:
             conn_str = (
@@ -44,61 +44,63 @@ class MSSQLInfo:
                 f"UID={self.user};"
                 f"PWD={self.password}"
             )
-            self.connection = pyodbc.connect(conn_str, timeout=self.timeout)
-            self.cursor = self.connection.cursor()
+            self.connection = await aioodbc.connect(dsn=conn_str, timeout=self.timeout, autocommit=True)
+            self.cursor = await self.connection.cursor()
             logger.info(f"Connected to MSSQL database at {self.host}:{self.port}")
-        except pyodbc.Error as e:
+        except Exception as e:
             logger.error(f"Failed to connect to MSSQL: {str(e)}")
             raise RuntimeError(f"Connection error: {str(e)}")
 
-    def close(self):
+    async def close(self):
         """Close MSSQL connection and cursor."""
         try:
             if self.cursor:
-                self.cursor.close()
+                await self.cursor.close()
+                self.cursor = None
             if self.connection:
-                self.connection.close()
+                await self.connection.close()
+                self.connection = None
             logger.info("MSSQL connection closed successfully.")
-        except pyodbc.Error as e:
+        except Exception as e:
             logger.warning(f"Error closing MSSQL connection: {str(e)}")
 
-    def _exec_sql(self, query: str) -> Dict[str, Any]:
+    async def _exec_sql(self, query: str) -> Dict[str, Any]:
         """Execute SQL query and return first row as dict."""
         try:
             logger.debug(f"Executing SQL query: {query}")
-            self.cursor.execute(query)
-            row = self.cursor.fetchone()
+            await self.cursor.execute(query)
+            row = await self.cursor.fetchone()
             if row:
                 return dict(zip([desc[0] for desc in self.cursor.description], row))
             return {}
-        except pyodbc.Error as e:
+        except Exception as e:
             logger.error(f"Error executing SQL '{query}': {str(e)}")
             raise RuntimeError(f"SQL execution error: {str(e)}")
 
-    def _collect(self):
+    async def _collect(self):
         """Collect all required MSSQL info."""
         logger.info("Starting data collection from MSSQL database.")
         try:
             self.info["ip_addr"] = self.host
             self.info["port"] = self.port
             self.info["db_name"] = self.database
-            self.info["version"] = self._exec_sql(self.SQL_QUERIES["version"]).get("version", "")
-            self.info["max_conn"] = str(self._exec_sql(self.SQL_QUERIES["max_conn"]).get("max_conn", 0))
-            self.info["max_mem"] = str(self._exec_sql(self.SQL_QUERIES["max_mem"]).get("max_mem_mb", 0))
-            self.info["order_rule"] = self._exec_sql(self.SQL_QUERIES["order_rule"]).get("order_rule", "")
-            self.info["fill_factor"] = str(self._exec_sql(self.SQL_QUERIES["fill_factor"]).get("fill_factor", 0))
-            self.info["boot_account"] = self._exec_sql(self.SQL_QUERIES["boot_account"]).get("boot_account", "")
+            self.info["version"] = (await self._exec_sql(self.SQL_QUERIES["version"])).get("version", "")
+            self.info["max_conn"] = str((await self._exec_sql(self.SQL_QUERIES["max_conn"])).get("max_conn", 0))
+            self.info["max_mem"] = str((await self._exec_sql(self.SQL_QUERIES["max_mem"])).get("max_mem_mb", 0))
+            self.info["order_rule"] = (await self._exec_sql(self.SQL_QUERIES["order_rule"])).get("order_rule", "")
+            self.info["fill_factor"] = str((await self._exec_sql(self.SQL_QUERIES["fill_factor"])).get("fill_factor", 0))
+            self.info["boot_account"] = (await self._exec_sql(self.SQL_QUERIES["boot_account"])).get("boot_account", "")
             self.info["inst_name"] = f"{self.host}-mssql-{self.port}"
         except Exception as e:
             logger.error(f"Error during data collection: {str(e)}")
             raise
 
     @timer(logger=logger)
-    def list_all_resources(self):
+    async def list_all_resources(self):
         """Public method to collect all info and format it for Prometheus."""
         try:
-            self._connect()
-            self._collect()
+            await self._connect()
+            await self._collect()
             result = {"result": {"mssql": [self.info]}, "success": True}
             logger.info("Data collection completed successfully.")
         except Exception as e:
@@ -106,6 +108,6 @@ class MSSQLInfo:
             result = {"result": {"cmdb_collect_error": str(e)}, "success": False}
 
         finally:
-            self.close()
+            await self.close()
 
         return result

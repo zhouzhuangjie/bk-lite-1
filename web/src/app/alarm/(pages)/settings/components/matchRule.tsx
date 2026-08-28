@@ -12,13 +12,19 @@ import {
   ruleList,
   initialConditionLists,
 } from '@/app/alarm/constants/settings';
+import {
+  MatchRuleValue,
+  getMatchRuleOperatorOptions,
+  getMatchRuleValueAfterOperatorChange,
+  getMatchRuleValueSelectState,
+} from './matchRuleValue';
 
 const { Option } = Select;
 
 interface PolicyItem {
   key: string | undefined;
   operator: string | undefined;
-  value: string | undefined;
+  value: MatchRuleValue;
 }
 
 interface MatchRuleProps {
@@ -27,6 +33,7 @@ interface MatchRuleProps {
   ruleOptions?: { name: string; verbose_name: string }[];
   conditionOptions?: Record<string, { name: string; desc: string }[]>;
   levelType?: 'alert' | 'event' | 'incident';
+  enableLevelMultiSelect?: boolean;
 }
 
 const RulesMatch: React.FC<MatchRuleProps> = ({
@@ -35,6 +42,7 @@ const RulesMatch: React.FC<MatchRuleProps> = ({
   ruleOptions,
   conditionOptions,
   levelType = 'event',
+  enableLevelMultiSelect = false,
 }) => {
   const { getAlertSources } = useSourceApi();
   const { levelMeta } = useCommon();
@@ -162,26 +170,49 @@ const RulesMatch: React.FC<MatchRuleProps> = ({
                           placeholder={`${t('common.selectTip')}`}
                           onChange={(value) => {
                             const updatedPolicyList = [...policyList];
-                            updatedPolicyList[index][ind].operator = value;
+                            const item = updatedPolicyList[index][ind];
+                            item.operator = value;
+                            item.value = getMatchRuleValueAfterOperatorChange(
+                              item.key,
+                              enableLevelMultiSelect,
+                              item.value,
+                            );
                             setPolicyList(updatedPolicyList);
                             onChange?.(updatedPolicyList);
                           }}
                         >
-                          {((conditionOptions || initialConditionLists)[i.key as string] || []).map(
-                            (item) => (
+                          {getMatchRuleOperatorOptions(
+                            i.key,
+                            enableLevelMultiSelect,
+                            (conditionOptions || initialConditionLists)[
+                              i.key as string
+                            ] || [],
+                          ).map((item) => (
                               <Option key={item.name} value={item.name}>
                                 {item.desc}
                               </Option>
-                            ),
-                          )}
+                          ))}
                         </Select>
                       </div>
                       <div className={styles.valueInput}>
-                        {['level', 'source_id'].includes(i.key as string) ? (
+                        {['level', 'source_id', 'source_name'].includes(i.key as string) ? (
                           <Select
-                            value={i.value}
+                            mode={
+                              getMatchRuleValueSelectState(
+                                i.key,
+                                enableLevelMultiSelect,
+                                i.value,
+                              ).mode
+                            }
+                            value={
+                              getMatchRuleValueSelectState(
+                                i.key,
+                                enableLevelMultiSelect,
+                                i.value,
+                              ).value
+                            }
                             showSearch
-                            loading={i.key === 'source_id' && sourceLoading}
+                            loading={(i.key === 'source_id' || i.key === 'source_name') && sourceLoading}
                             placeholder={`${t('common.selectTip')}`}
                             onChange={(value) => {
                               const updatedPolicyList = [...policyList];
@@ -198,16 +229,22 @@ const RulesMatch: React.FC<MatchRuleProps> = ({
                                   </Option>
                                 ),
                               )}
-                            {i.key === 'source_id' &&
-                              sourceList.map((source) => (
-                                <Option key={source.id} value={source.id}>
-                                  {source.name}
-                                </Option>
-                              ))}
+                            {(i.key === 'source_id' || i.key === 'source_name') &&
+                              sourceList.map((source) => {
+                                // source_id 存 AlertSource.id（向后兼容老数据）；
+                                // source_name 存 AlertSource.name 字符串（推荐新规则用）。
+                                const optionValue =
+                                  i.key === 'source_name' ? String(source.name) : String(source.id);
+                                return (
+                                  <Option key={optionValue} value={optionValue}>
+                                    {source.name}
+                                  </Option>
+                                );
+                              })}
                           </Select>
                         ) : (
                           <Input
-                            value={i.value}
+                            value={Array.isArray(i.value) ? undefined : i.value}
                             placeholder={t('common.inputTip')}
                             onChange={(e) => {
                               const updatedPolicyList = [...policyList];

@@ -1,5 +1,7 @@
 from django.db import transaction
+from django.utils import timezone
 
+from apps.core.exceptions.base_app_exception import BaseAppException
 from apps.monitor.constants.database import DatabaseConstants
 from apps.monitor.models import MonitorPlugin, MonitorPluginUITemplate
 from apps.monitor.models.monitor_metrics import MetricGroup, Metric
@@ -10,6 +12,7 @@ from apps.monitor.utils.instance_id_keys import (
     resolve_monitor_object_instance_id_keys,
 )
 from apps.monitor.utils.node_selector import normalize_node_selector
+from apps.monitor.services.instance_facts import InstanceFactResolver
 
 
 class MonitorPluginService:
@@ -78,6 +81,16 @@ class MonitorPluginService:
     @staticmethod
     def import_monitor_plugin(data: dict):
         """Import monitor plugin"""
+        mark_objects_builtin = bool(data.pop("_mark_objects_builtin", False))
+        if data.get("is_compound_object"):
+            for object_info in data.get("objects", []):
+                object_info.pop("is_builtin", None)
+                if mark_objects_builtin:
+                    object_info["is_builtin"] = True
+        else:
+            data.pop("is_builtin", None)
+            if mark_objects_builtin:
+                data["is_builtin"] = True
         plugin_name = data.get("plugin", "")
         monitor_object_names = MonitorPluginService._extract_monitor_object_names(data)
 
@@ -89,10 +102,38 @@ class MonitorPluginService:
         MonitorPluginService._sync_plugin_monitor_objects(plugin_name, monitor_object_names)
 
     @staticmethod
+    def import_monitor_plugins(documents: list[dict]) -> None:
+        """跨插件批量导入，供内置目录初始化使用。"""
+        from apps.monitor.services.plugin_import_bulk import import_monitor_plugins
+
+        import_monitor_plugins(documents)
+
+    @staticmethod
+    def _ensure_language_skeleton(plugin_dir, plugin_name: str) -> None:
+        """为新 plugin 在 metrics.json 同目录生成 language/{en,zh-Hans}.yaml 空骨架。
+
+        若文件已存在且非空,不覆盖。
+        """
+        import yaml
+        from pathlib import Path
+
+        lang_dir = Path(plugin_dir) / "language"
+        lang_dir.mkdir(parents=True, exist_ok=True)
+        skeleton = {plugin_name: {"name": "", "desc": ""}}
+        for lang in ("en", "zh-Hans"):
+            target = lang_dir / f"{lang}.yaml"
+            if target.is_file() and target.stat().st_size > 0:
+                continue
+            with target.open("w", encoding="utf-8") as f:
+                yaml.safe_dump(skeleton, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+
+    @staticmethod
     def import_basic_monitor_object(data: dict):
         """导入基础监控对象"""
         metrics = data.pop("metrics")
         display_fields_block = data.pop("display_fields", None)
+        instance_summary_columns = data.pop("instance_summary_columns", None)
+        instance_fact_bindings = InstanceFactResolver.validate_bindings(data.pop("instance_fact_bindings", []))
         plugin = data.pop("plugin")
         desc = data.pop("plugin_desc", "")
         status_query = data.pop("status_query", "")
@@ -130,9 +171,25 @@ class MonitorPluginService:
             monitor_obj.default_metric = data.get("default_metric", monitor_obj.default_metric)
             monitor_obj.instance_id_keys = data.get("instance_id_keys", monitor_obj.instance_id_keys)
             monitor_obj.supplementary_indicators = list(set(supplementary_indicators))
+            if data.get("is_builtin"):
+                monitor_obj.is_builtin = True
             monitor_obj.save()
         else:
+            if data.get("cleanup_policy") == MonitorObject.CLEANUP_POLICY_TIMEOUT:
+                data["cleanup_policy_effective_at"] = timezone.now()
             monitor_obj = MonitorObject.objects.create(**data)
+
+        if instance_summary_columns is not None:
+            if not isinstance(instance_summary_columns, list):
+                raise BaseAppException("instance_summary_columns 必须是列表")
+            available_facts = {binding["fact"] for binding in instance_fact_bindings}
+            for index, column in enumerate(instance_summary_columns):
+                if not isinstance(column, dict) or not str(column.get("fact") or "").strip():
+                    raise BaseAppException(f"instance_summary_columns[{index}] 缺少 fact")
+                if column["fact"] not in available_facts:
+                    raise BaseAppException(f"实例摘要列引用了插件未绑定的事实: {column['fact']}")
+            monitor_obj.instance_summary_columns = instance_summary_columns
+            monitor_obj.save(update_fields=["instance_summary_columns"])
 
         # seed 展示列配置：仅当未被用户自定义
         if not monitor_obj.display_fields_customized:
@@ -160,6 +217,7 @@ class MonitorPluginService:
                     collect_type=collect_type,
                     support_collect_detect=support_collect_detect,
                     node_selector=node_selector,
+                    instance_fact_bindings=instance_fact_bindings,
                 ),
             )
             plugin_obj.monitor_object.add(monitor_obj)
@@ -211,11 +269,14 @@ class MonitorPluginService:
                 existing_metric.monitor_plugin_id = plugin_obj.id
                 existing_metric.display_name = metric["display_name"]
                 existing_metric.query = metric["query"]
+                existing_metric.view_query = metric.get("view_query", "")
+                existing_metric.view_config = metric.get("view_config", {})
                 existing_metric.unit = metric["unit"]
                 existing_metric.data_type = metric["data_type"]
                 existing_metric.description = metric["description"]
                 existing_metric.dimensions = metric["dimensions"]
                 existing_metric.instance_id_keys = metric_instance_id_keys
+                existing_metric.is_ifmib = bool(metric.get("is_ifmib", False))
                 metrics_to_update.append(existing_metric)
             else:
                 metrics_to_create.append(
@@ -226,18 +287,33 @@ class MonitorPluginService:
                         name=metric["name"],
                         display_name=metric["display_name"],
                         query=metric["query"],
+                        view_query=metric.get("view_query", ""),
+                        view_config=metric.get("view_config", {}),
                         unit=metric["unit"],
                         data_type=metric["data_type"],
                         description=metric["description"],
                         dimensions=metric["dimensions"],
                         instance_id_keys=metric_instance_id_keys,
+                        is_ifmib=bool(metric.get("is_ifmib", False)),
                     )
                 )
 
         if metrics_to_update:
             Metric.objects.bulk_update(
                 metrics_to_update,
-                ["metric_group_id", "display_name", "query", "unit", "data_type", "description", "dimensions", "instance_id_keys"],
+                [
+                    "metric_group_id",
+                    "display_name",
+                    "query",
+                    "view_query",
+                    "view_config",
+                    "unit",
+                    "data_type",
+                    "description",
+                    "dimensions",
+                    "instance_id_keys",
+                    "is_ifmib",
+                ],
                 batch_size=DatabaseConstants.BULK_UPDATE_BATCH_SIZE,
             )
 
@@ -255,8 +331,12 @@ class MonitorPluginService:
         collect_type = data.get("collect_type", "")
         support_collect_detect = bool(data.get("support_collect_detect", False))
         node_selector = data.get("node_selector", {})
+        instance_fact_bindings = data.get("instance_fact_bindings", [])
+        base_summary_columns = data.get("instance_summary_columns")
 
         for object_info in data.get("objects", []):
+            if object_info.get("level") == "base" and "instance_summary_columns" not in object_info:
+                object_info["instance_summary_columns"] = base_summary_columns
             object_info.update(
                 plugin=data["plugin"],
                 plugin_desc=data["plugin_desc"],
@@ -265,6 +345,7 @@ class MonitorPluginService:
                 collect_type=collect_type,
                 support_collect_detect=support_collect_detect,
                 node_selector=node_selector,
+                instance_fact_bindings=instance_fact_bindings,
             )
             if object_info.get("level") == "base":
                 base_object = object_info
@@ -302,6 +383,8 @@ class MonitorPluginService:
             "collect_type": plugin_obj.collect_type,
             "support_collect_detect": plugin_obj.support_collect_detect,
             "node_selector": plugin_obj.node_selector or {},
+            "instance_fact_bindings": plugin_obj.instance_fact_bindings or [],
+            "instance_summary_columns": monitor_obj.instance_summary_columns or [],
             "name": monitor_obj.name,
             "type": monitor_obj.type_id if monitor_obj.type else None,  # 导出type的id值
             "description": monitor_obj.description,
@@ -332,6 +415,7 @@ class MonitorPluginService:
             "collect_type": plugin_obj.collector,
             "support_collect_detect": plugin_obj.support_collect_detect,
             "node_selector": plugin_obj.node_selector or {},
+            "instance_fact_bindings": plugin_obj.instance_fact_bindings or [],
             "is_compound_object": True,
             "objects": [],
         }

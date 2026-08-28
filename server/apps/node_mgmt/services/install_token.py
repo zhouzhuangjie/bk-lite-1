@@ -1,11 +1,48 @@
+import time
 import uuid
+
 from django.core.cache import cache
+
 from apps.core.exceptions.base_app_exception import BaseAppException
 from apps.node_mgmt.constants.installer import InstallerConstants
+from apps.node_mgmt.constants.node import NodeConstants
+from apps.node_mgmt.models import ControllerTaskNode
 
 
 class InstallTokenService:
     """节点安装令牌服务 - 管理限时安装令牌"""
+
+    USAGE_COUNT_CACHE_SUFFIX = "usage_count"
+
+    @classmethod
+    def _consume_token_usage(
+        cls,
+        cache_key: str,
+        data: dict,
+        max_usage: int,
+        timeout: int,
+        invalid_message: str,
+        exceeded_message: str,
+    ) -> int:
+        """Atomically consume one use without extending the token lifetime."""
+        usage_cache_key = f"{cache_key}:{cls.USAGE_COUNT_CACHE_SUFFIX}"
+
+        # ``add`` is atomic on supported cache backends. Seeding from the
+        # payload keeps tokens issued before the separate counter compatible.
+        cache.add(usage_cache_key, data.get("usage_count", 0), timeout=timeout)
+        try:
+            usage_count = cache.incr(usage_cache_key)
+        except ValueError:
+            raise BaseAppException(invalid_message)
+
+        if usage_count > max_usage:
+            # Keep the exhausted counter as a tombstone until its TTL ends.
+            # A request that already read ``data`` must not be able to recreate
+            # the counter from the stale payload after this token is deleted.
+            cache.delete(cache_key)
+            raise BaseAppException(exceeded_message)
+
+        return usage_count
 
     @staticmethod
     def generate_install_token(
@@ -18,6 +55,11 @@ class InstallTokenService:
         organizations: list,
         node_name: str,
         cpu_architecture: str = "",
+        install_mode: str = "manual",
+        task_node_id: int | None = None,
+        execution_id: str = "",
+        execution_attempt: int | None = None,
+        execution_deadline_unix: int | None = None,
     ) -> str:
         """
         生成安装令牌（30分钟有效，最多使用5次）
@@ -48,6 +90,11 @@ class InstallTokenService:
                 "organizations": organizations,
                 "node_name": node_name,
                 "cpu_architecture": cpu_architecture,
+                "install_mode": install_mode,
+                "task_node_id": task_node_id,
+                "execution_id": execution_id,
+                "execution_attempt": execution_attempt,
+                "execution_deadline_unix": execution_deadline_unix,
                 "usage_count": 0,
                 "max_usage": InstallerConstants.INSTALL_TOKEN_MAX_USAGE,
             },
@@ -57,35 +104,34 @@ class InstallTokenService:
         return token
 
     @staticmethod
-    def validate_and_get_token_data(token: str) -> dict:
-        """
-        验证令牌并获取关联的参数（带次数限制）
-
-        :param token: 限时令牌
-        :return: 包含节点安装所需参数的字典
-        :raises BaseAppException: 令牌无效、已过期或超过使用次数
-        """
+    def _get_valid_install_token_payload(token: str) -> tuple[str, dict, int]:
         cache_key = f"{InstallerConstants.INSTALL_TOKEN_CACHE_PREFIX}:{token}"
         data = cache.get(cache_key)
 
         if not data:
             raise BaseAppException("Invalid or expired token")
 
-        # 检查使用次数
-        usage_count = data.get("usage_count", 0)
+        if data.get("os") == NodeConstants.WINDOWS_OS and data.get("install_mode") == "auto":
+            task_node = ControllerTaskNode.objects.filter(id=data.get("task_node_id"), status="running").first()
+            result = task_node.result if task_node and isinstance(task_node.result, dict) else {}
+            if (
+                not task_node
+                or result.get(InstallerConstants.INSTALLER_EXECUTION_ID_KEY) != data.get("execution_id")
+                or result.get(InstallerConstants.EXECUTION_ATTEMPT_KEY) != data.get("execution_attempt")
+                or result.get(InstallerConstants.EXECUTION_PHASE_KEY)
+                != InstallerConstants.EXECUTION_PHASE_BOOTSTRAP_RUNNING
+                or result.get(InstallerConstants.EXECUTION_DEADLINE_UNIX_KEY)
+                != data.get("execution_deadline_unix")
+                or not isinstance(data.get("execution_deadline_unix"), int)
+                or int(time.time()) >= data["execution_deadline_unix"]
+            ):
+                raise BaseAppException("Windows remote installation execution is no longer active")
+
         max_usage = data.get("max_usage", InstallerConstants.INSTALL_TOKEN_MAX_USAGE)
+        return cache_key, data, max_usage
 
-        if usage_count >= max_usage:
-            # 超过最大使用次数,删除令牌
-            cache.delete(cache_key)
-            raise BaseAppException(f"Token has exceeded maximum usage limit ({max_usage} times)")
-
-        # 增加使用次数
-        data["usage_count"] = usage_count + 1
-
-        # 更新 cache
-        cache.set(cache_key, data, timeout=InstallerConstants.INSTALL_TOKEN_EXPIRE_TIME)
-
+    @staticmethod
+    def _format_install_token_data(data: dict, remaining_usage: int) -> dict:
         return {
             "node_id": data["node_id"],
             "ip": data["ip"],
@@ -96,8 +142,44 @@ class InstallTokenService:
             "organizations": data["organizations"],
             "node_name": data["node_name"],
             "cpu_architecture": data.get("cpu_architecture", ""),
-            "remaining_usage": max_usage - data["usage_count"],
+            "install_mode": data.get("install_mode", "manual"),
+            "task_node_id": data.get("task_node_id"),
+            "execution_id": data.get("execution_id", ""),
+            "execution_attempt": data.get("execution_attempt"),
+            "execution_deadline_unix": data.get("execution_deadline_unix"),
+            "remaining_usage": remaining_usage,
         }
+
+    @staticmethod
+    def inspect_token_data(token: str) -> dict:
+        """验证安装令牌但不消耗次数，仅用于响应生成前的无副作用预检。"""
+        cache_key, data, max_usage = InstallTokenService._get_valid_install_token_payload(token)
+        usage_cache_key = f"{cache_key}:{InstallTokenService.USAGE_COUNT_CACHE_SUFFIX}"
+        usage_count = cache.get(usage_cache_key, data.get("usage_count", 0))
+        if usage_count >= max_usage:
+            raise BaseAppException(f"Token has exceeded maximum usage limit ({max_usage} times)")
+        return InstallTokenService._format_install_token_data(data, max_usage - usage_count)
+
+    @staticmethod
+    def validate_and_get_token_data(token: str) -> dict:
+        """
+        验证令牌、原子消耗一次并获取关联的参数。
+
+        :param token: 限时令牌
+        :return: 包含节点安装所需参数的字典
+        :raises BaseAppException: 令牌无效、已过期或超过使用次数
+        """
+        cache_key, data, max_usage = InstallTokenService._get_valid_install_token_payload(token)
+        usage_count = InstallTokenService._consume_token_usage(
+            cache_key=cache_key,
+            data=data,
+            max_usage=max_usage,
+            timeout=InstallerConstants.INSTALL_TOKEN_EXPIRE_TIME,
+            invalid_message="Invalid or expired token",
+            exceeded_message=f"Token has exceeded maximum usage limit ({max_usage} times)",
+        )
+
+        return InstallTokenService._format_install_token_data(data, max_usage - usage_count)
 
     @staticmethod
     def generate_download_token(package_id: str, node_id: str) -> str:
@@ -140,23 +222,18 @@ class InstallTokenService:
         if not data:
             raise BaseAppException("Invalid or expired download token")
 
-        # 检查使用次数
-        usage_count = data.get("usage_count", 0)
         max_usage = data.get("max_usage", InstallerConstants.DOWNLOAD_TOKEN_MAX_USAGE)
-
-        if usage_count >= max_usage:
-            # 超过最大使用次数,删除令牌
-            cache.delete(cache_key)
-            raise BaseAppException(f"Download token has exceeded maximum usage limit ({max_usage} times)")
-
-        # 增加使用次数
-        data["usage_count"] = usage_count + 1
-
-        # 更新 cache
-        cache.set(cache_key, data, timeout=InstallerConstants.DOWNLOAD_TOKEN_EXPIRE_TIME)
+        usage_count = InstallTokenService._consume_token_usage(
+            cache_key=cache_key,
+            data=data,
+            max_usage=max_usage,
+            timeout=InstallerConstants.DOWNLOAD_TOKEN_EXPIRE_TIME,
+            invalid_message="Invalid or expired download token",
+            exceeded_message=f"Download token has exceeded maximum usage limit ({max_usage} times)",
+        )
 
         return {
             "package_id": data["package_id"],
             "node_id": data["node_id"],
-            "remaining_usage": max_usage - data["usage_count"],
+            "remaining_usage": max_usage - usage_count,
         }

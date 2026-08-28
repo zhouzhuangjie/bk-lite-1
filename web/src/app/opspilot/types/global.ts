@@ -1,24 +1,3 @@
-export interface KnowledgeItem {
-  score: number;
-  content: string;
-}
-
-export interface KnowledgeBase {
-  citing_num: number;
-  knowledge_id: number;
-  knowledge_base_id: number;
-  knowledge_source_type: string;
-  knowledge_title: string;
-  result: KnowledgeItem[]
-}
-
-export interface Annotation {
-  answer: CustomChatMessage;
-  question: CustomChatMessage;
-  selectedKnowledgeBase: string | number;
-  tagId?: number | string;
-}
-
 export interface BrowserStepAction {
   navigate?: { url: string; new_tab?: boolean };
   wait?: { seconds: number };
@@ -107,6 +86,24 @@ export interface AgentStepProgressData {
   total_elapsed_seconds?: number;
 }
 
+/** DeepAgent planned_execution_step 分组后的对话展示数据 */
+export interface PlannedExecutionStepView {
+  step_index: number;
+  total_steps: number;
+  objective: string;
+  status: 'running' | 'done' | 'failed';
+  toolCallIds: string[];
+  error?: string;
+}
+
+export interface PlannedStepToolCallView {
+  id: string;
+  name: string;
+  args: string;
+  status: 'calling' | 'completed' | 'error';
+  result?: string;
+}
+
 export interface SkillViewItem {
   id: string;
   name: string;
@@ -123,8 +120,6 @@ export interface CustomChatMessage {
   isThinking?: boolean;
   createAt?: string;
   updateAt?: string;
-  knowledgeBase?: KnowledgeBase | null;
-  annotation?: Annotation | null;
   images?: Array<{
     id: string;
     url: string;
@@ -140,7 +135,43 @@ export interface CustomChatMessage {
   reportFileDownloads?: ReportFileDownload[];
   repairCommands?: RepairCommands[];
   agentStepProgress?: AgentStepProgressData[];
+  plannedExecutionSteps?: PlannedExecutionStepView[];
+  /** 规划阶段状态：planning/replanning 时展示「正在规划」反馈 */
+  plannedExecutionStatus?: {
+    phase: 'planning' | 'replanning' | 'planned' | 'idle' | string;
+    step_count?: number;
+    goal?: string;
+    replan_count?: number;
+    reason?: string;
+  } | null;
+  /** 与 plannedExecutionSteps 配套的工具快照；无步骤分组时也可用于历史回放 */
+  toolCalls?: PlannedStepToolCallView[];
+  /** 流式进行中为 true；结束后收起计划步骤 */
+  isStreamingTools?: boolean;
   skillViews?: SkillViewItem[];
+  wikiCitations?: WikiCitation[];
+}
+
+export interface WikiSearchExplanation {
+  matched_by: Array<'keyword' | 'vector' | 'chunk_vector' | string>;
+  keyword_score?: number;
+  vector_score?: number;
+  matched_terms?: string[];
+  keyword_rank?: number;
+  semantic_rank?: number;
+  chunk_index?: number;
+  fusion?: string;
+}
+
+// Wiki 知识库引用:答案中对应的来源(知识页面/资料)。
+// n/kb_id 仅智能体对话(按 [n] 标注)有;概览问答助手按标题引用,无 n。
+export interface WikiCitation {
+  n?: number;
+  kb_id?: number;
+  kind: string; // page | material_summary
+  id: number;
+  title: string;
+  explanation?: WikiSearchExplanation;
 }
 
 export interface ConfigDiffItem {
@@ -151,6 +182,8 @@ export interface ConfigDiffItem {
   summary: string;
   before_yaml: string;
   after_yaml: string;
+  fix_description?: string;  // 兜底:非 YAML issue 给的文字建议
+  skill_id?: number;  // 可选,后端派 event 时塞入,前端 modal 用它查 k8s 配置
 }
 
 export interface A2UIAction {
@@ -172,6 +205,7 @@ export interface ConfigDiffReport {
   report_id: string;
   title: string;
   cluster_name: string;
+  skill_id?: number;
   a2ui?: A2UIReportContract;
   items: ConfigDiffItem[];
   received_at: number;
@@ -187,7 +221,7 @@ export interface ConfigAnalysisReportItem {
 
 export interface ConfigAnalysisReportScope {
   cluster_name?: string;
-  namespace?: string | null;
+  namespace?: string | string[] | null;
   instance_name?: string | null;
   name?: string | null;
   target_name?: string | null;

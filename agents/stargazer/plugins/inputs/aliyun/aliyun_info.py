@@ -2,10 +2,17 @@
 # @File: aliyun_info.py
 # @Time: 2025/3/10 15:06
 # @Author: windyzhao
+import asyncio
 import copy
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# 必须先安装 Python 3.12 兼容别名，再导入会加载旧版 aliyunsdkcore 的 SDK。
+# isort: off
+from plugins.inputs.aliyun import sdk_compat as _sdk_compat  # noqa: F401
+
+# isort: on
 
 import oss2
 from alibabacloud_alb20200616 import models as alb_20200616_models
@@ -81,14 +88,13 @@ from aliyunsdkvpc.request.v20160428 import (
     DescribeVpcsRequest,
     DescribeVSwitchesRequest,
 )
-from six.moves import range
-from Tea.core import TeaCore
-
 from common.cmp.cloud_apis.constant import CloudType
 from common.cmp.cloud_apis.resource_apis.cw_aliyun import RESOURCE_MAP
 from common.cmp.cloud_apis.resource_apis.resource_format.common.base_format import get_format_method
 from common.cmp.utils import set_dir_size
-from plugins.base_utils import utc_to_dts, ts_to_dts
+from plugins.base_utils import ts_to_dts, utc_to_dts
+from six.moves import range
+from Tea.core import TeaCore
 
 
 def convert_param_to_list(param):
@@ -181,21 +187,21 @@ class CwAliyun(object):
         :param region_id:
         :param kwargs:
         """
-        print(params)
         self.AccessKey = params["secret_id"]
         self.AccessSecret = params["secret_key"]
         self.RegionId = params.get("region_id", "cn-hangzhou")
-        self.timeout = int(params.get("timeout", 30))
-        
+        self.timeout = 30  # 连接超时硬编码；读超时用 timeout*2；表单 timeout 由框架作单对象预算
+
         # 🆕 支持自定义endpoint（私有云场景）
         # 从host参数读取endpoint，如: ecs.private-cloud.example.com
         self.custom_endpoint = params.get("host")
-        
+
         for k, v in kwargs.items():
             setattr(self, k, v)
 
         # 猴子补丁：为CredentialModel类添加缺失的provider_name属性
         from alibabacloud_credentials.models import CredentialModel
+
         if not hasattr(CredentialModel, "provider_name"):
             setattr(CredentialModel, "provider_name", None)
 
@@ -205,18 +211,19 @@ class CwAliyun(object):
 
         # 创建ACS客户端
         self.client = client.AcsClient(
-            self.AccessKey, self.AccessSecret, self.RegionId, timeout=self.timeout * 2, connect_timeout=self.timeout,
-            max_retry_time=3
+            self.AccessKey,
+            self.AccessSecret,
+            self.RegionId,
+            timeout=self.timeout * 2,
+            connect_timeout=self.timeout,
+            max_retry_time=3,
         )
 
         # 创建OSS认证对象
         self.auth = oss2.Auth(self.AccessKey, self.AccessSecret)
 
         # 创建配置 - 不使用credential对象，直接设置access_key_id和access_key_secret
-        self.auth_config = open_api_models.Config(
-            access_key_id=self.AccessKey,
-            access_key_secret=self.AccessSecret
-        )
+        self.auth_config = open_api_models.Config(access_key_id=self.AccessKey, access_key_secret=self.AccessSecret)
         self.auth_config.region_id = self.RegionId
 
     def __getattr__(self, item):
@@ -226,9 +233,17 @@ class CwAliyun(object):
         :return:
         """
         return Aliyun(
-            aliyun_client=self.client, name=item, region=self.RegionId, auth=self.auth, 
-            auth_config=self.auth_config, custom_endpoint=self.custom_endpoint
+            aliyun_client=self.client,
+            name=item,
+            region=self.RegionId,
+            auth=self.auth,
+            auth_config=self.auth_config,
+            custom_endpoint=self.custom_endpoint,
         )
+
+    async def list_all_resources(self, **kwargs):
+        manager = self.__getattr__("list_all_resources")
+        return await manager.list_all_resources(**kwargs)
 
 
 class Aliyun(object):
@@ -251,7 +266,7 @@ class Aliyun(object):
         self.cloud_type = CloudType.ALIYUN.value
         self.auth_config = auth_config
         self.custom_endpoint = custom_endpoint
-        
+
         # 如果有自定义endpoint，优先使用自定义endpoint
         domain_config = copy.deepcopy(auth_config)
         domain_config.endpoint = custom_endpoint if custom_endpoint else "domain.aliyuncs.com"
@@ -645,7 +660,13 @@ class Aliyun(object):
                 ali_response = self.client.do_action_with_exception(request)
                 ali_result = json.loads(ali_response)
                 price = ali_result["PriceInfo"]["Price"]["TradePrice"]
-                res_list.append({"price": round(float(price) * 24 * 30 / 100, 4), "name": i["name"], "type": i["type"]})
+                res_list.append(
+                    {
+                        "price": round(float(price) * 24 * 30 / 100, 4),
+                        "name": i["name"],
+                        "type": i["type"],
+                    }
+                )
             return {"result": True, "data": res_list}
         except Exception as e:
             print("get_storage_list error")
@@ -708,9 +729,8 @@ class Aliyun(object):
             ali_response = self.client.do_action_with_exception(request)
             ali_result = json.loads(ali_response)
             vnc_url = ali_result["VncUrl"]
-            url = (
-                "https://g.alicdn.com/aliyun/ecs-console-vnc2/0.0.5/index.html?vncUrl={0}&instanceId={"
-                "1}&isWindows={2}".format(vnc_url, vm_id, is_windows)
+            url = "https://g.alicdn.com/aliyun/ecs-console-vnc2/0.0.5/index.html?vncUrl={0}&instanceId={" "1}&isWindows={2}".format(
+                vnc_url, vm_id, is_windows
             )
             return {"result": True, "data": url}
         except Exception as e:
@@ -752,9 +772,7 @@ class Aliyun(object):
             ali_result = json.loads(ali_response)
             data = ""
             if "Code" not in ali_result:
-                available_resource = ali_result["AvailableZones"]["AvailableZone"][0]["AvailableResources"][
-                    "AvailableResource"
-                ]
+                available_resource = ali_result["AvailableZones"]["AvailableZone"][0]["AvailableResources"]["AvailableResource"]
                 if available_resource:
                     supported_resource = available_resource[0]["SupportedResources"]["SupportedResource"]
                     t5_vm = ""
@@ -903,9 +921,7 @@ class Aliyun(object):
         try:
             cas = []
             while True:
-                resp = self.cas_client.list_user_certificate_order_with_options(
-                    list_user_certificate_order_request, runtime
-                )
+                resp = self.cas_client.list_user_certificate_order_with_options(list_user_certificate_order_request, runtime)
                 result = TeaCore.to_map(resp.body)
                 page_cas = result.get("CertificateOrderList", [])
                 if not page_cas:
@@ -941,6 +957,7 @@ class Aliyun(object):
             return {"result": True, "data": buckets}
         except Exception as e:
             import traceback
+
             print("list_buckets error. error={}".format(traceback.format_exc()))
             return {"result": False, "message": repr(e)}
 
@@ -970,6 +987,7 @@ class Aliyun(object):
             return {"result": True, "data": rds_instances}
         except Exception as e:
             import traceback
+
             print("list_rds error. error={}".format(traceback.format_exc()))
             return {"result": False, "message": repr(e)}
 
@@ -995,6 +1013,7 @@ class Aliyun(object):
             return {"result": True, "data": redis_instances}
         except Exception as e:
             import traceback
+
             print("list_redis error. error={}".format(traceback.format_exc()))
             return {"result": False, "message": repr(e)}
 
@@ -1029,6 +1048,7 @@ serverless"""
             return {"result": True, "data": mongodb_instances}
         except Exception as e:
             import traceback
+
             print("list_mongodb error. error={}".format(traceback.format_exc()))
             return {"result": False, "message": repr(e)}
 
@@ -1091,9 +1111,7 @@ serverless"""
         get_topic_subscribe_status_request.region_id = self.RegionId
         get_topic_subscribe_status_request.topic = topic
         try:
-            resp = self.kafka_client.get_topic_subscribe_status_with_options(
-                get_topic_subscribe_status_request, runtime
-            )
+            resp = self.kafka_client.get_topic_subscribe_status_with_options(get_topic_subscribe_status_request, runtime)
             result = TeaCore.to_map(resp.body)
             consumer_groups = result.get("TopicSubscribeStatus", {}).get("ConsumerGroups", [])
 
@@ -1178,6 +1196,7 @@ serverless"""
             return {"result": True, "data": clb_instances}
         except Exception as e:
             import traceback
+
             print("list_slb error. error={}".format(traceback.format_exc()))
             return {"result": False, "message": repr(e)}
 
@@ -1343,7 +1362,6 @@ serverless"""
             return {"result": True, "data": []}
         mse_insts = []
         try:
-
             for mse_service in mse_services:
                 list_mse_inst_request = mse20190531_models.ListAnsInstancesRequest()
                 runtime = util_models.RuntimeOptions()
@@ -1425,8 +1443,10 @@ serverless"""
             print("list_nas error")
             return {"result": False, "message": repr(e)}
 
-    def list_all_resources(self, **kwargs):
+    async def list_all_resources(self, **kwargs):
+        return await asyncio.to_thread(self._list_all_resources_sync, **kwargs)
 
+    def _list_all_resources_sync(self, **kwargs):
         def handle_resource(resource_func, resource_name):
             try:
                 result = resource_func()
@@ -1438,6 +1458,7 @@ serverless"""
                     return {resource_name: {"cmdb_collect_error": error_msg}}
             except Exception as e:
                 import traceback
+
                 return {resource_name: {"cmdb_collect_error": str(e) + "\n" + traceback.format_exc()}}
 
         try:
@@ -1460,7 +1481,6 @@ serverless"""
                 (self.list_mongodb, "aliyun_mongodb"),
                 (lambda: kafka_result, "aliyun_kafka_inst"),
                 (self.list_clb, "aliyun_clb"),
-
                 # (lambda: self.list_kafka_consumer_group(kafka_instances=kafka_result), "aliyun_kafka_group"),
                 # (lambda: self.list_kafka_topic(kafka_instances=kafka_result), "aliyun_kafka_topic"),
                 # (self.list_k8s_clusters, "aliyun_k8s_cluster"),
@@ -1475,8 +1495,7 @@ serverless"""
             data = {}
             with ThreadPoolExecutor(max_workers=10) as executor:
                 future_to_resource = {
-                    executor.submit(handle_resource, resource_func, resource_name): resource_name
-                    for resource_func, resource_name in resources
+                    executor.submit(handle_resource, resource_func, resource_name): resource_name for resource_func, resource_name in resources
                 }
                 for future in as_completed(future_to_resource):
                     result = future.result()
@@ -1487,7 +1506,9 @@ serverless"""
             result_data = {"result": format_data, "success": True}
         except Exception as err:
             import traceback
+
             from sanic.log import logger
+
             logger.error("aliyun_list_all_resources_error: {}".format(traceback.format_exc()))
             result_data = {"result": {"cmdb_collect_error": str(err)}, "success": False}
 
@@ -1503,8 +1524,7 @@ serverless"""
                     "resource_name": data["resource_name"],
                     "resource_id": data["resource_id"],
                     "ip_addr": data["inner_ip"][0] if data["inner_ip"] else "",
-                    "public_ip": data["public_ip"][0] if data["public_ip"] else (
-                        data["inner_ip"][0] if data["inner_ip"] else ""),
+                    "public_ip": data["public_ip"][0] if data["public_ip"] else (data["inner_ip"][0] if data["inner_ip"] else ""),
                     "region": data["region"],
                     "zone": data["zone"],
                     "vpc": data["vpc"],
@@ -1535,7 +1555,7 @@ serverless"""
                     "storage_class": data["StorageClass"],
                     "cross_region_replication": data["CrossRegionReplication"],
                     "block_public_access": data["BlockPublicAccess"],
-                    "creation_date": utc_to_dts(data["CreationDate"], utc_fmt='%Y-%m-%dT%H:%M:%S.%fZ'),
+                    "creation_date": utc_to_dts(data["CreationDate"], utc_fmt="%Y-%m-%dT%H:%M:%S.%fZ"),
                 }
             )
 
@@ -1546,27 +1566,29 @@ serverless"""
         result = []
         for data in data_list:
             zone_slave = ",".join([data[i] for i in data if i.startswith("ZoneIdSlave")])
-            result.append({
-                "resource_name": data.get("DBInstanceDescription"),
-                "resource_id": data.get("DBInstanceId"),
-                "region": data.get("RegionId"),
-                "zone": data.get("ZoneId"),
-                "zone_slave": zone_slave,
-                "engine": data.get("Engine"),
-                "version": data.get("EngineVersion"),
-                "type": data.get("DBInstanceType"),
-                "status": data.get("DBInstanceStatus"),
-                "class": data.get("DBInstanceClass"),
-                "storage_type": data.get("DBInstanceStorageType"),
-                "network_type": data.get("InstanceNetworkType"),
-                "connection_mode": data.get("ConnectionMode"),
-                "lock_mode": data.get("LockMode"),
-                "cpu": data.get("DBInstanceCPU"),
-                "memory_mb": data.get("DBInstanceMemory"),
-                "charge_type": data.get("ChargeType"),
-                "create_time": utc_to_dts(data.get("CreateTime")),
-                "expire_time": utc_to_dts(data.get("ExpireTime")),
-            })
+            result.append(
+                {
+                    "resource_name": data.get("DBInstanceDescription"),
+                    "resource_id": data.get("DBInstanceId"),
+                    "region": data.get("RegionId"),
+                    "zone": data.get("ZoneId"),
+                    "zone_slave": zone_slave,
+                    "engine": data.get("Engine"),
+                    "version": data.get("EngineVersion"),
+                    "type": data.get("DBInstanceType"),
+                    "status": data.get("DBInstanceStatus"),
+                    "class": data.get("DBInstanceClass"),
+                    "storage_type": data.get("DBInstanceStorageType"),
+                    "network_type": data.get("InstanceNetworkType"),
+                    "connection_mode": data.get("ConnectionMode"),
+                    "lock_mode": data.get("LockMode"),
+                    "cpu": data.get("DBInstanceCPU"),
+                    "memory_mb": data.get("DBInstanceMemory"),
+                    "charge_type": data.get("ChargeType"),
+                    "create_time": utc_to_dts(data.get("CreateTime")),
+                    "expire_time": utc_to_dts(data.get("ExpireTime")),
+                }
+            )
         return result
 
     @staticmethod
@@ -1574,54 +1596,58 @@ serverless"""
         result = []
         for data in data_list:
             zone_slave = ",".join([data[i] for i in data if i.startswith("ZoneIdSlave")])
-            result.append({
-                "resource_name": data.get("DBInstanceDescription"),
-                "resource_id": data.get("DBInstanceId"),
-                "region": data.get("RegionId"),
-                "zone": data.get("ZoneId"),
-                "zone_slave": zone_slave,
-                "engine": data.get("Engine"),
-                "version": data.get("EngineVersion"),
-                "type": data.get("DBInstanceType"),
-                "status": data.get("DBInstanceStatus"),
-                "class": data.get("DBInstanceClass"),
-                "storage_type": data.get("DBInstanceStorageType"),
-                "network_type": data.get("InstanceNetworkType"),
-                "net_type": data.get("DBInstanceNetType"),
-                "connection_mode": data.get("ConnectionMode"),
-                "lock_mode": data.get("LockMode"),
-                "cpu": data.get("DBInstanceCPU", ""),
-                "memory_mb": data.get("DBInstanceMemory"),
-                "charge_type": data.get("ChargeType", ""),
-                "create_time": utc_to_dts(data.get("CreateTime")),
-                "expire_time": utc_to_dts(data.get("ExpireTime")),
-            })
+            result.append(
+                {
+                    "resource_name": data.get("DBInstanceDescription"),
+                    "resource_id": data.get("DBInstanceId"),
+                    "region": data.get("RegionId"),
+                    "zone": data.get("ZoneId"),
+                    "zone_slave": zone_slave,
+                    "engine": data.get("Engine"),
+                    "version": data.get("EngineVersion"),
+                    "type": data.get("DBInstanceType"),
+                    "status": data.get("DBInstanceStatus"),
+                    "class": data.get("DBInstanceClass"),
+                    "storage_type": data.get("DBInstanceStorageType"),
+                    "network_type": data.get("InstanceNetworkType"),
+                    "net_type": data.get("DBInstanceNetType"),
+                    "connection_mode": data.get("ConnectionMode"),
+                    "lock_mode": data.get("LockMode"),
+                    "cpu": data.get("DBInstanceCPU", ""),
+                    "memory_mb": data.get("DBInstanceMemory"),
+                    "charge_type": data.get("ChargeType", ""),
+                    "create_time": utc_to_dts(data.get("CreateTime")),
+                    "expire_time": utc_to_dts(data.get("ExpireTime")),
+                }
+            )
         return result
 
     @staticmethod
     def format_aliyun_redis(data_list):
         result = []
         for data in data_list:
-            result.append({
-                "resource_name": data.get("InstanceName"),
-                "resource_id": data.get("InstanceId"),
-                "region": data["RegionId"],
-                "zone": data["ZoneId"],
-                "engine_version": data["EngineVersion"],
-                "architecture_type": data["ArchitectureType"],
-                "capacity": data["Capacity"],
-                "network_type": data["NetworkType"],
-                "connection_domain": data["ConnectionDomain"],
-                "port": data["Port"],
-                "bandwidth": data["Bandwidth"],
-                "shard_count": data.get("ShardCount", ""),
-                "qps": data["QPS"],
-                "instance_class": data["InstanceClass"],
-                "package_type": data["PackageType"],
-                "charge_type": data["ChargeType"],
-                "create_time": utc_to_dts(data.get("CreateTime")),
-                "end_time": utc_to_dts(data.get("EndTime")),
-            })
+            result.append(
+                {
+                    "resource_name": data.get("InstanceName"),
+                    "resource_id": data.get("InstanceId"),
+                    "region": data["RegionId"],
+                    "zone": data["ZoneId"],
+                    "engine_version": data["EngineVersion"],
+                    "architecture_type": data["ArchitectureType"],
+                    "capacity": data["Capacity"],
+                    "network_type": data["NetworkType"],
+                    "connection_domain": data["ConnectionDomain"],
+                    "port": data["Port"],
+                    "bandwidth": data["Bandwidth"],
+                    "shard_count": data.get("ShardCount", ""),
+                    "qps": data["QPS"],
+                    "instance_class": data["InstanceClass"],
+                    "package_type": data["PackageType"],
+                    "charge_type": data["ChargeType"],
+                    "create_time": utc_to_dts(data.get("CreateTime")),
+                    "end_time": utc_to_dts(data.get("EndTime")),
+                }
+            )
         return result
 
     @staticmethod
@@ -1629,66 +1655,72 @@ serverless"""
         result = []
         for data in data_list:
             zone_slave = ",".join([data.get("SecondaryZoneId", "") or data.get("HiddenZoneId", "")])
-            result.append({
-                "resource_name": data.get("DBInstanceDescription"),
-                "resource_id": data.get("DBInstanceId"),
-                "region": data.get("RegionId"),
-                "zone": data.get("ZoneId"),
-                "zone_slave": zone_slave,
-                "engine": data.get("Engine"),
-                "version": data.get("EngineVersion"),
-                "type": data.get("DBInstanceType"),
-                "status": data.get("DBInstanceStatus"),
-                "class": data.get("DBInstanceClass"),
-                "storage_type": data.get("StorageType"),
-                "storage_gb": data.get("DBInstanceStorage", ""),
-                "lock_mode": data.get("LockMode", ""),
-                "charge_type": data.get("ChargeType", ""),
-                "create_time": utc_to_dts(data.get("CreateTime"), utc_fmt='%Y-%m-%dT%H:%MZ'),
-                "expire_time": utc_to_dts(data.get("ExpireTime"), utc_fmt='%Y-%m-%dT%H:%MZ'),
-            })
+            result.append(
+                {
+                    "resource_name": data.get("DBInstanceDescription"),
+                    "resource_id": data.get("DBInstanceId"),
+                    "region": data.get("RegionId"),
+                    "zone": data.get("ZoneId"),
+                    "zone_slave": zone_slave,
+                    "engine": data.get("Engine"),
+                    "version": data.get("EngineVersion"),
+                    "type": data.get("DBInstanceType"),
+                    "status": data.get("DBInstanceStatus"),
+                    "class": data.get("DBInstanceClass"),
+                    "storage_type": data.get("StorageType"),
+                    "storage_gb": data.get("DBInstanceStorage", ""),
+                    "lock_mode": data.get("LockMode", ""),
+                    "charge_type": data.get("ChargeType", ""),
+                    "create_time": utc_to_dts(data.get("CreateTime"), utc_fmt="%Y-%m-%dT%H:%MZ"),
+                    "expire_time": utc_to_dts(data.get("ExpireTime"), utc_fmt="%Y-%m-%dT%H:%MZ"),
+                }
+            )
         return result
 
     @staticmethod
     def format_aliyun_kafka_inst(data_list):
         result = []
         for data in data_list:
-            result.append({
-                "resource_name": data.get("LoadBalancerName"),
-                "resource_id": data.get("LoadBalancerId"),
-                "region": data.get("RegionId"),
-                "zone": data.get("ZoneId"),
-                "vpc": data.get("VpcId"),
-                "status": data.get("LoadBalancerStatus"),
-                "class": data.get("LoadBalancerSpec"),
-                "storage_gb": data.get("DiskSize", ""),
-                "storage_type": data.get("DiskType", ""),
-                "msg_retain": data.get("MsgRetain"),
-                "topoc_num": data.get("TopicNumLimit", ""),
-                "io_max_read": data.get("IoMaxRead", ""),
-                "io_max_write": data.get("IoMaxWrite", ""),
-                "charge_type": data.get("PaidType", ""),
-                "create_time": ts_to_dts(data.get("CreateTime")),
-            })
+            result.append(
+                {
+                    "resource_name": data.get("LoadBalancerName"),
+                    "resource_id": data.get("LoadBalancerId"),
+                    "region": data.get("RegionId"),
+                    "zone": data.get("ZoneId"),
+                    "vpc": data.get("VpcId"),
+                    "status": data.get("LoadBalancerStatus"),
+                    "class": data.get("LoadBalancerSpec"),
+                    "storage_gb": data.get("DiskSize", ""),
+                    "storage_type": data.get("DiskType", ""),
+                    "msg_retain": data.get("MsgRetain"),
+                    "topoc_num": data.get("TopicNumLimit", ""),
+                    "io_max_read": data.get("IoMaxRead", ""),
+                    "io_max_write": data.get("IoMaxWrite", ""),
+                    "charge_type": data.get("PaidType", ""),
+                    "create_time": ts_to_dts(data.get("CreateTime")),
+                }
+            )
         return result
 
     @staticmethod
     def format_aliyun_clb(data_list):
         result = []
         for data in data_list:
-            result.append({
-                "resource_name": data.get("LoadBalancerName"),
-                "resource_id": data.get("LoadBalancerId"),
-                "region": data.get("RegionId"),
-                "zone": data.get("MasterZoneId"),
-                "zone_slave": data.get("SlaveZoneId"),
-                "vpc": data.get("VpcId"),
-                "ip_addr": data.get("Address"),
-                "status": data.get("LoadBalancerStatus"),
-                "class": data.get("LoadBalancerSpec"),
-                "charge_type": data.get("PayType", ""),
-                "create_time": utc_to_dts(data["CreateTime"], utc_fmt='%Y-%m-%dT%H:%MZ'),
-            })
+            result.append(
+                {
+                    "resource_name": data.get("LoadBalancerName"),
+                    "resource_id": data.get("LoadBalancerId"),
+                    "region": data.get("RegionId"),
+                    "zone": data.get("MasterZoneId"),
+                    "zone_slave": data.get("SlaveZoneId"),
+                    "vpc": data.get("VpcId"),
+                    "ip_addr": data.get("Address"),
+                    "status": data.get("LoadBalancerStatus"),
+                    "class": data.get("LoadBalancerSpec"),
+                    "charge_type": data.get("PayType", ""),
+                    "create_time": utc_to_dts(data["CreateTime"], utc_fmt="%Y-%m-%dT%H:%MZ"),
+                }
+            )
         return result
 
     @property
@@ -2138,14 +2170,10 @@ serverless"""
                     if not ret.get("result"):
                         continue
                     result["data"][index]["backend_servers"] = (
-                        ret["data"]["BackendServers"].get("BackendServer")
-                        if isinstance(ret["data"].get("BackendServers"), dict)
-                        else []
+                        ret["data"]["BackendServers"].get("BackendServer") if isinstance(ret["data"].get("BackendServers"), dict) else []
                     )
                     if isinstance(ret["data"].get("ListenerPortsAndProtocal"), dict):
-                        result["data"][index]["port"] = ret["data"]["ListenerPortsAndProtocal"].get(
-                            "ListenerPortAndProtocal", []
-                        )
+                        result["data"][index]["port"] = ret["data"]["ListenerPortsAndProtocal"].get("ListenerPortAndProtocal", [])
             return result
         except Exception as e:
             print("list_load_balancer failed")
@@ -2278,7 +2306,11 @@ serverless"""
         try:
             required_list = ["VServerGroupId"]
             checkout_required_parameters(required_list, kwargs)
-            list_optional_params = ["VServerGroupId", "OldBackendServers", "NewBackendServers"]
+            list_optional_params = [
+                "VServerGroupId",
+                "OldBackendServers",
+                "NewBackendServers",
+            ]
             action_name = "ModifyVServerGroupBackendServers"
             request = self._set_common_request_params(action_name, list_optional_params, **kwargs)
             response = self.client.do_action(request)
@@ -2425,7 +2457,12 @@ serverless"""
         :return:
         """
         try:
-            list_optional_params = ["NextToken", "MaxResults", "ListenerProtocol", "LoadBalancerId"]
+            list_optional_params = [
+                "NextToken",
+                "MaxResults",
+                "ListenerProtocol",
+                "LoadBalancerId",
+            ]
             action_name = "DescribeLoadBalancerListeners"
             request = self._set_common_request_params(action_name, list_optional_params, **kwargs)
             return self.__handle_list_request_with_next_token_c("listener", request)
@@ -2611,7 +2648,13 @@ serverless"""
         request = CreateDiskRequest.CreateDiskRequest()
         request.set_ZoneId(kwargs["ZoneId"])
         # request.set_InstanceId(kwargs["InstanceId"])
-        list_optional_params = ["DiskCategory", "Size", "DiskName", "Encrypted", "Description"]
+        list_optional_params = [
+            "DiskCategory",
+            "Size",
+            "DiskName",
+            "Encrypted",
+            "Description",
+        ]
         request = set_optional_params(request, list_optional_params, kwargs)
         request.set_accept_format("json")
         return request
@@ -2624,7 +2667,11 @@ serverless"""
         """
 
         try:
-            bucket = oss2.Bucket(self.auth, "http://oss-" + location + ".aliyuncs.com", kwargs["BucketName"])
+            bucket = oss2.Bucket(
+                self.auth,
+                "http://oss-" + location + ".aliyuncs.com",
+                kwargs["BucketName"],
+            )
             file_path = kwargs.get("file_path", "")
             object_list = bucket.list_objects(prefix=file_path, delimiter="/")
             ali_result = [item.key for item in object_list.object_list]
@@ -2669,7 +2716,14 @@ serverless"""
         if ids:
             kwargs["FileSystemId"] = ids[0]
         request = DescribeFileSystemsRequest.DescribeFileSystemsRequest()
-        list_optional_params = ["FileSystemId", "FileSystemType", "VpcId", "PageSize", "PageNumber", "Tag"]
+        list_optional_params = [
+            "FileSystemId",
+            "FileSystemType",
+            "VpcId",
+            "PageSize",
+            "PageNumber",
+            "Tag",
+        ]
         request = set_optional_params(request, list_optional_params, kwargs)
         return self._handle_list_request_with_page("file_system", request)
 
@@ -2695,7 +2749,13 @@ serverless"""
         :return:
         """
         request = kwargs.pop("request", "") or DescribeVpcsRequest.DescribeVpcsRequest()
-        list_optional_params = ["VpcId", "VpcName", "IsDefault", "PageNumber", "PageSize"]
+        list_optional_params = [
+            "VpcId",
+            "VpcName",
+            "IsDefault",
+            "PageNumber",
+            "PageSize",
+        ]
         request = set_optional_params(request, list_optional_params, kwargs)
         request.set_accept_format("json")
         return request
@@ -2731,7 +2791,13 @@ serverless"""
         try:
             request = CreateVSwitchRequest.CreateVSwitchRequest()
             list_required_params = ["CidrBlock", "VpcId", "ZoneId"]
-            list_optional_params = ["Ipv6CidrBlock", "Description", "VSwitchName", "ClientToken", "OwnerAccount"]
+            list_optional_params = [
+                "Ipv6CidrBlock",
+                "Description",
+                "VSwitchName",
+                "ClientToken",
+                "OwnerAccount",
+            ]
             request = set_required_params(request, list_required_params, kwargs)
             request = set_optional_params(request, list_optional_params, kwargs)
             ali_result = self._get_result(request, True)
@@ -2782,7 +2848,13 @@ serverless"""
         :return:
         """
         request = kwargs.pop("request", "") or DescribeVSwitchesRequest.DescribeVSwitchesRequest()
-        list_optional_params = ["VpcId", "VSwitchId", "ZoneId", "PageNumber", "PageSize"]
+        list_optional_params = [
+            "VpcId",
+            "VSwitchId",
+            "ZoneId",
+            "PageNumber",
+            "PageSize",
+        ]
         request = set_optional_params(request, list_optional_params, kwargs)
         request.set_accept_format("json")
         return request

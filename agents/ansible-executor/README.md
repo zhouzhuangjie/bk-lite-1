@@ -81,6 +81,14 @@ make package
 dist/ansible-executor/
 ```
 
+`make package` 会校验 Windows collection 的打包层级，缺少以下文件时直接失败：
+
+```text
+dist/ansible-executor/_internal/collections/ansible_collections/ansible/windows/plugins/modules/win_copy.ps1
+```
+
+发布时必须归档完整的 onedir 目录，不能只复制 `ansible-executor` 主程序，也不能把 collection 放成 `_internal/collections/ansible/windows`。
+
 运行方式：
 
 ```bash
@@ -118,6 +126,7 @@ runtime:
 security:
   allowed_callback_subjects:
     - job.ansible_task_callback
+    - default_stargazer.host_remote.callback
   allowed_stream_subjects:
     - job.stream.>
     - executor.stream.>
@@ -135,6 +144,45 @@ jetstream:
 `ANSIBLE_ALLOWED_CALLBACK_SUBJECTS`、`ANSIBLE_ALLOWED_STREAM_SUBJECTS` 以逗号分隔形式注入；仅在部署确有自定义回调或流式日志 subject 时扩展。
 
 兼容的环境变量模式仍保留，便于迁移，但不再推荐作为主配置方式。
+
+## SSH 主机密钥校验
+
+密码 SSH 任务可通过 `SSH_KNOWN_HOSTS_FILE` 指向已准备好的 `known_hosts` 文件。配置后，
+ansible-executor 会为未显式传入 SSH 公共参数的密码认证任务启用严格主机密钥校验：
+
+```bash
+SSH_KNOWN_HOSTS_FILE=/etc/ansible-executor/known_hosts
+```
+
+部署前应通过可信渠道准备并只读挂载该文件。调用方显式传入的 `ansible_ssh_common_args` 或
+`ssh_common_args` 仍优先，现有接口与任务载荷无需修改。
+
+fusion-collector 容器需同时注入变量并只读挂载信任文件：
+
+```bash
+docker run \
+  -e SSH_KNOWN_HOSTS_FILE=/etc/fusion-collectors/known_hosts \
+  -v /etc/fusion-collectors/known_hosts:/etc/fusion-collectors/known_hosts:ro \
+  <其它现有参数> <fusion-collector-image>
+```
+
+原生 Linux 部署可使用 sidecar systemd unit 的可选环境文件：
+
+```bash
+# /etc/fusion-collectors/environment
+SSH_KNOWN_HOSTS_FILE=/etc/fusion-collectors/known_hosts
+
+systemctl daemon-reload
+systemctl restart bk-sidecar.service
+```
+
+systemd 会把该变量传给 sidecar 拉起的 ansible-executor 和 nats-executor；信任文件须对服务用户
+可读。文件缺失、不可读、目标未登记或主机密钥不匹配时，SSH 任务会失败且不会回退到关闭校验的
+兼容路径。应通过可信渠道准备并核验主机指纹，先在非生产环境验证，再分批重启部署实例。
+
+未配置该变量时暂时保留历史兼容行为，并在每次构造密码 SSH inventory 时记录安全告警。
+这便于先盘点并迁移没有信任锚的存量任务，再在后续版本翻转默认策略。回滚时从容器参数或
+`/etc/fusion-collectors/environment` 移除该变量并重启对应实例，即可恢复兼容行为；无需数据迁移。
 
 ## 任务执行可靠性
 

@@ -1,3 +1,4 @@
+'use client';
 import React, { useCallback } from 'react';
 import { TooltipProps } from 'recharts';
 import customTooltipStyle from './index.module.scss';
@@ -5,6 +6,7 @@ import { getEnumValue } from '@/app/monitor/utils/common';
 import { MetricItem, TableDataItem } from '@/app/monitor/types';
 import { useLocalizedTime } from '@/hooks/useLocalizedTime';
 import { useUnitTransform } from '@/app/monitor/hooks/useUnitTransform';
+import { useTranslation } from '@/utils/i18n';
 
 interface CustomToolTipProps extends Omit<TooltipProps<any, string>, 'unit'> {
   unit?: string;
@@ -32,11 +34,14 @@ const CustomTooltip: React.FC<CustomToolTipProps> = ({
 }) => {
   const { convertToLocalizedTime } = useLocalizedTime();
   const { findUnitNameById } = useUnitTransform();
+  const { t } = useTranslation();
 
   const formatDetailText = useCallback(
     (detail: { label?: string; value?: string }) => {
-      const labelText = detail.label?.trim() || '';
-      const valueText = detail.value?.trim() || '';
+      const normalizeInlineText = (text?: string) =>
+        text?.replace(/\s+/g, ' ').trim() || '';
+      const labelText = normalizeInlineText(detail.label);
+      const valueText = normalizeInlineText(detail.value);
 
       if (labelText && valueText && labelText !== valueText) {
         return `${labelText}：${valueText}`;
@@ -60,12 +65,22 @@ const CustomTooltip: React.FC<CustomToolTipProps> = ({
   );
 
   if (active && payload?.length && visible) {
+    const isNoDataSnapshot = payload.some(
+      (item) => item.payload?.noDataSnapshot
+    );
     // 对payload进行排序
-    const sortedPayload = [...payload].sort((a, b) => {
-      const valueA = getEnumValue(metric as MetricItem, a.value);
-      const valueB = getEnumValue(metric as MetricItem, b.value);
-      return valueB - valueA; // 从大到小排序
+    const sortedPayload = [...payload]
+      .filter(
+        (item) =>
+          item.value != null && Number.isFinite(Number(item.value))
+      )
+      .sort((a, b) => {
+      return Number(b.value) - Number(a.value);
     });
+
+    if (!sortedPayload.length && !isNoDataSnapshot) {
+      return null;
+    }
 
     return (
       <div
@@ -90,45 +105,82 @@ const CustomTooltip: React.FC<CustomToolTipProps> = ({
         <p className="label font-[600]">{`${convertToLocalizedTime(
           new Date(label * 1000) + ''
         )}`}</p>
-        {sortedPayload.map((item: any, index: number) => (
-          <div key={index}>
-            <div className="flex items-start mt-[4px] text-[13px]">
+        {isNoDataSnapshot && !sortedPayload.length ? (
+          <div
+            className="mt-[4px] text-[13px]"
+            style={{
+              display: 'grid',
+              gridTemplateColumns: `${dark ? '16px' : '10px'} minmax(0, 1fr)`,
+              alignItems: 'center',
+              columnGap: dark ? 8 : 6
+            }}
+          >
+            <span
+              style={{
+                width: dark ? '16px' : '10px',
+                height: 0,
+                borderTop: '2px dashed var(--color-chart-gap-boundary)'
+              }}
+            />
+            <span>{t('monitor.events.alertTypeNoData')}</span>
+          </div>
+        ) : null}
+        {sortedPayload.map((item: any, index: number) => {
+          const dimensionText = (item.payload.details?.[item.dataKey] || [])
+            .map((detail: any) => formatDetailText(detail))
+            .filter(Boolean)
+            .join(' · ');
+
+          return (
+            <div
+              key={item.dataKey || index}
+              className="mt-[4px] text-[13px]"
+              style={{
+                display: 'grid',
+                gridTemplateColumns: `${dark ? '16px' : '10px'} minmax(0, 1fr) max-content`,
+                alignItems: 'center',
+                columnGap: dark ? 8 : 6,
+                minWidth: 0
+              }}
+            >
               {dark ? (
                 <span
                   style={{
                     width: '16px',
-                    minWidth: '16px',
                     height: 0,
-                    borderTop: `2px solid ${item.color}`,
-                    marginRight: '8px',
-                    marginTop: '8px'
+                    borderTop: `${item.strokeDasharray ? '2px dashed' : '2px solid'} ${item.color}`
                   }}
-                ></span>
+                />
               ) : (
                 <span
                   style={{
                     width: '10px',
-                    minWidth: '10px',
                     height: '10px',
                     backgroundColor: item.color,
-                    borderRadius: '50%',
-                    marginRight: '5px',
-                    marginTop: '5px'
+                    borderRadius: '50%'
                   }}
-                ></span>
+                />
               )}
-              <span className="flex-1 min-w-0 break-words">
-                {(item.payload.details?.[item.dataKey] || [])
-                  .map((detail: any) => formatDetailText(detail))
-                  .filter(Boolean)
-                  .join('-')}
+              <span
+                title={dimensionText}
+                style={{
+                  minWidth: 0,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap'
+                }}
+              >
+                {dimensionText}
               </span>
-              <span className="font-[600] ml-[10px] whitespace-nowrap">
+              <span
+                className="font-[600] whitespace-nowrap"
+                style={{ fontVariantNumeric: 'tabular-nums' }}
+              >
                 {getValue(item)}
               </span>
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
     );
   }

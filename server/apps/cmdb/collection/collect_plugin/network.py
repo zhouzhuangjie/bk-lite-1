@@ -8,6 +8,17 @@ from apps.cmdb.collection.collect_plugin.base import CollectBase
 from apps.cmdb.collection.collect_plugin.topology import build_pipeline_aggregate, parse_aggregate_result
 from apps.cmdb.collection.collect_util import timestamp_gt_one_day_ago
 from apps.cmdb.collection.constants import NETWORK_INTERFACES_RELATIONS, NETWORK_TOPOLOGY_FACTS
+from apps.cmdb.collection.interface_nic_link import (
+    _ENSURE_FAILED_STAGE,
+    _ENSURE_FAILED_TEMPLATE,
+    bind_fdb_learned_macs_to_nics,
+    bind_unresolved_neighbors_to_nics,
+    candidate_nic_lookup_macs,
+    ensure_interface_connect_nic_association,
+    inventory_interface_macs,
+    load_nic_instances_by_mac,
+    nic_index_from_instances,
+)
 from apps.cmdb.collection.plugins import get_collection_plugin
 from apps.cmdb.constants.constants import CollectPluginTypes
 from apps.cmdb.models import CollectModels, OidMapping
@@ -26,14 +37,12 @@ class CollectNetworkMetrics(CollectBase):
         super().__init__(inst_name, inst_id, task_id, *args, **kwargs)
         self.oid_map = self.get_oid_map()
         # 4：other  （冗余用的）
-        self.interface_status_map = {
-            "1": "UP",
-            "2": "Down",
-            "3": "Testing"
-        }
+        self.interface_status_map = {"1": "UP", "2": "Down", "3": "Testing"}
         self.instance_id_map = {}
         self.collect_inst = self.get_collect_inst()
-        self.is_topo = self.collect_inst.is_network_topo
+        # 拓扑拆分后：设备对账不再内联解析拓扑；拓扑由 topology_replay_service 触发。
+        # 子类 TopologyReplayCollector 可强制 is_topo=True。
+        self.is_topo = bool(kwargs.pop("force_topology_replay", False))
         self._instance_metrics = list(self._metrics)
         self.set_metrics()
         self.interfaces_data = {}
@@ -93,12 +102,7 @@ class CollectNetworkMetrics(CollectBase):
         instance = self.instance_id_map[instance_id]
         model_id = instance["device_type"]
         return [
-            {
-                "model_id": model_id,
-                "inst_name": self.set_inst_name(instance),
-                "asst_id": "belong",
-                "model_asst_id": f"interface_belong_{model_id}"
-            }
+            {"model_id": model_id, "inst_name": self.set_inst_name(instance), "asst_id": "belong", "model_asst_id": f"interface_belong_{model_id}"}
         ]
 
     @property
@@ -108,7 +112,7 @@ class CollectNetworkMetrics(CollectBase):
 
     @staticmethod
     def interface_name(data, *args, **kwargs):
-        return data.get("alias", data['description'])
+        return data.get("alias", data["description"])
 
     @property
     def model_field_mapping(self):
@@ -161,8 +165,8 @@ class CollectNetworkMetrics(CollectBase):
             for index_data in metrics:
                 if index_data["instance_id"] not in self.instance_id_map:
                     logger.info(
-                        "This data is discarded because no feature library can be found for the OID. instance_id={}".format(
-                            index_data["instance_id"]))
+                        "This data is discarded because no feature library can be found for the OID. instance_id={}".format(index_data["instance_id"])
+                    )
                     continue
                 if "sysobjectid" in index_data:
                     model_id = index_data["device_type"]
@@ -207,10 +211,7 @@ class CollectNetworkMetrics(CollectBase):
         topology = parsed.get("topology", {})
         current_links = list(topology.get("authoritative_links", [])) + list(topology.get("inferred_links", []))
         for link in current_links:
-            if (
-                str(link.get("relationship_type", "")) != "authoritative"
-                and int(link.get("confidence", 0) or 0) < min_confidence
-            ):
+            if str(link.get("relationship_type", "")) != "authoritative" and int(link.get("confidence", 0) or 0) < min_confidence:
                 dropped.append(self.slim_topology_link(link, reason="below_min_confidence"))
                 continue
             source_inst_name = self.resolve_pipeline_inst_name(link.get("source_port_id"))
@@ -230,8 +231,27 @@ class CollectNetworkMetrics(CollectBase):
             }
             self.append_unique_relationship(relationships, seen, relation)
 
+        nic_relationships, unmatched_macs, nic_dropped = self.collect_nic_connect_relationships(parsed)
+        if nic_relationships:
+            try:
+                ensure_interface_connect_nic_association(task_id=self.task_id)
+            except Exception as exc:  # noqa: BLE001 — 模型关联补齐失败不阻断拓扑主路径
+                logger.warning(
+                    _ENSURE_FAILED_TEMPLATE,
+                    self.task_id or "",
+                    _ENSURE_FAILED_STAGE,
+                    type(exc).__name__,
+                )
+        for relation in nic_relationships:
+            self.append_unique_relationship(relationships, seen, relation)
+        dropped.extend(nic_dropped)
+
+        summary = dict(parsed.get("summary") or {})
+        summary["unmatched_macs"] = len(unmatched_macs)
+        summary["nic_connects"] = len(nic_relationships)
+
         snapshot = {
-            "summary": parsed.get("summary", {}),
+            "summary": summary,
             "links": [self.slim_topology_link(link) for link in current_links],
             "stale_links": [self.slim_topology_link(link) for link in topology.get("stale_links", [])],
             "unresolved_neighbors": [
@@ -243,6 +263,48 @@ class CollectNetworkMetrics(CollectBase):
         }
         self.save_topology_snapshot(snapshot)
         return relationships
+
+    def collect_nic_connect_relationships(self, parsed):
+        """FDB（必做）以及未解析 LLDP/CDP（便宜路径）匹配已入库 nic。"""
+        normalized = parsed.get("normalized") or {}
+        unresolved = (parsed.get("topology") or {}).get("unresolved_neighbors") or []
+        candidate_macs = candidate_nic_lookup_macs(normalized, unresolved)
+        nic_index = self.load_nic_mac_index(candidate_macs)
+        nic_relationships, unmatched_macs, dropped = bind_fdb_learned_macs_to_nics(
+            normalized=normalized,
+            nic_index=nic_index,
+            resolve_source_inst_name=self.resolve_pipeline_inst_name,
+        )
+        neighbor_relationships = bind_unresolved_neighbors_to_nics(
+            unresolved_neighbors=unresolved,
+            nic_index=nic_index,
+            interface_macs=inventory_interface_macs(normalized),
+            resolve_source_inst_name=self.resolve_pipeline_inst_name,
+        )
+        seen = {(item["source_inst_name"], item["target_inst_name"], item["model_asst_id"]) for item in nic_relationships}
+        for relation in neighbor_relationships:
+            edge_key = (relation["source_inst_name"], relation["target_inst_name"], relation["model_asst_id"])
+            if edge_key in seen:
+                continue
+            seen.add(edge_key)
+            nic_relationships.append(relation)
+        return nic_relationships, unmatched_macs, dropped
+
+    def load_nic_mac_index(self, macs):
+        """查询已入库 nic；失败时返回空索引，不编造 nic、不碰 host。"""
+        if not macs:
+            return {}
+        try:
+            instances = load_nic_instances_by_mac(macs)
+        except Exception as exc:  # noqa: BLE001 — 拓扑主路径不因 nic 查询失败中断
+            logger.warning(
+                "event=network_topology_nic_index_load_failed task_id=%s failed_stage=%s error_type=%s",
+                self.task_id or "",
+                "load_nic_mac_index",
+                type(exc).__name__,
+            )
+            return {}
+        return nic_index_from_instances(instances)
 
     def resolve_pipeline_inst_name(self, port_id):
         """流水线 port_id 形如 "{instance_id}:{ifindex}"，映射到 CMDB 接口实例名"""
@@ -274,7 +336,11 @@ class CollectNetworkMetrics(CollectBase):
 
     @staticmethod
     def append_unique_relationship(relationships, seen, relation):
-        edge_key = (relation["source_inst_name"], relation["target_inst_name"])
+        edge_key = (
+            relation["source_inst_name"],
+            relation["target_inst_name"],
+            relation.get("model_asst_id", "interface_connect_interface"),
+        )
         if edge_key in seen:
             return
         seen.add(edge_key)
@@ -286,11 +352,12 @@ class CollectNetworkMetrics(CollectBase):
             source_interface_data = self.interfaces_data.get(source_inst_name)
             if not source_interface_data:
                 continue
-            data = {'asst_id': 'connect',
-                    'inst_name': relationship["target_inst_name"],
-                    'model_asst_id': 'interface_connect_interface',
-                    'model_id': 'interface'
-                    }
+            data = {
+                "asst_id": relationship.get("asst_id", "connect"),
+                "inst_name": relationship["target_inst_name"],
+                "model_asst_id": relationship.get("model_asst_id", "interface_connect_interface"),
+                "model_id": relationship.get("model_id", "interface"),
+            }
             assos = source_interface_data.setdefault("assos", [])
             if data not in assos:
                 assos.append(data)

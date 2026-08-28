@@ -3,7 +3,7 @@
 DeepSeek/Qwen thinking mode fix:
 
 Problem: Models like DeepSeek and Qwen return a ``reasoning_content`` field in
-their API responses. In multi-turn conversations (e.g. ReAct tool-calling
+their API responses. In multi-turn conversations (e.g. DeepAgent tool-calling
 loops), this field MUST be passed back with the assistant message. However
 langchain-openai's deserialization (``_convert_dict_to_message``) discards it,
 so on the next turn the field is missing and the model returns HTTP 400:
@@ -21,9 +21,15 @@ import langchain_openai.chat_models.base as _lc_openai_base
 import openai
 from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_openai.chat_models.base import BaseChatOpenAI as _BaseChatOpenAI
+from langchain_openai.chat_models.base import ChatOpenAI as _ChatOpenAI
 from langchain_openai.chat_models.base import _convert_delta_to_message_chunk as _original_convert_delta_to_message_chunk
 from langchain_openai.chat_models.base import _convert_dict_to_message as _original_convert_dict_to_message
 from langchain_openai.chat_models.base import _convert_message_to_dict as _original_convert_message_to_dict
+
+try:
+    from openai.types.chat.chat_completion_chunk import ChatCompletionChunk as _ChatCompletionChunk
+except Exception:  # pragma: no cover - openai 版本缺该类型时跳过
+    _ChatCompletionChunk = None
 
 # --- Patch 1: Response deserialization (preserve reasoning_content) ----------
 #
@@ -32,6 +38,74 @@ from langchain_openai.chat_models.base import _convert_message_to_dict as _origi
 #   - Qwen: "reasoning"
 # We normalize to "reasoning_content" in additional_kwargs for internal use.
 _REASONING_FIELD_NAMES = ("reasoning_content", "reasoning")
+
+
+def _int_token(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def usage_payload_from_raw(raw_usage) -> dict | None:
+    """从 OpenAI usage 对象/字典取出非零 token 计数。dump 成全 0 时返回 None。"""
+    if raw_usage is None:
+        return None
+    if isinstance(raw_usage, dict):
+        prompt = raw_usage.get("prompt_tokens", raw_usage.get("input_tokens"))
+        completion = raw_usage.get("completion_tokens", raw_usage.get("output_tokens"))
+        total = raw_usage.get("total_tokens")
+    else:
+        prompt = getattr(raw_usage, "prompt_tokens", None)
+        if prompt is None:
+            prompt = getattr(raw_usage, "input_tokens", None)
+        completion = getattr(raw_usage, "completion_tokens", None)
+        if completion is None:
+            completion = getattr(raw_usage, "output_tokens", None)
+        total = getattr(raw_usage, "total_tokens", None)
+    prompt_i = _int_token(prompt)
+    completion_i = _int_token(completion)
+    total_i = _int_token(total) or (prompt_i + completion_i)
+    if not (prompt_i or completion_i or total_i):
+        return None
+    return {
+        "prompt_tokens": prompt_i,
+        "completion_tokens": completion_i,
+        "total_tokens": total_i,
+    }
+
+
+def restore_usage_on_dumped_chunk(raw_chunk, dumped):
+    """流式 chunk.model_dump() 丢掉 usage 时，用原始 chunk.usage 填回去。"""
+    if not isinstance(dumped, dict):
+        return dumped
+    if usage_payload_from_raw(dumped.get("usage")):
+        return dumped
+    restored = usage_payload_from_raw(getattr(raw_chunk, "usage", None))
+    if not restored:
+        return dumped
+    dumped = dict(dumped)
+    dumped["usage"] = restored
+    return dumped
+
+
+def _install_chat_completion_chunk_usage_patch() -> None:
+    """LangChain 流式路径会 chunk.model_dump()；兼容网关常把 usage dump 成空/全 0。"""
+    if _ChatCompletionChunk is None:
+        return
+    original = _ChatCompletionChunk.model_dump
+    if getattr(original, "_opspilot_usage_preserve", False):
+        return
+
+    def _model_dump(self, *args, **kwargs):
+        data = original(self, *args, **kwargs)
+        return restore_usage_on_dumped_chunk(self, data)
+
+    _model_dump._opspilot_usage_preserve = True
+    _ChatCompletionChunk.model_dump = _model_dump
+
+
+_install_chat_completion_chunk_usage_patch()
 
 
 def _patched_convert_dict_to_message(_dict, *args, **kwargs):
@@ -84,6 +158,35 @@ def _patched_create_chat_result(self, response, generation_info=None):
                 if isinstance(gen_msg, AIMessage) and "reasoning_content" not in gen_msg.additional_kwargs:
                     gen_msg.additional_kwargs["reasoning_content"] = rc
 
+    # MiniMax 等兼容网关:model_dump 后 usage 可能变空/全 0,但从原始 response.usage
+    # 仍能读到 prompt_tokens/completion_tokens。这里回填到 AIMessage。
+    usage_payload = usage_payload_from_raw(getattr(response, "usage", None))
+    if usage_payload and result.generations:
+        prompt_i = usage_payload["prompt_tokens"]
+        completion_i = usage_payload["completion_tokens"]
+        total_i = usage_payload["total_tokens"]
+        for generation in result.generations:
+            gen_msg = generation.message
+            if not isinstance(gen_msg, AIMessage):
+                continue
+            existing = getattr(gen_msg, "usage_metadata", None) or {}
+            existing_total = int(existing.get("total_tokens") or 0) if isinstance(existing, dict) else 0
+            existing_input = int(existing.get("input_tokens") or existing.get("prompt_tokens") or 0) if isinstance(existing, dict) else 0
+            if existing_total or existing_input:
+                continue
+            gen_msg.usage_metadata = {
+                "input_tokens": prompt_i,
+                "output_tokens": completion_i,
+                "total_tokens": total_i,
+            }
+            metadata = dict(getattr(gen_msg, "response_metadata", None) or {})
+            metadata["token_usage"] = {
+                "prompt_tokens": prompt_i,
+                "completion_tokens": completion_i,
+                "total_tokens": total_i,
+            }
+            gen_msg.response_metadata = metadata
+
     return result
 
 
@@ -119,3 +222,88 @@ def _patched_convert_message_to_dict(message, *args, **kwargs):
 
 
 _lc_openai_base._convert_message_to_dict = _patched_convert_message_to_dict
+
+
+# --- Patch 5: merge system messages to the front of the OpenAI payload --------
+#
+# Qwen / MiniMax compatible gateways reject any system message that is not
+# messages[0] ("System message must be at the beginning."). DeepAgent prepends
+# its own system_prompt while the graph already inserted a SystemMessage, and
+# some tool loops inject extra SystemMessage mid-conversation. Merge them.
+
+
+def _payload_message_text(content) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("text"):
+                parts.append(str(item.get("text") or ""))
+        return "\n".join(part for part in parts if part)
+    return str(content)
+
+
+def merge_openai_payload_system_messages(messages: list) -> list:
+    """Keep a single system/developer message at index 0; leave other roles in order."""
+    if not messages:
+        return messages
+
+    system_indexes = [
+        index
+        for index, message in enumerate(messages)
+        if isinstance(message, dict) and str(message.get("role") or "").lower() in {"system", "developer"}
+    ]
+    if not system_indexes or system_indexes == [0]:
+        return messages
+
+    system_parts = []
+    rest = []
+    first_system = None
+    for message in messages:
+        if isinstance(message, dict) and str(message.get("role") or "").lower() in {"system", "developer"}:
+            if first_system is None:
+                first_system = dict(message)
+            text = _payload_message_text(message.get("content"))
+            if text:
+                system_parts.append(text)
+            continue
+        rest.append(message)
+
+    merged = dict(first_system or {"role": "system", "content": ""})
+    merged["content"] = "\n\n".join(system_parts)
+    return [merged] + rest
+
+
+def _install_system_message_payload_patch(cls) -> None:
+    """Merge system/developer messages after the class builds the OpenAI payload.
+
+    ChatOpenAI overrides ``_get_request_payload`` and calls ``super()``, then
+    may rewrite ``system`` → ``developer`` for o-series models. Patching only
+    BaseChatOpenAI still works via super(), but patching ChatOpenAI itself
+    makes the merge the last step on the class LLMClientFactory actually uses.
+    """
+    original = cls._get_request_payload
+    if getattr(original, "_opspilot_system_merge", False):
+        return
+
+    def _patched(self, *args, **kwargs):
+        payload = original(self, *args, **kwargs)
+        messages = payload.get("messages") if isinstance(payload, dict) else None
+        if isinstance(messages, list):
+            payload["messages"] = merge_openai_payload_system_messages(messages)
+        return payload
+
+    _patched._opspilot_system_merge = True
+    cls._get_request_payload = _patched
+
+
+_install_system_message_payload_patch(_BaseChatOpenAI)
+if _ChatOpenAI is not _BaseChatOpenAI:
+    _install_system_message_payload_patch(_ChatOpenAI)
+
+_patched_get_request_payload = _BaseChatOpenAI._get_request_payload

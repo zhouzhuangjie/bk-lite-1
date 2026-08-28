@@ -1,0 +1,754 @@
+'use client';
+
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Button,
+  Empty,
+  Form,
+  Input,
+  message,
+  Modal,
+  Radio,
+  Select,
+  Switch,
+  Table,
+  Tooltip,
+} from 'antd';
+import { HolderOutlined, MinusOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
+import {
+  DndContext,
+  PointerSensor,
+  KeyboardSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from '@dnd-kit/core';
+import {
+  SortableContext,
+  arrayMove,
+  useSortable,
+  verticalListSortingStrategy,
+  sortableKeyboardCoordinates,
+} from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
+import type {
+  DatasourceItem,
+  DynamicOptionsSource,
+  InputControlConfig,
+  InputOption,
+} from '@/app/ops-analysis/types/dataSource';
+import { useDataSourceApi } from '@/app/ops-analysis/api/dataSource';
+import {
+  extractDataSourceItems,
+  resolveDynamicSourceId,
+} from '@/app/ops-analysis/utils/paramInputConfigUtils';
+import { useTranslation } from '@/utils/i18n';
+
+interface StaticRow extends InputOption {
+  uid: string;
+}
+
+interface ParamInputConfigEditorProps {
+  open: boolean;
+  value?: InputControlConfig;
+  onConfirm: (value: InputControlConfig, resolvedOptions?: InputOption[]) => void;
+  onCancel: () => void;
+  excludeSourceIds?: number[];
+  componentSwitchEnabled?: boolean;
+  componentSwitchOwner?: { name: string; label: string };
+  editingParamName?: string;
+}
+
+interface SortableStaticRowProps {
+  row: StaticRow;
+  onChange: (uid: string, field: 'label' | 'value', value: string) => void;
+  onAddAfter: (uid: string) => void;
+  onRemove: (uid: string) => void;
+  showRemove: boolean;
+  placeholder: string;
+}
+
+const newId = () => Math.random().toString(36).slice(2);
+const createRow = (): StaticRow => ({ uid: newId(), label: '', value: '' });
+const SortableStaticRow: React.FC<SortableStaticRowProps> = ({
+  row,
+  onChange,
+  onAddAfter,
+  onRemove,
+  showRemove,
+  placeholder,
+}) => {
+  const { attributes, listeners, setNodeRef, transform, transition } =
+    useSortable({ id: row.uid });
+
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+  };
+
+  return (
+    <li ref={setNodeRef} style={style} className="mb-2 flex items-center">
+      <HolderOutlined
+        {...attributes}
+        {...listeners}
+        className="mr-[4px] cursor-grab text-[var(--color-text-3)]"
+      />
+      <Input
+        className="mr-[10px] w-2/5"
+        value={String(row.value)}
+        placeholder={String(row.value).trim() ? undefined : placeholder}
+        onChange={(event) => onChange(row.uid, 'value', event.target.value)}
+      />
+      <Input
+        className="mr-[10px] w-2/5"
+        value={row.label}
+        placeholder={row.label.trim() ? undefined : placeholder}
+        onChange={(event) => onChange(row.uid, 'label', event.target.value)}
+      />
+      <PlusOutlined
+        className="mr-[10px] cursor-pointer text-[var(--color-primary)]"
+        onClick={() => onAddAfter(row.uid)}
+      />
+      {showRemove && (
+        <MinusOutlined
+          className="cursor-pointer text-[var(--color-primary)]"
+          onClick={() => onRemove(row.uid)}
+        />
+      )}
+    </li>
+  );
+};
+
+export const ParamInputConfigEditor: React.FC<ParamInputConfigEditorProps> = ({
+  open,
+  value,
+  onConfirm,
+  onCancel,
+  excludeSourceIds = [],
+  componentSwitchEnabled = false,
+  componentSwitchOwner,
+  editingParamName,
+}) => {
+  const { t } = useTranslation();
+  const { getDataSourceList, getSourceDataByApiId } = useDataSourceApi();
+  const [form] = Form.useForm();
+  const [control, setControl] = useState<InputControlConfig['control']>('input');
+  const [picker, setPicker] = useState<'dropdown' | 'table'>('dropdown');
+  const [componentSwitch, setComponentSwitch] = useState(false);
+  const [multiple, setMultiple] = useState(false);
+  const [sourceType, setSourceType] = useState<'static' | 'dynamic'>('static');
+  const [staticRows, setStaticRows] = useState<StaticRow[]>([createRow()]);
+  const [dataSourceList, setDataSourceList] = useState<DatasourceItem[]>([]);
+  const [dsLoading, setDsLoading] = useState(false);
+  const [dynamicSourceId, setDynamicSourceId] = useState<number | undefined>();
+  const [dynamicValueField, setDynamicValueField] = useState<string | undefined>();
+  const [dynamicLabelField, setDynamicLabelField] = useState<string | undefined>();
+  const [dynamicPreview, setDynamicPreview] = useState<Record<string, unknown>[]>([]);
+  const [dynamicPreviewLoading, setDynamicPreviewLoading] = useState(false);
+  const previewRequestIdRef = useRef(0);
+  const staticSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    }),
+  );
+
+  useEffect(() => {
+    if (!open) return;
+    if (!value) {
+      setControl('input');
+      setPicker('dropdown');
+      setComponentSwitch(false);
+      setMultiple(false);
+      setSourceType('static');
+      setStaticRows([createRow()]);
+      setDynamicSourceId(undefined);
+      setDynamicValueField(undefined);
+      setDynamicLabelField(undefined);
+      setDynamicPreview([]);
+      form.resetFields(['dynamicSourceId', 'dynamicValueField', 'dynamicLabelField']);
+      return;
+    }
+
+    setControl(value.control);
+    setPicker(value.control === 'select' && value.picker === 'table' ? 'table' : 'dropdown');
+    setComponentSwitch(
+      value.control === 'input' ? false : Boolean(value.componentSwitch),
+    );
+    setMultiple(
+      value.control === 'select' ? Boolean(value.multiple) : false,
+    );
+    if (value.control === 'input') {
+      setSourceType('static');
+      setStaticRows([createRow()]);
+      setDynamicSourceId(undefined);
+      setDynamicValueField(undefined);
+      setDynamicLabelField(undefined);
+      setDynamicPreview([]);
+      form.resetFields(['dynamicSourceId', 'dynamicValueField', 'dynamicLabelField']);
+      return;
+    }
+
+    if (value.optionsSource.type === 'static') {
+      setSourceType('static');
+      setStaticRows(
+        value.optionsSource.staticItems.length > 0
+          ? value.optionsSource.staticItems.map((item) => ({ ...item, uid: newId() }))
+          : [createRow()],
+      );
+      setDynamicSourceId(undefined);
+      setDynamicValueField(undefined);
+      setDynamicLabelField(undefined);
+      setDynamicPreview([]);
+      form.resetFields(['dynamicSourceId', 'dynamicValueField', 'dynamicLabelField']);
+      return;
+    }
+
+    const initialSourceId = value.optionsSource.sourceRef
+      ? undefined
+      : value.optionsSource.sourceId;
+    setSourceType('dynamic');
+    setDynamicSourceId(initialSourceId);
+    setDynamicValueField(value.optionsSource.valueField);
+    setDynamicLabelField(value.optionsSource.labelField);
+    setDynamicPreview([]);
+    form.setFieldsValue({
+      dynamicSourceId: initialSourceId,
+      dynamicValueField: value.optionsSource.valueField,
+      dynamicLabelField: value.optionsSource.labelField,
+    });
+  }, [form, open, value]);
+
+  const filteredDataSourceList = useMemo(() => {
+    if (excludeSourceIds.length === 0) return dataSourceList;
+    return dataSourceList.filter((item) => !excludeSourceIds.includes(item.id));
+  }, [dataSourceList, excludeSourceIds]);
+
+  const selectedDataSource = useMemo(
+    () => dataSourceList.find((item) => item.id === dynamicSourceId),
+    [dataSourceList, dynamicSourceId],
+  );
+
+  const availableFields = useMemo(() => {
+    const first = dynamicPreview[0];
+    if (!first) {
+      return (selectedDataSource?.field_schema || []).map((field) => ({
+        label: field.title ? `${field.title}（${field.key}）` : field.key,
+        value: field.key,
+      }));
+    }
+    return Object.keys(first).map((key) => ({ label: key, value: key }));
+  }, [dynamicPreview, selectedDataSource?.field_schema]);
+
+  const dynamicPreviewColumns = useMemo(() => {
+    const first = dynamicPreview[0];
+    const fieldKeys = first
+      ? Object.keys(first)
+      : availableFields.map((field) => String(field.value));
+    const uniqueFieldKeys = Array.from(new Set(fieldKeys));
+
+    return uniqueFieldKeys.map((fieldKey) => ({
+      title:
+        availableFields.find((field) => field.value === fieldKey)?.label ||
+        fieldKey,
+      dataIndex: fieldKey,
+      key: fieldKey,
+      width: 160,
+      ellipsis: true,
+      render: (text: unknown) => String(text ?? ''),
+    }));
+  }, [availableFields, dynamicPreview]);
+
+  const staticRowIds = useMemo(
+    () => staticRows.map((row) => row.uid),
+    [staticRows],
+  );
+
+  useEffect(() => {
+    if (!open || sourceType !== 'dynamic' || control === 'input') return;
+    setDsLoading(true);
+    getDataSourceList({ page_size: -1 })
+      .then((response) => {
+        const items = Array.isArray(response) ? response : response?.items || [];
+        setDataSourceList(items as DatasourceItem[]);
+      })
+      .catch((error: Error) => {
+        message.error(error.message || t('paramInput.dynamic.loadDataSourceFailed'));
+      })
+      .finally(() => setDsLoading(false));
+  }, [control, getDataSourceList, open, sourceType, t]);
+
+  useEffect(() => {
+    if (
+      !open ||
+      control === 'input' ||
+      sourceType !== 'dynamic' ||
+      dynamicSourceId ||
+      !value ||
+      value.control === 'input' ||
+      value.optionsSource.type !== 'dynamic' ||
+      !value.optionsSource.sourceRef ||
+      dataSourceList.length === 0
+    ) {
+      return;
+    }
+
+    const resolvedSourceId = resolveDynamicSourceId(
+      value.optionsSource,
+      dataSourceList,
+    );
+    if (resolvedSourceId) {
+      setDynamicSourceId(resolvedSourceId);
+      form.setFieldValue('dynamicSourceId', resolvedSourceId);
+    }
+  }, [control, dataSourceList, dynamicSourceId, form, open, sourceType, value]);
+
+  const fetchDynamicPreview = useCallback((sourceId: number) => {
+    const requestId = ++previewRequestIdRef.current;
+    setDynamicPreviewLoading(true);
+    return getSourceDataByApiId(sourceId, {})
+      .then(({ data }) => {
+        if (requestId !== previewRequestIdRef.current) return;
+        setDynamicPreview(extractDataSourceItems(data).slice(0, 5));
+      })
+      .catch((error: any) => {
+        if (requestId !== previewRequestIdRef.current) return;
+        setDynamicPreview([]);
+        message.error(
+          error?.response?.data?.message ||
+          error?.message ||
+          t('paramInput.dynamic.testFailed'),
+        );
+      })
+      .finally(() => {
+        if (requestId === previewRequestIdRef.current) setDynamicPreviewLoading(false);
+      });
+  }, [getSourceDataByApiId, t]);
+
+  useEffect(() => {
+    if (!open || control === 'input' || sourceType !== 'dynamic' || !dynamicSourceId) {
+      return;
+    }
+
+    void fetchDynamicPreview(dynamicSourceId);
+  }, [control, dynamicSourceId, fetchDynamicPreview, open, sourceType]);
+
+  const handleStaticChange = (
+    uid: string,
+    field: 'label' | 'value',
+    nextValue: string,
+  ) => {
+    setStaticRows((prev) =>
+      prev.map((row) =>
+        row.uid === uid
+          ? {
+            ...row,
+            [field]: nextValue,
+          }
+          : row,
+      ),
+    );
+  };
+
+  const handleAddStaticRowAfter = (uid: string) => {
+    setStaticRows((prev) => {
+      const index = prev.findIndex((row) => row.uid === uid);
+      const next = [...prev];
+      next.splice(index + 1, 0, createRow());
+      return next;
+    });
+  };
+
+  const handleRemoveStaticRow = (uid: string) => {
+    setStaticRows((prev) => (prev.length <= 1 ? prev : prev.filter((row) => row.uid !== uid)));
+  };
+
+  const handleStaticDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+
+    setStaticRows((prev) => {
+      const oldIndex = prev.findIndex((row) => row.uid === active.id);
+      const newIndex = prev.findIndex((row) => row.uid === over.id);
+      return arrayMove(prev, oldIndex, newIndex);
+    });
+  };
+
+  const buildOptionControlExtras = (): Pick<
+    Extract<InputControlConfig, { control: 'select' | 'radio' }>,
+    'multiple' | 'maxCount' | 'picker'
+  > => {
+    const current = value && value.control !== 'input' ? value : undefined;
+    return {
+      ...(control === 'select' && multiple
+        ? { multiple: true as const, maxCount: current?.maxCount }
+        : {}),
+      ...(control === 'select' && picker === 'table' ? { picker: 'table' as const } : {}),
+    };
+  };
+
+  const handleConfirm = async () => {
+    if (control === 'input') {
+      onConfirm({ control: 'input' });
+      return;
+    }
+
+    if (sourceType === 'static') {
+      const staticItems = staticRows
+        .filter((row) => String(row.value).trim() !== '' && row.label.trim() !== '')
+        .map(({ label, value }) => ({ label: label.trim(), value }));
+
+      if (staticItems.length === 0) {
+        message.warning(t('paramInput.static.emptyError'));
+        return;
+      }
+
+      const values = new Set(staticItems.map((item) => String(item.value)));
+      if (values.size !== staticItems.length) {
+        message.warning(t('paramInput.static.duplicateValueError'));
+        return;
+      }
+
+      onConfirm(
+        {
+          control,
+          componentSwitch: componentSwitch || undefined,
+          ...buildOptionControlExtras(),
+          optionsSource: {
+            type: 'static',
+            staticItems,
+          },
+        },
+        staticItems,
+      );
+      return;
+    }
+
+    let dynamicValues: {
+      dynamicSourceId: number;
+      dynamicValueField: string;
+      dynamicLabelField: string;
+    };
+    try {
+      dynamicValues = await form.validateFields([
+        'dynamicSourceId',
+        'dynamicValueField',
+        'dynamicLabelField',
+      ]);
+    } catch {
+      return;
+    }
+
+    const selectedSource = dataSourceList.find(
+      (item) => item.id === dynamicValues.dynamicSourceId,
+    );
+    const sourceRef = selectedSource?.rest_api
+      ? { type: 'rest_api' as const, value: selectedSource.rest_api }
+      : undefined;
+    const optionsSource: DynamicOptionsSource = {
+      type: 'dynamic',
+      ...(sourceRef
+        ? { sourceRef }
+        : { sourceId: dynamicValues.dynamicSourceId }),
+      valueField: dynamicValues.dynamicValueField,
+      labelField: dynamicValues.dynamicLabelField,
+    };
+
+    onConfirm({
+      control,
+      componentSwitch: componentSwitch || undefined,
+      ...buildOptionControlExtras(),
+      optionsSource,
+    });
+  };
+
+  return (
+    <Modal
+      title={t('paramInput.title')}
+      open={open}
+      onCancel={onCancel}
+      onOk={handleConfirm}
+      okText={t('common.confirm')}
+      cancelText={t('common.cancel')}
+      width={640}
+      centered
+      destroyOnHidden
+      styles={{
+        body: { maxHeight: 'calc(100vh - 200px)', overflowY: 'auto' },
+      }}
+    >
+      <Form form={form} layout="vertical" colon={false}>
+        <Form.Item label={t('paramInput.controlType')} className="mb-3">
+          <Radio.Group
+            value={control}
+            onChange={(event) => {
+              const nextControl = event.target.value as InputControlConfig['control'];
+              setControl(nextControl);
+              if (nextControl !== 'select') {
+                setPicker('dropdown');
+              }
+              if (nextControl === 'input') {
+                setComponentSwitch(false);
+                setDynamicSourceId(undefined);
+                setDynamicValueField(undefined);
+                setDynamicLabelField(undefined);
+                setDynamicPreview([]);
+                form.resetFields(['dynamicSourceId', 'dynamicValueField', 'dynamicLabelField']);
+              }
+            }}
+            options={[
+              { label: t('paramInput.control.input'), value: 'input' },
+              { label: t('paramInput.control.select'), value: 'select' },
+              { label: t('paramInput.control.radio'), value: 'radio' },
+            ]}
+          />
+        </Form.Item>
+
+        {control === 'select' && (
+          <Form.Item label={t('paramInput.picker')} className="mb-3">
+            <Radio.Group
+              value={picker}
+              onChange={(event) => setPicker(event.target.value)}
+              options={[
+                { label: t('paramInput.pickerDropdown'), value: 'dropdown' },
+                { label: t('paramInput.pickerTable'), value: 'table' },
+              ]}
+            />
+          </Form.Item>
+        )}
+
+        {control === 'select' && (
+          <Form.Item label={t('paramInput.multiple')} className="mb-3">
+            <Tooltip
+              title={
+                componentSwitch
+                  ? t('paramInput.multipleDisabledByComponentSwitch')
+                  : undefined
+              }
+            >
+              <Switch
+                size="small"
+                checked={multiple}
+                disabled={componentSwitch}
+                onChange={(checked) => {
+                  setMultiple(checked);
+                  if (checked) {
+                    setComponentSwitch(false);
+                  }
+                }}
+              />
+            </Tooltip>
+          </Form.Item>
+        )}
+
+        {control !== 'input' && (
+          <>
+            {componentSwitchEnabled && (
+              <Form.Item
+                label={t('dashboard.componentSwitch')}
+                className="mb-3"
+              >
+                <Tooltip
+                  title={
+                    componentSwitchOwner &&
+                      componentSwitchOwner.name !== editingParamName
+                      ? t('dashboard.componentSwitchOccupied', undefined, {
+                        label: componentSwitchOwner.label,
+                      })
+                      : multiple
+                        ? t('dashboard.componentSwitchDisabledByMultiple')
+                        : undefined
+                  }
+                >
+                  <Switch
+                    size='small'
+                    checked={componentSwitch}
+                    disabled={Boolean(
+                      (componentSwitchOwner &&
+                        componentSwitchOwner.name !== editingParamName) ||
+                      multiple,
+                    )}
+                    onChange={(checked) => {
+                      setComponentSwitch(checked);
+                      if (checked) {
+                        setMultiple(false);
+                      }
+                    }}
+                  />
+                </Tooltip>
+              </Form.Item>
+            )}
+            <Form.Item label={t('paramInput.sourceType')} className="mb-3">
+              <Radio.Group
+                value={sourceType}
+                onChange={(event) => {
+                  setSourceType(event.target.value);
+                  setDynamicSourceId(undefined);
+                  setDynamicValueField(undefined);
+                  setDynamicLabelField(undefined);
+                  setDynamicPreview([]);
+                  form.resetFields(['dynamicSourceId', 'dynamicValueField', 'dynamicLabelField']);
+                }}
+                options={[
+                  { label: t('paramInput.source.static'), value: 'static' },
+                  { label: t('paramInput.source.dynamic'), value: 'dynamic' },
+                ]}
+              />
+            </Form.Item>
+
+            {sourceType === 'static' ? (
+              <Form.Item label={t('paramInput.static.options')} className="mb-2">
+                <DndContext
+                  sensors={staticSensors}
+                  collisionDetection={closestCenter}
+                  onDragEnd={handleStaticDragEnd}
+                >
+                  <SortableContext
+                    items={staticRowIds}
+                    strategy={verticalListSortingStrategy}
+                  >
+                    <ul className="pt-1">
+                      <li className="mb-2 flex items-center text-sm text-[var(--color-text-2)]">
+                        <span className="mr-[4px] w-[14px]" />
+                        <span className="mr-[10px] w-2/5">
+                          {t('paramInput.static.value')}
+                        </span>
+                        <span className="mr-[10px] w-2/5">
+                          {t('paramInput.static.label')}
+                        </span>
+                      </li>
+                      {staticRows.map((row) => (
+                        <SortableStaticRow
+                          key={row.uid}
+                          row={row}
+                          onChange={handleStaticChange}
+                          onAddAfter={handleAddStaticRowAfter}
+                          onRemove={handleRemoveStaticRow}
+                          showRemove={staticRows.length > 1}
+                          placeholder={t('common.inputMsg')}
+                        />
+                      ))}
+                    </ul>
+                  </SortableContext>
+                </DndContext>
+              </Form.Item>
+            ) : (
+              <>
+                <div className="mb-3 flex items-start gap-0">
+                  <Form.Item
+                    name="dynamicSourceId"
+                    label={t('paramInput.dynamic.source')}
+                    className="mb-0 flex-1"
+                    rules={[
+                      {
+                        required: true,
+                        message: t('paramInput.dynamic.sourcePlaceholder'),
+                      },
+                    ]}
+                  >
+                    <Select
+                      showSearch
+                      loading={dsLoading}
+                      value={dynamicSourceId}
+                      placeholder={t('paramInput.dynamic.sourcePlaceholder')}
+                      optionFilterProp="label"
+                      style={{ width: '100%' }}
+                      options={filteredDataSourceList.map((item) => ({
+                        value: item.id,
+                        label: `${item.name}${item.rest_api ? `（${item.rest_api}）` : ''}`,
+                      }))}
+                      onChange={(sourceId) => {
+                        previewRequestIdRef.current += 1;
+                        setDynamicSourceId(sourceId);
+                        setDynamicValueField(undefined);
+                        setDynamicLabelField(undefined);
+                        setDynamicPreview([]);
+                        form.setFieldsValue({
+                          dynamicSourceId: sourceId,
+                          dynamicValueField: undefined,
+                          dynamicLabelField: undefined,
+                        });
+                      }}
+                      notFoundContent={
+                        dsLoading ? undefined : (
+                          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('common.noData')} />
+                        )
+                      }
+                    />
+                  </Form.Item>
+                  <Button
+                    icon={<ReloadOutlined />}
+                    disabled={!dynamicSourceId}
+                    loading={dynamicPreviewLoading}
+                    title={t('paramInput.dynamic.preview')}
+                    className="mt-[30px]"
+                    onClick={() => {
+                      if (dynamicSourceId) void fetchDynamicPreview(dynamicSourceId);
+                    }}
+                  />
+                </div>
+
+                <Form.Item
+                  name="dynamicValueField"
+                  label={t('paramInput.dynamic.valueField')}
+                  className="mb-3"
+                  rules={[
+                    {
+                      required: true,
+                      message: t('paramInput.dynamic.valueFieldPlaceholder'),
+                    },
+                  ]}
+                >
+                  <Select
+                    value={dynamicValueField}
+                    placeholder={t('paramInput.dynamic.valueFieldPlaceholder')}
+                    disabled={availableFields.length === 0}
+                    options={availableFields}
+                    onChange={(field) => {
+                      setDynamicValueField(field);
+                    }}
+                  />
+                </Form.Item>
+                <Form.Item
+                  name="dynamicLabelField"
+                  label={t('paramInput.dynamic.labelField')}
+                  className="mb-3"
+                  rules={[
+                    {
+                      required: true,
+                      message: t('paramInput.dynamic.labelFieldPlaceholder'),
+                    },
+                  ]}
+                >
+                  <Select
+                    value={dynamicLabelField}
+                    placeholder={t('paramInput.dynamic.labelFieldPlaceholder')}
+                    disabled={availableFields.length === 0}
+                    options={availableFields}
+                    onChange={(field) => {
+                      setDynamicLabelField(field);
+                    }}
+                  />
+                </Form.Item>
+                <Form.Item label={t('paramInput.dynamic.preview')} className="mb-0">
+                  <Table
+                    bordered
+                    size="small"
+                    loading={dynamicPreviewLoading}
+                    pagination={false}
+                    showHeader={dynamicPreviewColumns.length > 0}
+                    dataSource={dynamicPreview}
+                    rowKey={(_, index) => String(index)}
+                    columns={dynamicPreviewColumns}
+                    scroll={{ x: 'max-content' }}
+                  />
+                </Form.Item>
+              </>
+            )}
+          </>
+        )}
+      </Form>
+    </Modal>
+  );
+};

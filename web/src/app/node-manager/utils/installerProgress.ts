@@ -59,6 +59,11 @@ const normalizeFailureContext = (context?: InstallerFailureContext | null) => {
   const installDir = normalizeText(context.install_dir);
   const targetPath = normalizeText(context.target_path);
   const exitCode = normalizeNumber(context.exit_code);
+  const nodeTime = normalizeText(context.node_time);
+  const serverTime = normalizeText(context.server_time);
+  const clockOffsetSeconds = normalizeNumber(context.clock_offset_seconds);
+  const clockSkewSeconds = normalizeNumber(context.clock_skew_seconds);
+  const maxClockSkewSeconds = normalizeNumber(context.max_clock_skew_seconds);
 
   if (bucket) normalizedContext.bucket = bucket;
   if (fileKey) normalizedContext.file_key = fileKey;
@@ -67,6 +72,17 @@ const normalizeFailureContext = (context?: InstallerFailureContext | null) => {
   if (installDir) normalizedContext.install_dir = installDir;
   if (targetPath) normalizedContext.target_path = targetPath;
   if (exitCode !== null) normalizedContext.exit_code = Math.round(exitCode);
+  if (nodeTime) normalizedContext.node_time = nodeTime;
+  if (serverTime) normalizedContext.server_time = serverTime;
+  if (clockOffsetSeconds !== null)
+    normalizedContext.clock_offset_seconds = clockOffsetSeconds;
+  if (clockSkewSeconds !== null)
+    normalizedContext.clock_skew_seconds = Math.max(clockSkewSeconds, 0);
+  if (maxClockSkewSeconds !== null)
+    normalizedContext.max_clock_skew_seconds = Math.max(
+      Math.round(maxClockSkewSeconds),
+      0
+    );
 
   return Object.keys(normalizedContext).length ? normalizedContext : undefined;
 };
@@ -279,6 +295,12 @@ export const normalizeInstallerResult = (
   }
 
   return {
+    overall_status: result.overall_status,
+    connectivity_observed: result.connectivity_observed === true,
+    connectivity_observed_node_id: normalizeText(
+      result.connectivity_observed_node_id
+    ) || undefined,
+    connectivity_observed_at: normalizeText(result.connectivity_observed_at) || undefined,
     steps: normalizeInstallerLogs(result.steps),
     installer_progress: installerProgress,
     installer_summary: normalizeInstallerSummary(result.installer_summary),
@@ -326,11 +348,13 @@ export const INSTALLER_STEP_LABEL_KEYS: InstallerStepLabelMap = {
   execute_command: 'node-manager.cloudregion.node.stepExecuteCollectorAction',
   callback_or_timeout: 'node-manager.cloudregion.node.stepAwaitCollectorResult',
   fetch_session: 'node-manager.cloudregion.node.installerStepFetchSession',
+  clock_check: 'node-manager.cloudregion.node.installerStepClockCheck',
   prepare_dirs: 'node-manager.cloudregion.node.installerStepPrepareDirs',
   prepare_directories:
     'node-manager.cloudregion.node.installerStepPrepareDirs',
   download: 'node-manager.cloudregion.node.installerStepDownload',
   download_package: 'node-manager.cloudregion.node.installerStepDownload',
+  stop_service: 'node-manager.cloudregion.node.installerStepStopService',
   extract: 'node-manager.cloudregion.node.installerStepExtract',
   extract_package: 'node-manager.cloudregion.node.installerStepExtract',
   write_config: 'node-manager.cloudregion.node.installerStepWriteConfig',
@@ -345,11 +369,13 @@ export const INSTALLER_STEP_LABEL_KEYS: InstallerStepLabelMap = {
 
 export const INSTALLER_STEP_SUGGESTION_KEYS: InstallerStepLabelMap = {
   fetch_session: 'node-manager.cloudregion.node.installerSuggestionFetchSession',
+  clock_check: 'node-manager.cloudregion.node.installerSuggestionClockSkew',
   prepare_dirs: 'node-manager.cloudregion.node.installerSuggestionPrepareDirs',
   prepare_directories:
     'node-manager.cloudregion.node.installerSuggestionPrepareDirs',
   download: 'node-manager.cloudregion.node.installerSuggestionDownload',
   download_package: 'node-manager.cloudregion.node.installerSuggestionDownload',
+  stop_service: 'node-manager.cloudregion.node.installerSuggestionStopService',
   extract: 'node-manager.cloudregion.node.installerSuggestionExtract',
   extract_package: 'node-manager.cloudregion.node.installerSuggestionExtract',
   write_config: 'node-manager.cloudregion.node.installerSuggestionWriteConfig',
@@ -360,17 +386,39 @@ export const INSTALLER_STEP_SUGGESTION_KEYS: InstallerStepLabelMap = {
     'node-manager.cloudregion.node.installerSuggestionInstall'
 };
 
+export const INSTALLER_FAILURE_REASON_KEYS: Partial<Record<InstallerFailureType, string>> = {
+  object_missing: 'node-manager.cloudregion.node.installerFailureObjectMissing',
+  bucket_missing: 'node-manager.cloudregion.node.installerFailureBucketMissing',
+  connection: 'node-manager.cloudregion.node.installerFailureConnection',
+  certificate: 'node-manager.cloudregion.node.installerFailureCertificate',
+  winrm_busy: 'node-manager.cloudregion.node.installerFailureWinrmBusy',
+  timeout: 'node-manager.cloudregion.node.installerFailureTimeout',
+  auth: 'node-manager.cloudregion.node.installerFailureAuth',
+  permission: 'node-manager.cloudregion.node.installerFailurePermission',
+  file_busy: 'node-manager.cloudregion.node.installerFailureFileBusy',
+  disk: 'node-manager.cloudregion.node.installerFailureDisk',
+  package_invalid: 'node-manager.cloudregion.node.installerFailurePackageInvalid',
+  arch_mismatch: 'node-manager.cloudregion.node.installerFailureArchMismatch',
+  manual_recovery_required:
+    'node-manager.cloudregion.node.installerFailureManualRecoveryRequired',
+  clock_skew: 'node-manager.cloudregion.node.installerFailureClockSkew',
+  unknown: 'node-manager.cloudregion.node.installerFailureUnknown'
+};
+
 export const INSTALLER_FAILURE_SUGGESTION_KEYS: Partial<Record<InstallerFailureType, string>> = {
   object_missing: 'node-manager.cloudregion.node.installerSuggestionObjectMissing',
   bucket_missing: 'node-manager.cloudregion.node.installerSuggestionBucketMissing',
   connection: 'node-manager.cloudregion.node.installerSuggestionConnection',
+  certificate: 'node-manager.cloudregion.node.installerSuggestionCertificate',
+  winrm_busy: 'node-manager.cloudregion.node.installerSuggestionWinrmBusy',
   timeout: 'node-manager.cloudregion.node.installerSuggestionTimeout',
   auth: 'node-manager.cloudregion.node.installerSuggestionAuth',
   permission: 'node-manager.cloudregion.node.installerSuggestionPermission',
   file_busy: 'node-manager.cloudregion.node.installerSuggestionFileBusy',
   disk: 'node-manager.cloudregion.node.installerSuggestionDisk',
   package_invalid: 'node-manager.cloudregion.node.installerSuggestionPackageInvalid',
-  arch_mismatch: 'node-manager.cloudregion.node.installerSuggestionArchMismatch'
+  arch_mismatch: 'node-manager.cloudregion.node.installerSuggestionArchMismatch',
+  clock_skew: 'node-manager.cloudregion.node.installerSuggestionClockSkew'
 };
 
 export const INSTALLER_FAILURE_CONTEXT_LABEL_KEYS: Partial<Record<keyof InstallerFailureContext, string>> = {
@@ -380,7 +428,14 @@ export const INSTALLER_FAILURE_CONTEXT_LABEL_KEYS: Partial<Record<keyof Installe
   cpu_architecture: 'node-manager.cloudregion.node.failureContextArchitecture',
   install_dir: 'node-manager.cloudregion.node.failureContextInstallDir',
   target_path: 'node-manager.cloudregion.node.failureContextTargetPath',
-  exit_code: 'node-manager.cloudregion.node.failureContextExitCode'
+  exit_code: 'node-manager.cloudregion.node.failureContextExitCode',
+  node_time: 'node-manager.cloudregion.node.failureContextNodeTime',
+  server_time: 'node-manager.cloudregion.node.failureContextServerTime',
+  clock_offset_seconds:
+    'node-manager.cloudregion.node.failureContextClockOffset',
+  clock_skew_seconds: 'node-manager.cloudregion.node.failureContextClockSkew',
+  max_clock_skew_seconds:
+    'node-manager.cloudregion.node.failureContextMaxClockSkew'
 };
 
 export const formatInstallerProgressValue = (value?: number, unit?: string) => {
@@ -520,6 +575,17 @@ export const getInstallerFailureSuggestion = (
   return t('node-manager.cloudregion.node.installerSuggestionGeneric');
 };
 
+export const getInstallerFailureReasonByType = (
+  t: TranslationFunction,
+  failureType?: InstallerFailureType | null
+) => {
+  if (failureType && INSTALLER_FAILURE_REASON_KEYS[failureType]) {
+    return t(INSTALLER_FAILURE_REASON_KEYS[failureType]);
+  }
+
+  return null;
+};
+
 export const getInstallerFailureSuggestionByType = (
   t: TranslationFunction,
   failureType?: InstallerFailureType | null
@@ -533,7 +599,11 @@ export const getInstallerFailureSuggestionByType = (
 
 export const getInstallerSummaryGuidance = (
   t: TranslationFunction,
-  summary?: InstallerEventSummary | null
+  summary?: InstallerEventSummary | null,
+  options?: {
+    suppressNoInstallerEvents?: boolean;
+    suppressIncompleteWhenFailedStep?: boolean;
+  }
 ) => {
   const state = normalizeText(summary?.state);
   const guidanceKeyMap: Record<string, string> = {
@@ -549,9 +619,42 @@ export const getInstallerSummaryGuidance = (
       'node-manager.cloudregion.node.installerSummaryNoReportConnectivityTimeout',
     installer_success_without_detail:
       'node-manager.cloudregion.node.installerSummarySuccessWithoutDetail',
+    installer_success_with_incomplete_detail:
+      'node-manager.cloudregion.node.installerSummarySuccessWithIncompleteDetail',
     duplicated_events:
       'node-manager.cloudregion.node.installerSummaryDuplicatedEvents'
   };
+
+  // When a concrete installer step already failed, "incomplete events" is just
+  // telemetry incompleteness and should not replace the step-level suggestion.
+  if (
+    options?.suppressIncompleteWhenFailedStep &&
+    (state === 'incomplete_installer_events' ||
+      summary?.anomalies?.includes('incomplete_installer_events')) &&
+    summary?.steps?.some((step) =>
+      ['error', 'timeout'].includes(step.status || '')
+    )
+  ) {
+    return null;
+  }
+
+  // Bootstrap/WinRM failures happen before installer events exist. In that case
+  // "no installer events" is expected noise and must not override typed guidance.
+  if (
+    options?.suppressNoInstallerEvents &&
+    (state === 'no_installer_events' ||
+      summary?.anomalies?.includes('no_installer_events'))
+  ) {
+    const filteredState =
+      state === 'no_installer_events' ? null : state;
+    if (filteredState && guidanceKeyMap[filteredState]) {
+      return t(guidanceKeyMap[filteredState]);
+    }
+    const anomaly = summary?.anomalies?.find(
+      (item) => item !== 'no_installer_events' && guidanceKeyMap[item]
+    );
+    return anomaly ? t(guidanceKeyMap[anomaly]) : null;
+  }
 
   if (state && guidanceKeyMap[state]) {
     return t(guidanceKeyMap[state]);
@@ -603,13 +706,28 @@ export const getInstallerFailureGuidance = (
   const failedStep = getFailedInstallerStep(result?.steps);
   const rawStep = failedStep?.details?.raw_step || failedStep?.action;
   const failure = failedStep?.details?.failure || result?.failure;
+  const typedReason = getInstallerFailureReasonByType(t, failure?.type);
+  const typedSuggestion = getInstallerFailureSuggestionByType(t, failure?.type);
+  const stepSuggestion =
+    rawStep && INSTALLER_STEP_SUGGESTION_KEYS[rawStep]
+      ? getInstallerFailureSuggestion(t, rawStep)
+      : null;
 
-  const reason = normalizeText(
-    failure?.summary ||
-      failure?.message ||
+  // Prefer concrete runtime/installer messages over the generic "unknown" typed
+  // reason so pages can show install.sh / executor output when available.
+  const concreteReason = normalizeText(
+    failure?.message ||
       failedStep?.details?.error ||
       failedStep?.message ||
+      failure?.raw_error ||
       result?.installer_progress?.current_message ||
+      null
+  );
+  const reason = normalizeText(
+    (failure?.type && failure.type !== 'unknown' ? typedReason : null) ||
+      concreteReason ||
+      typedReason ||
+      failure?.summary ||
       null
   );
 
@@ -618,9 +736,7 @@ export const getInstallerFailureGuidance = (
   return {
     reason,
     context: contextEntries,
-    suggestion:
-      getInstallerFailureSuggestionByType(t, failure?.type) ||
-      getInstallerFailureSuggestion(t, rawStep)
+    suggestion: typedSuggestion || stepSuggestion
   };
 };
 
@@ -764,6 +880,31 @@ export const deriveControllerInstallDisplay = (
   const credentialStep = findLatestStepByAction(steps, 'credential_check');
   const commandStep = findLatestStepByAction(steps, 'run');
 
+  if (normalizedResult?.overall_status === 'success') {
+    if (summary?.state === 'installer_success_without_detail') {
+      return buildDisplayResult(
+        'success_without_detail',
+        'node_connectivity',
+        'success',
+        false
+      );
+    }
+    if (summary?.state === 'installer_success_with_incomplete_detail') {
+      return buildDisplayResult(
+        'success_with_incomplete_detail',
+        'node_connectivity',
+        'success',
+        installerStepsReceived
+      );
+    }
+    return buildDisplayResult(
+      'success',
+      'node_connectivity',
+      'success',
+      installerStepsReceived
+    );
+  }
+
   if (['error', 'timeout'].includes(credentialStep?.status || '')) {
     return buildDisplayResult(
       'credential_failed',
@@ -824,6 +965,15 @@ export const deriveControllerInstallDisplay = (
         installerStepsReceived
       );
     }
+    case 'installer_events_in_progress':
+      return buildDisplayResult(
+        normalizedResult?.connectivity_observed
+          ? 'installer_finalizing'
+          : 'installer_running',
+        'installer_execution',
+        'processing',
+        installerStepsReceived
+      );
     case 'installer_success_connectivity_pending':
       return buildDisplayResult(
         'connectivity_waiting',
@@ -891,14 +1041,21 @@ export const deriveControllerInstallPhases = (
   const commandStep = findLatestStepByAction(steps, 'run');
   const connectivityStep = findLatestStepByAction(steps, 'connectivity_check');
   const installerStepsReceived = !!summary?.observed_count;
-  const showMissingSteps = installerStepsReceived && !!summary?.missing_steps?.length;
+  const terminalSuccess = normalizedResult?.overall_status === 'success';
+  const showMissingSteps =
+    !terminalSuccess &&
+    summary?.state === 'incomplete_installer_events' &&
+    installerStepsReceived &&
+    !!summary?.missing_steps?.length;
   const commandDispatched = commandStep?.status === 'success' || installerStepsReceived;
   let installerDetailState: ControllerInstallPhaseDetailState = 'none';
   if (commandDispatched && !installerStepsReceived) {
     installerDetailState = 'no_report';
   } else if (
     commandDispatched &&
-    (showMissingSteps || summary?.state === 'incomplete_installer_events')
+    (showMissingSteps ||
+      summary?.state === 'incomplete_installer_events' ||
+      summary?.state === 'installer_success_with_incomplete_detail')
   ) {
     installerDetailState = 'partial';
   } else if (commandDispatched) {
@@ -909,7 +1066,13 @@ export const deriveControllerInstallPhases = (
   if (display.phase === 'installer_execution') {
     installerStatus = displaySeverityToPhaseStatus(display.severity);
   } else if (
-    ['connectivity_waiting', 'connectivity_failed', 'success', 'success_without_detail'].includes(
+    [
+      'connectivity_waiting',
+      'connectivity_failed',
+      'success',
+      'success_without_detail',
+      'success_with_incomplete_detail'
+    ].includes(
       display.state
     )
   ) {
@@ -941,7 +1104,9 @@ export const deriveControllerInstallPhases = (
     },
     {
       code: 'node_connectivity',
-      status: stepStatusToPhaseStatus(connectivityStep?.status),
+      status: normalizedResult?.connectivity_observed
+        ? 'success'
+        : stepStatusToPhaseStatus(connectivityStep?.status),
       detailState: 'none',
       showMissingSteps: false
     }
@@ -968,12 +1133,15 @@ export const CONTROLLER_INSTALL_STATE_LABEL_KEYS: Partial<
   installer_waiting: 'node-manager.cloudregion.node.installStateInstallerWaiting',
   installer_no_report: 'node-manager.cloudregion.node.installStateInstallerNoReport',
   installer_running: 'node-manager.cloudregion.node.installStateInstallerRunning',
+  installer_finalizing: 'node-manager.cloudregion.node.installStateInstallerFinalizing',
   installer_failed: 'node-manager.cloudregion.node.installStateInstallerFailed',
   connectivity_waiting: 'node-manager.cloudregion.node.installStateConnectivityWaiting',
   connectivity_failed: 'node-manager.cloudregion.node.installStateConnectivityFailed',
   success: 'node-manager.cloudregion.node.installStateSuccess',
   success_without_detail:
-    'node-manager.cloudregion.node.installStateSuccessWithoutDetail'
+    'node-manager.cloudregion.node.installStateSuccessWithoutDetail',
+  success_with_incomplete_detail:
+    'node-manager.cloudregion.node.installStateSuccessWithIncompleteDetail'
 };
 
 export const getControllerInstallPhaseLabel = (

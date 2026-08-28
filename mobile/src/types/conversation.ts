@@ -1,25 +1,14 @@
-export interface ChatItem {
-  id: string;
-  name: string;
-  avatar: string;
-  lastMessage?: string;
-  time?: string;
-  hasCall?: boolean;
-  website?: string;
-  unread?: number;
-}
-
-export interface ChatMessage {
-  id: string;
-  chatId: string;
-  sender: 'user' | 'bot';
-  content: string;
-  timestamp: number;
-}
-export interface sessionsItem {
+export interface SessionItem {
   bot_id: number;
+  node_id?: string;
   session_id: string;
   title: string;
+  app_id?: number | null;
+  app_name?: string;
+  app_tags?: string[];
+  source?: string;
+  created_at?: string;
+  updated_at?: string;
 }
 export interface ChatInfo {
   id: string;
@@ -44,14 +33,16 @@ export interface ContentPart {
   }; // 组件配置
   toolCall?: ToolCall; // 工具调用信息
   segmentIndex?: number; // 分段索引
+  isStreamingText?: boolean; // 流式纯文本中间态；结束后替换为完整 Markdown 渲染结果
 }
 
 export interface Message {
   id: string;
   message: string | React.ReactNode | null | { text: string; suggestions: string[] };
-  status: 'local' | 'ai' | 'thinking' | 'loading' | 'success' | 'ended' | 'history';
+  status: 'local' | 'ai' | 'thinking' | 'loading' | 'success' | 'ended' | 'interrupted' | 'history';
   timestamp: number;
   thinking?: string;
+  streamError?: string;
   userInput?: string | MessageContentItem[]; // 支持字符串或数组格式
   isWelcome?: boolean;
   isFileMessage?: boolean; // 标记为文件/图片消息，用于特殊样式

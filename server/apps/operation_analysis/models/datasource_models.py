@@ -10,6 +10,11 @@ from apps.core.models.maintainer_info import MaintainerInfo
 from apps.core.models.time_info import TimeInfo
 from apps.core.utils.crypto.password_crypto import PasswordCrypto
 from apps.operation_analysis.constants.constants import SECRET_KEY
+from apps.operation_analysis.services.credential_write_policy import validate_credential_write_key
+
+
+class NamespacePasswordDecryptionError(ValueError):
+    pass
 
 
 class NameSpace(MaintainerInfo, TimeInfo):
@@ -40,6 +45,7 @@ class NameSpace(MaintainerInfo, TimeInfo):
         if not raw_password:
             return raw_password
 
+        validate_credential_write_key(SECRET_KEY)
         crypto = PasswordCrypto(SECRET_KEY)
         return crypto.encrypt(raw_password)
 
@@ -55,9 +61,8 @@ class NameSpace(MaintainerInfo, TimeInfo):
         try:
             crypto = PasswordCrypto(SECRET_KEY)
             return crypto.decrypt(self.password)
-        except Exception:
-            # 如果解密失败，可能是明文密码，直接返回
-            return self.password
+        except Exception as exc:
+            raise NamespacePasswordDecryptionError("命名空间密码解密失败，请重新录入密码") from exc
 
     def set_password(self, raw_password):
         """
@@ -65,32 +70,11 @@ class NameSpace(MaintainerInfo, TimeInfo):
         :param raw_password: 明文密码
         """
         self.password = self.encrypt_password(raw_password)
-
-    def _is_password_encrypted(self):
-        """
-        判断密码是否已经加密
-        加密后的密码特征:
-        1. 长度 >= 44 (AES加密后base64编码的最小长度)
-        2. 能够成功解密
-
-        :return: True 表示已加密，False 表示明文
-        """
-        if not self.password:
-            return False
-
-        # 尝试解密，如果成功说明已加密
-        try:
-            crypto = PasswordCrypto(SECRET_KEY)
-            crypto.decrypt(self.password)
-            return True
-        except Exception:
-            # 解密失败，说明是明文密码
-            return False
+        self._password_explicitly_encrypted = True
 
     def save(self, *args, **kwargs):
-        # 只有在密码未加密时才进行加密
-        if self.password and not self._is_password_encrypted():
-            self.password = self.encrypt_password(self.password)
+        if self._state.adding and self.password and not getattr(self, "_password_explicitly_encrypted", False):
+            self.set_password(self.password)
         super().save(*args, **kwargs)
 
 
@@ -108,12 +92,39 @@ class DataSourceTag(MaintainerInfo, TimeInfo):
         return f"{self.name}({self.tag_id})"
 
 
+class DataConnection(MaintainerInfo, TimeInfo, Groups):
+    TYPE_MYSQL = "mysql"
+    TYPE_POSTGRESQL = "postgresql"
+    TYPE_REST_API = "rest_api"
+
+    TYPE_CHOICES = [
+        (TYPE_MYSQL, "MySQL"),
+        (TYPE_POSTGRESQL, "PostgreSQL"),
+        (TYPE_REST_API, "REST API"),
+    ]
+
+    name = models.CharField(max_length=255, verbose_name="数据连接名称")
+    connection_type = models.CharField(max_length=32, choices=TYPE_CHOICES, verbose_name="连接类型")
+    description = models.TextField(verbose_name="描述", blank=True, null=True)
+    is_active = models.BooleanField(default=True, verbose_name="是否启用")
+    # 敏感字段（密码、Header 值）以加密后的值落库；API 层脱敏回显。
+    config = JSONField(default=dict, blank=True, verbose_name="连接配置")
+
+    class Meta:
+        db_table = "operation_analysis_data_connection"
+        verbose_name = "数据连接"
+
+    def __str__(self):
+        return f"{self.name}({self.connection_type})"
+
+
 class DataSourceAPIModel(MaintainerInfo, TimeInfo, Groups):
     SOURCE_TYPE_NATS = "nats"
     SOURCE_TYPE_MYSQL = "mysql"
     SOURCE_TYPE_POSTGRESQL = "postgresql"
     SOURCE_TYPE_REST_API = "rest_api"
     SOURCE_TYPE_EXCEL = "excel"
+    SOURCE_TYPE_PROMETHEUS = "prometheus"
 
     SOURCE_TYPE_CHOICES = [
         (SOURCE_TYPE_NATS, "NATS"),
@@ -121,14 +132,42 @@ class DataSourceAPIModel(MaintainerInfo, TimeInfo, Groups):
         (SOURCE_TYPE_POSTGRESQL, "PostgreSQL"),
         (SOURCE_TYPE_REST_API, "REST API"),
         (SOURCE_TYPE_EXCEL, "Excel"),
+        (SOURCE_TYPE_PROMETHEUS, "Prometheus"),
     ]
 
     name = models.CharField(max_length=255, verbose_name="数据源名称")
     rest_api = models.CharField(max_length=255, verbose_name="REST API URL", blank=True)
     desc = models.TextField(verbose_name="描述", blank=True, null=True)
     source_type = models.CharField(max_length=32, choices=SOURCE_TYPE_CHOICES, default=SOURCE_TYPE_NATS, verbose_name="数据来源类型")
+    connection = models.ForeignKey(
+        DataConnection,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="data_sources",
+        verbose_name="数据连接",
+    )
     connection_config = JSONField(default=dict, blank=True, verbose_name="连接配置")
+    connection_overrides = JSONField(default=dict, blank=True, verbose_name="连接覆盖项")
     query_config = JSONField(default=dict, blank=True, verbose_name="取数配置")
+    transform_config = JSONField(default=dict, blank=True, verbose_name="转换配置")
+    excel_success_slot = models.ForeignKey(
+        "operation_analysis.ExcelMaterializationSlot",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        verbose_name="Excel 当前成功槽位",
+    )
+    excel_candidate_slot = models.ForeignKey(
+        "operation_analysis.ExcelMaterializationSlot",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        verbose_name="Excel 当前候选槽位",
+    )
+    excel_materialization_generation = models.PositiveIntegerField(default=0, verbose_name="Excel 物化代数")
     # [内部预留] 当前无产品功能依赖，仅用于历史兼容透传（导入导出/内置数据导入）；前端不暴露、运行时不校验
     is_active = models.BooleanField(default=True, verbose_name="是否启用")
     params = JSONField(help_text="API请求参数", verbose_name="请求参数", blank=True, null=True)
@@ -136,6 +175,8 @@ class DataSourceAPIModel(MaintainerInfo, TimeInfo, Groups):
     tag = models.ManyToManyField(to=DataSourceTag, related_name="data_sources", help_text="数据源标签", blank=True)
     chart_type = JSONField(help_text="图表类型", default=list, blank=True, null=True)
     field_schema = JSONField(default=list, blank=True, help_text="接口返回字段定义（数据源级配置，表格默认列可使用）")
+    is_build_in = models.BooleanField(default=False, db_index=True, verbose_name="是否内置")
+    build_in_key = models.CharField(max_length=512, null=True, blank=True, unique=True, verbose_name="内置配置稳定键")
 
     class Meta:
         db_table = "operation_analysis_data_source_api"

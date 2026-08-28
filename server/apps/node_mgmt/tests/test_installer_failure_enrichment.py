@@ -1,5 +1,9 @@
+from types import SimpleNamespace
+
 import pytest
 
+from apps.node_mgmt.constants.installer import InstallerConstants
+from apps.node_mgmt.tasks import installer as installer_tasks
 from apps.node_mgmt.tasks.installer import _handle_step_exception
 from apps.node_mgmt.utils.installer_schema import build_installer_event_record, normalize_failure
 from apps.node_mgmt.utils.task_result_schema import normalize_task_result_for_read
@@ -12,6 +16,55 @@ class _DummyNode:
 
     def save(self, update_fields=None):
         return None
+
+
+class _InstallNode(_DummyNode):
+    def __init__(self, password="", private_key="", passphrase=""):
+        super().__init__(
+            result={InstallerConstants.EXECUTION_PHASE_KEY: InstallerConstants.EXECUTION_PHASE_BOOTSTRAP_RUNNING}
+        )
+        self.password = password
+        self.private_key = private_key
+        self.passphrase = passphrase
+        self.status = InstallerConstants.STEP_STATUS_RUNNING
+        self.cpu_architecture = ""
+
+
+class _FailingCryptor:
+    def decode(self, ciphertext):
+        if ciphertext == "invalid-ciphertext":
+            raise ValueError("invalid encrypted value")
+        return "decoded-value"
+
+
+@pytest.mark.parametrize(
+    ("password", "private_key", "passphrase"),
+    [
+        ("invalid-ciphertext", "", ""),
+        ("", "invalid-ciphertext", ""),
+        ("", "valid-ciphertext", "invalid-ciphertext"),
+    ],
+)
+def test_install_controller_on_nodes_converges_credential_decryption_failure(
+    monkeypatch, password, private_key, passphrase
+):
+    node = _InstallNode(password=password, private_key=private_key, passphrase=passphrase)
+    dispatch_calls = []
+    monkeypatch.setattr(installer_tasks, "AESCryptor", _FailingCryptor)
+    monkeypatch.setattr(
+        installer_tasks,
+        "_dispatch_or_finalize_controller_task",
+        lambda task_id: dispatch_calls.append(task_id),
+    )
+
+    installer_tasks.install_controller_on_nodes(SimpleNamespace(id=4076), [node], SimpleNamespace())
+
+    assert node.status == InstallerConstants.STEP_STATUS_ERROR
+    assert node.result[InstallerConstants.EXECUTION_PHASE_KEY] == InstallerConstants.EXECUTION_PHASE_FINISHED
+    assert node.result["overall_status"] == InstallerConstants.OVERALL_STATUS_ERROR
+    assert node.result["final_message"] == "Credential decryption failed"
+    assert node.result["steps"][-1]["status"] == InstallerConstants.STEP_STATUS_ERROR
+    assert dispatch_calls == [4076]
 
 
 def test_normalize_failure_classifies_object_missing_and_preserves_context():
@@ -44,6 +97,223 @@ def test_normalize_failure_classifies_file_busy_and_extracts_target_path():
     assert failure["context"]["target_path"] == "/opt/fusion-collectors/bin/vector"
 
 
+def test_stop_service_event_uses_current_installer_protocol_position():
+    record = build_installer_event_record(
+        {
+            "step": "stop_service",
+            "status": "success",
+            "message": "Existing controller service stopped",
+        }
+    )
+
+    assert record["action"] == "stop_service"
+    assert record["details"]["step_index"] == 5
+    assert record["details"]["step_total"] == 9
+
+
+def test_normalize_failure_marks_manual_windows_recovery_as_non_retriable():
+    failure = normalize_failure(
+        message="Transactional Windows installation failed",
+        error="previous installation retained at C:\\fusion-collectors.bklite-backup for recovery",
+        details={"error_type": "manual_recovery_required"},
+    )
+
+    assert failure is not None
+    assert failure["type"] == "manual_recovery_required"
+    assert failure["retriable"] is False
+
+
+def test_windows_transaction_failure_remains_canonical_after_ansible_wrapper_error():
+    disk_error = (
+        "Transactional Windows installation failed: extract package to staging directory: "
+        "write C:\\fusion-collectors.bklite-staging\\bin\\winlogbeat\\winlogbeat.exe: "
+        "There is not enough space on the disk."
+    )
+    normalized = normalize_task_result_for_read(
+        {
+            "overall_status": "error",
+            "failure": {
+                "message": "Target host is unreachable over WinRM HTTPS (non-zero return code)",
+                "raw_error": "Target host is unreachable over WinRM HTTPS (non-zero return code)",
+            },
+            "steps": [
+                {
+                    "action": "run",
+                    "status": "running",
+                    "message": "Run installer",
+                },
+                {
+                    "action": "extract",
+                    "status": "error",
+                    "message": disk_error,
+                    "details": {
+                        "installer_event": True,
+                        "raw_step": "run_package_installer",
+                        "error": disk_error,
+                    },
+                },
+                {
+                    "action": "unknown",
+                    "status": "error",
+                    "message": "Unexpected error: Target host is unreachable over WinRM HTTPS (non-zero return code)",
+                    "details": {
+                        "error": "Target host is unreachable over WinRM HTTPS (non-zero return code)",
+                    },
+                },
+            ],
+        }
+    )
+
+    assert normalized["failure"]["type"] == "disk"
+    assert normalized["installer_summary"]["last_step"] == "extract"
+    assert normalized["installer_summary"]["last_status"] == "error"
+    assert normalized["installer_summary"]["missing_steps"] == ["fetch_session", "prepare_dirs", "download", "write_config", "install"]
+
+
+def test_normalize_failure_preserves_clock_skew_type_and_context():
+    failure = normalize_failure(
+        message="Node clock is 726 seconds ahead of Server",
+        error="Node clock is 726 seconds ahead of Server",
+        details={
+            "error_type": "clock_skew",
+            "node_time": "2026-07-29T10:12:06Z",
+            "server_time": "2026-07-29T10:00:00Z",
+            "clock_offset_seconds": 726.0,
+            "clock_skew_seconds": 726.0,
+            "max_clock_skew_seconds": 300,
+        },
+    )
+
+    assert failure is not None
+    assert failure["type"] == "clock_skew"
+    assert failure["retriable"] is False
+    assert failure["context"] == {
+        "node_time": "2026-07-29T10:12:06Z",
+        "server_time": "2026-07-29T10:00:00Z",
+        "clock_offset_seconds": 726.0,
+        "clock_skew_seconds": 726.0,
+        "max_clock_skew_seconds": 300,
+    }
+
+
+def test_clock_check_event_is_optional_for_historical_installer_summaries():
+    installer_steps = [
+        ("fetch_session", "success"),
+        ("prepare_dirs", "success"),
+        ("download", "success"),
+        ("extract", "success"),
+        ("write_config", "success"),
+        ("install", "success"),
+    ]
+    normalized = normalize_task_result_for_read(
+        {
+            "overall_status": "running",
+            "steps": [
+                {
+                    "action": action,
+                    "status": status,
+                    "message": action,
+                    "details": {"installer_event": True, "raw_step": action},
+                }
+                for action, status in installer_steps
+            ]
+            + [{"action": "connectivity_check", "status": "running", "message": "waiting"}],
+        }
+    )
+
+    assert normalized["installer_summary"]["expected_count"] == 6
+    assert normalized["installer_summary"]["completed_count"] == 6
+    assert normalized["installer_summary"]["missing_steps"] == []
+
+    with_clock_check = normalize_task_result_for_read(
+        {
+            "overall_status": "running",
+            "steps": [
+                {
+                    "action": "clock_check",
+                    "status": "success",
+                    "message": "clock checked",
+                    "details": {"installer_event": True, "raw_step": "clock_check"},
+                }
+            ]
+            + normalized["installer_summary"]["steps"]
+            + [{"action": "connectivity_check", "status": "running", "message": "waiting"}],
+        }
+    )
+    assert with_clock_check["installer_summary"]["expected_count"] == 7
+    assert with_clock_check["installer_summary"]["completed_count"] == 7
+    assert "clock_check" in with_clock_check["installer_summary"]["completed_steps"]
+    assert with_clock_check["installer_summary"]["missing_steps"] == []
+    assert [step["action"] for step in with_clock_check["installer_summary"]["steps"]] == [
+        "clock_check",
+        *[action for action, _ in installer_steps],
+    ]
+
+
+def test_clock_check_counts_toward_installer_progress_when_present():
+    normalized = normalize_task_result_for_read(
+        {
+            "overall_status": "running",
+            "steps": [
+                {
+                    "action": action,
+                    "status": status,
+                    "message": action,
+                    "details": {"installer_event": True, "raw_step": action},
+                }
+                for action, status in (
+                    ("fetch_session", "success"),
+                    ("clock_check", "success"),
+                    ("prepare_dirs", "success"),
+                    ("download", "running"),
+                )
+            ]
+            + [{"action": "connectivity_check", "status": "waiting", "message": "waiting"}],
+        }
+    )
+
+    summary = normalized["installer_summary"]
+    assert summary["expected_count"] == 7
+    assert summary["completed_count"] == 3
+    assert summary["completed_steps"] == ["fetch_session", "clock_check", "prepare_dirs"]
+    assert summary["expected_steps"][1] == "clock_check"
+    assert summary["missing_steps"] == ["extract", "write_config", "install"]
+
+
+def test_stop_service_counts_toward_current_installer_progress_when_present():
+    installer_steps = [
+        "fetch_session",
+        "clock_check",
+        "prepare_dirs",
+        "download",
+        "stop_service",
+        "extract",
+        "write_config",
+        "install",
+    ]
+    normalized = normalize_task_result_for_read(
+        {
+            "overall_status": "running",
+            "steps": [
+                {
+                    "action": action,
+                    "status": "success",
+                    "message": action,
+                    "details": {"installer_event": True, "raw_step": action},
+                }
+                for action in installer_steps
+            ]
+            + [{"action": "connectivity_check", "status": "running", "message": "waiting"}],
+        }
+    )
+
+    summary = normalized["installer_summary"]
+    assert summary["expected_steps"] == installer_steps
+    assert summary["expected_count"] == 8
+    assert summary["completed_count"] == 8
+    assert summary["missing_steps"] == []
+
+
 def test_normalize_failure_ignores_successful_status_messages():
     assert normalize_failure(message="Sidecar acknowledged action", details={}) is None
     assert normalize_failure(message="Collector action completed", details={}) is None
@@ -72,6 +342,70 @@ def test_normalize_failure_classifies_ssh_auth_failure_before_connection():
     assert failure["summary"] == "Authentication failed while accessing the required resource"
 
 
+def test_normalize_failure_classifies_winrm_certificate_error():
+    failure = normalize_failure(
+        message=(
+            "Ansible task failed: WinRM HTTPS certificate validation failed: the Ansible "
+            "Executor does not trust the target host certificate "
+            "(ntlm: HTTPSConnectionPool(... CERTIFICATE_VERIFY_FAILED ... unable to get local issuer certificate))"
+        ),
+        error=(
+            "WinRM HTTPS certificate validation failed: the Ansible Executor does not trust "
+            "the target host certificate (CERTIFICATE_VERIFY_FAILED)"
+        ),
+        details={},
+    )
+
+    assert failure is not None
+    assert failure["type"] == "certificate"
+    assert failure["retriable"] is False
+    assert "HTTPS certificate validation failed" in failure["summary"]
+
+
+def test_normalize_failure_classifies_bootstrap_x509_certificate_error():
+    failure = normalize_failure(
+        message=(
+            "Fetch failed: Get https://server.example/installer/session?token=<redacted>: "
+            "tls: failed to verify certificate: x509: certificate signed by unknown authority"
+        ),
+        error="x509: certificate signed by unknown authority",
+        details={"step": "fetch_session"},
+    )
+
+    assert failure is not None
+    assert failure["type"] == "certificate"
+    assert failure["retriable"] is False
+    assert "HTTPS certificate validation failed" in failure["summary"]
+
+
+def test_normalize_failure_classifies_winrm_unreachable_as_connection():
+    failure = normalize_failure(
+        message="Target host is unreachable over WinRM HTTPS (connection refused)",
+        error="fatal: [10.10.40.57]: UNREACHABLE! => connection refused",
+        details={},
+    )
+
+    assert failure is not None
+    assert failure["type"] == "connection"
+    assert failure["retriable"] is True
+
+
+def test_normalize_failure_classifies_busy_winrm_session_before_connection():
+    failure = normalize_failure(
+        message=(
+            "WinRM session is busy or stalled (WSMan fault 170 while sending module input). "
+            "Wait for the current WinRM operation to finish, then retry."
+        ),
+        error="WSManFaultError 请求的资源在使用中。 wsmanfault_code: 170; winrm send_input failed",
+        details={},
+    )
+
+    assert failure is not None
+    assert failure["type"] == "winrm_busy"
+    assert failure["retriable"] is True
+    assert "WinRM session is busy" in failure["summary"]
+
+
 def test_build_installer_event_record_attaches_typed_failure_metadata():
     event = build_installer_event_record(
         {
@@ -91,6 +425,44 @@ def test_build_installer_event_record_attaches_typed_failure_metadata():
     assert event["details"]["failure"]["summary"]
     assert event["details"]["bucket"] == "bklite"
     assert event["details"]["failure"]["context"]["file_key"] == "linux/arm64/Controller/3.1.22/fusion-collectors-arm64.tar.gz"
+
+
+def test_build_installer_event_record_redacts_session_tokens_from_failures():
+    raw_message = (
+        'Fetch failed: Get "https://server.example/api/v1/node_mgmt/open_api/'
+        'installer/session?token=01234567-89ab-cdef-0123-456789abcdef": unknown authority'
+    )
+
+    event = build_installer_event_record(
+        {
+            "step": "fetch_session",
+            "status": "failed",
+            "message": raw_message,
+            "error": raw_message,
+        }
+    )
+
+    assert "01234567-89ab-cdef-0123-456789abcdef" not in event["message"]
+    assert "token=<redacted>" in event["message"]
+    assert "01234567-89ab-cdef-0123-456789abcdef" not in event["details"]["error"]
+    assert "01234567-89ab-cdef-0123-456789abcdef" not in event["details"]["failure"]["raw_error"]
+
+
+def test_installer_event_step_position_keeps_legacy_and_new_protocols_separate():
+    legacy_event = build_installer_event_record({"step": "download_package", "status": "running"})
+    assert legacy_event["details"]["step_index"] == 3
+    assert legacy_event["details"]["step_total"] == 7
+
+    new_event = build_installer_event_record(
+        {
+            "step": "download_package",
+            "status": "running",
+            "step_index": 4,
+            "step_total": 8,
+        }
+    )
+    assert new_event["details"]["step_index"] == 4
+    assert new_event["details"]["step_total"] == 8
 
 
 def test_handle_step_exception_carries_forward_installer_context():
@@ -376,6 +748,44 @@ def test_normalize_task_result_for_read_reports_complete_success_display_state()
     assert display["phase"] == "node_connectivity"
     assert display["severity"] == "success"
     assert display["installer_steps_received"] is True
+
+
+def test_normalize_task_result_for_read_terminal_success_dominates_partial_installer_telemetry():
+    normalized = normalize_task_result_for_read(
+        {
+            "overall_status": "success",
+            "steps": [
+                {"action": "credential_check", "status": "success", "message": "Validate credentials"},
+                {"action": "run", "status": "success", "message": "Installer bootstrap completed"},
+                {
+                    "action": "fetch_session",
+                    "status": "success",
+                    "message": "Installer session fetched",
+                    "details": {"installer_event": True, "raw_step": "fetch_session"},
+                },
+                {
+                    "action": "extract",
+                    "status": "success",
+                    "message": "Controller package staged and activated",
+                    "details": {"installer_event": True, "raw_step": "extract_package"},
+                },
+                {"action": "connectivity_check", "status": "success", "message": "Sidecar connectivity confirmed"},
+            ],
+        }
+    )
+
+    summary = normalized["installer_summary"]
+    assert summary["state"] == "installer_success_with_incomplete_detail"
+    assert summary["missing_steps"] == ["prepare_dirs", "download", "write_config", "install"]
+    assert "incomplete_installer_events" in summary["anomalies"]
+
+    display = normalized["controller_install_display"]
+    assert display == {
+        "state": "success_with_incomplete_detail",
+        "phase": "node_connectivity",
+        "severity": "success",
+        "installer_steps_received": True,
+    }
 
 
 def test_normalize_task_result_for_read_reports_incomplete_installer_events():

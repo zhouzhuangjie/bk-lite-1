@@ -1,12 +1,10 @@
 import base64
 import hashlib
-import logging
 from typing import Any, Dict, Optional
 
+from apps.core.logger import logger
 from cryptography.fernet import Fernet, InvalidToken
 from django.conf import settings
-
-logger = logging.getLogger(__name__)
 
 
 class EncryptMixin:
@@ -112,11 +110,39 @@ class PeriodicTaskUtils:
                 "enabled": True,
             },
         )
-        logger.info(f"已创建周期任务: {task_name}, 执行时间: {sync_time}")
+        logger.info("已创建周期任务: %s, 执行时间: %s", task_name, sync_time)
+
+    @staticmethod
+    def create_periodic_task_from_spec(schedule_spec, task_name, task_args, task_path):
+        from django.utils import timezone
+        from django_celery_beat.models import CrontabSchedule, PeriodicTask
+
+        if schedule_spec.get("kind") != "crontab":
+            raise ValueError(f"Unsupported schedule kind: {schedule_spec.get('kind')}")
+
+        schedule, _ = CrontabSchedule.objects.get_or_create(
+            minute=str(schedule_spec["minute"]),
+            hour=str(schedule_spec["hour"]),
+            day_of_week=str(schedule_spec.get("day_of_week", "*")),
+            day_of_month=str(schedule_spec.get("day_of_month", "*")),
+            month_of_year=str(schedule_spec.get("month_of_year", "*")),
+            timezone=schedule_spec.get("timezone") or timezone.get_current_timezone(),
+        )
+
+        PeriodicTask.objects.update_or_create(
+            name=task_name,
+            defaults={
+                "crontab": schedule,
+                "task": task_path,
+                "args": task_args,
+                "enabled": True,
+            },
+        )
+        logger.info("已创建周期任务: %s, 调度配置: %s", task_name, schedule_spec)
 
     @staticmethod
     def delete_periodic_task(task_name):
         from django_celery_beat.models import PeriodicTask
 
         PeriodicTask.objects.filter(name=task_name).delete()
-        logger.info(f"已删除周期任务: {task_name}")
+        logger.info("已删除周期任务: %s", task_name)

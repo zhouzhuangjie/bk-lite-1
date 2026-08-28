@@ -1,9 +1,9 @@
 # -- coding: utf-8 --
 from __future__ import annotations
 
+import os
 from typing import Any
 
-from django.db.models import Q
 from rest_framework.exceptions import PermissionDenied
 
 from apps.core.utils.permission_utils import get_permission_rules
@@ -14,12 +14,14 @@ from apps.operation_analysis.schemas.import_export_schema import YAMLDocument
 class ImportExportAuthorizationService:
     APP_NAME = "operation_analysis"
     APP_PERMISSION_NAME = "ops-analysis"
+    EXPORT_DEPENDENCY_PERMISSION_MODE_ENV = "OPS_ANALYSIS_EXPORT_DEPENDENCY_PERMISSION_MODE"
     ORG_SCOPED_OBJECT_TYPES = {
         ObjectType.DASHBOARD,
         ObjectType.TOPOLOGY,
         ObjectType.ARCHITECTURE,
         ObjectType.SCREEN,
         ObjectType.REPORT,
+        ObjectType.NETWORK_TOPOLOGY,
         ObjectType.DATASOURCE,
     }
 
@@ -29,6 +31,7 @@ class ImportExportAuthorizationService:
         ObjectType.ARCHITECTURE: {"permission": "view-View", "permission_key": "directory.architecture"},
         ObjectType.SCREEN: {"permission": "view-View", "permission_key": "directory.screen"},
         ObjectType.REPORT: {"permission": "view-View", "permission_key": "directory.report"},
+        ObjectType.NETWORK_TOPOLOGY: {"permission": "view-View", "permission_key": "directory.networkTopology"},
         ObjectType.DATASOURCE: {"permission": "data_source-View", "permission_key": "datasource"},
         ObjectType.NAMESPACE: {"permission": "namespace-View", "permission_key": None},
     }
@@ -39,6 +42,7 @@ class ImportExportAuthorizationService:
         ObjectType.ARCHITECTURE: {"create": "view-AddChart", "overwrite": "view-EditChart"},
         ObjectType.SCREEN: {"create": "view-AddChart", "overwrite": "view-EditChart"},
         ObjectType.REPORT: {"create": "view-AddChart", "overwrite": "view-EditChart"},
+        ObjectType.NETWORK_TOPOLOGY: {"create": "view-AddChart", "overwrite": "view-EditChart"},
         ObjectType.DATASOURCE: {"create": "data_source-Add", "overwrite": "data_source-Edit"},
         ObjectType.NAMESPACE: {"create": "namespace-Add", "overwrite": "namespace-Edit"},
     }
@@ -74,7 +78,15 @@ class ImportExportAuthorizationService:
         return current_team
 
     @classmethod
-    def filter_export_object_ids(cls, request, object_type: str, object_ids: list[int], current_team: int | None) -> list[int]:
+    def filter_export_object_ids(
+        cls,
+        request,
+        object_type: str,
+        object_ids: list[int],
+        current_team: int | None,
+        *,
+        allow_partial: bool = False,
+    ) -> list[int]:
         object_enum = ObjectType(object_type)
         cls.validate_current_team(request, current_team)
 
@@ -85,9 +97,63 @@ class ImportExportAuthorizationService:
         group_ids = cls._get_export_group_ids(request, current_team)
         filtered_ids = cls._filter_ids_by_org(object_enum, object_ids, current_team, group_ids)
         filtered_ids = cls._filter_ids_by_scope(request, object_enum, filtered_ids, current_team)
-        if not filtered_ids:
+        if not filtered_ids or (not allow_partial and set(filtered_ids) != set(object_ids)):
             raise PermissionDenied("无权导出所选对象或对象不存在")
         return filtered_ids
+
+    @classmethod
+    def is_legacy_export_dependency_permission_mode(cls) -> bool:
+        return os.getenv(cls.EXPORT_DEPENDENCY_PERMISSION_MODE_ENV, "enforce").strip().lower() == "legacy"
+
+    @classmethod
+    def validate_export_dependencies(
+        cls,
+        request,
+        scope_type: str,
+        object_type: str,
+        object_ids: list[int],
+        current_team: int | None,
+    ) -> tuple[set[int], set[int], dict[int, set[int]]]:
+        """校验导出闭包中的每类依赖，避免顶层授权后的隐式扩展绕过权限。"""
+        from apps.operation_analysis.services.import_export.export_service import ExportService
+
+        datasource_ids, namespace_ids, datasource_namespace_ids = ExportService.collect_export_dependencies(
+            scope_type,
+            object_type,
+            object_ids,
+            lock=True,
+        )
+        locked_root_ids = cls.filter_export_object_ids(request, object_type, object_ids, current_team)
+        if set(locked_root_ids) != set(object_ids):
+            raise PermissionDenied("导出对象的权限范围已发生变化")
+
+        if cls.is_legacy_export_dependency_permission_mode():
+            return datasource_ids, namespace_ids, datasource_namespace_ids
+
+        cls._validate_export_dependency_ids(request, ObjectType.DATASOURCE, datasource_ids, current_team)
+        cls._validate_export_dependency_ids(request, ObjectType.NAMESPACE, namespace_ids, current_team)
+        return datasource_ids, namespace_ids, datasource_namespace_ids
+
+    @classmethod
+    def _validate_export_dependency_ids(
+        cls,
+        request,
+        object_type: ObjectType,
+        object_ids: set[int],
+        current_team: int | None,
+    ) -> None:
+        if not object_ids:
+            return
+
+        ordered_ids = sorted(object_ids)
+        allowed_ids = cls.filter_export_object_ids(
+            request,
+            object_type.value,
+            ordered_ids,
+            current_team,
+        )
+        if set(allowed_ids) != object_ids:
+            raise PermissionDenied("导出依赖包含当前用户无权访问的对象")
 
     @classmethod
     def apply_precheck_permissions(
@@ -131,7 +197,8 @@ class ImportExportAuthorizationService:
                     continue
 
                 if not view_allowed or not cls.can_access_existing_object(request, object_type, existing, current_team):
-                    suggested_actions = [ConflictAction.RENAME.value] if create_allowed else []
+                    permission_actions = [ConflictAction.RENAME.value] if create_allowed else []
+                    suggested_actions = cls._intersect_precheck_actions(conflict, permission_actions)
                     conflict["reason"] = ConflictReason.NO_PERMISSION_CONFLICT
                     conflict["suggested_actions"] = suggested_actions
                     if not suggested_actions:
@@ -145,21 +212,27 @@ class ImportExportAuthorizationService:
                         )
                     continue
 
-                suggested_actions = []
+                permission_actions = []
                 if overwrite_allowed:
-                    suggested_actions.append(ConflictAction.OVERWRITE.value)
-                suggested_actions.append(ConflictAction.SKIP.value)
+                    permission_actions.append(ConflictAction.OVERWRITE.value)
+                permission_actions.append(ConflictAction.SKIP.value)
                 if create_allowed:
-                    suggested_actions.append(ConflictAction.RENAME.value)
+                    permission_actions.append(ConflictAction.RENAME.value)
 
                 conflict["reason"] = ConflictReason.NAME_CONFLICT
-                conflict["suggested_actions"] = suggested_actions
+                conflict["suggested_actions"] = cls._intersect_precheck_actions(conflict, permission_actions)
 
         if permission_errors:
             result["valid"] = False
             result.setdefault("errors", []).extend(permission_errors)
 
         return result
+
+    @staticmethod
+    def _intersect_precheck_actions(conflict: dict[str, Any], permission_actions: list[str]) -> list[str]:
+        """权限过滤只能收窄预检动作，不能重新放宽安全或兼容约束。"""
+        precheck_actions = set(conflict.get("suggested_actions", []))
+        return [action for action in permission_actions if action in precheck_actions]
 
     @classmethod
     def validate_conflict_decisions(cls, conflicts: list[dict], conflict_decisions: dict[str, str]) -> list[dict]:
@@ -255,6 +328,7 @@ class ImportExportAuthorizationService:
         yield ObjectType.ARCHITECTURE, getattr(doc, "architectures", [])
         yield ObjectType.SCREEN, getattr(doc, "screens", [])
         yield ObjectType.REPORT, getattr(doc, "reports", [])
+        yield ObjectType.NETWORK_TOPOLOGY, getattr(doc, "network_topologies", [])
 
     @classmethod
     def build_permission_error(cls, object_type: ObjectType, item, required_permissions: list[str], message: str) -> dict:
@@ -270,7 +344,7 @@ class ImportExportAuthorizationService:
     @classmethod
     def get_existing_object(cls, object_type: ObjectType, item):
         from apps.operation_analysis.models.datasource_models import DataSourceAPIModel, NameSpace
-        from apps.operation_analysis.models.models import Architecture, Dashboard, Report, Screen, Topology
+        from apps.operation_analysis.models.models import Architecture, Dashboard, NetworkTopology, Report, Screen, Topology
 
         if object_type == ObjectType.DASHBOARD:
             return Dashboard.objects.filter(name=item.name).first()
@@ -282,6 +356,8 @@ class ImportExportAuthorizationService:
             return Screen.objects.filter(name=item.name).first()
         if object_type == ObjectType.REPORT:
             return Report.objects.filter(name=item.name).first()
+        if object_type == ObjectType.NETWORK_TOPOLOGY:
+            return NetworkTopology.objects.filter(name=item.name).first()
         if object_type == ObjectType.DATASOURCE:
             return DataSourceAPIModel.objects.filter(name=item.name, rest_api=item.rest_api).first()
         if object_type == ObjectType.NAMESPACE:
@@ -292,7 +368,7 @@ class ImportExportAuthorizationService:
     def get_existing_objects_batch(cls, object_type: ObjectType, items) -> dict:
         """批量查询一组 items 对应的已存在对象，返回 {lookup_key: object} 字典，消除 N+1 查询。"""
         from apps.operation_analysis.models.datasource_models import DataSourceAPIModel, NameSpace
-        from apps.operation_analysis.models.models import Architecture, Dashboard, Report, Screen, Topology
+        from apps.operation_analysis.models.models import Architecture, Dashboard, NetworkTopology, Report, Screen, Topology
 
         if not items:
             return {}
@@ -311,6 +387,7 @@ class ImportExportAuthorizationService:
             ObjectType.ARCHITECTURE: Architecture,
             ObjectType.SCREEN: Screen,
             ObjectType.REPORT: Report,
+            ObjectType.NETWORK_TOPOLOGY: NetworkTopology,
             ObjectType.NAMESPACE: NameSpace,
         }
         model = model_map.get(object_type)
@@ -330,13 +407,14 @@ class ImportExportAuthorizationService:
         if getattr(request.user, "is_superuser", False):
             return True
 
-        if (
-            object_type in cls.ORG_SCOPED_OBJECT_TYPES
-            and current_team
-            and hasattr(existing, "groups")
-            and current_team not in (getattr(existing, "groups", None) or [])
-        ):
-            return False
+        if object_type in cls.ORG_SCOPED_OBJECT_TYPES and current_team and hasattr(existing, "groups"):
+            if object_type == ObjectType.DATASOURCE:
+                from apps.operation_analysis.common.datasource_visibility import can_access_datasource_in_org
+
+                if not can_access_datasource_in_org(existing, int(current_team)):
+                    return False
+            elif current_team not in (getattr(existing, "groups", None) or []):
+                return False
 
         export_config = cls.EXPORT_PERMISSION_MAP[object_type]
         permission_key = export_config.get("permission_key")
@@ -405,10 +483,21 @@ class ImportExportAuthorizationService:
         if model is not None:
             queryset = model.objects.filter(id__in=object_ids)
             if current_team is not None:
-                org_query = Q()
-                for group_id in group_ids or [current_team]:
-                    org_query |= Q(groups__contains=int(group_id))
-                queryset = queryset.filter(org_query)
+                required_fields = ["id", "groups"]
+                if object_type == ObjectType.DATASOURCE:
+                    required_fields.append("is_build_in")
+                target_group_ids = {int(group_id) for group_id in group_ids or [current_team]}
+                visible_ids = []
+                for instance in queryset.only(*required_fields):
+                    instance_group_ids = {int(group_id) for group_id in (getattr(instance, "groups", None) or [])}
+                    is_global_builtin = (
+                        object_type == ObjectType.DATASOURCE
+                        and bool(getattr(instance, "is_build_in", False))
+                        and not instance_group_ids
+                    )
+                    if is_global_builtin or target_group_ids.intersection(instance_group_ids):
+                        visible_ids.append(instance.id)
+                return visible_ids
             return list(queryset.values_list("id", flat=True))
 
         if object_type == ObjectType.NAMESPACE:
@@ -431,7 +520,7 @@ class ImportExportAuthorizationService:
     @staticmethod
     def _get_org_scoped_model(object_type: ObjectType):
         from apps.operation_analysis.models.datasource_models import DataSourceAPIModel
-        from apps.operation_analysis.models.models import Architecture, Dashboard, Report, Screen, Topology
+        from apps.operation_analysis.models.models import Architecture, Dashboard, NetworkTopology, Report, Screen, Topology
 
         return {
             ObjectType.DASHBOARD: Dashboard,
@@ -439,6 +528,7 @@ class ImportExportAuthorizationService:
             ObjectType.ARCHITECTURE: Architecture,
             ObjectType.SCREEN: Screen,
             ObjectType.REPORT: Report,
+            ObjectType.NETWORK_TOPOLOGY: NetworkTopology,
             ObjectType.DATASOURCE: DataSourceAPIModel,
         }.get(object_type)
 

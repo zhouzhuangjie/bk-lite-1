@@ -5,15 +5,66 @@
 """
 VMware 监控数据采集器
 """
+import asyncio
 import datetime
 from sanic.log import logger
 from .base_collector import BaseCollector
 
 
+def _resource_ip_map(object_id, object_list):
+    """ESXi / VM 的 resource_id → ip；其它对象不带 IP。"""
+    if object_id not in {"vmware_esxi", "vmware_vm"}:
+        return {}
+    mapping = {}
+    for resource in object_list or ():
+        resource_id = resource.get("resource_id")
+        ip = str(resource.get("ip_addr") or "").strip()
+        if resource_id and ip:
+            mapping[resource_id] = ip
+    return mapping
+
+
+def _attach_ip_dimension(metrics, ip):
+    """把 ip 写成 convert_to_prometheus 已支持的维度，不改公共转换层。"""
+    ip_dim = ("ip", ip)
+    attached = {}
+    for metric_name, metric_data in (metrics or {}).items():
+        if isinstance(metric_data, list):
+            attached[metric_name] = {(ip_dim,): metric_data}
+        elif isinstance(metric_data, dict):
+            attached[metric_name] = {
+                (ip_dim,) + tuple(dims): values
+                for dims, values in metric_data.items()
+            }
+        else:
+            attached[metric_name] = metric_data
+    return attached
+
+
 class VmwareCollector(BaseCollector):
     """VMware vCenter 监控数据采集器"""
 
+    async def probe(self):
+        return await asyncio.to_thread(self._probe_sync)
+
+    def _probe_sync(self):
+        from plugins.inputs.vmware_vc.vmware_info import VmwareManage
+
+        manager = VmwareManage(
+            params=dict(
+                username=self.params.get("username"),
+                password=self.params.get("password"),
+                hostname=self.params.get("host"),
+                ssl=self.params.get("ssl", "false"),
+                port=self.params.get("port", 443),
+            )
+        )
+        return manager._probe_sync()
+
     async def collect(self) -> str:
+        return await asyncio.to_thread(self._collect_sync)
+
+    def _collect_sync(self) -> str:
         """
         采集 VMware 监控指标
 
@@ -31,7 +82,7 @@ class VmwareCollector(BaseCollector):
 
         logger.info(f"[VMware Collector] ===== START COLLECTION =====")
         logger.info(f"[VMware Collector] Params: {list(self.params.keys())}")
-        logger.info(f"[VMware Collector] Target Host={host}, Minutes={minutes}, Username={username}")
+        logger.info(f"[VMware Collector] Target Host={host}, Minutes={minutes}")
         logger.info(f"[VMware Collector] ===================================")
 
         # 获取时间范围
@@ -74,6 +125,7 @@ class VmwareCollector(BaseCollector):
             if object_id == "vmware_vc" or not object_list:
                 continue
 
+            ip_by_resource = _resource_ip_map(object_id, object_list)
             resource_ids = [resource["resource_id"] for resource in object_list]
             logger.info(f"[VMware Collector] Processing '{object_id}': {len(resource_ids)} resources")
 
@@ -92,6 +144,9 @@ class VmwareCollector(BaseCollector):
                     continue
 
                 for resource_id, metrics in data["data"].items():
+                    ip = ip_by_resource.get(resource_id)
+                    if ip:
+                        metrics = _attach_ip_dimension(metrics, ip)
                     metric_dict[(resource_id, object_id)] = metrics
 
                 total_resources_processed += len(data["data"])

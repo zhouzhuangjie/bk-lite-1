@@ -5,14 +5,9 @@
 
 import pytest
 
-from apps.monitor.models import (
-    MonitorAlert,
-    MonitorAlertMetricSnapshot,
-    MonitorEvent,
-    MonitorEventRawData,
-)
+from apps.monitor.models import MonitorAlert, MonitorAlertMetricSnapshot, MonitorEvent, MonitorEventRawData
 from apps.monitor.models.monitor_object import MonitorObject
-from apps.monitor.models.monitor_policy import MonitorPolicy
+from apps.monitor.models.monitor_policy import MonitorPolicy, PolicyOrganization
 
 pytestmark = pytest.mark.django_db
 
@@ -21,14 +16,14 @@ BASE = "/api/v1/monitor"
 
 @pytest.fixture
 def grant_all(mocker):
-    # 两个 ViewSet 各自 import 了 get_permissions_rules / check_instance_permission
+    # 两个 ViewSet 共享策略权限根。
     mocker.patch(
         "apps.monitor.views.monitor_alert.get_permissions_rules",
-        return_value={"data": {"all": True}, "team": [1]},
+        return_value={"data": {"all": {"team": [1]}}, "team": [1]},
     )
     mocker.patch(
-        "apps.monitor.views.monitor_alert.check_instance_permission",
-        return_value=True,
+        "apps.core.utils.current_team_scope.SystemMgmt.get_authorized_groups_scoped",
+        return_value={"result": True, "data": [1]},
     )
 
 
@@ -44,12 +39,20 @@ def stub_s3(mocker):
     )
 
 
-def _policy():
+def _policy(**overrides):
     obj = MonitorObject.objects.create(name="AlertViewObj", level="base")
-    return MonitorPolicy.objects.create(
-        monitor_object=obj, name="p", algorithm="max",
-        query_condition={}, source={}, group_by=[],
-    )
+    values = {
+        "monitor_object": obj,
+        "name": "p",
+        "algorithm": "max",
+        "query_condition": {},
+        "source": {},
+        "group_by": [],
+    }
+    values.update(overrides)
+    policy = MonitorPolicy.objects.create(organizations=[1], **values)
+    PolicyOrganization.objects.create(policy=policy, organization=1)
+    return policy
 
 
 class TestGetSnapshots:
@@ -60,13 +63,82 @@ class TestGetSnapshots:
 
     def test_no_snapshot_returns_empty(self, api_client, grant_all):
         api_client.cookies["current_team"] = "1"
-        policy = _policy()
+        policy = _policy(
+            metric_unit="bytes",
+            calculation_unit="bytes",
+            threshold_unit="kibibytes",
+        )
         alert = MonitorAlert.objects.create(policy_id=policy.id, monitor_instance_id="h1", status="new")
         resp = api_client.get(f"{BASE}/api/monitor_alert/snapshots/{alert.id}/")
         assert resp.status_code == 200
         body = resp.json()["data"]
         assert body["snapshots"] == []
+        assert body["chart_unit"] == "kibibytes"
         assert body["alert_info"]["id"] == alert.id
+
+    def test_no_snapshot_legacy_policy_falls_back_to_calculation_unit(
+        self, api_client, grant_all
+    ):
+        api_client.cookies["current_team"] = "1"
+        policy = _policy(
+            metric_unit="bytes",
+            calculation_unit="kibibytes",
+            threshold_unit="",
+        )
+        alert = MonitorAlert.objects.create(
+            policy_id=policy.id, monitor_instance_id="h1", status="new"
+        )
+
+        resp = api_client.get(
+            f"{BASE}/api/monitor_alert/snapshots/{alert.id}/"
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["data"]["chart_unit"] == "kibibytes"
+
+    def test_converts_snapshot_copy_to_threshold_unit(
+        self, api_client, grant_all, mocker
+    ):
+        api_client.cookies["current_team"] = "1"
+        policy = _policy(
+            metric_unit="bytes",
+            calculation_unit="bytes",
+            threshold_unit="kibibytes",
+        )
+        alert = MonitorAlert.objects.create(
+            policy_id=policy.id, monitor_instance_id="h1", status="new"
+        )
+        source_snapshots = [
+            {
+                "type": "event",
+                "raw_data": {"values": [[1, "2048"], [2, None]]},
+            }
+        ]
+        mocker.patch(
+            "apps.core.fields.s3_json_field.S3JSONField._load_from_s3",
+            return_value=source_snapshots,
+        )
+        MonitorAlertMetricSnapshot.objects.create(
+            alert=alert,
+            policy_id=policy.id,
+            monitor_instance_id="h1",
+        )
+
+        resp = api_client.get(
+            f"{BASE}/api/monitor_alert/snapshots/{alert.id}/"
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()["data"]
+        assert body["chart_unit"] == "kibibytes"
+        assert body["snapshots"][0]["raw_data"]["values"] == [
+            [1, "2.0"],
+            [2, None],
+        ]
+        assert source_snapshots[0]["raw_data"]["values"] == [
+            [1, "2048"],
+            [2, None],
+        ]
 
     def test_returns_snapshot_data(self, api_client, grant_all, mocker):
         api_client.cookies["current_team"] = "1"
@@ -101,6 +173,37 @@ class TestAlertUpdateClose:
         assert alert.operator == "testuser"
         assert alert.operation_logs[-1]["action"] == "closed"
         notifier.return_value.notify_alerts.assert_called_once()
+
+
+class TestAlertListNoticeUsersDisplay:
+    def test_list_enriches_notice_users_display(self, api_client, grant_all):
+        from apps.system_mgmt.models import User
+
+        api_client.cookies["current_team"] = "1"
+        user = User.objects.create(
+            username="notifier1",
+            display_name="通知人甲",
+            email="notifier1@example.com",
+            password="x",
+        )
+        policy = _policy(notice=True, notice_users=[user.id])
+        MonitorAlert.objects.create(
+            policy_id=policy.id,
+            monitor_instance_id="h1",
+            status="new",
+            notice_users=[user.id],
+            content="memory high",
+        )
+
+        resp = api_client.get(
+            f"{BASE}/api/monitor_alert/",
+            {"status_in": "new", "page": 1, "page_size": 20},
+        )
+
+        assert resp.status_code == 200
+        results = resp.json()["data"]["results"]
+        assert results
+        assert results[0]["notice_users_display"] == ["通知人甲(notifier1)"]
 
 
 class TestGetEvents:

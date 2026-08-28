@@ -2,7 +2,7 @@ from django.db.models import Q
 from django.http import JsonResponse
 from django_filters import filters
 from django_filters.rest_framework import FilterSet
-from rest_framework import viewsets
+from rest_framework import serializers, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
@@ -11,7 +11,8 @@ from apps.core.utils.loader import LanguageLoader
 from apps.core.utils.viewset_utils import GenericViewSetFun
 from apps.system_mgmt.models import Channel, ChannelChoices, User
 from apps.system_mgmt.serializers import ChannelSerializer
-from apps.system_mgmt.utils.channel_utils import send_by_dingtalk_bot, send_by_feishu_bot, send_by_wecom_bot, send_email
+from apps.system_mgmt.utils.channel_utils import send_by_custom_webhook, send_by_dingtalk_bot, send_by_feishu_bot, send_by_wecom_bot, send_email
+from apps.system_mgmt.utils.network_whitelist_error import NETWORK_WHITELIST_REQUIRED, build_network_whitelist_error_payload
 from apps.system_mgmt.utils.operation_log_utils import log_operation
 
 
@@ -263,8 +264,11 @@ class ChannelViewSet(viewsets.ModelViewSet, GenericViewSetFun):
             obj.encrypt_field("webhook_url", config)
             config.setdefault("webhook_url", obj.config["webhook_url"])
         elif obj.channel_type == "nats":
-            # NATS 配置无需加密处理
-            pass
+            try:
+                ChannelSerializer.validate_nats_config(config)
+                ChannelSerializer.validate_nats_subject_key_unique(config, exclude_channel_id=obj.pk)
+            except serializers.ValidationError as exc:
+                return Response({"result": False, "message": exc.detail}, status=400)
         obj.config = config
         obj.save()
 
@@ -285,6 +289,7 @@ class ChannelViewSet(viewsets.ModelViewSet, GenericViewSetFun):
             ChannelChoices.ENTERPRISE_WECHAT_BOT,
             ChannelChoices.FEISHU_BOT,
             ChannelChoices.DINGTALK_BOT,
+            ChannelChoices.CUSTOM_WEBHOOK,
         }
         if channel_type not in supported_types:
             return Response({"result": False, "message": "Unsupported channel type"}, status=400)
@@ -295,18 +300,27 @@ class ChannelViewSet(viewsets.ModelViewSet, GenericViewSetFun):
         content = f"This is a test message from channel '{channel_name}'.<br/>Receiver: {receiver_name}"
 
         if channel_type == ChannelChoices.EMAIL:
-            if not request.user.email:
+            # request.user 是 base.User；发信收件人必须定位到同 username/domain 的 system_mgmt.User，
+            # 不能用 base 主键去查业务用户表（两表自增 id 不对齐）。
+            domain = getattr(request.user, "domain", None) or "domain.com"
+            user_list = User.objects.filter(username=request.user.username, domain=domain)
+            if not user_list.exists():
+                return Response({"result": False, "message": "Current user not found"}, status=400)
+            if not user_list.exclude(email="").exists():
                 return Response({"result": False, "message": "Current user email is empty"}, status=400)
-            user_list = User.objects.filter(id=request.user.id)
             result = send_email(test_channel, title, content, user_list)
         elif channel_type == ChannelChoices.ENTERPRISE_WECHAT_BOT:
             result = send_by_wecom_bot(test_channel, content, [receiver_name])
         elif channel_type == ChannelChoices.FEISHU_BOT:
             result = send_by_feishu_bot(test_channel, title, content, [receiver_name])
+        elif channel_type == ChannelChoices.CUSTOM_WEBHOOK:
+            result = send_by_custom_webhook(test_channel, content, [receiver_name])
         else:
             result = send_by_dingtalk_bot(test_channel, title, content, [receiver_name])
 
         if result.get("result") is False:
+            if result.get("code") == NETWORK_WHITELIST_REQUIRED or result.get("message") == "webhook domain or IP not in whitelist":
+                return JsonResponse(build_network_whitelist_error_payload(self._get_loader(request)), status=400)
             return Response({"result": False, "message": result.get("message") or "Test send failed"}, status=400)
 
         if channel_type != ChannelChoices.EMAIL:

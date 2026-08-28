@@ -1,6 +1,6 @@
 'use client';
 
-import React, {useCallback, useEffect, useState} from 'react';
+import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {Button, Dropdown, Form, Menu, message, Spin, Tag} from 'antd';
 import {useTranslation} from '@/utils/i18n';
 import {DownOutlined} from '@ant-design/icons';
@@ -14,6 +14,8 @@ import {useStudioApi} from '@/app/opspilot/api/studio';
 import ChatflowSettings from '@/app/opspilot/components/studio/chatflowSettings';
 import {useUnsavedChanges} from '@/app/opspilot/hooks/useUnsavedChanges';
 import {useStudio} from '@/app/opspilot/context/studioContext';
+import { useThemeMode } from '@/theme';
+import { notifyWebchatAppsChanged } from '@/app/(core)/components/global-webchat/apps-changed';
 
 const actionButtonClassName = 'inline-flex h-7 items-center rounded-md px-2.5 text-[11px] font-medium leading-none';
 const actionTagClassName = 'mb-0 mr-0 inline-flex h-7 items-center rounded-md px-2 text-[11px] font-medium leading-none';
@@ -40,6 +42,13 @@ const StudioSettingsPage: React.FC = () => {
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
   const [originalWorkflowData, setOriginalWorkflowData] = useState<{ nodes: any[], edges: any[] }>({ nodes: [], edges: [] });
 
+  // 同步镜像 workflowData,绕开 setWorkflowData 的异步批处理:
+  // ChatflowEditor 节点配置改动 → onSaveWorkflow → setWorkflowData 是异步的,
+  // 用户立刻点"保存并发布"时 workflowData state 仍为旧版,publish 的 workflow_data 缺改动,
+  // 导致应用对话列表查不到,要再点开 web 应用节点保存一次才出现。
+  // 用 ref 同步镜像,handleChatflowSave 优先读 ref,杜绝时序竞态。
+  const workflowDataRef = useRef<{ nodes: any[]; edges: any[] }>({ nodes: [], edges: [] });
+
   const searchParams = useSearchParams();
   const botId = searchParams ? searchParams.get('id') : null;
   const { fetchInitialData, saveBotConfig, toggleOnlineStatus } = useStudioApi();
@@ -58,6 +67,7 @@ const StudioSettingsPage: React.FC = () => {
           const { nodes = [], edges = [] } = botData.workflow_data;
           if (Array.isArray(nodes) && Array.isArray(edges)) {
             setWorkflowData({ nodes, edges });
+            workflowDataRef.current = { nodes: [...nodes], edges: [...edges] };
           }
         }
 
@@ -97,13 +107,14 @@ const StudioSettingsPage: React.FC = () => {
       await toggleOnlineStatus(botId);
       setOnline(prevOnline => !prevOnline);
       message.success(t('common.saveSuccess'));
+      notifyWebchatAppsChanged();
     } catch {
       message.error(t('common.saveFailed'));
     }
   };
 
-  const theme = typeof window !== 'undefined' && localStorage.getItem('theme');
-  const overlayBgClass = theme === 'dark' ? 'bg-gray-950' : 'bg-white';
+  const { mode } = useThemeMode();
+  const overlayBgClass = mode === 'dark' ? 'bg-gray-950' : 'bg-white';
 
   // Move chatflow related functions to top level
   const handleClearCanvas = () => {
@@ -126,6 +137,12 @@ const StudioSettingsPage: React.FC = () => {
       const newDataStr = JSON.stringify(newWorkflowData);
 
       if (prevDataStr !== newDataStr) {
+        // 同步写 ref,handleChatflowSave 发布时能立刻读到最新数据
+        workflowDataRef.current = {
+          nodes: [...newWorkflowData.nodes],
+          edges: [...newWorkflowData.edges],
+        };
+
         // Check if data has changed from original
         const originalDataStr = JSON.stringify(originalWorkflowData);
         const isChanged = newDataStr !== originalDataStr;
@@ -143,12 +160,17 @@ const StudioSettingsPage: React.FC = () => {
     try {
       const values = await form.validateFields();
 
+      // 优先读 ref(同步值),回退到 state(ref 缺失兜底):避免 setWorkflowData 异步竞态
+      const currentWorkflowData = workflowDataRef.current.nodes.length || workflowDataRef.current.edges.length
+        ? workflowDataRef.current
+        : workflowData;
+
       const payload = {
         name: values.name,
         introduction: values.introduction,
         team: values.group,
         usage_team: values.usage_team,
-        workflow_data: workflowData,
+        workflow_data: currentWorkflowData,
         is_publish: isPublish
       };
 
@@ -156,8 +178,8 @@ const StudioSettingsPage: React.FC = () => {
 
       // Reset unsaved changes status after successful save
       setOriginalWorkflowData({
-        nodes: [...workflowData.nodes],
-        edges: [...workflowData.edges]
+        nodes: [...currentWorkflowData.nodes],
+        edges: [...currentWorkflowData.edges]
       });
       setHasUnsavedChanges(false);
       refreshBotInfo();
@@ -167,6 +189,7 @@ const StudioSettingsPage: React.FC = () => {
       if (isPublish) {
         setOnline(true);
       }
+      notifyWebchatAppsChanged();
     } catch (error) {
       console.error('Save failed', error);
       message.error(t('common.saveFailed'));

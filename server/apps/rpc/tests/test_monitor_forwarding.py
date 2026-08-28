@@ -4,7 +4,6 @@
 两个客户端的方法名 + 参数转发契约。替换 self.client 为记录器，不触达真实 NATS。
 """
 import pydantic.root_model  # noqa
-
 import pytest
 
 from apps.rpc.monitor import Monitor, MonitorOperationAnaRpc
@@ -50,10 +49,21 @@ def test_monitor_get_module_list(monitor):
     assert _last(monitor.client) == ("get_monitor_module_list", (), {"module": "cpu"})
 
 
+def test_monitor_ingest_from_source(monitor):
+    monitor.ingest_client = monitor.client
+    monitor.ingest_from_source(source_module="node_mgmt", allowed_org_ids=[1])
+    assert _last(monitor.client) == (
+        "monitor_ingest_from_source",
+        (),
+        {"params": {"source_module": "node_mgmt", "allowed_org_ids": [1]}},
+    )
+
+
 def test_monitor_local_client_appclient_path(monkeypatch):
     monkeypatch.setenv("IS_LOCAL_RPC", "0")
     m = Monitor(is_local_client=True)
     assert m.client.path == "apps.monitor.nats.permission"
+    assert m.ingest_client.path == "apps.monitor.nats.monitor"
 
 
 def test_create_monitor_object_type(ana_rpc):
@@ -88,6 +98,24 @@ def test_create_metric(ana_rpc):
 def test_create_monitor_policy(ana_rpc):
     ana_rpc.create_monitor_policy({"pol": 1})
     assert _last(ana_rpc.client) == ("create_monitor_policy", (), {"data": {"pol": 1}})
+
+
+def test_search_monitor_policies(ana_rpc):
+    ana_rpc.search_monitor_policies("demo-host-cpu-high", user_info={"team": 1})
+    assert _last(ana_rpc.client) == (
+        "search_monitor_policies",
+        (),
+        {"name": "demo-host-cpu-high", "user_info": {"team": 1}},
+    )
+
+
+def test_delete_monitor_policy(ana_rpc):
+    ana_rpc.delete_monitor_policy(9, user_info={"team": 1})
+    assert _last(ana_rpc.client) == (
+        "delete_monitor_policy",
+        (),
+        {"policy_id": 9, "user_info": {"team": 1}},
+    )
 
 
 def test_monitor_objects(ana_rpc):
@@ -146,3 +174,40 @@ def test_query_latest_active_alerts(ana_rpc):
     qd = {"limit": 5}
     ana_rpc.query_latest_active_alerts(qd)
     assert _last(ana_rpc.client) == ("query_latest_active_alerts", (), {"query_data": qd})
+
+
+def test_query_latest_interface_metrics(ana_rpc):
+    ana_rpc.query_latest_interface_metrics(["mon-1", "mon-2"])
+    assert _last(ana_rpc.client) == (
+        "query_latest_interface_metrics",
+        (),
+        {"instance_ids": ["mon-1", "mon-2"]},
+    )
+
+
+def test_get_host_instance_list(ana_rpc):
+    ana_rpc.get_host_instance_list(user_info={"team": 1})
+    assert _last(ana_rpc.client) == ("get_host_instance_list", (), {"user_info": {"team": 1}})
+
+
+def test_get_host_metric_range(ana_rpc):
+    ana_rpc.get_host_metric_range(instance_ids=["host-a"], metric_type="cpu")
+    assert _last(ana_rpc.client) == (
+        "get_host_metric_range",
+        (),
+        {"instance_ids": ["host-a"], "metric_type": "cpu"},
+    )
+
+
+def test_get_host_resource_snapshot(ana_rpc):
+    ana_rpc.get_host_resource_snapshot(instance_ids=["host-a"])
+    assert _last(ana_rpc.client) == ("get_host_resource_snapshot", (), {"instance_ids": ["host-a"]})
+
+
+def test_get_host_resource_top(ana_rpc):
+    ana_rpc.get_host_resource_top("cpu", instance_ids=["host-a"])
+    assert _last(ana_rpc.client) == (
+        "get_host_resource_top",
+        (),
+        {"metric_type": "cpu", "instance_ids": ["host-a"]},
+    )

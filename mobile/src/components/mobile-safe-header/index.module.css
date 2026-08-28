@@ -1,0 +1,21 @@
+.header {
+  flex: 0 0 auto;
+  padding-top: var(--safe-area-inset-top);
+  background: var(--color-page-header-bg);
+}
+
+.headerElevated {
+  position: relative;
+  z-index: 30;
+}
+
+.headerElevated {
+  position: relative;
+  z-index: 30;
+}
+
+.content {
+  box-sizing: border-box;
+  height: var(--mobile-header-height);
+  min-height: var(--mobile-header-height);
+}

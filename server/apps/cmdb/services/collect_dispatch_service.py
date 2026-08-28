@@ -32,13 +32,9 @@ class DispatchAttemptResult:
 class CollectDispatchService:
     """负责目标分组、凭据选择、复用现有采集链路并聚合结果。"""
 
-    SUPPORTED_TASK_TYPES = {
-        CollectPluginTypes.HOST,
-        CollectPluginTypes.DB,
-        CollectPluginTypes.MIDDLEWARE,
+    # 仅保留真正需要逐目标触发采集的类型；VM 结果由 Server 按任务统一消费。
+    TARGET_DISPATCH_TASK_TYPES = {
         CollectPluginTypes.CONFIG_FILE,
-        CollectPluginTypes.SNMP,
-        CollectPluginTypes.PROTOCOL,
     }
 
     CREDENTIAL_ERROR_KEYWORDS = (
@@ -56,9 +52,9 @@ class CollectDispatchService:
 
     @classmethod
     def should_dispatch(cls, task) -> bool:
-        """仅在首期支持任务且凭据池大于 1 时启用多凭据派发。"""
+        """仅异步逐目标触发任务启用多凭据派发；VM 结果型任务按任务同步一次。"""
         pool = CollectCredentialPoolService.normalize_pool(cls._resolve_task_credentials(task))
-        return len(pool) > 1 and task.task_type in cls.SUPPORTED_TASK_TYPES
+        return len(pool) > 1 and task.task_type in cls.TARGET_DISPATCH_TASK_TYPES
 
     @classmethod
     def execute_task(cls, task) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -90,7 +86,7 @@ class CollectDispatchService:
                     target = target_map[attempt.object_key]
                     snapshot = CollectTargetService.build_target_snapshot(target)
                     if attempt.success:
-                        logger.info(
+                        logger.debug(
                             "[CollectDispatch] 凭据尝试成功 task_id=%s object_key=%s credential_id=%s",
                             task.id,
                             attempt.object_key,
@@ -132,7 +128,17 @@ class CollectDispatchService:
 
             pending_object_keys = list(dict.fromkeys(next_pending))
 
-        return cls.merge_attempt_results(task, attempts)
+        success_count = sum(attempt.success for attempt in attempts)
+        merged_result = cls.merge_attempt_results(task, attempts)
+        logger.info(
+            "[CollectDispatch] 任务派发完成 task_id=%s target_count=%s attempt_count=%s success_count=%s failure_count=%s",
+            task.id,
+            len(targets),
+            len(attempts),
+            success_count,
+            len(attempts) - success_count,
+        )
+        return merged_result
 
     @classmethod
     def plan_dispatch(cls, task, targets, pool, states) -> dict[str, list[CanonicalCollectTarget]]:

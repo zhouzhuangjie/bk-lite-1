@@ -1,4 +1,6 @@
 # -- coding: utf-8 --
+from django.db.models import Count, F, Q, Window
+from django.db.models.functions import RowNumber
 from django.db.models.query import QuerySet
 from django.utils import timezone
 from rest_framework import serializers
@@ -21,7 +23,6 @@ class AlertModelSerializer(AuthSerializer):
     permission_key = PERMISSION_ALERT
 
     event_count = serializers.SerializerMethodField()
-    source_names = serializers.SerializerMethodField()
     # 持续时间
     duration = serializers.SerializerMethodField()
     operator_user = serializers.SerializerMethodField()
@@ -33,14 +34,22 @@ class AlertModelSerializer(AuthSerializer):
     last_event_time = serializers.DateTimeField(format="%Y-%m-%d %H:%M:%S", read_only=True)
     incident_name = serializers.SerializerMethodField()
     notify_status = serializers.SerializerMethodField()
+    notify_total = serializers.SerializerMethodField()
+    notify_records = serializers.SerializerMethodField()
 
     def __init__(self, instance=None, data=empty, **kwargs):
         super().__init__(instance=instance, data=data, **kwargs)
         try:
-            self.alert_notify_result_map = self.set_alert_notify_result_map(instance)
+            (
+                self.alert_notify_result_map,
+                self.alert_notify_total_map,
+                self.alert_notify_records_map,
+            ) = self.set_alert_notification_maps(instance)
         except Exception:
             logger.warning("初始化告警通知结果映射失败", exc_info=True)
             self.alert_notify_result_map = {}
+            self.alert_notify_total_map = {}
+            self.alert_notify_records_map = {}
 
     class Meta:
         model = Alert
@@ -69,23 +78,89 @@ class AlertModelSerializer(AuthSerializer):
 
     @staticmethod
     def set_alert_notify_result_map(instance):
-        result = {}
+        result_map, _, _ = AlertModelSerializer.set_alert_notification_maps(instance)
+        return result_map
+
+    @staticmethod
+    def set_alert_notification_maps(instance):
+        from apps.alerts.models import NotifyResult
+
         if isinstance(instance, (list, tuple, QuerySet)):
-            from apps.alerts.models import NotifyResult
+            alert_instances = instance
+        elif getattr(instance, "alert_id", None):
+            alert_instances = [instance]
+        else:
+            return {}, {}, {}
 
-            alerts = [item.alert_id for item in instance if getattr(item, "alert_id", None)]
-            if not alerts:
-                return result
+        alert_ids = [item.alert_id for item in alert_instances if getattr(item, "alert_id", None)]
+        if not alert_ids:
+            return {}, {}, {}
 
-            notify_result = NotifyResult.objects.filter(
-                notify_type="alert",
-                notify_object__in=alerts,
-            ).values_list("notify_object", "notify_result")
+        status_map = {}
+        total_map = {}
+        raw_records_map = {}
+        usernames = set()
+        notify_result_filter = NotifyResult.objects.filter(
+            notify_type="alert",
+            notify_object__in=alert_ids,
+        )
 
-            for notify_object, notify_status in notify_result:
-                result.setdefault(notify_object, []).append(notify_status == NotifyResultStatus.SUCCESS)
+        aggregate_rows = notify_result_filter.values("notify_object").annotate(
+            total=Count("id"),
+            success=Count("id", filter=Q(notify_result=NotifyResultStatus.SUCCESS)),
+        )
+        for row in aggregate_rows:
+            notify_object = row["notify_object"]
+            total = row["total"]
+            success = row["success"]
+            total_map[notify_object] = total
+            if success == total:
+                status_map[notify_object] = [True]
+            elif success == 0:
+                status_map[notify_object] = [False]
+            else:
+                status_map[notify_object] = [True, False]
 
-        return result
+        latest_notify_results = (
+            notify_result_filter.annotate(
+                row_number=Window(
+                    expression=RowNumber(),
+                    partition_by=[F("notify_object")],
+                    order_by=[F("notify_time").desc(), F("id").desc()],
+                )
+            )
+            .filter(row_number__lte=5)
+            .order_by("notify_object", "-notify_time", "-id")
+        )
+
+        for notify_result in latest_notify_results:
+            notify_object = notify_result.notify_object
+            records = raw_records_map.setdefault(notify_object, [])
+            records.append(notify_result)
+            usernames.update(str(user) for user in (notify_result.notify_people or []))
+
+        user_map = dict(User.objects.filter(username__in=usernames).values_list("username", "display_name")) if usernames else {}
+        records_map = {}
+        for notify_object, notify_results in raw_records_map.items():
+            records_map[notify_object] = [
+                {
+                    "notify_time": timezone.localtime(item.notify_time).strftime("%Y-%m-%d %H:%M:%S"),
+                    "channel": item.notify_channel or "",
+                    "channel_name": item.notify_channel_name or item.notify_channel or "",
+                    "recipients": [
+                        {
+                            "username": str(username),
+                            "display_name": user_map.get(str(username)) or str(username),
+                        }
+                        for username in (item.notify_people or [])
+                    ],
+                    "result": item.notify_result,
+                    "failure_reason": item.failure_reason,
+                }
+                for item in notify_results
+            ]
+
+        return status_map, total_map, records_map
 
     @staticmethod
     def get_duration(obj):
@@ -118,28 +193,6 @@ class AlertModelSerializer(AuthSerializer):
             result += f"{seconds}s"
 
         return result
-
-    @staticmethod
-    def get_source_names(obj):
-        """
-        Get the names of the sources associated with the alert.
-        通过 Alert -> Events -> AlertSource 获取告警源名称
-        """
-        # 如果使用了注解（推荐）
-        if hasattr(obj, "source_names_annotated") and obj.source_names_annotated:
-            return obj.source_names_annotated
-
-        # fallback: 通过关联查询获取
-        try:
-            # Alert -> Events -> AlertSource
-            source_names = set()  # 使用set去重
-            for event in obj.events.all():
-                if event.source:
-                    source_names.add(event.source.name)
-            return ", ".join(sorted(source_names))
-        except Exception:
-            logger.warning("获取告警源名称失败", exc_info=True)
-            return ""
 
     @staticmethod
     def get_event_count(obj):
@@ -197,3 +250,9 @@ class AlertModelSerializer(AuthSerializer):
         if any(alert_result):
             return NotifyResultStatus.PARTIAL_SUCCESS
         return NotifyResultStatus.FAILED
+
+    def get_notify_total(self, obj):
+        return self.alert_notify_total_map.get(obj.alert_id, 0)
+
+    def get_notify_records(self, obj):
+        return self.alert_notify_records_map.get(obj.alert_id, [])

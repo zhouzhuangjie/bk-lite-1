@@ -1,3 +1,4 @@
+from apps.core.utils.internal_event_auth import build_internal_event_payload, sign_internal_event
 from apps.rpc.base import AppClient
 
 
@@ -8,6 +9,18 @@ class SystemMgmt(object):
     def bk_lite_user_login(self, username, domain):
         return_data = self.client.run("bk_lite_user_login", username=username, domain=domain)
         return return_data
+
+    def login_with_binding(self, binding_id, auth_code="", username="", password=""):
+        return self.client.run(
+            "login_with_binding",
+            binding_id=binding_id,
+            auth_code=auth_code,
+            username=username,
+            password=password,
+        )
+
+    def get_login_auth_bindings(self):
+        return self.client.run("get_login_auth_bindings")
 
     def create_default_rule(self, llm_model, ocr_model, embed_model, rerank_model):
         return_data = self.client.run(
@@ -43,6 +56,10 @@ class SystemMgmt(object):
         return_data = self.client.run("get_all_groups")
         return return_data
 
+    def get_archived_groups(self, page=1, page_size=100):
+        """分页查询已归档组织，供其他模块自行处理资产/数据。"""
+        return self.client.run("get_archived_groups", page=page, page_size=page_size)
+
     def get_all_users(self):
         return_data = self.client.run("get_all_users")
         return return_data
@@ -54,6 +71,25 @@ class SystemMgmt(object):
             include_children=include_children,
         )
         return return_data
+
+    def get_user_group_tree(self, username, sync_source_id=None):
+        """
+        按 (username, sync_source_id) 唯一定位用户，返回其组织树。
+        返回结构与 login_info.group_tree 形态一致。
+
+        :param username: 用户名
+        :param sync_source_id: UserSyncSource 主键(int)；None 或空串表示本地用户(User.sync_source IS NULL)
+        :return: {"result": bool, "data": {"user_id", "username", "domain", "group_list", "group_tree"} | "message": str}
+        """
+        return_data = self.client.run(
+            "get_user_group_tree",
+            username=username,
+            sync_source_id=sync_source_id,
+        )
+        return return_data
+
+    def get_assignable_groups(self, actor_context):
+        return self.client.run("get_assignable_groups", actor_context=actor_context)
 
     def get_client(self, client_id, username="", domain="domain.com"):
         return_data = self.client.run("get_client", client_id=client_id, username=username, domain=domain)
@@ -171,8 +207,7 @@ class SystemMgmt(object):
         """
         return self.client.run("save_error_log", username=username, app=app, module=module, error_message=error_message, domain=domain)
 
-    def save_operation_log(self, username, source_ip, app, action_type, summary="", domain="domain.com",
-                           target_type="", target_id="", detail=None):
+    def save_operation_log(self, username, source_ip, app, action_type, summary="", domain="domain.com", target_type="", target_id="", detail=None):
         """
         保存操作日志
         :param username: 用户名
@@ -186,28 +221,116 @@ class SystemMgmt(object):
         :param detail: 操作详情 JSON（可选，默认空字典）
         """
         return self.client.run(
-            "save_operation_log", username=username, source_ip=source_ip, app=app, action_type=action_type,
-            summary=summary, domain=domain, target_type=target_type, target_id=target_id, detail=detail,
+            "save_operation_log",
+            username=username,
+            source_ip=source_ip,
+            app=app,
+            action_type=action_type,
+            summary=summary,
+            domain=domain,
+            target_type=target_type,
+            target_id=target_id,
+            detail=detail,
         )
 
-    def search_channel_list(self, channel_type, teams, include_children):
+    def search_channel_list(self, channel_type, teams, include_children, channel_method=""):
         """
         :param channel_type: str， 目前只有email、enterprise_wechat
         :param teams: list, [1,2,3]
         :param include_children: bool , True、False
         """
-        return_data = self.client.run("search_channel_list", channel_type=channel_type, teams=teams, include_children=include_children)
+        kwargs = {
+            "channel_type": channel_type,
+            "teams": teams,
+            "include_children": include_children,
+        }
+        if channel_method:
+            kwargs["channel_method"] = channel_method
+        return_data = self.client.run("search_channel_list", **kwargs)
         return return_data
 
-    def search_channel_list_scoped(self, actor_context, channel_type="", teams=None, include_children=False):
-        return_data = self.client.run(
-            "search_channel_list_scoped",
+    def search_channel_list_scoped(
+        self,
+        actor_context,
+        channel_type="",
+        teams=None,
+        include_children=False,
+        channel_method="",
+    ):
+        kwargs = {
+            "actor_context": actor_context,
+            "channel_type": channel_type,
+            "teams": teams,
+            "include_children": include_children,
+        }
+        if channel_method:
+            kwargs["channel_method"] = channel_method
+        return_data = self.client.run("search_channel_list_scoped", **kwargs)
+        return return_data
+
+    def list_notification_channels_scoped(self, actor_context, teams=None, include_children=False):
+        return self.client.run(
+            "list_notification_channels_scoped",
             actor_context=actor_context,
-            channel_type=channel_type,
             teams=teams,
             include_children=include_children,
         )
-        return return_data
+
+    def search_notification_recipients_scoped(
+        self,
+        actor_context,
+        teams=None,
+        include_children=False,
+        search="",
+        limit=100,
+    ):
+        return self.client.run(
+            "search_notification_recipients_scoped",
+            actor_context=actor_context,
+            teams=teams,
+            include_children=include_children,
+            search=search,
+            limit=limit,
+        )
+
+    def dispatch_notification(
+        self,
+        *,
+        delivery_key,
+        channel_id,
+        organization_ids,
+        recipients,
+        title,
+        body,
+        event_payload,
+        required_delivery_mode="",
+        producer="lite-apm",
+        ack_mode="",
+        ack_token="",
+        internal_caller="",
+    ):
+        request_payload = build_internal_event_payload("system_mgmt.dispatch_notification", locals())
+        internal_auth = None
+        if internal_caller:
+            if internal_caller != producer:
+                raise ValueError("Internal notification caller must match producer.")
+            internal_auth = sign_internal_event(
+                "system_mgmt.dispatch_notification",
+                request_payload,
+                caller=internal_caller,
+            )
+        return self.client.run(
+            "dispatch_notification",
+            **request_payload,
+            internal_auth=internal_auth,
+        )
+
+    def probe_notification_channel(self, channel_id, capability_only=False):
+        return self.client.run(
+            "probe_notification_channel",
+            channel_id=channel_id,
+            capability_only=capability_only,
+        )
 
     def search_groups(self, query_params):
         """
@@ -245,7 +368,7 @@ class SystemMgmt(object):
         return_data = self.client.run("send_email_to_receiver", title=title, content=content, receiver=receiver)
         return return_data
 
-    def send_msg_with_channel(self, channel_id, title, content, receivers, attachments=None):
+    def send_msg_with_channel(self, channel_id, title, content, receivers, attachments=None, *, internal_caller=""):
         """
         通过指定通道发送消息
         :param channel_id: 1 通道id
@@ -256,15 +379,21 @@ class SystemMgmt(object):
             [{"filename": "文件名.pdf", "content": "base64编码的文件内容"}, ...]
             注意: 附件内容必须是base64编码的字符串，因为NATS使用JSON序列化传输
         """
-        return_data = self.client.run(
+        request_payload = build_internal_event_payload("system_mgmt.send_msg_with_channel", locals())
+        internal_auth = None
+        if internal_caller:
+            if not isinstance(content, dict) or content.get("pusher") != internal_caller:
+                raise ValueError("Internal notification caller must match payload pusher.")
+            internal_auth = sign_internal_event(
+                "system_mgmt.send_msg_with_channel",
+                request_payload,
+                caller=internal_caller,
+            )
+        return self.client.run(
             "send_msg_with_channel",
-            channel_id=channel_id,
-            title=title,
-            content=content,
-            receivers=receivers,
-            attachments=attachments,
+            **request_payload,
+            internal_auth=internal_auth,
         )
-        return return_data
 
     def sync_opspilot_nats_channels(self, bot_id, bot_name, team, nodes, timeout=60):
         """对账 OpsPilot 某个 bot 的 NATS 触发节点对应的通道（增/改/删）。

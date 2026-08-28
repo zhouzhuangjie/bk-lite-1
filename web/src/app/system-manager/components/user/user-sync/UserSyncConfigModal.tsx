@@ -1,0 +1,165 @@
+import React, { useEffect, useMemo, useState } from 'react';
+import { Button, Form, message } from 'antd';
+
+import OperateModal from '@/components/operate-modal';
+import type { ProviderManifest } from '@/app/system-manager/types/integration-center';
+import type { AvailableInstance, UserSyncSource, UserSyncSourceConfigFormValues } from '@/app/system-manager/types/user-sync';
+import {
+  getWriteOnlyKeys,
+  getEffectiveRootDepartmentFieldKey,
+  getUserSyncEditFormBusinessConfig,
+  resolveUserSyncTemplate,
+} from '@/app/system-manager/utils/userSyncUtils';
+import {
+  type MappingRow,
+  toMappingRows,
+  validateRequiredUserMapping,
+} from '@/app/system-manager/utils/userSyncPageUtils';
+import UserSyncConfigFields from '@/app/system-manager/components/user/user-sync/UserSyncConfigFields';
+
+interface UserSyncConfigModalProps {
+  open: boolean;
+  source: UserSyncSource | null;
+  loading: boolean;
+  previewLoading: boolean;
+  availableInstances: AvailableInstance[];
+  providers: ProviderManifest[];
+  providersLoading: boolean;
+  t: (key: string, fallback?: string) => string;
+  onClose: () => void;
+  onPreview: (values: UserSyncSourceConfigFormValues, mappingRows: MappingRow[], writeOnlyKeys: Set<string>) => void;
+  onSubmit: (values: UserSyncSourceConfigFormValues, mappingRows: MappingRow[]) => void;
+}
+
+const UserSyncConfigModal: React.FC<UserSyncConfigModalProps> = ({
+  open,
+  source,
+  loading,
+  previewLoading,
+  availableInstances,
+  providers,
+  providersLoading,
+  t,
+  onClose,
+  onPreview,
+  onSubmit,
+}) => {
+  const [form] = Form.useForm<UserSyncSourceConfigFormValues>();
+  const [mappingRows, setMappingRows] = useState<MappingRow[]>(toMappingRows({}));
+  const [mappingError, setMappingError] = useState('');
+
+  const resolvedTemplate = useMemo(
+    () => resolveUserSyncTemplate(
+      source?.integration_instance,
+      availableInstances,
+      providers,
+      source?.integration_provider_key,
+    ),
+    [source?.integration_instance, source?.integration_provider_key, availableInstances, providers],
+  );
+  const rootScopeFieldKey = useMemo(
+    () => getEffectiveRootDepartmentFieldKey(source, resolvedTemplate),
+    [resolvedTemplate, source],
+  );
+  const initialRootScopeValue = (() => {
+    const raw = source?.business_config?.[rootScopeFieldKey]
+      ?? source?.business_config?.root_dns
+      ?? source?.business_config?.root_dn;
+    if (Array.isArray(raw)) {
+      return raw.map((item) => String(item)).join('\n');
+    }
+    return typeof raw === 'string' ? raw : '';
+  })();
+
+  useEffect(() => {
+    if (!open || !source) return;
+    form.resetFields();
+    form.setFieldsValue({
+      business_config: getUserSyncEditFormBusinessConfig(
+        source.business_config,
+        resolvedTemplate,
+        rootScopeFieldKey,
+      ),
+      platform_config: source.platform_config || {},
+    });
+    setMappingRows(toMappingRows(source.field_mapping));
+    setMappingError('');
+  }, [open, resolvedTemplate, rootScopeFieldKey, source, form]);
+
+  const writeOnlyKeys = useMemo(() => getWriteOnlyKeys(resolvedTemplate), [resolvedTemplate]);
+
+  const showMissingUsernameMapping = () => {
+    const mappingErrorMessage = t('system.user.userSyncPage.usernameMappingRequired');
+    setMappingError(mappingErrorMessage);
+    message.warning(mappingErrorMessage);
+  };
+
+  const handleSubmit = async () => {
+    try {
+      await form.validateFields();
+    } catch {
+      return;
+    }
+    if (!validateRequiredUserMapping(mappingRows)) {
+      showMissingUsernameMapping();
+      return;
+    }
+    onSubmit(form.getFieldsValue(true) as UserSyncSourceConfigFormValues, mappingRows);
+  };
+
+  const handlePreview = async () => {
+    try {
+      await form.validateFields();
+    } catch {
+      return;
+    }
+    if (!validateRequiredUserMapping(mappingRows)) {
+      showMissingUsernameMapping();
+      return;
+    }
+    onPreview(form.getFieldsValue(true) as UserSyncSourceConfigFormValues, mappingRows, writeOnlyKeys);
+  };
+
+  return (
+    <OperateModal
+    title={t('system.user.userSyncPage.accessConfig')}
+    subTitle={source ? `${source.name}` : ''}
+    open={open}
+    onCancel={onClose}
+    width={820}
+    footer={(
+      <div className="flex justify-end gap-2">
+        <Button onClick={onClose} disabled={loading || previewLoading}>
+          {t('common.cancel')}
+        </Button>
+        <Button onClick={handlePreview} loading={previewLoading} disabled={loading}>
+          {t('system.integrationCenter.testConnection')}
+        </Button>
+        <Button type="primary" onClick={handleSubmit} loading={loading} disabled={previewLoading}>
+          {t('common.save')}
+        </Button>
+      </div>
+    )}
+    destroyOnClose
+  >
+    <Form form={form} layout="vertical">
+      <UserSyncConfigFields
+        selectedInstanceId={source?.integration_instance}
+        providersLoading={providersLoading}
+        resolvedTemplate={resolvedTemplate}
+        mappingRows={mappingRows}
+        t={t}
+        onMappingRowsChange={(nextRows) => {
+          setMappingRows(nextRows);
+          setMappingError('');
+        }}
+        mappingError={mappingError}
+        rootScopeField={source?.root_scope_field}
+        initialRootScopeValue={typeof initialRootScopeValue === 'string' ? initialRootScopeValue : ''}
+      />
+    </Form>
+  </OperateModal>
+  );
+};
+
+export default UserSyncConfigModal;

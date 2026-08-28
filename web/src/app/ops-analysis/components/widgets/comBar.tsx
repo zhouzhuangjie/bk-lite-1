@@ -1,15 +1,17 @@
 import React, { useEffect, useRef, useCallback, useState } from 'react';
 import ReactEcharts from 'echarts-for-react';
-import { Spin, Empty } from 'antd';
+import { Spin } from 'antd';
 import { randomColorForLegend } from '@/app/ops-analysis/utils/randomColorForChart';
 import { ChartDataTransformer } from '@/app/ops-analysis/utils/chartDataTransform';
 import { useTranslation } from '@/utils/i18n';
 import {
   getOpsChartColorsByMode,
   getOpsChartThemeByMode,
+  isScreenChartThemeMode,
   resolveOpsChartThemeName,
 } from '@/app/ops-analysis/utils/chartTheme';
 import ChartLegend from '@/app/ops-analysis/components/chartLegend';
+import WidgetState from '@/app/ops-analysis/components/widget-state';
 import type {
   ScreenRenderContext,
   ValueConfig,
@@ -19,6 +21,11 @@ import {
   scaleScreenMetric,
   scaleScreenMetricFloat,
 } from './shared/screenMetrics';
+import {
+  formatLineBarAxisTick,
+  formatVisibleChartValue,
+  getLineBarYAxisName,
+} from '@/app/ops-analysis/utils/chartValueFormat';
 
 interface BarChartProps {
   rawData: any;
@@ -38,14 +45,13 @@ const BarChart: React.FC<BarChartProps> = ({
   const { t } = useTranslation();
   const chartRef = useRef<any>(null);
   const themeName = resolveOpsChartThemeName();
-  const usesScreenChartTheme =
-    config?.chartThemeMode === 'screen-dark' ||
-    config?.chartThemeMode === 'screen-light';
+  const usesScreenChartTheme = isScreenChartThemeMode(config?.chartThemeMode);
   const chartTheme = getOpsChartThemeByMode(config?.chartThemeMode);
   const chartColors = usesScreenChartTheme
     ? getOpsChartColorsByMode(config?.chartThemeMode, themeName)
     : randomColorForLegend(themeName);
   const widgetScale = getScreenWidgetScale(screenRenderContext);
+  const yAxisName = getLineBarYAxisName(config);
   const [legendSelected, setLegendSelected] = useState<Record<string, boolean>>({});
 
   const handleLegendChange = useCallback((selected: Record<string, boolean>) => {
@@ -103,7 +109,7 @@ const BarChart: React.FC<BarChartProps> = ({
           content += `
             <div style="display: flex; align-items: center; margin-bottom: ${scaleScreenMetric(2, screenRenderContext)}px;">
               <span style="display: inline-block; width: ${markerSize}px; height: ${markerSize}px; background-color: ${param.color}; border-radius: ${scaleScreenMetric(2, screenRenderContext)}px; margin-right: ${markerGap}px;"></span>
-              <span>${param.seriesName}: ${param.value}</span>
+              <span>${param.seriesName}: ${formatVisibleChartValue(param.value, config)}</span>
             </div>`;
         });
 
@@ -112,7 +118,7 @@ const BarChart: React.FC<BarChartProps> = ({
       },
     },
     grid: {
-      top: scaleScreenMetric(8, screenRenderContext),
+      top: scaleScreenMetric(yAxisName ? 24 : 8, screenRenderContext),
       left: scaleScreenMetric(16, screenRenderContext),
       right: scaleScreenMetric(16, screenRenderContext),
       bottom: scaleScreenMetric(8, screenRenderContext),
@@ -151,6 +157,12 @@ const BarChart: React.FC<BarChartProps> = ({
     },
     yAxis: {
       type: 'value',
+      name: yAxisName,
+      nameGap: 6,
+      nameTextStyle: {
+        color: chartTheme.axisLabelColor,
+        fontSize: scaleScreenMetric(11, screenRenderContext),
+      },
       minInterval: 1,
       axisTick: {
         show: false,
@@ -159,12 +171,7 @@ const BarChart: React.FC<BarChartProps> = ({
         show: false,
       },
       axisLabel: {
-        formatter: function (value: number) {
-          if (value >= 1000) {
-            return (value / 1000).toFixed(1) + 'k';
-          }
-          return value.toString();
-        },
+        formatter: (value: number) => formatLineBarAxisTick(value, config),
         textStyle: {
           color: chartTheme.axisLabelColor,
           fontSize: scaleScreenMetric(11, screenRenderContext),
@@ -277,11 +284,7 @@ const BarChart: React.FC<BarChartProps> = ({
   }
 
   if (!isDataReady || !chartData || chartData.categories.length === 0) {
-    return (
-      <div className="h-full flex flex-col items-center justify-center">
-        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} />
-      </div>
-    );
+    return <WidgetState />;
   }
 
   return (

@@ -1,5 +1,5 @@
-from rest_framework import serializers
 from django.db import transaction
+from rest_framework import serializers
 
 from apps.monitor.models import MonitorPlugin
 from apps.monitor.services.custom_pull_plugin import CustomPullPluginService
@@ -63,17 +63,36 @@ class MonitorPluginSerializer(serializers.ModelSerializer):
 
     def get_parent_monitor_object(self, obj):
         """
-        获取唯一的父监控对象ID（过滤掉子对象）
+        获取插件入口使用的根监控对象 ID。
+
+        插件正常情况下会直接绑定根对象；兼容存量复合插件只绑定派生对象的情况，
+        此时沿派生对象的 parent 解析根对象。list view 会预取 entry_context_objects，
+        单对象路径则回退到一次带 parent 的关联查询。
         """
-        # 获取所有关联的监控对象中的父对象（parent 为 None 的对象）
-        parent_objects = obj.monitor_object.filter(parent__isnull=True)
+        parent = MonitorPluginSerializer.get_parent_monitor_object_instance(obj)
+        return parent.id if parent is not None else None
 
-        # 如果存在父对象，返回第一个父对象的 ID
-        if parent_objects.exists():
-            return parent_objects.first().id
+    @staticmethod
+    def get_parent_monitor_object_instance(obj):
+        cached = getattr(obj, "entry_context_objects", None)
+        related_objects = (
+            cached
+            if cached is not None
+            else obj.monitor_object.select_related("parent", "type", "parent__type").all()
+        )
+        roots = {}
+        for monitor_object in related_objects:
+            root = monitor_object if monitor_object.parent_id is None else monitor_object.parent
+            if root is not None:
+                roots[root.id] = root
+        if not roots:
+            return None
 
-        # 如果没有父对象，返回 None
-        return None
+        def ordering_key(monitor_object):
+            type_order = monitor_object.type.order if monitor_object.type is not None else 999
+            return type_order, monitor_object.order, monitor_object.id
+
+        return min(roots.values(), key=ordering_key)
 
     @staticmethod
     def build_default_status_query(plugin):
@@ -110,4 +129,29 @@ class MonitorPluginSerializer(serializers.ModelSerializer):
                 CustomPullPluginService.initialize_templates(plugin)
             elif template_type == "snmp":
                 CustomSnmpPluginService.initialize_templates(plugin)
-        return plugin
+            return plugin
+
+
+class MonitorPluginListSerializer(serializers.ModelSerializer):
+    """集成卡片 / 下拉等 list 场景专用:只序列化可见字段,缩小 payload。"""
+
+    is_pre = serializers.BooleanField(read_only=True)
+    parent_monitor_object = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = MonitorPlugin
+        fields = (
+            "id",
+            "name",
+            "display_name",
+            "description",
+            "template_type",
+            "template_id",
+            "collect_type",
+            "collector",
+            "is_pre",
+            "parent_monitor_object",
+        )
+
+    def get_parent_monitor_object(self, obj):
+        return MonitorPluginSerializer.get_parent_monitor_object(self, obj)

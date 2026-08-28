@@ -1,0 +1,527 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Button, DatePicker, Input, Select, Tooltip, message } from 'antd';
+import { SearchOutlined } from '@ant-design/icons';
+import type { ColumnsType } from 'antd/es/table';
+import type {
+  DashboardActionConfig,
+  DatasourceItem,
+  TableColumnConfigItem,
+  TableFilterFieldConfig,
+  ValueConfig,
+} from '@/app/ops-analysis/components/ops-analysis-widgets';
+import {
+  applyValueMapping,
+  getColorByThreshold,
+} from '@/app/ops-analysis/components/ops-analysis-config-sections';
+import {
+  buildDashboardActionUrl,
+  resolveDashboardActionParams,
+} from '@/app/ops-analysis/components/ops-analysis-widgets/runtime';
+import CustomTable from '@/components/custom-table';
+import { useTranslation } from '@/utils/i18n';
+import MoreActionsDropdown from '@/components/more-actions-dropdown';
+import type { MoreActionsDropdownItem } from '@/components/more-actions-dropdown';
+import { useShareMode } from '@/app/ops-analysis/context/shareMode';
+import {
+  parseTableLikeData,
+  resolveTableLikeColumns,
+  type TableLikePaginationState,
+} from '@/app/ops-analysis/components/ops-analysis-widgets/table-like-data';
+import { supportsServerPagination } from '@/app/ops-analysis/utils/tablePagination';
+import {
+  applyTableRowFilters,
+  buildTableQueryList,
+} from '@/app/ops-analysis/utils/tableQueryList';
+import { useTableBodyScrollY } from '@/app/ops-analysis/components/widgets/shared/useTableBodyScrollY';
+
+const { RangePicker } = DatePicker;
+const DEFAULT_CELL_MAX_WIDTH = 260;
+
+export interface OpsAnalysisTableProps {
+  rawData: any;
+  loading?: boolean;
+  onReady?: (ready: boolean) => void;
+  config?: ValueConfig;
+  dataSource?: DatasourceItem;
+  onQueryChange?: (params: Record<string, any>) => void;
+}
+
+interface TableDataItem {
+  [key: string]: any;
+}
+
+const OpsAnalysisTable: React.FC<OpsAnalysisTableProps> = ({
+  rawData,
+  loading = false,
+  onReady,
+  config,
+  dataSource,
+  onQueryChange,
+}) => {
+  const { t } = useTranslation();
+  const shareMode = useShareMode();
+  const tableContainerRef = useRef<HTMLDivElement | null>(null);
+  const [filters, setFilters] = useState<Record<string, any>>({});
+  const [keywordDrafts, setKeywordDrafts] = useState<Record<string, string>>({});
+  const [activeKeywordFieldKey, setActiveKeywordFieldKey] = useState<string>('');
+  const [queryPagination, setQueryPagination] = useState<TableLikePaginationState>({
+    current: 1,
+    pageSize: 20,
+  });
+
+  const supportsPaginationParams = useMemo(
+    () => supportsServerPagination(dataSource?.params),
+    [dataSource?.params],
+  );
+
+  const { tableData, pagination, isPaginated } = useMemo(() => {
+    const parsed = parseTableLikeData<TableDataItem>(
+      rawData,
+      queryPagination,
+      supportsPaginationParams,
+    );
+
+    return {
+      tableData: parsed.rows,
+      pagination: parsed.pagination,
+      isPaginated: parsed.isPaginated,
+    };
+  }, [rawData, queryPagination.current, queryPagination.pageSize, supportsPaginationParams]);
+  const displayedTableData = useMemo(
+    () => applyTableRowFilters(tableData, filters),
+    [filters, tableData],
+  );
+  const tableScrollY = useTableBodyScrollY({
+    containerRef: tableContainerRef,
+    hasPagination: isPaginated,
+  });
+
+  const filterFields = useMemo<TableFilterFieldConfig[]>(() => {
+    return config?.tableConfig?.filterFields || [];
+  }, [config?.tableConfig?.filterFields]);
+
+  const searchableFilterFields = useMemo<TableFilterFieldConfig[]>(() => {
+    return filterFields.filter(
+      (field) => (field.inputType === 'keyword' || field.inputType === 'time_range') && !!field.key,
+    );
+  }, [filterFields]);
+
+  const nonKeywordFilterFields = useMemo<TableFilterFieldConfig[]>(() => {
+    return filterFields.filter((field) => field.inputType !== 'keyword' && !!field.key);
+  }, [filterFields]);
+
+  useEffect(() => {
+    if (searchableFilterFields.length === 0) {
+      if (activeKeywordFieldKey) {
+        setActiveKeywordFieldKey('');
+      }
+      return;
+    }
+
+    const exists = searchableFilterFields.some((field) => field.key === activeKeywordFieldKey);
+    if (!exists) {
+      setActiveKeywordFieldKey(searchableFilterFields[0].key);
+    }
+  }, [searchableFilterFields, activeKeywordFieldKey]);
+
+  const columnConfigs = useMemo((): TableColumnConfigItem[] => {
+    return resolveTableLikeColumns({
+      configuredColumns: config?.tableConfig?.columns,
+      schemaFields: dataSource?.field_schema,
+      rows: tableData,
+    }).filter((col) => col.visible);
+  }, [config?.tableConfig?.columns, dataSource?.field_schema, tableData]);
+
+  const handleActionClick = useCallback(
+    (action: DashboardActionConfig, record: TableDataItem) => {
+      if (shareMode) {
+        message.warning(t('dashboard.shareNavigationDisabled'));
+        return;
+      }
+      const params = resolveDashboardActionParams(action.params, record);
+      const url = buildDashboardActionUrl(action.url, params);
+      if (!url) {
+        message.warning(t('dashboard.actionUrlUnavailable'));
+        return;
+      }
+
+      if (action.openMode === 'newTab') {
+        window.open(url, '_blank', 'noopener,noreferrer');
+        return;
+      }
+
+      window.location.href = url;
+    },
+    [shareMode, t],
+  );
+
+  const renderActionButtons = useCallback(
+    (actions: DashboardActionConfig[], record: TableDataItem) => {
+      if (shareMode || actions.length === 0) {
+        return '-';
+      }
+
+      const visibleActions = actions.slice(0, 2);
+      const dropdownActions = actions.slice(2);
+
+      return (
+        <div className="flex items-center gap-1">
+          {visibleActions.map((action, index) => (
+            <Button
+              key={`${action.columnKey}_${index}_${action.text}`}
+              type="link"
+              size="small"
+              className="p-0"
+              onClick={() => handleActionClick(action, record)}
+            >
+              {action.text}
+            </Button>
+          ))}
+          {dropdownActions.length > 0 && (
+            <MoreActionsDropdown
+              items={dropdownActions.map<MoreActionsDropdownItem>((action, index) => ({
+                key: String(index),
+                label: action.text,
+                onClick: () => handleActionClick(action, record),
+              }))}
+              buttonType="link"
+            />
+          )}
+        </div>
+      );
+    },
+    [handleActionClick, shareMode, t],
+  );
+
+  const antColumns = useMemo((): ColumnsType<TableDataItem> => {
+    const colGaugeMax: Record<string, number> = {};
+    columnConfigs.forEach((col) => {
+      if (col.cellType === 'gauge' && col.cellMax == null) {
+        let maxValue = 0;
+        for (const row of displayedTableData) {
+          const numericValue = Number((row as any)?.[col.key]);
+          if (!Number.isNaN(numericValue) && numericValue > maxValue) maxValue = numericValue;
+        }
+        colGaugeMax[col.key] = maxValue;
+      }
+    });
+
+    return columnConfigs.map((col) => {
+      const columnActions = (config?.actions || []).filter((action) => action.columnKey === col.key);
+      const column: any = {
+        title: col.title,
+        dataIndex: col.key,
+        key: col.key,
+        ellipsis: { showTitle: false },
+        render: (text: any, record: TableDataItem) => {
+          if (col.columnType === 'actions') {
+            return renderActionButtons(columnActions, record);
+          }
+
+          const mapping = applyValueMapping(text, col.valueMappings);
+          const cellText = text === null || text === undefined ? '' : String(text);
+          const baseText = cellText.trim() ? cellText : '--';
+          const displayText = mapping?.text !== undefined ? mapping.text : baseText;
+
+          const numericValue = typeof text === 'number' ? text : parseFloat(String(text));
+          const cellColor =
+            mapping?.color ||
+            (col.cellThresholdColors?.length && !Number.isNaN(numericValue)
+              ? getColorByThreshold(numericValue, col.cellThresholdColors, undefined as any)
+              : undefined);
+
+          if (col.cellType === 'colorBackground' && cellColor) {
+            return (
+              <Tooltip placement="topLeft" title={displayText}>
+                <div
+                  className="overflow-hidden text-ellipsis whitespace-nowrap rounded px-2 py-px text-center font-semibold text-white"
+                  style={{ background: cellColor }}
+                >
+                  {displayText}
+                </div>
+              </Tooltip>
+            );
+          }
+
+          if (col.cellType === 'gauge' && !Number.isNaN(numericValue)) {
+            const maxValue = col.cellMax || colGaugeMax[col.key] || 100;
+            const ratio = maxValue > 0 ? Math.min(Math.max(numericValue / maxValue, 0), 1) : 0;
+            const barColor = cellColor || '#366ce4';
+            return (
+              <div className="flex items-center gap-2">
+                <div
+                  className="relative h-2.5 flex-1 overflow-hidden rounded bg-[var(--color-fill-2)]"
+                >
+                  <div
+                    className="absolute left-0 top-0 h-full rounded"
+                    style={{ width: `${ratio * 100}%`, background: barColor }}
+                  />
+                </div>
+                <span className="shrink-0 text-xs tabular-nums">{displayText}</span>
+              </div>
+            );
+          }
+
+          return (
+            <Tooltip placement="topLeft" title={displayText}>
+              <div
+                className={`overflow-hidden text-ellipsis whitespace-nowrap${mapping?.color ? ' font-semibold' : ''}`}
+                style={{
+                  maxWidth: col.width || DEFAULT_CELL_MAX_WIDTH,
+                  ...(mapping?.color ? { color: mapping.color } : {}),
+                }}
+              >
+                {displayText}
+              </div>
+            </Tooltip>
+          );
+        },
+      };
+
+      if (col.width) {
+        column.width = col.width;
+      }
+
+      return column;
+    });
+  }, [columnConfigs, config?.actions, displayedTableData, handleActionClick, renderActionButtons]);
+
+  useEffect(() => {
+    if (!onQueryChange) return;
+
+    const queryParams: Record<string, any> = {};
+    if (supportsPaginationParams) {
+      queryParams.page = queryPagination.current;
+      queryParams.page_size = queryPagination.pageSize;
+    }
+    const queryList = buildTableQueryList(filters);
+    if (queryList.length > 0) {
+      queryParams.query_list = queryList;
+    }
+
+    onQueryChange(queryParams);
+  }, [onQueryChange, queryPagination, filters, supportsPaginationParams]);
+
+  useEffect(() => {
+    if (!loading) {
+      const hasData = tableData && tableData.length > 0;
+      onReady?.(hasData);
+    }
+  }, [tableData, loading, onReady]);
+
+  const handleKeywordFilterCommit = useCallback(
+    (key: string, value: string) => {
+      const nextValue = value.trim();
+      setFilters((prev) => {
+        const nextFilters = { ...prev };
+        searchableFilterFields.forEach((field) => {
+          if (field.key !== key) {
+            delete nextFilters[field.key];
+          }
+        });
+
+        if (nextValue) {
+          nextFilters[key] = nextValue;
+        } else {
+          delete nextFilters[key];
+        }
+
+        if (JSON.stringify(nextFilters) === JSON.stringify(prev)) {
+          return prev;
+        }
+
+        setQueryPagination((pagePrev) => ({ ...pagePrev, current: 1 }));
+        return nextFilters;
+      });
+    },
+    [searchableFilterFields],
+  );
+
+  const handleKeywordFieldSwitch = useCallback(
+    (nextKey: string) => {
+      setActiveKeywordFieldKey(nextKey);
+      setFilters((prev) => {
+        const nextFilters = { ...prev };
+        searchableFilterFields.forEach((field) => {
+          if (field.key !== nextKey) {
+            delete nextFilters[field.key];
+          }
+        });
+
+        if (JSON.stringify(nextFilters) === JSON.stringify(prev)) {
+          return prev;
+        }
+
+        setQueryPagination((pagePrev) => ({ ...pagePrev, current: 1 }));
+        return nextFilters;
+      });
+    },
+    [searchableFilterFields],
+  );
+
+  const activeSearchField = useMemo(() => {
+    return searchableFilterFields.find((field) => field.key === activeKeywordFieldKey);
+  }, [searchableFilterFields, activeKeywordFieldKey]);
+
+  const handleTableChange = useCallback((pageConfig: any) => {
+    setQueryPagination({
+      current: pageConfig?.current || 1,
+      pageSize: pageConfig?.pageSize || 20,
+    });
+  }, []);
+
+  const renderFilters = () => {
+    if (!filterFields || filterFields.length === 0) {
+      return null;
+    }
+
+    return (
+      <div className="mb-3 flex flex-wrap gap-2">
+        {searchableFilterFields.length > 0 && (
+          <div className="flex items-center">
+            <Input.Group compact>
+              <Select
+                value={activeKeywordFieldKey}
+                placeholder={t('common.selectTip')}
+                onChange={handleKeywordFieldSwitch}
+                style={{ width: 130 }}
+                options={searchableFilterFields.map((field) => ({
+                  label: field.label || field.key,
+                  value: field.key,
+                }))}
+              />
+              {activeSearchField?.inputType === 'time_range' ? (
+                <RangePicker
+                  placeholder={[t('common.startTime'), t('common.endTime')]}
+                  value={activeKeywordFieldKey ? filters[activeKeywordFieldKey] : undefined}
+                  onChange={(dates) => {
+                    if (!activeKeywordFieldKey) {
+                      return;
+                    }
+                    setFilters((prev) => ({
+                      ...prev,
+                      [activeKeywordFieldKey]: dates,
+                    }));
+                    setQueryPagination((prev) => ({ ...prev, current: 1 }));
+                  }}
+                  showTime
+                />
+              ) : (
+                <Input
+                  placeholder={t('dashboard.searchPlaceholder')}
+                  suffix={
+                    <SearchOutlined
+                      className="cursor-pointer text-[var(--color-text-3)]"
+                      onClick={() => {
+                        if (!activeKeywordFieldKey) {
+                          return;
+                        }
+                        handleKeywordFilterCommit(
+                          activeKeywordFieldKey,
+                          keywordDrafts[activeKeywordFieldKey]
+                            ?? filters[activeKeywordFieldKey]
+                            ?? '',
+                        );
+                      }}
+                    />
+                  }
+                  value={
+                    activeKeywordFieldKey
+                      ? (keywordDrafts[activeKeywordFieldKey] ?? filters[activeKeywordFieldKey] ?? '')
+                      : ''
+                  }
+                  onPressEnter={(event) => {
+                    if (!activeKeywordFieldKey) {
+                      return;
+                    }
+                    handleKeywordFilterCommit(activeKeywordFieldKey, (event.target as HTMLInputElement).value);
+                  }}
+                  onChange={(event) => {
+                    if (!activeKeywordFieldKey) {
+                      return;
+                    }
+                    const nextValue = event.target.value;
+                    setKeywordDrafts((prev) => ({
+                      ...prev,
+                      [activeKeywordFieldKey]: nextValue,
+                    }));
+
+                    if (!nextValue) {
+                      handleKeywordFilterCommit(activeKeywordFieldKey, '');
+                    }
+                  }}
+                  onBlur={(event) => {
+                    if (!activeKeywordFieldKey) {
+                      return;
+                    }
+                    handleKeywordFilterCommit(activeKeywordFieldKey, event.target.value);
+                  }}
+                  style={{ width: 220 }}
+                  allowClear
+                />
+              )}
+            </Input.Group>
+          </div>
+        )}
+
+        {nonKeywordFilterFields.map((field) => {
+          switch (field.inputType) {
+            case 'select':
+              return (
+                <div key={field.key} className="flex items-center gap-2">
+                  <span className="text-(--color-text-2) whitespace-nowrap text-[12px]">{field.label}</span>
+                  <Select
+                    placeholder={t('common.selectTip')}
+                    value={filters[field.key]}
+                    onChange={(value) => setFilters((prev) => ({ ...prev, [field.key]: value }))}
+                    style={{ width: 160 }}
+                    allowClear
+                    options={field.options?.map((opt) => ({
+                      label: opt,
+                      value: opt,
+                    }))}
+                  />
+                </div>
+              );
+            default:
+              return null;
+          }
+        })}
+      </div>
+    );
+  };
+
+  return (
+    <div className="flex h-full flex-col">
+      {renderFilters()}
+
+      <div ref={tableContainerRef} className="min-h-0 flex-1 overflow-hidden">
+        <CustomTable
+          columns={antColumns}
+          dataSource={displayedTableData}
+          loading={loading}
+          rowKey={(record, index) => record.id || record.key || index?.toString() || '0'}
+          size="small"
+          pagination={
+            isPaginated
+              ? {
+                current: pagination.current,
+                pageSize: pagination.pageSize,
+                total: pagination.total,
+                showSizeChanger: {
+                  getPopupContainer: () => document.body,
+                },
+                showQuickJumper: true,
+                showTotal: (total) => `${t('common.total')} ${total} ${t('common.items')}`,
+              }
+              : false
+          }
+          onChange={isPaginated ? handleTableChange : undefined}
+          scroll={{ x: 'max-content', y: tableScrollY }}
+        />
+      </div>
+    </div>
+  );
+};
+
+export default OpsAnalysisTable;

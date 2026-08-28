@@ -2,14 +2,16 @@
 
 import React, { useEffect, useRef } from 'react';
 import BaseTaskForm, { BaseTaskRef } from './baseTask';
-import { useLocale } from '@/context/locale';
 import { useTranslation } from '@/utils/i18n';
+import { useCollectionFormLayout } from '../hooks/useCollectionFormLayout';
 import { useTaskForm } from '../hooks/useTaskForm';
 import { getCleanupFormValues } from '../hooks/useTaskForm';
 import { TreeNode, ModelItem } from '@/app/cmdb/types/autoDiscovery';
 import {
   buildSnmpTopologyParams,
+  CYCLE_OPTIONS,
   getSnmpTopologyFormValues,
+  recommendedTopologyIntervalMinutes,
   SNMP_FORM_INITIAL_VALUES,
   PASSWORD_PLACEHOLDER,
   TOPOLOGY_FALLBACK_STRATEGY_OPTIONS,
@@ -22,8 +24,14 @@ import {
   normalizeCredentialPool,
   buildCredentialPool,
 } from '../hooks/formatTaskValues';
-import { Form, InputNumber, Select, Spin, Switch } from 'antd';
+import { QuestionCircleOutlined } from '@ant-design/icons';
+import { Button, Form, InputNumber, Select, Spin, Switch, Tooltip } from 'antd';
 import CredentialPoolEditor from './credentialPoolEditor';
+import { buildSnmpCredentialHelp } from './credentialHelp';
+
+const LONG_TOOLTIP_OVERLAY_STYLE = {
+  maxWidth: 'min(520px, calc(100vw - 48px))',
+};
 
 interface SNMPTaskFormProps {
   onClose: () => void;
@@ -41,8 +49,8 @@ const SNMPTask: React.FC<SNMPTaskFormProps> = ({
   editId,
 }) => {
   const { t } = useTranslation();
+  const collectionFormLayout = useCollectionFormLayout();
   const baseRef = useRef<BaseTaskRef>(null as any);
-  const localeContext = useLocale();
   const { copyTaskData, setCopyTaskData } = useAssetManageStore();
   const { model_id: modelId } = modelItem;
   const initialFormValues = {
@@ -127,10 +135,22 @@ const SNMPTask: React.FC<SNMPTaskFormProps> = ({
           }
           return credential;
         }),
-        params: buildSnmpTopologyParams(values),
+        params: {
+          ...baseData.params,
+          ...buildSnmpTopologyParams(values),
+        },
       };
     },
   });
+  const hasNetworkTopo = Form.useWatch('hasNetworkTopo', form);
+  const deviceCycleType = Form.useWatch('cycle', form);
+  const deviceCycleMinutes = Form.useWatch('intervalValue', form);
+  const topologyIntervalMode = Form.useWatch('topologyIntervalMode', form);
+  const recommendedInterval =
+    deviceCycleType === CYCLE_OPTIONS.INTERVAL &&
+    Number(deviceCycleMinutes) > 0
+      ? recommendedTopologyIntervalMinutes(Number(deviceCycleMinutes))
+      : undefined;
 
   // 构建表单值，用于复制任务和编辑任务中回填表单数据（true:复制任务，false:编辑任务）
   const buildFormValues = (values: any, isCopy: boolean, ipRange?: string[]) => {
@@ -143,11 +163,12 @@ const SNMPTask: React.FC<SNMPTaskFormProps> = ({
     return {
       ...getCleanupFormValues(values),
       ...values,
-      ...getSnmpTopologyFormValues(values.params),
+      ...getSnmpTopologyFormValues(values.params, values.intervalValue),
       credentialPool,
       ipRange,
       taskName: isCopy ? '' : values.name,
       timeout: values.timeout,
+      ip_precheck: Boolean(values.params?.ip_precheck),
       input_method: values.input_method,
       organization: values.team || [],
       accessPointId: values.access_point?.[0]?.id,
@@ -185,12 +206,68 @@ const SNMPTask: React.FC<SNMPTaskFormProps> = ({
     initForm();
   }, [modelId, copyTaskData, setCopyTaskData]);
 
+  useEffect(() => {
+    if (!hasNetworkTopo) {
+      return;
+    }
+
+    if (recommendedInterval === undefined) {
+      void form
+        .validateFields(['topologyIntervalMinutes'])
+        .catch(() => undefined);
+      return;
+    }
+
+    const currentInterval = form.getFieldValue('topologyIntervalMinutes');
+    if (currentInterval === undefined || currentInterval === null) {
+      form.setFieldsValue({
+        topologyIntervalMinutes: recommendedInterval,
+        topologyIntervalMode: 'recommended',
+      });
+      return;
+    }
+
+    if (topologyIntervalMode === 'recommended') {
+      form.setFieldValue('topologyIntervalMinutes', recommendedInterval);
+      void form
+        .validateFields(['topologyIntervalMinutes'])
+        .catch(() => undefined);
+      return;
+    }
+
+    void form
+      .validateFields(['topologyIntervalMinutes'])
+      .catch(() => undefined);
+  }, [
+    deviceCycleMinutes,
+    deviceCycleType,
+    form,
+    hasNetworkTopo,
+    recommendedInterval,
+    topologyIntervalMode,
+  ]);
+
+  const restoreRecommendedInterval = () => {
+    if (recommendedInterval === undefined) {
+      void form
+        .validateFields(['topologyIntervalMinutes'])
+        .catch(() => undefined);
+      return;
+    }
+    form.setFieldsValue({
+      topologyIntervalMinutes: recommendedInterval,
+      topologyIntervalMode: 'recommended',
+    });
+    void form
+      .validateFields(['topologyIntervalMinutes'])
+      .catch(() => undefined);
+  };
+
   return (
     <Spin spinning={loading}>
       <Form
+        {...collectionFormLayout}
         form={form}
-        layout="horizontal"
-        labelCol={{ span: localeContext.locale === 'en' ? 6 : 5 }}
         onFinish={onFinish}
         initialValues={initialFormValues}
       >
@@ -202,8 +279,9 @@ const SNMPTask: React.FC<SNMPTaskFormProps> = ({
           submitLoading={submitLoading}
           instPlaceholder={`${t('Collection.chooseAsset')}`}
           timeoutProps={{
-            min: 0,
-            defaultValue: 600,
+            min: 1,
+            max: 86400,
+            defaultValue: 30,
             addonAfter: t('Collection.k8sTask.second'),
           }}
         >
@@ -224,9 +302,175 @@ const SNMPTask: React.FC<SNMPTaskFormProps> = ({
               getFieldValue('hasNetworkTopo') ? (
                 <>
                   <Form.Item
-                    label={t('Collection.SNMPTask.topologyProtocols')}
+                    label={
+                      <span>
+                        {t('Collection.SNMPTask.topologyInterval')}
+                        <Tooltip
+                          overlayStyle={LONG_TOOLTIP_OVERLAY_STYLE}
+                          title={t('Collection.SNMPTask.topologyIntervalHelp')}
+                        >
+                          <QuestionCircleOutlined
+                            aria-label={t(
+                              'Collection.SNMPTask.topologyIntervalHelp'
+                            )}
+                            className="ml-1 cursor-help text-gray-400"
+                            tabIndex={0}
+                          />
+                        </Tooltip>
+                      </span>
+                    }
+                    name="topologyIntervalMinutes"
+                    dependencies={['hasNetworkTopo', 'cycle', 'intervalValue']}
+                    extra={
+                      <div className="flex items-center gap-2">
+                        <span>
+                          {recommendedInterval === undefined
+                            ? t(
+                              'Collection.SNMPTask.topologyIntervalRecommendedUnavailable'
+                            )
+                            : t(
+                              'Collection.SNMPTask.topologyIntervalRecommended',
+                              undefined,
+                              { minutes: recommendedInterval }
+                            )}
+                        </span>
+                        <Button
+                          className="h-auto p-0"
+                          type="link"
+                          onClick={restoreRecommendedInterval}
+                        >
+                          {t('Collection.SNMPTask.restoreRecommended')}
+                        </Button>
+                      </div>
+                    }
+                    rules={[
+                      {
+                        validator: (_, value) => {
+                          if (!form.getFieldValue('hasNetworkTopo')) {
+                            return Promise.resolve();
+                          }
+                          if (
+                            form.getFieldValue('cycle') !==
+                            CYCLE_OPTIONS.INTERVAL
+                          ) {
+                            return Promise.reject(
+                              new Error(
+                                t(
+                                  'Collection.SNMPTask.topologyIntervalCycleTypeError'
+                                )
+                              )
+                            );
+                          }
+                          if (
+                            !Number.isInteger(value) ||
+                            Number(value) < 1
+                          ) {
+                            return Promise.reject(
+                              new Error(
+                                t(
+                                  'Collection.SNMPTask.topologyIntervalMinError'
+                                )
+                              )
+                            );
+                          }
+                          if (
+                            Number(value) <
+                            Number(form.getFieldValue('intervalValue'))
+                          ) {
+                            return Promise.reject(
+                              new Error(
+                                t(
+                                  'Collection.SNMPTask.topologyIntervalDeviceCycleError'
+                                )
+                              )
+                            );
+                          }
+                          return Promise.resolve();
+                        },
+                      },
+                    ]}
+                  >
+                    <InputNumber
+                      min={1}
+                      precision={0}
+                      addonAfter={t('Collection.SNMPTask.minuteUnit')}
+                      placeholder={t('common.inputTip')}
+                      className="w-48"
+                      onChange={() =>
+                        form.setFieldValue(
+                          'topologyIntervalMode',
+                          'custom'
+                        )
+                      }
+                    />
+                  </Form.Item>
+                  <Form.Item name="topologyIntervalMode" hidden>
+                    <input />
+                  </Form.Item>
+                  <Form.Item
+                    label={
+                      <span>
+                        {t('Collection.SNMPTask.topologyTimeout')}
+                        <Tooltip
+                          title={t('Collection.SNMPTask.topologyTimeoutHelp')}
+                        >
+                          <QuestionCircleOutlined
+                            aria-label={t(
+                              'Collection.SNMPTask.topologyTimeoutHelp'
+                            )}
+                            className="ml-1 cursor-help text-gray-400"
+                            tabIndex={0}
+                          />
+                        </Tooltip>
+                      </span>
+                    }
+                    name="topologyTimeout"
+                    rules={[
+                      {
+                        validator: (_, value) => {
+                          if (!form.getFieldValue('hasNetworkTopo')) {
+                            return Promise.resolve();
+                          }
+                          if (
+                            !Number.isInteger(value) ||
+                            Number(value) < 1 ||
+                            Number(value) > 86400
+                          ) {
+                            return Promise.reject(
+                              new Error(
+                                t(
+                                  'Collection.SNMPTask.topologyTimeoutRangeError'
+                                )
+                              )
+                            );
+                          }
+                          return Promise.resolve();
+                        },
+                      },
+                    ]}
+                  >
+                    <InputNumber
+                      min={1}
+                      max={86400}
+                      precision={0}
+                      addonAfter={t('Collection.k8sTask.second')}
+                      placeholder={t('common.inputTip')}
+                      className="w-48"
+                    />
+                  </Form.Item>
+                  <Form.Item
+                    label={
+                      <span>
+                        {t('Collection.SNMPTask.topologyProtocols')}
+                        <Tooltip
+                          overlayStyle={LONG_TOOLTIP_OVERLAY_STYLE}
+                          title={t('Collection.SNMPTask.topologyProtocolsHelp')}
+                        >
+                          <QuestionCircleOutlined className="ml-1 cursor-help text-gray-400" />
+                        </Tooltip>
+                      </span>
+                    }
                     name="topologyProtocols"
-                    extra={t('Collection.SNMPTask.topologyProtocolsHelp')}
                   >
                     <Select
                       mode="multiple"
@@ -238,11 +482,20 @@ const SNMPTask: React.FC<SNMPTaskFormProps> = ({
                     />
                   </Form.Item>
                   <Form.Item
-                    label={t('Collection.SNMPTask.topologyFallbackStrategy')}
+                    label={
+                      <span>
+                        {t('Collection.SNMPTask.topologyFallbackStrategy')}
+                        <Tooltip
+                          overlayStyle={LONG_TOOLTIP_OVERLAY_STYLE}
+                          title={t(
+                            'Collection.SNMPTask.topologyFallbackStrategyHelp'
+                          )}
+                        >
+                          <QuestionCircleOutlined className="ml-1 cursor-help text-gray-400" />
+                        </Tooltip>
+                      </span>
+                    }
                     name="topologyFallbackStrategy"
-                    extra={t(
-                      'Collection.SNMPTask.topologyFallbackStrategyHelp'
-                    )}
                   >
                     <Select
                       placeholder={t('common.selectTip')}
@@ -253,9 +506,18 @@ const SNMPTask: React.FC<SNMPTaskFormProps> = ({
                     />
                   </Form.Item>
                   <Form.Item
-                    label={t('Collection.SNMPTask.minConfidence')}
+                    label={
+                      <span>
+                        {t('Collection.SNMPTask.minConfidence')}
+                        <Tooltip
+                          overlayStyle={LONG_TOOLTIP_OVERLAY_STYLE}
+                          title={t('Collection.SNMPTask.minConfidenceHelp')}
+                        >
+                          <QuestionCircleOutlined className="ml-1 cursor-help text-gray-400" />
+                        </Tooltip>
+                      </span>
+                    }
                     name="minConfidence"
-                    extra={t('Collection.SNMPTask.minConfidenceHelp')}
                   >
                     <InputNumber
                       min={0}
@@ -272,7 +534,11 @@ const SNMPTask: React.FC<SNMPTaskFormProps> = ({
           </Form.Item>
 
           <Form.Item name="credentialPool">
-            <CredentialPoolEditor credentialShape="snmp" editMode={Boolean(editId)} />
+            <CredentialPoolEditor
+              credentialShape="snmp"
+              editMode={Boolean(editId)}
+              credentialHelp={buildSnmpCredentialHelp(t)}
+            />
           </Form.Item>
         </BaseTaskForm>
       </Form>

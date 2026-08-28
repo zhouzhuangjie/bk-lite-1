@@ -1,10 +1,15 @@
 'use client';
 
-import { createContext, useContext, useState, ReactNode, useEffect } from 'react';
+import { createContext, useContext, useState, ReactNode, useEffect, useMemo } from 'react';
 import { IntlProvider } from 'react-intl';
+import { ConfigProvider } from 'antd';
+import dayjs from 'dayjs';
 import { useTranslation } from '@/utils/i18n';
 import Spin from '@/components/spin';
 import { getStoredLocale, normalizeLocale, persistLocale } from '@/utils/userPreferences';
+import { createLatestRequestGuard } from '@/context/latestRequestGuard';
+import { locales, LocaleKey } from '@/constants/locales';
+import { dayjsLocales } from '@/constants/dayjsLocales';
 
 const LocaleContext = createContext<{
   locale: string;
@@ -15,26 +20,47 @@ export const LocaleProvider = ({ children }: { children: ReactNode }) => {
   const [locale, setLocale] = useState('en');
   const [messages, setMessages] = useState<Record<string, string>>({});
   const [isLoading, setIsLoading] = useState(true);
+  const [requestGuard] = useState(createLatestRequestGuard);
+  const normalizedLocale = normalizeLocale(locale);
+  const antdLocale = useMemo(
+    () => locales[normalizedLocale as LocaleKey] || locales.en,
+    [normalizedLocale]
+  );
 
   useEffect(() => {
+    let cancelled = false;
     const savedLocale = getStoredLocale();
     setLocale(savedLocale);
-    fetchLocaleMessages(savedLocale);
+    setIsLoading(true);
+    fetchLocaleMessages(savedLocale).finally(() => {
+      if (!cancelled) {
+        setIsLoading(false);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
+  useEffect(() => {
+    return () => requestGuard.invalidate();
+  }, [requestGuard]);
+
+  useEffect(() => {
+    dayjs.locale(dayjsLocales[normalizedLocale as LocaleKey] || dayjsLocales.en);
+  }, [normalizedLocale]);
+
   const fetchLocaleMessages = async (locale: string) => {
-    setIsLoading(true);
+    const requestId = requestGuard.begin();
     try {
-      const response = await fetch(`/api/locales?locale=${locale}`);
+      const response = await fetch(`/api/locales?locale=${locale}`, { cache: 'no-store' });
       if (!response.ok) {
         throw new Error(`Failed to fetch locale ${locale} from api`);
       }
       const data = await response.json();
-      setMessages(data);
+      requestGuard.commitIfCurrent(requestId, () => setMessages(data));
     } catch (error) {
       console.error('Failed to load locale messages form api:', error);
-    } finally {
-      setIsLoading(false);
     }
   };
 
@@ -50,9 +76,8 @@ export const LocaleProvider = ({ children }: { children: ReactNode }) => {
       {isLoading ? (
         <Spin></Spin>
       ) : (
-        // @ts-expect-error react-intl type incompatibility with React 19
         <IntlProvider locale={locale} messages={messages as any}>
-          {children}
+          <ConfigProvider locale={antdLocale}>{children}</ConfigProvider>
         </IntlProvider>
       )}
     </LocaleContext.Provider>

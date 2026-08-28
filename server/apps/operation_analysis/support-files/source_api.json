@@ -49,66 +49,24 @@
     ]
   },
   {
-    "name": "告警趋势",
-    "desc": "查询告警趋势的数据",
+        "key": "告警趋势::alert/get_alert_trend_data",
+"name": "告警与关联事件趋势",
+    "desc": "跟随时间范围，返回告警数、关联事件数和已恢复告警数的时间序列",
     "rest_api": "alert/get_alert_trend_data",
     "tag": [
       "alerts"
     ],
     "chart_type": [
-      "single"
+      "line",
+      "bar"
     ],
     "params": [
       {
         "name": "time",
         "type": "timeRange",
         "value": 10080,
-        "alias_name": "time",
+        "alias_name": "时间范围",
         "filterType": "filter"
-      },
-      {
-        "name": "group_by",
-        "type": "string",
-        "value": "day",
-        "alias_name": "group_by",
-        "filterType": "fixed"
-      }
-    ]
-  },
-  {
-    "name": "查询时间范围内的指标数据",
-    "desc": "",
-    "rest_api": "monitor/mm_query_range",
-    "chart_type": [
-      "line",
-      "bar",
-      "pie",
-      "single"
-    ],
-    "tag": [
-      "monitor"
-    ],
-    "params": [
-      {
-        "name": "query",
-        "type": "string",
-        "value": "",
-        "alias_name": "query",
-        "filterType": "params"
-      },
-      {
-        "name": "time_range",
-        "type": "timeRange",
-        "value": 10080,
-        "alias_name": "time_range",
-        "filterType": "fixed"
-      },
-      {
-        "name": "step",
-        "type": "string",
-        "value": "5m",
-        "alias_name": "step",
-        "filterType": "params"
       }
     ]
   },
@@ -149,32 +107,183 @@
       }
     ]
   },
-  {
-    "desc": "",
-    "name": "查询单个指标数据",
-    "rest_api": "monitor/mm_query",
+{
+    "name": "主机资源使用率Top10",
+    "desc": "查询当前组织权限范围内主机的CPU、内存、磁盘使用率排行榜",
+    "rest_api": "monitor/get_host_resource_top",
     "tag": [
       "monitor"
     ],
     "chart_type": [
-      "single"
+      "topN",
+      "table"
     ],
     "params": [
       {
-        "alias_name": "查询语句",
-        "filterType": "params",
-        "name": "query",
+        "name": "metric_type",
         "type": "string",
-        "value": ""
+        "value": "cpu",
+        "alias_name": "指标类型",
+        "filterType": "params",
+        "required": true,
+        "inputConfig": {
+          "control": "select",
+          "componentSwitch": true,
+          "optionsSource": {
+            "type": "static",
+            "staticItems": [
+              {"label": "CPU使用率", "value": "cpu"},
+              {"label": "内存使用率", "value": "memory"},
+              {"label": "磁盘使用率", "value": "disk"}
+            ]
+          }
+        }
       },
       {
-        "alias_name": "步长间隔",
-        "filterType": "fixed",
-        "name": "step",
+        "name": "instance_ids",
         "type": "string",
-        "value": "5m"
+        "value": [],
+        "alias_name": "主机",
+        "filterType": "filter",
+        "inputConfig": {
+          "control": "select",
+          "multiple": true,
+          "optionsSource": {
+            "type": "dynamic",
+            "sourceRef": {"type": "rest_api", "value": "monitor/get_host_instance_list"},
+            "valueField": "instance_id",
+            "labelField": "display_name"
+          }
         }
-     ]
+      }
+    ],
+    "field_schema": [
+      {"key": "rank", "title": "排名", "value_type": "number"},
+      {"key": "display_name", "title": "主机", "value_type": "string"},
+      {"key": "usage_percent", "title": "使用率(%)", "value_type": "number"},
+      {"key": "instance_id", "title": "实例ID", "value_type": "string"},
+      {"key": "host_name", "title": "主机名", "value_type": "string"},
+      {"key": "ip", "title": "IP地址", "value_type": "string"},
+      {"key": "metric_type", "title": "指标类型", "value_type": "string"},
+      {"key": "mount", "title": "挂载点", "value_type": "string"},
+      {"key": "path", "title": "路径", "value_type": "string"},
+      {"key": "fstype", "title": "文件系统类型", "value_type": "string"},
+      {"key": "sampled_at", "title": "采样时间", "value_type": "datetime"}
+    ]
+},
+{
+    "key": "监控主机列表::monitor/get_host_instance_list",
+    "name": "监控主机列表（选项）",
+    "desc": "当前组织权限范围内的主机实例，供统一筛选下拉使用，本身不直接出图",
+    "rest_api": "monitor/get_host_instance_list",
+    "tag": ["monitor"],
+    "chart_type": [],
+    "params": [],
+    "field_schema": [
+      {"key": "instance_id", "title": "实例ID", "value_type": "string"},
+      {"key": "display_name", "title": "主机", "value_type": "string"}
+    ]
+},
+{
+    "key": "主机指标趋势::monitor/get_host_metric_range",
+    "name": "主机指标趋势",
+    "desc": "按所选主机查询单一指标趋势，一主机一线；未选主机不退化为全量",
+    "rest_api": "monitor/get_host_metric_range",
+    "tag": ["monitor"],
+    "chart_type": ["line", "bar"],
+    "params": [
+      {
+        "name": "instance_ids",
+        "type": "string",
+        "value": [],
+        "alias_name": "主机",
+        "filterType": "filter",
+        "inputConfig": {
+          "control": "select",
+          "multiple": true,
+          "optionsSource": {
+            "type": "dynamic",
+            "sourceRef": {"type": "rest_api", "value": "monitor/get_host_instance_list"},
+            "valueField": "instance_id",
+            "labelField": "display_name"
+          }
+        }
+      },
+      {
+        "name": "metric_type",
+        "type": "string",
+        "value": "cpu",
+        "alias_name": "指标类型",
+        "filterType": "params",
+        "required": true,
+        "inputConfig": {
+          "control": "select",
+          "componentSwitch": true,
+          "optionsSource": {
+            "type": "static",
+            "staticItems": [
+              {"label": "CPU使用率", "value": "cpu"},
+              {"label": "内存使用率", "value": "memory"},
+              {"label": "磁盘使用率", "value": "disk"},
+              {"label": "5分钟负载", "value": "load5"},
+              {"label": "入流量", "value": "net_in"},
+              {"label": "出流量", "value": "net_out"},
+              {"label": "磁盘IO使用率", "value": "disk_io"},
+              {"label": "磁盘写入延迟", "value": "disk_write_latency"},
+              {"label": "磁盘读速率", "value": "disk_read_rate"},
+              {"label": "磁盘写速率", "value": "disk_write_rate"},
+              {"label": "阻塞进程", "value": "processes_blocked"},
+              {"label": "僵尸进程", "value": "processes_zombies"}
+            ]
+          }
+        }
+      },
+      {
+        "name": "time",
+        "type": "timeRange",
+        "value": 10080,
+        "alias_name": "时间范围",
+        "filterType": "filter"
+      }
+    ],
+    "field_schema": []
+},
+{
+    "key": "主机资源快照::monitor/get_host_resource_snapshot",
+    "name": "主机资源快照",
+    "desc": "按所选主机返回数量、CPU/内存/磁盘均值与最高值；未选主机不退化为全量",
+    "rest_api": "monitor/get_host_resource_snapshot",
+    "tag": ["monitor"],
+    "chart_type": ["single", "multiValue", "table"],
+    "params": [
+      {
+        "name": "instance_ids",
+        "type": "string",
+        "value": [],
+        "alias_name": "主机",
+        "filterType": "filter",
+        "inputConfig": {
+          "control": "select",
+          "multiple": true,
+          "optionsSource": {
+            "type": "dynamic",
+            "sourceRef": {"type": "rest_api", "value": "monitor/get_host_instance_list"},
+            "valueField": "instance_id",
+            "labelField": "display_name"
+          }
+        }
+      }
+    ],
+    "field_schema": [
+      {"key": "host_count", "title": "主机数", "value_type": "number"},
+      {"key": "avg_cpu", "title": "平均CPU(%)", "value_type": "number"},
+      {"key": "avg_memory", "title": "平均内存(%)", "value_type": "number"},
+      {"key": "avg_disk", "title": "平均磁盘(%)", "value_type": "number"},
+      {"key": "max_cpu", "title": "最高CPU(%)", "value_type": "number"},
+      {"key": "max_cpu_host", "title": "最高CPU主机", "value_type": "string"},
+      {"key": "max_memory", "title": "最高内存(%)", "value_type": "number"},
+      {"key": "max_memory_host", "title": "最高内存主机", "value_type": "string"}
+    ]
 },
 {
     "name": "监控活跃告警",
@@ -295,12 +404,55 @@
             "value": "",
             "alias_name": "实例ID",
             "filterType": "params"
+        },
+        {
+            "name": "instance_ids",
+            "type": "string",
+            "value": "",
+            "alias_name": "实例ID列表",
+            "filterType": "params"
         }
     ]
 },
 {
-    "name": "今日告警状态总览",
-    "desc": "今日产生、今日关闭与当前处理中告警统计",
+    "key": "监控接口最新指标::monitor/query_latest_interface_metrics",
+    "name": "监控接口最新指标",
+    "desc": "按监控实例批量查询接口最新 IF-MIB 值，响应含 instance_id、ifDescr 与固定指标集合",
+    "rest_api": "monitor/query_latest_interface_metrics",
+    "tag": [
+        "monitor"
+    ],
+    "chart_type": [
+        "table"
+    ],
+    "field_schema": [
+        {
+            "key": "instance_id",
+            "title": "实例ID",
+            "value_type": "string",
+            "description": "监控实例ID"
+        },
+        {
+            "key": "ifDescr",
+            "title": "接口名称",
+            "value_type": "string",
+            "description": "IF-MIB ifDescr"
+        }
+    ],
+    "params": [
+        {
+            "name": "instance_ids",
+            "type": "string",
+            "value": "",
+            "alias_name": "实例ID列表",
+            "filterType": "params"
+        }
+    ]
+},
+{
+        "key": "今日告警状态总览::alert/get_alert_today_status_summary",
+"name": "今日产生关闭与当前处理中",
+    "desc": "今日新产生与关闭的告警数，以及当前处理中告警数；前两项为今日口径，处理中为当前快照",
     "rest_api": "alert/get_alert_today_status_summary",
     "tag": [
         "alerts"
@@ -312,12 +464,13 @@
     "field_schema": [
         {"key": "today_created_count", "title": "今日产生告警数", "value_type": "number", "description": "今日 0 点起新产生的告警数"},
         {"key": "today_closed_count", "title": "今日关闭告警数", "value_type": "number", "description": "今日关闭、自动关闭或自动恢复的告警数"},
-        {"key": "processing_count", "title": "当前处理中告警数", "value_type": "number", "description": "当前处理中的告警数"}
+        {"key": "processing_count", "title": "处理中告警数", "value_type": "number", "description": "当前处理中的告警数"}
     ]
 },
 {
-    "name": "告警状态分布",
-    "desc": "活跃告警按未分派、待响应、处理中状态分布",
+        "key": "告警状态分布::alert/get_alert_status_distribution",
+"name": "活跃告警状态分布",
+    "desc": "未分派、待响应、处理中分布，不受时间范围影响",
     "rest_api": "alert/get_alert_status_distribution",
     "tag": [
         "alerts"
@@ -332,8 +485,9 @@
     ]
 },
 {
-    "name": "近7日告警等级趋势",
-    "desc": "指定时间范围内按告警等级分组的趋势数据",
+        "key": "告警等级趋势::alert/get_alert_level_trend",
+"name": "告警等级趋势",
+    "desc": "跟随时间范围，按告警等级分组的时间序列",
     "rest_api": "alert/get_alert_level_trend",
     "tag": [
         "alerts"
@@ -344,17 +498,10 @@
     ],
     "params": [
         {
-            "name": "group_by",
-            "type": "string",
-            "value": "day",
-            "alias_name": "group_by",
-            "filterType": "fixed"
-        },
-        {
             "name": "time",
             "type": "timeRange",
             "value": 10080,
-            "alias_name": "time",
+            "alias_name": "时间范围",
             "filterType": "filter"
         }
     ],
@@ -387,7 +534,7 @@
         {"key": "policy_total", "title": "告警策略总数", "value_type": "number", "description": "告警策略总数"},
         {"key": "policy_enabled", "title": "启用策略数", "value_type": "number", "description": "启用的告警策略数"},
         {"key": "policy_disabled", "title": "禁用策略数", "value_type": "number", "description": "禁用的告警策略数"},
-        {"key": "alert_current", "title": "当前告警总数", "value_type": "number", "description": "当前未处理的告警总数"},
+        {"key": "alert_current", "title": "告警总数", "value_type": "number", "description": "当前未处理的告警总数"},
         {"key": "alert_history", "title": "历史告警总数", "value_type": "number", "description": "历史告警总数"},
         {"key": "alert_today", "title": "今日新增告警数", "value_type": "number", "description": "今日新增的告警数"},
         {"key": "alert_recovered", "title": "已恢复告警数", "value_type": "number", "description": "已恢复状态的告警数"},
@@ -398,6 +545,369 @@
         {"key": "event_today", "title": "今日新增事件数", "value_type": "number", "description": "今日新增的监控事件数"},
         {"key": "alert_snapshot_total", "title": "告警快照总数", "value_type": "number", "description": "告警指标快照总数"},
         {"key": "no_data_baseline_total", "title": "无数据基准总数", "value_type": "number", "description": "策略实例基准总数"}
+    ]
+},
+{
+    "name": "CMDB 3D机房布局",
+    "desc": "查询指定 CMDB 机房的 3D 机柜布局数据",
+    "rest_api": "cmdb/get_room3d_layout",
+    "tag": [
+        "cmdb"
+    ],
+    "chart_type": [
+        "room3D"
+    ],
+    "params": [
+        {
+            "name": "server_room_id",
+            "type": "string",
+            "value": "",
+            "alias_name": "机房ID",
+            "filterType": "params",
+            "inputConfig": {
+                "control": "select",
+                "componentSwitch": true,
+                "optionsSource": {
+                    "type": "dynamic",
+                    "sourceRef": {
+                        "type": "rest_api",
+                        "value": "cmdb/get_room_list"
+                    },
+                    "valueField": "inst_uuid",
+                    "labelField": "inst_name"
+                }
+            }
+        }
+    ],
+    "field_schema": []
+},
+{
+    "name": "云资源成本汇总",
+    "desc": "按筛选条件汇总计费时段内总费用、计费实例数、日均费用和环比",
+    "rest_api": "cmdb/get_cloud_resource_cost_summary",
+    "tag": [
+      "cmdb"
+    ],
+    "chart_type": [
+      "single"
+    ],
+    "params": [
+      {"name": "department", "type": "string", "value": "", "alias_name": "使用部门", "filterType": "filter"},
+      {"name": "applying_user", "type": "string", "value": "", "alias_name": "申请人", "filterType": "filter"},
+      {"name": "inst_type", "type": "string", "value": "", "alias_name": "对象类型", "filterType": "filter"},
+      {"name": "billing_period", "type": "dateRange", "value": null, "alias_name": "计费日期", "filterType": "filter"}
+    ],
+    "field_schema": [
+      {"key": "total_cost", "title": "总费用(元)", "value_type": "string", "description": "所选计费时段内的费用合计"},
+      {"key": "instance_count", "title": "计费实例数", "value_type": "number", "description": "所选时段内按资源实例 ID 去重后的实例数"},
+      {"key": "avg_daily_cost", "title": "日均费用(元)", "value_type": "string", "description": "总费用除以所选计费时段的日历天数"},
+      {"key": "mom_change_pct", "title": "环比变化(%)", "value_type": "string", "description": "与上一等长时段的费用变化比例；无法计算时返回空值"}
+    ]
+},
+{
+    "name": "云资源费用分布",
+    "desc": "按对象类型、使用部门或申请人汇总计费时段内费用和实例数",
+    "rest_api": "cmdb/get_cloud_resource_cost_distribution",
+    "tag": [
+      "cmdb"
+    ],
+    "chart_type": [
+      "topN"
+    ],
+    "params": [
+      {"name": "department", "type": "string", "value": "", "alias_name": "使用部门", "filterType": "filter"},
+      {"name": "applying_user", "type": "string", "value": "", "alias_name": "申请人", "filterType": "filter"},
+      {"name": "inst_type", "type": "string", "value": "", "alias_name": "对象类型", "filterType": "filter"},
+      {"name": "billing_period", "type": "dateRange", "value": null, "alias_name": "计费日期", "filterType": "filter"},
+      {
+        "name": "group_by",
+        "type": "string",
+        "value": "instance_type",
+        "alias_name": "分组维度",
+        "filterType": "params",
+        "required": true,
+        "inputConfig": {
+          "control": "select",
+          "optionsSource": {
+            "type": "static",
+            "staticItems": [
+              {"label": "对象类型", "value": "instance_type"},
+              {"label": "使用部门", "value": "department"},
+              {"label": "申请人", "value": "user"}
+            ]
+          }
+        }
+      }
+    ],
+    "field_schema": [
+        {"key": "key", "title": "分组值", "value_type": "string", "description": "当前分组维度对应的对象类型、使用部门或申请人"},
+        {"key": "total_cost", "title": "费用合计(元)", "value_type": "number", "description": "所选计费时段内该分组的费用合计"},
+        {"key": "instance_count", "title": "实例数", "value_type": "number", "description": "该分组中按资源实例 ID 去重后的实例数"},
+        {"key": "pct", "title": "费用占比(%)", "value_type": "number", "description": "该分组费用占所有分组费用合计的百分比"}
+    ]
+},
+{
+    "name": "云资源账单明细",
+    "desc": "分页展示计费时段内账单，可按费用、实例名称或使用部门排序",
+    "rest_api": "cmdb/get_cloud_resource_cost_bill_detail",
+    "tag": [
+        "cmdb"
+    ],
+    "chart_type": [
+        "table"
+    ],
+    "params": [
+        {"name": "department", "type": "string", "value": "", "alias_name": "使用部门", "filterType": "filter"},
+        {"name": "applying_user", "type": "string", "value": "", "alias_name": "申请人", "filterType": "filter"},
+        {"name": "inst_type", "type": "string", "value": "", "alias_name": "对象类型", "filterType": "filter"},
+        {"name": "billing_period", "type": "dateRange", "value": null, "alias_name": "计费日期", "filterType": "filter"},
+        {"name": "page", "type": "number", "value": 1, "alias_name": "页码", "filterType": "params"},
+        {"name": "page_size", "type": "number", "value": 20, "alias_name": "每页数量", "filterType": "params"},
+        {
+          "name": "sort_by",
+          "type": "string",
+          "value": "total_cost_incurred",
+          "alias_name": "排序字段",
+          "filterType": "params",
+          "inputConfig": {
+            "control": "select",
+            "optionsSource": {
+              "type": "static",
+              "staticItems": [
+                {"label": "已发生费用", "value": "total_cost_incurred"},
+                {"label": "实例名称", "value": "instance_name"},
+                {"label": "使用部门", "value": "department"}
+              ]
+            }
+          }
+        },
+        {
+          "name": "order",
+          "type": "string",
+          "value": "desc",
+          "alias_name": "排序方向",
+          "filterType": "params",
+          "inputConfig": {
+            "control": "select",
+            "optionsSource": {
+              "type": "static",
+              "staticItems": [
+                {"label": "降序", "value": "desc"},
+                {"label": "升序", "value": "asc"}
+              ]
+            }
+          }
+        }
+    ],
+    "field_schema": [
+        {"key": "instance_name", "title": "实例名称", "value_type": "string", "description": "计费资源实例的显示名称"},
+        {"key": "object_type", "title": "对象类型", "value_type": "string", "description": "资源所属的对象类型，如数据库、缓存或计算资源"},
+        {"key": "object_name", "title": "对象名称", "value_type": "string", "description": "业务侧资源对象名称"},
+        {"key": "department", "title": "使用部门", "value_type": "string", "description": "账单归属的使用部门"},
+        {"key": "user", "title": "申请人", "value_type": "string", "description": "账单记录的资源申请人"},
+        {"key": "object_id", "title": "资源实例 ID", "value_type": "string", "description": "计费资源实例的唯一标识"},
+        {"key": "total_cost_incurred", "title": "已发生费用(元)", "value_type": "string", "description": "所选计费时段内该账单的费用合计"},
+        {"key": "unit_price", "title": "日均费用(元/天)", "value_type": "string", "description": "已发生费用除以所选时段的日历天数；未选择时段时按账单日志跨度计算"}
+    ]
+},
+{
+        "key": "CMDB 机房列表::cmdb/get_room_list",
+"name": "CMDB 机房列表（选项）",
+    "desc": "机房列表，供参数动态选项使用，本身不直接出图",
+    "rest_api": "cmdb/get_room_list",
+    "tag": [
+        "cmdb"
+    ],
+    "chart_type": [],
+    "params": [],
+    "field_schema": []
+},
+{
+    "key": "CMDB 实例监控ID映射::cmdb/get_monitor_ids_by_inst_uuids",
+    "name": "CMDB 实例监控ID映射",
+    "desc": "按实例 UUID 批量返回关联的监控实例 ID，供网络状态拓扑叠色使用，本身不直接出图",
+    "rest_api": "cmdb/get_monitor_ids_by_inst_uuids",
+    "tag": ["cmdb"],
+    "chart_type": [],
+    "params": [
+        {
+            "name": "inst_uuids",
+            "type": "string",
+            "value": "",
+            "alias_name": "实例UUID列表",
+            "filterType": "params"
+        }
+    ],
+    "field_schema": [
+        {"key": "inst_uuid", "title": "实例UUID", "value_type": "string", "description": "CMDB 实例 UUID"},
+        {"key": "model_id", "title": "模型ID", "value_type": "string", "description": "CMDB 模型 ID"},
+        {"key": "monitor_id", "title": "监控实例ID", "value_type": "string", "description": "未关联时为空字符串"}
+    ]
+},
+{
+        "key": "CMDB 变更趋势::cmdb/get_change_trend",
+"name": "CMDB 变更趋势",
+    "desc": "跟随时间范围，统计实例新增、修改和删除趋势，可按模型筛选",
+    "rest_api": "cmdb/get_change_trend",
+    "tag": ["cmdb"],
+    "chart_type": ["line", "bar"],
+    "params": [
+        {
+            "name": "time",
+            "type": "timeRange",
+            "value": 10080,
+            "alias_name": "时间范围",
+            "filterType": "filter"
+        },
+        {
+            "name": "model_id",
+            "type": "string",
+            "value": "",
+            "alias_name": "模型 ID",
+            "filterType": "params"
+        }
+    ],
+    "field_schema": []
+},
+{
+        "key": "CMDB 模型分类列表::cmdb/get_model_classification_options",
+"name": "CMDB 模型分类列表（选项）",
+    "desc": "模型分类列表，供参数动态选项使用，本身不直接出图",
+    "rest_api": "cmdb/get_model_classification_options",
+    "tag": ["cmdb"],
+    "chart_type": [],
+    "params": [],
+    "field_schema": [
+        {"key": "classification_id", "title": "模型分类 ID", "value_type": "string", "description": "模型分类唯一标识"},
+        {"key": "classification_name", "title": "模型分类名称", "value_type": "string", "description": "当前语言下的模型分类显示名称"}
+    ]
+},
+{
+        "key": "分类模型实例数量::cmdb/get_classification_model_instance_counts",
+"name": "分类下模型实例数",
+    "desc": "指定模型分类下各模型的实例数量，过滤零实例并降序；依赖分类参数",
+    "rest_api": "cmdb/get_classification_model_instance_counts",
+    "tag": ["cmdb"],
+    "chart_type": ["multiValue"],
+    "params": [
+        {
+            "name": "classification_id",
+            "type": "string",
+            "value": "",
+            "alias_name": "模型分类",
+            "filterType": "params",
+            "required": true,
+            "inputConfig": {
+                "control": "select",
+                "optionsSource": {
+                    "type": "dynamic",
+                    "sourceRef": {"type": "rest_api", "value": "cmdb/get_model_classification_options"},
+                    "valueField": "classification_id",
+                    "labelField": "classification_name"
+                }
+            }
+        }
+    ],
+    "field_schema": [
+        {"key": "label", "title": "模型名称", "value_type": "string", "description": "指定分类下实例数大于零的模型名称"},
+        {"key": "value", "title": "实例数量", "value_type": "number", "description": "当前权限范围内该模型的实例数量"}
+    ]
+},
+{
+        "key": "CMDB 地区列表::cmdb/get_region_options",
+"name": "CMDB 地区列表（选项）",
+    "desc": "地区标签候选项，供参数动态选项使用，本身不直接出图",
+    "rest_api": "cmdb/get_region_options",
+    "tag": ["cmdb"],
+    "chart_type": [],
+    "params": [],
+    "field_schema": [
+        {"key": "label", "title": "地区名称", "value_type": "string", "description": "region 标签候选项的地区名称"},
+        {"key": "value", "title": "地区值", "value_type": "string", "description": "传给地区资源概览接口的 region 参数值"}
+    ]
+},
+{
+        "key": "地区资源概览::cmdb/get_region_resource_overview",
+"name": "地区分类实例数",
+    "desc": "按地区标签统计各模型分类的实例总数；依赖地区参数",
+    "rest_api": "cmdb/get_region_resource_overview",
+    "tag": ["cmdb"],
+    "chart_type": ["multiValue"],
+    "params": [
+        {
+            "name": "region",
+            "type": "string",
+            "value": "",
+            "alias_name": "地区",
+            "filterType": "params",
+            "required": true,
+            "inputConfig": {
+                "control": "select",
+                "optionsSource": {
+                    "type": "dynamic",
+                    "sourceRef": {"type": "rest_api", "value": "cmdb/get_region_options"},
+                    "valueField": "value",
+                    "labelField": "label"
+                }
+            }
+        }
+    ],
+    "field_schema": [
+        {"key": "label", "title": "资源分类", "value_type": "string", "description": "当前语言下的 CMDB 模型分类名称"},
+        {"key": "value", "title": "实例数量", "value_type": "number", "description": "指定地区和当前权限范围内的分类实例总数"}
+    ]
+},
+{
+    "name": "网络设备资源排行",
+    "desc": "查询当前权限范围内交换机、路由器、防火墙和负载均衡设备的CPU、内存及当前双向总流量排行",
+    "rest_api": "monitor/get_network_device_resource_top",
+    "tag": ["monitor"],
+    "chart_type": ["topN", "table"],
+    "params": [
+        {
+            "name": "metric_type",
+            "type": "string",
+            "value": "cpu",
+            "alias_name": "指标类型",
+            "filterType": "params",
+            "required": true,
+            "inputConfig": {
+                "control": "select",
+                "componentSwitch": true,
+                "optionsSource": {
+                    "type": "static",
+                    "staticItems": [
+                        {"label": "CPU使用率", "value": "cpu"},
+                        {"label": "内存使用率", "value": "memory"},
+                        {"label": "总流量", "value": "traffic"}
+                    ]
+                }
+            }
+        },
+        {"name": "limit", "type": "number", "value": 10, "alias_name": "返回条数", "filterType": "fixed"}
+    ],
+    "field_schema": [
+        {"key": "rank", "title": "排名", "value_type": "number"},
+        {"key": "display_name", "title": "网络设备", "value_type": "string"},
+        {"key": "value", "title": "指标值", "value_type": "number"},
+        {"key": "unit", "title": "单位", "value_type": "string"},
+        {"key": "ip", "title": "IP地址", "value_type": "string"},
+        {"key": "instance_id", "title": "实例ID", "value_type": "string"},
+        {"key": "device_type", "title": "设备类型", "value_type": "string"},
+        {"key": "sampled_at", "title": "采样时间", "value_type": "datetime"}
+    ]
+},
+{
+        "key": "告警来源分布::alert/get_alert_source_distribution",
+"name": "告警按来源分布",
+    "desc": "按来源统计全部告警存量，不受时间范围影响；空来源归为未知来源，非关联事件口径",
+    "rest_api": "alert/get_alert_source_distribution",
+    "tag": ["alerts"],
+    "chart_type": ["pie"],
+    "params": [],
+    "field_schema": [
+        {"key": "name", "title": "告警来源", "value_type": "string", "description": "告警数据中的来源名称，空值归为未知来源"},
+        {"key": "value", "title": "告警数量", "value_type": "number", "description": "当前权限范围内该来源的全部告警数量"}
     ]
 }
 ]

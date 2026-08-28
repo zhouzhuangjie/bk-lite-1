@@ -1,0 +1,172 @@
+# BK-Lite 开发与运行
+
+> 从 [AGENTS.md](AGENTS.md) 提取的明细。AGENTS.md 给快速开始，本文给完整命令、开发到发布流程与故障 Runbook。
+
+## 1. 完整命令清单
+
+### Agent 工作流
+
+仓库使用 vendored Grill Skills 与本地 Markdown 事实源，无需安装仓库专用 CLI 或启动 MCP。入口见 `docs/agents/workflow.md`。
+
+### Server（`server/`，Django）
+```bash
+make install          # uv sync 安装依赖
+make migrate          # makemigrations + migrate + 建缓存表
+make dev              # Uvicorn 启动于 :8011（--reload）
+make test             # pytest
+make test-unit        # 仅 unit marker
+make test-bdd         # 仅 bdd marker
+make test-fast        # 跳过 slow
+make test-app         # 指定 app 测试
+make celery           # Celery worker
+make celery-beat      # Beat 调度
+make start-nats       # NATS 监听
+make shell            # IPython shell_plus
+make setup-dev-user   # 建 admin/password 超管
+make server-init      # batch_init 初始化
+make collect-static   # 收集静态文件
+make init-buckets     # 初始化 MinIO bucket
+```
+
+运营分析目录父链发布前检查：
+
+```bash
+cd server
+python manage.py audit_directory_cycles
+```
+
+该命令只读列出循环节点，不自动修改存量数据。若发现循环，先备份数据库，再人工把
+循环中的一个目录 `parent` 置空并复跑检查。代码回滚使用 `git revert`；该修复不含
+数据库迁移，回滚代码不会恢复已经拒绝的非法写入。
+单测运行:
+```bash
+cd server
+uv run pytest apps/monitor/tests/test_x.py -v
+uv run pytest apps/monitor/tests/test_x.py::TestClass::test_method -v
+uv run pytest -m unit         # 按 marker
+uv run pytest -m "not slow"
+```
+
+### Web（`web/`）
+```bash
+pnpm install   # 强制 pnpm（only-allow）
+pnpm dev       # :3000（--turbo）
+pnpm build     # 生产构建
+pnpm lint      # ESLint
+pnpm type-check
+pnpm storybook # :6006
+```
+
+### APM 数据面（`deploy/apm/`，契约夹具）
+```bash
+cd deploy/apm
+make up        # 启动契约验证用 Collector/NATS/VictoriaTraces（非生产编排）
+make ps        # 查看状态
+make logs      # 跟随日志
+make down      # 停止夹具
+make test      # Collector 单元测试
+make validate  # Compose 与 Collector 配置校验
+make contract  # 真实 SDK 全链路容器契约
+```
+生产 Stream/VT/系统 Collector 与流水线由运维落地；验收约束见 `deploy/apm/ACCEPTANCE.md`。
+
+### Mobile（`mobile/`）
+```bash
+pnpm dev            # :3001
+pnpm dev:tauri      # Tauri 桌面
+pnpm test           # Node 核心流程 + Rust 单测
+pnpm test:node      # 登录、会话与 Tauri 流契约
+pnpm test:rust      # Tauri Rust 单测
+pnpm build          # Web 产物
+pnpm build:android  # Android release
+pnpm build:aab      # AAB
+```
+
+### WebChat（`webchat/`）/ Stargazer / Algorithms
+```bash
+cd webchat && npm install && npm run dev|build|test
+cd agents/stargazer && make install && make run   # Sanic :8083；make lint / make build
+cd algorithms/<svc> && make install && make serving  # BentoML :3000；uv run pytest
+```
+
+## 2. 工作流（dev → test → build → release）
+
+### Server
+- dev `make dev` → `uvicorn ... --port 8011` 启动成功
+- test `make test` → pytest 退出码 0
+- build `docker build -t bklite/server -f support-files/release/Dockerfile .`（在 `server/`）
+- release 容器执行 `support-files/release/startup.sh`(migrate/createcachetable/collectstatic/supervisord)
+- 常见失败:`.env` 缺 DB/NATS/Redis;迁移冲突;依赖安装失败
+- 回滚:`git revert` / `manage.py migrate <app> <target>` / 回退镜像 tag
+- 本地验证 APM 告警中心事件副本时，`INSTALL_APPS` 必须同时包含 `apm`、`system_mgmt`、`alerts`，并分别启动 API、Celery Worker、Celery Beat 和 NATS Listener。一个本地环境只运行一组 Worker/Beat/Listener；重复进程会造成任务重复领取或 responder 归属不明确，先用 `pgrep -af 'celery|nats_listener'` 对账后再排查业务逻辑。
+
+### Web
+- dev `pnpm dev`(:3000)/ test `pnpm lint && pnpm type-check` / build `pnpm build`（单次准备构建资源后执行 `next build --turbopack`，静默期间每 10 秒输出心跳）/ release 镜像 `pnpm run start`
+- 常见失败:非 pnpm 被拦;`NEXTAPI_URL` 配错;Node 版本不一致
+- 回滚:`git revert` / `pnpm clean && pnpm install && pnpm build` / 回退镜像
+
+### Mobile
+- dev `pnpm dev` / `pnpm dev:tauri`;build `pnpm build:android` / `pnpm build:aab`;release 由 `scripts/android-build.mjs` + `src-tauri/tauri.conf.json` 生成
+- 常见失败:缺 `keystore.properties`/keystore;Android SDK/NDK/Java 异常;3001 端口冲突
+
+### WebChat
+- release:手工触发`.github/workflows/webchat-tests.yml`并显式启用publish输入;需 `NPM_TOKEN`/`NODE_AUTH_TOKEN`
+- 常见失败:token 缺失/权限不足;Node matrix 18/20 不满足
+
+### Stargazer
+- dev `make run`(`sanic ... --port=8083`);test `make lint`(pre-commit);build `make build`
+- 常见失败:Server/Worker Redis 配置不一致;`.env` 缺 NATS/Redis。**先起 Worker 再起 Server**
+
+### APM 数据面（`deploy/apm/`，契约夹具）
+- dev `make up` → 本地契约夹具就绪（非生产编排）
+- test `make test && make validate`；全链路契约 `make contract`（需 Docker）
+- release 运维按 [deploy/apm/ACCEPTANCE.md](deploy/apm/ACCEPTANCE.md) 验收；容量下界见 `CAPACITY.md`；Server 运行期变量模板见 `server/support-files/env/.env.apm.example`
+- 常见失败:镜像 tag 不存在;NATS ACL/Stream 漂移;4318 对非受信网络开放;把本地 Compose 参数直接当生产容量
+- 回滚:只回退本次上线的区域/系统 Collector、Stream/Consumer 与 VT；不恢复 Edge/APM VM/spanmetrics；编排回退由运维流水线执行
+
+### K8s 采集器（`deploy/dist/bk-lite-kubernetes-collector/`）
+- release:`kubectl apply -f bk-lite-metric-collector.yaml` / `bk-lite-log-collector.yaml`
+- 验证:`kubectl get pods/ds/deploy -n bk-lite-collector` 健康
+- 常见失败:`secret.env`/`ca.crt` 未注入或 NATS 参数错
+
+## 3. Algorithms 设计约定（补充,真相源 [algorithms/DESIGN_GUIDE.md](algorithms/DESIGN_GUIDE.md)）
+
+- 每个算法服务遵循 classifier 模式 + `ModelRegistry` 装饰器注册。
+- 训练配置由 `TrainingConfig` 驱动;MLflow 做实验追踪。
+- 传统 ML(anomaly/timeseries/log/text):最终训练前 **合并 train+val**。
+- 深度学习(image/object_detection):**train/val 分离**(YOLO 要求)。
+
+## 4. 关键环境变量
+
+| 变量 | 说明 |
+|------|------|
+| `DB_ENGINE` | postgresql(默认)/ mysql / sqlite / dameng / gaussdb / goldendb / oceanbase |
+| `DB_NAME/USER/PASSWORD/HOST/PORT` | 数据库连接 |
+| `INSTALL_APPS` | 逗号分隔的加载 app(空=全加载) |
+| `NEXTAPI_URL` | 前端访问后端的 API 地址 |
+
+模板:`server/envs/.env.example`、`server/support-files/env/*.example`（APM 使用 `.env.apm.example`）、`web/.env.example`、`agents/stargazer/.env.example`、K8s `secret.*.template`。
+> 新增 env 走 `os.getenv` 默认值,不改 `.env.example`(易冲突,见团队约定)。
+
+Celery Beat 静态任务对账使用 `CELERY_BEAT_SCHEDULE_RECONCILE_MODE`，代码默认 `shadow`（只报告）；
+确认 shadow 明细后可切为 `enforce`，仅禁用带有效所有权指纹且退出完整配置快照的任务。回退代码前先切
+`restore` 并重复运行至恢复明细清空。首次上线不会接管无指纹历史任务；确认历史静态名称基线后，先将精确名称
+以逗号分隔写入 `CELERY_BEAT_SCHEDULE_LEGACY_MANAGED_NAMES` 并保持 `shadow`，再把日志输出的
+`名称@行指纹` 原样写回该配置并切 `enforce`，仅在行身份未漂移时原子导入并禁用。回滚该次存量导入时保留
+同一份 `名称@行指纹` 清单并切 `restore`，任务恢复后会释放导入的机器所有权标记。
+
+## 5. Runbook（常见故障）
+
+1. `git pull --ff-only` 失败 → 先解决分叉/未提交变更。
+2. `make dev` 启动失败 → 核对 `.env` 的 DB/NATS/Redis。
+3. `make test` 因迁移失败 → 先 `make migrate`,再查 `server/scripts/check_migrate/`。
+4. `web pnpm install` 被拒 → 必须用 pnpm(`only-allow`)。
+5. `web build` 内存不足 → 参考 `web/Dockerfile` 的 `NODE_OPTIONS`,降并发。
+6. `mobile dev:tauri` 连不上后端 → 确认 `tauri.conf.json` `devUrl=3001` 且后端可达。
+7. `mobile build:android` 签名报错 → 补 `src-tauri/gen/android/keystore.properties` 与 keystore。
+8. `webchat publish` 失败 → 检查 `NPM_TOKEN`、npm 权限与版本冲突。
+9. `stargazer` 不接纳采集 → 检查 Redis/NATS 与 `/api/health/ready`；Stargazer 已无独立 ARQ Worker。
+10. K8s 采集器无数据 → 检查 `secret.env` 的 `CLUSTER_NAME/NATS_*` 与 `ca.crt`。
+11. CMDB 推监控「成功但无实例 / ignored」→ 若 `.env` 的 `NATS_SERVERS` 指向远端共享集群，本地 `nats_listener` 与远端消费者抢同一 queue，请求常被远端旧代码接走并 `ignored`。本地 monorepo 开发在 `.env` 设 `IS_LOCAL_RPC=1`（模块间走本进程 `AppClient`），改完后重启 `make dev`（环境变量不随 `--reload` 热更新）。
+
+> 质量门禁与代码红线见 [工程质量规格](specs/capabilities/engineering-quality.md)；回滚与韧性见 [平台可靠性规格](specs/capabilities/platform-reliability.md)。

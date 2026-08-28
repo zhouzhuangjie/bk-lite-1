@@ -1,0 +1,459 @@
+// ── 枚举类型 ─────────────────────────────────────────────────────────────────
+
+export type OSType = 'windows' | 'linux';
+export type PatchType = 'security' | 'generic';
+export type PatchSeverity = 'critical' | 'important' | 'moderate' | 'low' | 'unspecified';
+export type PackageStatus = 'pending' | 'downloading' | 'ready' | 'download_failed';
+export type ConnectivityStatus = 'unknown' | 'connected' | 'failed';
+export type SSHCredentialType = 'password' | 'key';
+export type WinRMScheme = 'http' | 'https';
+export type WinRMTransport = 'basic' | 'ntlm' | 'kerberos' | 'credssp';
+export type PatchSourceType = 'wsus' | 'yum_repo' | 'dnf_repo' | 'apt_repo';
+export type PatchOriginType = PatchSourceType | 'manual';
+export type PatchTargetSource = 'manual' | 'node_mgmt';
+export type ComplianceStatus = 'compliant' | 'non_compliant' | 'pending' | 'evaluating' | 'failed' | 'unconfigured' | 'unknown' | 'not_applicable';
+export type BaselineCompliancePerspective = 'host' | 'patch';
+export type BaselineComplianceResultStatus = 'satisfied' | 'missing' | 'not_applicable' | 'unknown' | 'pending' | 'evaluating' | 'failed';
+export type BaselineComplianceResultScope = 'requirement' | 'host';
+
+export interface BaselineComplianceDistribution {
+  status: BaselineComplianceResultStatus;
+  count: number;
+}
+
+export interface BaselineComplianceFailure {
+  reason: string;
+  error_code: string;
+  failed_stage: string;
+}
+
+export interface BaselineComplianceHostObject {
+  id: number;
+  binding_id: number;
+  name: string;
+  ip: string;
+  compliance_status: ComplianceStatus;
+  missing_count: number;
+  last_evaluated_at: string | null;
+  distribution: BaselineComplianceDistribution[];
+  failure?: BaselineComplianceFailure | null;
+}
+
+export interface BaselineCompliancePatchObject {
+  id: number;
+  requirement_id: number;
+  patch_id: number;
+  identifier: string;
+  title: string;
+  severity: PatchSeverity;
+  severity_display: string;
+  condition: string;
+  distribution: BaselineComplianceDistribution[];
+}
+
+export interface BaselineComplianceRequirementSummary {
+  requirement_id: number;
+  patch_id: number;
+  identifier: string;
+  title: string;
+  severity: PatchSeverity;
+  severity_display: string;
+  condition: string;
+}
+
+export interface BaselineComplianceResult {
+  status: BaselineComplianceResultStatus;
+  status_scope: BaselineComplianceResultScope;
+  satisfied: boolean;
+  evidence: Record<string, unknown>;
+  reason: string;
+  evaluated_at: string | null;
+}
+
+export interface BaselineComplianceHostDetail extends BaselineComplianceRequirementSummary, BaselineComplianceResult {}
+
+export interface BaselineCompliancePatchDetail extends BaselineComplianceResult {
+  binding_id: number;
+  target_id: number;
+  target_name: string;
+  target_ip: string;
+  compliance_status: ComplianceStatus;
+  failure?: BaselineComplianceFailure | null;
+}
+
+export interface BaselineCompliancePage<T> {
+  count: number;
+  page: number;
+  page_size: number;
+  items: T[];
+}
+
+interface BaselineComplianceResponseBase {
+  baseline: { id: number; name: string; os_type: OSType };
+}
+
+export interface BaselineComplianceObjectsParams {
+  perspective: BaselineCompliancePerspective;
+  page?: number;
+  page_size?: number;
+}
+
+export interface BaselineComplianceHostObjectsResponse extends BaselineComplianceResponseBase {
+  perspective: 'host';
+  count: number;
+  page: number;
+  page_size: number;
+  items: BaselineComplianceHostObject[];
+}
+
+export interface BaselineCompliancePatchObjectsResponse extends BaselineComplianceResponseBase {
+  perspective: 'patch';
+  count: number;
+  page: number;
+  page_size: number;
+  items: BaselineCompliancePatchObject[];
+}
+
+export type BaselineComplianceObjectsResponse =
+  | BaselineComplianceHostObjectsResponse
+  | BaselineCompliancePatchObjectsResponse;
+
+export interface BaselineComplianceDetailsParams {
+  perspective: BaselineCompliancePerspective;
+  selected_id: number;
+  page?: number;
+  page_size?: number;
+  search?: string;
+  status?: BaselineComplianceResultStatus;
+}
+
+export interface BaselineComplianceHostDetailsResponse extends BaselineComplianceResponseBase {
+  perspective: 'host';
+  selected: BaselineComplianceHostObject | null;
+  details: BaselineCompliancePage<BaselineComplianceHostDetail>;
+}
+
+export interface BaselineCompliancePatchDetailsResponse extends BaselineComplianceResponseBase {
+  perspective: 'patch';
+  selected: BaselineCompliancePatchObject | null;
+  details: BaselineCompliancePage<BaselineCompliancePatchDetail>;
+}
+
+export type BaselineComplianceDetailsResponse =
+  | BaselineComplianceHostDetailsResponse
+  | BaselineCompliancePatchDetailsResponse;
+
+// ── 通知配置候选 ──────────────────────────────────────────────────────────────
+
+export interface NoticeChannel {
+  id: number;
+  name: string;
+  channel_type: string;
+}
+
+export interface NoticeUser {
+  id: number;
+  user_id?: string;
+  username: string;
+  display_name?: string;
+}
+
+export interface NoticeRule {
+  channel_id: number;
+  channel_name: string;
+  channel_type: string;
+  receivers: number[];
+  team_id?: number;
+}
+
+export interface NoticeRuleInput {
+  channel_id: number;
+  receivers: number[];
+}
+
+export interface NoticeRuleDraft {
+  key: string;
+  channel_id?: number;
+  receivers: number[];
+}
+
+export interface NoticeCandidates {
+  channels: NoticeChannel[];
+  users: NoticeUser[];
+}
+
+// ── 通用响应 ──────────────────────────────────────────────────────────────────
+
+export interface ListResponse<T> {
+  count: number;
+  items: T[];
+}
+
+// ── 补丁源 ────────────────────────────────────────────────────────────────────
+
+export interface PatchSource {
+  id: number;
+  name: string;
+  is_builtin: boolean;
+  source_type: PatchSourceType;
+  source_type_display?: string;
+  connectivity_status_display?: string;
+  url: string;
+  distro_name: string;
+  os_version: string;
+  arch: string;
+  proxy_host: string;
+  proxy_port: number | null;
+  auth_user?: string;
+  auth_password?: string;
+  has_auth_password?: boolean;
+  is_enabled: boolean;
+  connectivity_status: ConnectivityStatus;
+  last_checked_at: string | null;
+  team: number[];
+  created_at: string;
+  updated_at: string;
+  permission?: string[];
+}
+
+export interface PatchSourceParams {
+  page?: number;
+  page_size?: number;
+  source_type?: PatchSourceType;
+  is_enabled?: boolean;
+  team?: string;
+  search?: string;
+}
+
+export interface ScanSetting {
+  id: number;
+  frequency: 'hourly' | 'daily' | 'weekly';
+  hour_interval: number;
+  weekday: number;
+  time: string;
+  timezone: string;
+  is_enabled: boolean;
+  notification_enabled: boolean;
+  notification_rules: NoticeRule[];
+  created_at: string;
+  updated_at: string;
+}
+
+// ── 补丁库 ────────────────────────────────────────────────────────────────────
+
+export interface Patch {
+  id: number;
+  title: string;
+  os_type: OSType;
+  patch_type: PatchType;
+  severity: PatchSeverity;
+  cve_list: string[];
+  pkg_status: PackageStatus;
+  os_type_display?: string;
+  patch_type_display?: string;
+  severity_display?: string;
+  pkg_status_display?: string;
+  applicable_scope: Record<string, unknown>;
+  windows_detail?: WindowsPatchDetail | null;
+  linux_detail?: LinuxPatchDetail | null;
+  sources: number[];
+  source_type: PatchOriginType | null;
+  source_details?: PatchSourceDetail[];
+  baseline_requirement_count?: number;
+  released_at: string | null;
+  last_synced_at: string | null;
+  team: number[];
+  created_at: string;
+  updated_at: string;
+  permission?: string[];
+  package_info?: {
+    file_name: string;
+    file_size: number;
+    sha256: string;
+    extension: '.msu' | '.cab';
+  } | null;
+}
+
+export interface PatchSourceDetail {
+  source_id: number | null;
+  source_type: PatchSourceType;
+  url: string;
+  deleted: boolean;
+}
+
+export interface WindowsPatchDetail {
+  kb_number: string;
+  product_list: string[];
+  architectures: string[];
+  ms_bulletin: string;
+}
+
+export interface LinuxPatchDetail {
+  pkg_name: string;
+  pkg_version: string;
+  distro_name: string;
+  os_version_range: string;
+  architectures: string[];
+  repo_type: string;
+}
+
+export interface PatchParams {
+  page?: number;
+  page_size?: number;
+  os_type?: OSType;
+  patch_type?: PatchType;
+  severity?: PatchSeverity;
+  pkg_status?: PackageStatus;
+  source_isnull?: boolean;
+  source_type?: PatchOriginType;
+  team?: string;
+  search?: string;
+  name?: string;
+  version?: string;
+  arch?: string;
+}
+
+// ── 目标管理 ──────────────────────────────────────────────────────────────────
+
+export interface PatchTarget {
+  id: number;
+  name: string;
+  ip: string;
+  os_type: OSType;
+  source_type: PatchTargetSource;
+  source_type_display?: string;
+  node_id: string;
+  cloud_region_id: number | null;
+  ssh_port: number;
+  ssh_user: string;
+  ssh_credential_type: SSHCredentialType;
+  ssh_password?: string;
+  ssh_key_passphrase?: string;
+  ssh_key_file?: string | null;
+  has_ssh_password?: boolean;
+  has_ssh_key?: boolean;
+  ssh_key_file_name?: string;
+  winrm_port: number;
+  winrm_scheme: WinRMScheme;
+  winrm_transport: WinRMTransport;
+  winrm_user: string;
+  winrm_password?: string;
+  has_winrm_password?: boolean;
+  connectivity_status: ConnectivityStatus;
+  os_type_display?: string;
+  connectivity_status_display?: string;
+  baseline_name?: string | null;
+  compliance_status?: ComplianceStatus;
+  missing_count?: number;
+  last_evaluated_at?: string | null;
+  last_detected_at?: string | null;
+  has_active_task?: boolean;
+  has_pending_reboot?: boolean;
+  arch?: string;
+  team: number[];
+  team_name?: string[];
+  created_at: string;
+  updated_at: string;
+  permission?: string[];
+}
+
+export interface PatchTargetParams {
+  page?: number;
+  page_size?: number;
+  ip?: string;
+  os_type?: OSType;
+  team?: string;
+  search?: string;
+  compliance_status?: ComplianceStatus;
+  baseline_id?: number;
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+
+export interface DistributionItem {
+  count: number;
+  severity?: string;
+  severity_display?: string;
+  status?: string;
+  status_display?: string;
+}
+
+export interface ComplianceDistributionItem {
+  label: string;
+  count: number;
+  color: string;
+  filter?: string;
+}
+
+export interface RecentTaskItem {
+  id: number;
+  name: string;
+  task_type: 'install' | 'reboot';
+  task_type_display: string;
+  execution_mode: 'now' | 'window';
+  execution_window_start?: string | null;
+  execution_window_end?: string | null;
+  status: string;
+  status_code?: string;
+  status_color: string;
+  created_at: string | null;
+}
+
+export interface TopRiskItem {
+  id: number;
+  patch: string;
+  hosts: number;
+  sev: string;
+  severity: PatchSeverity;
+}
+
+export interface PatchDashboardStats {
+  high_severity_missing: number;
+  affected_targets: number;
+  pending_reboot_targets: number;
+  failed_install_tasks: number;
+  recent_scan_status: string | null;
+  recent_scan_coverage: number | null;
+  target_total?: number;
+  patch_total?: number;
+  compliance_rate?: number;
+  coverage_rate?: number;
+  non_compliant_hosts?: number;
+  unconfigured_hosts?: number;
+  unknown_hosts?: number;
+  not_applicable_hosts?: number;
+  pending_risk_count?: number;
+  failed_tasks?: number;
+  compliance_distribution?: ComplianceDistributionItem[];
+  scan_tasks?: { total: number; running: number; pending: number; completed: number; failed: number };
+  install_tasks?: { total: number; running: number; pending: number; success: number; failed: number };
+  patch_severity_distribution?: DistributionItem[];
+  scan_result_distribution?: DistributionItem[];
+  recent_tasks?: RecentTaskItem[];
+  top_risks?: TopRiskItem[];
+}
+
+export interface CandidateItem {
+  key: string;
+  name: string;
+  title: string;
+  version?: string;
+  dist?: string;
+  arch: string;
+  added: boolean;
+  severity?: string;
+}
+
+export interface IngestSyncResult {
+  created: number;
+  updated: number;
+  skipped: number;
+  total: number;
+}
+
+export interface IngestAsyncResult {
+  accepted: true;
+  task_id: string;
+}
+
+export type IngestResult = IngestSyncResult | IngestAsyncResult;

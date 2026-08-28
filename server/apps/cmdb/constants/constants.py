@@ -1,7 +1,7 @@
 # 模型分类标签
 import os
-
 from enum import Enum
+
 from apps.cmdb.utils.time_util import parse_cmdb_time
 
 
@@ -53,6 +53,7 @@ INSTANCE_ASSOCIATION = "instance_association"
 # 拓扑主题：模型 -> 可用主题。network 主题表示「网络拓扑」视图
 TOPO_THEME_NETWORK = "network"
 TOPO_THEME_IPAM = "ipam"
+TOPO_THEME_APP_OVERVIEW = "app_overview"
 # 网络设备判定：存在 interface --belong--> <model> 的模型关联即视为网络设备
 NETWORK_INTERFACE_MODEL = "interface"
 NETWORK_INTERFACE_BELONG_ASST = "belong"
@@ -60,6 +61,9 @@ NETWORK_INTERFACE_BELONG_ASST = "belong"
 NETWORK_TOPO_DEFAULT_HOP = 2
 NETWORK_TOPO_MAX_HOP = 4
 NETWORK_TOPO_NODE_LIMIT = 100
+# 运营分析网络状态拓扑闭集：默认勾选上限与系统硬顶（不改变编辑页 BFS 的 100）
+NETWORK_STATUS_TOPOLOGY_DEFAULT_NODES = 100
+NETWORK_STATUS_TOPOLOGY_MAX_NODES = 200
 
 
 class ModelConstraintKey(BaseEnum):
@@ -383,7 +387,7 @@ COLLECT_OBJ_TREE = [
                 "desc": "通过 Netmiko 采集网络设备配置命令输出并归档为配置文件版本",
                 "icon": "config_file",
                 "encrypted_fields": ["password", "enable_password"],
-            }
+            },
         ],
     },
     {
@@ -412,6 +416,9 @@ COLLECT_OBJ_TREE = [
                 "name": "Mysql",
                 "task_type": CollectPluginTypes.PROTOCOL,
                 "type": CollectDriverTypes.PROTOCOL,
+                "credential_protocol": "mysql",
+                "credential_kind": "database_account",
+                "credential_default_port": 3306,
                 "tag": ["Agentless", "TCP"],
                 "desc": "采集MySQL关键配置信息",
                 "encrypted_fields": ["password"],
@@ -422,6 +429,9 @@ COLLECT_OBJ_TREE = [
                 "name": "【BETA】InfluxDB",
                 "task_type": CollectPluginTypes.PROTOCOL,
                 "type": CollectDriverTypes.PROTOCOL,
+                "credential_protocol": "influxdb_http",
+                "credential_kind": "optional_operator_token",
+                "credential_default_port": 8086,
                 "tag": ["Agentless", "HTTP", "Beta"],
                 "desc": "采集InfluxDB关键配置信息（兼容1.x/2.x，优先2.x）",
                 "encrypted_fields": ["password", "token"],
@@ -432,6 +442,9 @@ COLLECT_OBJ_TREE = [
                 "name": "PostgreSQL",
                 "task_type": CollectPluginTypes.PROTOCOL,
                 "type": CollectDriverTypes.PROTOCOL,
+                "credential_protocol": "postgresql",
+                "credential_kind": "database_account",
+                "credential_default_port": 5432,
                 "tag": ["Agentless", "TCP"],
                 "desc": "采集PostgreSQL关键配置信息",
                 "encrypted_fields": ["password"],
@@ -442,6 +455,9 @@ COLLECT_OBJ_TREE = [
                 "name": "【BETA】MSSQL",
                 "task_type": CollectPluginTypes.PROTOCOL,
                 "type": CollectDriverTypes.PROTOCOL,
+                "credential_protocol": "sql_server",
+                "credential_kind": "database_account",
+                "credential_default_port": 1433,
                 "tag": ["Agentless", "TCP", "Windows", "SQL Server"],
                 "desc": "采集MSSQL关键配置信息",
                 "encrypted_fields": ["password"],
@@ -452,6 +468,9 @@ COLLECT_OBJ_TREE = [
                 "name": "Redis",
                 "task_type": CollectPluginTypes.DB,
                 "type": CollectDriverTypes.JOB,
+                "credential_protocol": "ssh",
+                "credential_kind": "host_account",
+                "credential_default_port": 22,
                 "tag": ["Agent", "JOB", "Linux"],
                 "desc": "采集Redis关键配置信息",
                 "encrypted_fields": ["password"],
@@ -498,9 +517,12 @@ COLLECT_OBJ_TREE = [
                 "name": "【BETA】华为存储",
                 "task_type": CollectPluginTypes.CLOUD,
                 "type": CollectDriverTypes.PROTOCOL,
+                "credential_protocol": "oceanstor_https",
+                "credential_kind": "platform_api_account",
+                "credential_default_port": 8088,
                 "tag": ["Agentless", "HTTPS", "Beta"],
                 "desc": "采集华为 OceanStor 存储设备及其存储池、磁盘、卷（LUN）",
-                "encrypted_fields": ["password"],
+                "encrypted_fields": ["accessKey", "password", "accessSecret"],
             },
         ],
     },
@@ -514,6 +536,8 @@ COLLECT_OBJ_TREE = [
                 "name": "阿里云",
                 "task_type": CollectPluginTypes.CLOUD,
                 "type": CollectDriverTypes.PROTOCOL,
+                "credential_protocol": "aliyun_openapi",
+                "credential_kind": "access_key",
                 "tag": ["SDK"],
                 "desc": "采集阿里云账户下ECS、VPC、RDS等资产清单",
                 "encrypted_fields": ["accessKey", "accessSecret"],
@@ -524,6 +548,8 @@ COLLECT_OBJ_TREE = [
                 "name": "腾讯云",
                 "task_type": CollectPluginTypes.CLOUD,
                 "type": CollectDriverTypes.PROTOCOL,
+                "credential_protocol": "tencentcloud_api",
+                "credential_kind": "secret_id_key",
                 "tag": ["SDK"],
                 "desc": "采集腾讯云账户下CVM、VPC、云数据库等资产清单",
                 "encrypted_fields": ["accessKey", "accessSecret"],
@@ -534,6 +560,8 @@ COLLECT_OBJ_TREE = [
                 "name": "华为云【beta】",
                 "task_type": CollectPluginTypes.CLOUD,
                 "type": CollectDriverTypes.PROTOCOL,
+                "credential_protocol": "huaweicloud_sdk",
+                "credential_kind": "ak_sk_project",
                 "tag": ["SDK"],
                 "desc": "采集华为云平台及其下 ECS 等资产清单",
                 "encrypted_fields": ["accessKey", "accessSecret"],
@@ -544,15 +572,18 @@ COLLECT_OBJ_TREE = [
                 "name": "FusionInsight【beta】",
                 "task_type": CollectPluginTypes.CLOUD,
                 "type": CollectDriverTypes.PROTOCOL,
+                "credential_protocol": "fusioninsight_https",
+                "credential_kind": "http_basic_account",
+                "credential_default_port": 443,
                 "tag": ["SDK"],
                 "desc": "采集 FusionInsight 平台及其下集群、主机",
-                "encrypted_fields": ["accessKey", "accessSecret"],
+                "encrypted_fields": ["accessKey", "password", "accessSecret"],
             },
         ],
     },
     {
         "id": "host_manage",
-        "name": "主机管理",
+        "name": "主机逻辑主机",
         "children": [
             {
                 "id": "host",
@@ -560,6 +591,9 @@ COLLECT_OBJ_TREE = [
                 "name": "主机",
                 "task_type": CollectPluginTypes.HOST,
                 "type": CollectDriverTypes.JOB,
+                "credential_protocol": "ssh",
+                "credential_kind": "host_account",
+                "credential_default_port": 22,
                 "tag": ["JOB", "Linux"],
                 "desc": "采集操作系统基础信息CPU内存等",
                 "encrypted_fields": ["password"],
@@ -796,11 +830,52 @@ COLLECT_OBJ_TREE = [
     },
 ]
 
+# JOB 是执行分类，不等于连接协议。这里显式列出当前真实通过 SSH 登录目标主机的
+# 内置对象，避免前端按 task_type 推断，也避免未来新增非 SSH JOB 时被错误继承。
+SSH_CREDENTIAL_MODEL_IDS = {
+    "activemq",
+    "apache",
+    "config_file",
+    "consul",
+    "docker",
+    "es",
+    "etcd",
+    "haproxy",
+    "hbase",
+    "host",
+    "iis",
+    "kafka",
+    "keepalive",
+    "memcached",
+    "minio",
+    "mongodb",
+    "nginx",
+    "openresty",
+    "physcial_server",
+    "rabbitmq",
+    "redis",
+    "rocketmq",
+    "spark",
+    "squid",
+    "tomcat",
+    "tuxedo",
+    "zookeeper",
+}
+for _collect_group in COLLECT_OBJ_TREE:
+    for _collect_object in _collect_group.get("children", []):
+        if _collect_object.get("type") == CollectDriverTypes.JOB and _collect_object.get("model_id") in SSH_CREDENTIAL_MODEL_IDS:
+            _collect_object.update(
+                credential_protocol="ssh",
+                credential_kind="host_account",
+                credential_default_port=22,
+            )
+
 # ====== 配置采集 ======
 
 VICTORIAMETRICS_HOST = os.getenv("VICTORIAMETRICS_HOST", "")
 
 STARGAZER_URL = os.getenv("STARGAZER_URL", "http://stargazer:8083")
+CMDB_FIRST_COLLECTION_ENABLED = os.getenv("CMDB_FIRST_COLLECTION_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 # ===== 实例权限 =====
 PERMISSION_INSTANCES = "instances"  # 实例
 PERMISSION_TASK = "task"  # 采集任务

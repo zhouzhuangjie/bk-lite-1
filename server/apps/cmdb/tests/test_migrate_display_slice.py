@@ -11,13 +11,13 @@ system_mgmt Group/User(真实ORM) / FieldGroup·PublicEnumLibrary(真实Postgres
 断言真实输出、DB副作用、异常契约、入参契约。
 """
 
-import pydantic.root_model  # noqa: F401  预热避免 cov 竞态
-
 import io
 import json
+import sys
 from collections import defaultdict
 
 import pandas as pd
+import pydantic.root_model  # noqa: F401  预热避免 cov 竞态
 import pytest
 
 from apps.cmdb.constants.field_constraints import (
@@ -233,6 +233,30 @@ class TestModelMigrateParsing:
         assert existing["option"] == {"k": 1}
         assert existing["is_required"] is True
 
+    def test_merge_existing_attr_config_updates_attr_type(self, monkeypatch):
+        m = self._make(monkeypatch)
+        existing = {
+            "attr_id": "ip_status",
+            "attr_type": "str",
+            "attr_name": "旧状态",
+            "option": dict(DEFAULT_STRING_CONSTRAINT),
+        }
+        incoming = {
+            "attr_id": "ip_status",
+            "attr_type": "enum",
+            "attr_name": "IP状态",
+            "option": [{"id": "online", "name": "在线"}],
+            "enum_rule_type": "custom",
+            "public_library_id": None,
+            "enum_select_mode": "single",
+        }
+
+        changed = m._merge_existing_attr_config(existing, incoming)
+
+        assert changed is True
+        assert existing["attr_type"] == "enum"
+        assert existing["option"] == [{"id": "online", "name": "在线"}]
+
     def test_merge_existing_attr_config_no_change(self, monkeypatch):
         m = self._make(monkeypatch)
         existing = {"attr_id": "a", "attr_name": "same", "attr_type": "str"}
@@ -326,12 +350,12 @@ class TestPrepareAttr:
 # ===========================================================================
 @pytest.mark.django_db
 class TestModelMigrateWithDB:
-    def _make(self, monkeypatch, model_config):
+    def _make(self, monkeypatch, model_config, is_pre=True):
         from apps.cmdb.model_migrate import migrete_service
 
         monkeypatch.setattr(migrete_service.ModelMigrate, "get_model_config", lambda self: model_config)
         monkeypatch.setattr(migrete_service, "get_default_group_id", lambda: [99])
-        return migrete_service.ModelMigrate(file_source=None, is_pre=True), migrete_service
+        return migrete_service.ModelMigrate(file_source=None, is_pre=is_pre), migrete_service
 
     def test_migrate_public_enum_libraries_create_and_skip(self, monkeypatch):
         cfg = {
@@ -373,11 +397,7 @@ class TestModelMigrateWithDB:
             created_by="system",
             updated_by="system",
         )
-        cfg = {
-            "public_enum_libraries": [
-                {"library_id": "os_type", "name": "新名", "team": "[]", "options": "[{'id':'a','name':'A'}]"}
-            ]
-        }
+        cfg = {"public_enum_libraries": [{"library_id": "os_type", "name": "新名", "team": "[]", "options": "[{'id':'a','name':'A'}]"}]}
         m, mod = self._make(monkeypatch, cfg)
         refreshed = []
         monkeypatch.setattr(mod, "enqueue_library_snapshot_refresh", lambda lib_id, **k: refreshed.append(lib_id))
@@ -407,11 +427,7 @@ class TestModelMigrateWithDB:
 
     def test_validate_public_library_references_missing_raises(self, monkeypatch):
         m, _ = self._make(monkeypatch, {})
-        attrs = {
-            "host": [
-                {"attr_id": "os", "attr_type": "enum", "enum_rule_type": "public_library", "public_library_id": "nope"}
-            ]
-        }
+        attrs = {"host": [{"attr_id": "os", "attr_type": "enum", "enum_rule_type": "public_library", "public_library_id": "nope"}]}
         with pytest.raises(BaseAppException):
             m._validate_public_library_references(attrs)
 
@@ -420,11 +436,7 @@ class TestModelMigrateWithDB:
 
         PublicEnumLibrary.objects.create(library_id="exists", name="n", team=[], options=[], created_by="x", updated_by="x")
         m, _ = self._make(monkeypatch, {})
-        attrs = {
-            "host": [
-                {"attr_id": "os", "attr_type": "enum", "enum_rule_type": "public_library", "public_library_id": "exists"}
-            ]
-        }
+        attrs = {"host": [{"attr_id": "os", "attr_type": "enum", "enum_rule_type": "public_library", "public_library_id": "exists"}]}
         # 不抛异常即通过
         m._validate_public_library_references(attrs)
 
@@ -479,9 +491,7 @@ class TestModelMigrateWithDB:
 
         ag = FakeGraph()
         existing_attrs = [{"attr_id": "ip", "attr_type": "str", "attr_name": "旧"}]
-        existing_model_map = {
-            "host": {"_id": "n1", "model_id": "host", "attrs": json.dumps(existing_attrs)}
-        }
+        existing_model_map = {"host": {"_id": "n1", "model_id": "host", "attrs": json.dumps(existing_attrs)}}
         attrs_by_model = {"host": [{"attr_id": "ip", "attr_type": "str", "attr_name": "新名"}]}
         res = m._sync_added_attrs_to_existing_models(ag, attrs_by_model, existing_model_map)
         assert res["updated_attr_count"] == 1
@@ -498,9 +508,7 @@ class TestModelMigrateWithDB:
         from apps.cmdb.models.field_group import FieldGroup
 
         m, _ = self._make(monkeypatch, {})
-        existing = FieldGroup.objects.create(
-            model_id="host", group_name="网络", order=1, is_collapsed=False, attr_orders=["ip"], created_by="system"
-        )
+        existing = FieldGroup.objects.create(model_id="host", group_name="网络", order=1, is_collapsed=False, attr_orders=["ip"], created_by="system")
         field_group_map = {("host", "网络"): existing}
         max_order = defaultdict(int)
         max_order["host"] = 1
@@ -549,9 +557,7 @@ class TestModelMigrateWithDB:
     def test_migrate_associations_builds_edges(self, monkeypatch):
         cfg = {
             "models": [{"model_id": "host"}],
-            "asso-host": [
-                {"src_model_id": "host", "dst_model_id": "switch", "asst_id": "connect", "asst_name": "连接"}
-            ],
+            "asso-host": [{"src_model_id": "host", "dst_model_id": "switch", "asst_id": "connect", "asst_name": "连接"}],
         }
         m, mod = self._make(monkeypatch, cfg)
         fake = _patch_graph(
@@ -621,6 +627,380 @@ class TestModelMigrateWithDB:
         assert asso_result == [{"success": True}]
         # 真实 DB：新模型的 FieldGroup 已创建
         assert FieldGroup.objects.filter(model_id="router", group_name="网络").exists()
+
+    def test_migrate_models_updates_only_existing_model_name(self, monkeypatch):
+        from apps.cmdb.constants.constants import CLASSIFICATION, MODEL
+
+        cfg = {
+            "models": [
+                {
+                    "model_id": "sangforscp",
+                    "model_name": "SCP云平台",
+                    "classification_id": "sangforscp",
+                    "icn": "new-icon-must-not-overwrite",
+                }
+            ]
+        }
+        m, mod = self._make(monkeypatch, cfg)
+        monkeypatch.setattr(mod.ExcludeFieldsCache, "refresh_cache", classmethod(lambda cls: True))
+        existing = {
+            "_id": "model-1",
+            "model_id": "sangforscp",
+            "model_name": "深信服云平台",
+            "classification_id": "sangforscp",
+            "icn": "existing-icon",
+            "attrs": "[]",
+        }
+        fake = _patch_graph(
+            monkeypatch,
+            "apps.cmdb.model_migrate.migrete_service",
+            query_entity=lambda label, *args, **kwargs: (
+                ([existing], 1)
+                if label == MODEL
+                else ([{"_id": "classification-1", "classification_id": "sangforscp"}], 1)
+                if label == CLASSIFICATION
+                else ([], 0)
+            ),
+            set_entity_properties=[{**existing, "model_name": "SCP云平台"}],
+        )
+
+        m.migrate_models()
+
+        update_calls = [call for call in fake.calls if call[0] == "set_entity_properties"]
+        assert len(update_calls) == 1
+        assert update_calls[0][1][2] == {"model_name": "SCP云平台"}
+
+    def test_migrate_models_skips_existing_model_when_name_is_current(self, monkeypatch):
+        from apps.cmdb.constants.constants import CLASSIFICATION, MODEL
+
+        cfg = {
+            "models": [
+                {
+                    "model_id": "sangforscp",
+                    "model_name": "SCP云平台",
+                    "classification_id": "sangforscp",
+                    "icn": "new-icon-must-not-overwrite",
+                }
+            ]
+        }
+        m, mod = self._make(monkeypatch, cfg)
+        monkeypatch.setattr(mod.ExcludeFieldsCache, "refresh_cache", classmethod(lambda cls: True))
+        existing = {
+            "_id": "model-1",
+            "model_id": "sangforscp",
+            "model_name": "SCP云平台",
+            "classification_id": "sangforscp",
+            "icn": "existing-icon",
+            "attrs": "[]",
+        }
+        fake = _patch_graph(
+            monkeypatch,
+            "apps.cmdb.model_migrate.migrete_service",
+            query_entity=lambda label, *args, **kwargs: (
+                ([existing], 1)
+                if label == MODEL
+                else ([{"_id": "classification-1", "classification_id": "sangforscp"}], 1)
+                if label == CLASSIFICATION
+                else ([], 0)
+            ),
+        )
+
+        m.migrate_models()
+
+        assert not [call for call in fake.calls if call[0] == "set_entity_properties"]
+
+    def _stale_builtin_graph(
+        self,
+        monkeypatch,
+        existing_models,
+        instance_counts,
+        instance_rows=None,
+        instance_errors=None,
+        delete_errors=None,
+    ):
+        from apps.cmdb.constants.constants import CLASSIFICATION, INSTANCE, MODEL
+
+        instance_rows = instance_rows or {}
+        instance_errors = instance_errors or {}
+        delete_errors = delete_errors or {}
+
+        def query_entity(label, params=None, *args, **kwargs):
+            if label == MODEL:
+                return existing_models, len(existing_models)
+            if label == CLASSIFICATION:
+                return [{"_id": "cls-infra", "classification_id": "infra"}], 1
+            if label == INSTANCE:
+                model_id = (params or [{}])[0].get("value")
+                if model_id in instance_errors:
+                    raise instance_errors[model_id]
+                count = instance_counts.get(model_id, 0)
+                if model_id in instance_rows:
+                    rows = instance_rows[model_id]
+                else:
+                    rows = [{"_id": f"inst-{model_id}"}] if count else []
+                return rows, count
+            return [], 0
+
+        def batch_delete_entity(label, ids, *args, **kwargs):
+            if ids and ids[0] in delete_errors:
+                raise delete_errors[ids[0]]
+            return {}
+
+        return _patch_graph(
+            monkeypatch,
+            "apps.cmdb.model_migrate.migrete_service",
+            query_entity=query_entity,
+            batch_delete_entity=batch_delete_entity,
+        )
+
+    def test_migrate_models_deletes_stale_builtin_without_instances(self, monkeypatch):
+        from apps.cmdb.constants.constants import MODEL
+        from apps.cmdb.models.field_group import FieldGroup
+
+        cfg = {"models": [{"model_id": "host", "classification_id": "infra", "model_name": "主机"}]}
+        m, mod = self._make(monkeypatch, cfg)
+        monkeypatch.setattr(mod.ExcludeFieldsCache, "refresh_cache", classmethod(lambda cls: True))
+        FieldGroup.objects.create(model_id="aix", group_name="default", order=1, is_collapsed=False, attr_orders=[], created_by="system")
+        existing = [
+            {"_id": "host-1", "model_id": "host", "model_name": "主机", "classification_id": "infra", "is_pre": True, "attrs": "[]"},
+            {"_id": "aix-1", "model_id": "aix", "model_name": "AIX", "classification_id": "infra", "is_pre": True, "attrs": "[]"},
+        ]
+        fake = self._stale_builtin_graph(monkeypatch, existing, {"host": 0, "aix": 0})
+
+        m.migrate_models()
+
+        deletes = [call for call in fake.calls if call[0] == "batch_delete_entity"]
+        assert deletes == [("batch_delete_entity", (MODEL, ["aix-1"]), {})]
+        assert not FieldGroup.objects.filter(model_id="aix").exists()
+
+    def test_migrate_models_keeps_stale_builtin_when_it_has_instances(self, monkeypatch):
+        from apps.cmdb.models.field_group import FieldGroup
+
+        cfg = {"models": [{"model_id": "host", "classification_id": "infra", "model_name": "主机"}]}
+        m, mod = self._make(monkeypatch, cfg)
+        monkeypatch.setattr(mod.ExcludeFieldsCache, "refresh_cache", classmethod(lambda cls: True))
+        FieldGroup.objects.create(model_id="aix", group_name="default", order=1, is_collapsed=False, attr_orders=[], created_by="system")
+        existing = [
+            {"_id": "host-1", "model_id": "host", "model_name": "主机", "classification_id": "infra", "is_pre": True, "attrs": "[]"},
+            {"_id": "aix-1", "model_id": "aix", "model_name": "AIX", "classification_id": "infra", "is_pre": True, "attrs": "[]"},
+        ]
+        fake = self._stale_builtin_graph(monkeypatch, existing, {"host": 0, "aix": 1})
+
+        m.migrate_models()
+
+        assert not [call for call in fake.calls if call[0] == "batch_delete_entity"]
+        assert FieldGroup.objects.filter(model_id="aix").exists()
+
+    def test_migrate_models_keeps_custom_models_missing_from_config(self, monkeypatch):
+        cfg = {"models": [{"model_id": "host", "classification_id": "infra", "model_name": "主机"}]}
+        m, mod = self._make(monkeypatch, cfg)
+        monkeypatch.setattr(mod.ExcludeFieldsCache, "refresh_cache", classmethod(lambda cls: True))
+        existing = [
+            {"_id": "host-1", "model_id": "host", "model_name": "主机", "classification_id": "infra", "is_pre": True, "attrs": "[]"},
+            {"_id": "custom-1", "model_id": "my_custom", "model_name": "自定义", "classification_id": "infra", "is_pre": False, "attrs": "[]"},
+        ]
+        fake = self._stale_builtin_graph(monkeypatch, existing, {"host": 0, "my_custom": 0})
+
+        m.migrate_models()
+
+        assert not [call for call in fake.calls if call[0] == "batch_delete_entity"]
+
+    def test_user_import_does_not_retire_stale_builtin_models(self, monkeypatch):
+        cfg = {"models": [{"model_id": "host", "classification_id": "infra", "model_name": "主机"}]}
+        m, mod = self._make(monkeypatch, cfg, is_pre=False)
+        monkeypatch.setattr(mod.ExcludeFieldsCache, "refresh_cache", classmethod(lambda cls: True))
+        existing = [
+            {"_id": "host-1", "model_id": "host", "model_name": "主机", "classification_id": "infra", "is_pre": True, "attrs": "[]"},
+            {"_id": "aix-1", "model_id": "aix", "model_name": "AIX", "classification_id": "infra", "is_pre": True, "attrs": "[]"},
+        ]
+        fake = self._stale_builtin_graph(monkeypatch, existing, {"host": 0, "aix": 0})
+
+        m.migrate_models()
+
+        assert not [call for call in fake.calls if call[0] == "batch_delete_entity"]
+
+    def test_retire_stale_builtin_logs_use_stable_template_and_omit_sentinels(self, monkeypatch, caplog):
+        import logging
+
+        cfg = {"models": [{"model_id": "host", "classification_id": "infra", "model_name": "主机"}]}
+        m, mod = self._make(monkeypatch, cfg)
+        monkeypatch.setattr(mod.ExcludeFieldsCache, "refresh_cache", classmethod(lambda cls: True))
+        sentinel = "sentinel_cmdb_retire_9f3a"
+        existing = [
+            {"_id": "host-1", "model_id": "host", "model_name": "主机", "classification_id": "infra", "is_pre": True, "attrs": "[]"},
+            {
+                "_id": "aix-1",
+                "model_id": "aix",
+                "model_name": "AIX",
+                "classification_id": "infra",
+                "is_pre": True,
+                "attrs": json.dumps([{"attr_id": "password", "default": sentinel}]),
+            },
+            {"_id": "hpux-1", "model_id": "hpux", "model_name": "HP-UX", "classification_id": "infra", "is_pre": True, "attrs": "[]"},
+        ]
+        self._stale_builtin_graph(monkeypatch, existing, {"host": 0, "aix": 0, "hpux": 1})
+        caplog.set_level(logging.INFO, logger="cmdb")
+
+        m.migrate_models()
+
+        retired = [record for record in caplog.records if "event=cmdb_stale_builtin_models_retired" in record.msg]
+        kept = [record for record in caplog.records if "event=cmdb_stale_builtin_models_kept_with_instances" in record.msg]
+        assert len(retired) == 1
+        assert "%s" in retired[0].msg
+        assert retired[0].args == (1, "aix")
+        assert retired[0].getMessage() == "event=cmdb_stale_builtin_models_retired deleted_count=1 deleted_model_ids=aix"
+        assert sentinel not in retired[0].getMessage()
+        assert sentinel not in str(retired[0].args)
+        assert "password" not in retired[0].getMessage()
+        assert "secret" not in retired[0].getMessage()
+        assert len(kept) == 1
+        assert "%s" in kept[0].msg
+        assert kept[0].args == (1, "hpux")
+        assert kept[0].getMessage() == "event=cmdb_stale_builtin_models_kept_with_instances skipped_count=1 skipped_model_ids=hpux"
+        assert sentinel not in kept[0].getMessage()
+
+    def test_migrate_models_keeps_stale_builtin_when_instance_query_fails(self, monkeypatch, caplog):
+        import logging
+
+        from apps.cmdb.models.field_group import FieldGroup
+
+        sentinel = "sentinel_cmdb_retire_query_7c21"
+        cfg = {"models": [{"model_id": "host", "classification_id": "infra", "model_name": "主机"}]}
+        m, mod = self._make(monkeypatch, cfg)
+        monkeypatch.setattr(mod.ExcludeFieldsCache, "refresh_cache", classmethod(lambda cls: True))
+        FieldGroup.objects.create(model_id="aix", group_name="default", order=1, is_collapsed=False, attr_orders=[], created_by="system")
+        existing = [
+            {"_id": "host-1", "model_id": "host", "model_name": "主机", "classification_id": "infra", "is_pre": True, "attrs": "[]"},
+            {
+                "_id": "aix-1",
+                "model_id": "aix",
+                "model_name": "AIX",
+                "classification_id": "infra",
+                "is_pre": True,
+                "attrs": json.dumps([{"attr_id": "password", "default": sentinel}]),
+            },
+            {"_id": "hpux-1", "model_id": "hpux", "model_name": "HP-UX", "classification_id": "infra", "is_pre": True, "attrs": "[]"},
+        ]
+        fake = self._stale_builtin_graph(
+            monkeypatch,
+            existing,
+            {"host": 0, "hpux": 0},
+            instance_errors={"aix": RuntimeError("graph down")},
+        )
+        caplog.set_level(logging.ERROR, logger="cmdb")
+
+        m.migrate_models()
+
+        deletes = [call[1][1][0] for call in fake.calls if call[0] == "batch_delete_entity"]
+        assert deletes == ["hpux-1"]
+        assert FieldGroup.objects.filter(model_id="aix").exists()
+        failed = [record for record in caplog.records if "event=cmdb_stale_builtin_model_retire_failed" in record.msg]
+        assert len(failed) == 1
+        assert "%s" in failed[0].msg
+        assert failed[0].args == ("aix", "query_stale_builtin_instances", "RuntimeError")
+        formatted = failed[0].getMessage()
+        if failed[0].exc_text:
+            formatted = f"{formatted}\n{failed[0].exc_text}"
+        assert sentinel not in formatted
+        assert sentinel not in str(failed[0].args)
+
+    def test_migrate_models_keeps_stale_builtin_when_instance_count_unknown(self, monkeypatch):
+        cfg = {"models": [{"model_id": "host", "classification_id": "infra", "model_name": "主机"}]}
+        m, mod = self._make(monkeypatch, cfg)
+        monkeypatch.setattr(mod.ExcludeFieldsCache, "refresh_cache", classmethod(lambda cls: True))
+        existing = [
+            {"_id": "host-1", "model_id": "host", "model_name": "主机", "classification_id": "infra", "is_pre": True, "attrs": "[]"},
+            {"_id": "aix-1", "model_id": "aix", "model_name": "AIX", "classification_id": "infra", "is_pre": True, "attrs": "[]"},
+        ]
+        fake = self._stale_builtin_graph(monkeypatch, existing, {"host": 0, "aix": None})
+
+        m.migrate_models()
+
+        assert not [call for call in fake.calls if call[0] == "batch_delete_entity"]
+
+    def test_migrate_models_keeps_stale_builtin_when_rows_exist_even_if_count_zero(self, monkeypatch):
+        cfg = {"models": [{"model_id": "host", "classification_id": "infra", "model_name": "主机"}]}
+        m, mod = self._make(monkeypatch, cfg)
+        monkeypatch.setattr(mod.ExcludeFieldsCache, "refresh_cache", classmethod(lambda cls: True))
+        existing = [
+            {"_id": "host-1", "model_id": "host", "model_name": "主机", "classification_id": "infra", "is_pre": True, "attrs": "[]"},
+            {"_id": "aix-1", "model_id": "aix", "model_name": "AIX", "classification_id": "infra", "is_pre": True, "attrs": "[]"},
+        ]
+        fake = self._stale_builtin_graph(
+            monkeypatch,
+            existing,
+            {"host": 0, "aix": 0},
+            instance_rows={"aix": [{"_id": "inst-aix"}]},
+        )
+
+        m.migrate_models()
+
+        assert not [call for call in fake.calls if call[0] == "batch_delete_entity"]
+
+    def test_migrate_models_does_not_wipe_catalog_when_too_many_stale_builtins(self, monkeypatch):
+        cfg = {"models": [{"model_id": "host", "classification_id": "infra", "model_name": "主机"}]}
+        m, mod = self._make(monkeypatch, cfg)
+        monkeypatch.setattr(mod.ExcludeFieldsCache, "refresh_cache", classmethod(lambda cls: True))
+        existing = [
+            {"_id": "host-1", "model_id": "host", "model_name": "主机", "classification_id": "infra", "is_pre": True, "attrs": "[]"},
+        ]
+        instance_counts = {"host": 0}
+        for index in range(40):
+            model_id = f"stale_{index}"
+            existing.append(
+                {
+                    "_id": f"{model_id}-1",
+                    "model_id": model_id,
+                    "model_name": model_id,
+                    "classification_id": "infra",
+                    "is_pre": True,
+                    "attrs": "[]",
+                }
+            )
+            instance_counts[model_id] = 0
+        fake = self._stale_builtin_graph(monkeypatch, existing, instance_counts)
+
+        m.migrate_models()
+
+        assert not [call for call in fake.calls if call[0] == "batch_delete_entity"]
+
+    def test_migrate_models_keeps_model_when_is_pre_is_false_string(self, monkeypatch):
+        cfg = {"models": [{"model_id": "host", "classification_id": "infra", "model_name": "主机"}]}
+        m, mod = self._make(monkeypatch, cfg)
+        monkeypatch.setattr(mod.ExcludeFieldsCache, "refresh_cache", classmethod(lambda cls: True))
+        existing = [
+            {"_id": "host-1", "model_id": "host", "model_name": "主机", "classification_id": "infra", "is_pre": True, "attrs": "[]"},
+            {"_id": "custom-1", "model_id": "my_custom", "model_name": "自定义", "classification_id": "infra", "is_pre": "false", "attrs": "[]"},
+        ]
+        fake = self._stale_builtin_graph(monkeypatch, existing, {"host": 0, "my_custom": 0})
+
+        m.migrate_models()
+
+        assert not [call for call in fake.calls if call[0] == "batch_delete_entity"]
+
+    def test_migrate_models_continues_when_one_stale_delete_fails(self, monkeypatch):
+        from apps.cmdb.constants.constants import MODEL
+
+        cfg = {"models": [{"model_id": "host", "classification_id": "infra", "model_name": "主机"}]}
+        m, mod = self._make(monkeypatch, cfg)
+        monkeypatch.setattr(mod.ExcludeFieldsCache, "refresh_cache", classmethod(lambda cls: True))
+        existing = [
+            {"_id": "host-1", "model_id": "host", "model_name": "主机", "classification_id": "infra", "is_pre": True, "attrs": "[]"},
+            {"_id": "aix-1", "model_id": "aix", "model_name": "AIX", "classification_id": "infra", "is_pre": True, "attrs": "[]"},
+            {"_id": "hpux-1", "model_id": "hpux", "model_name": "HP-UX", "classification_id": "infra", "is_pre": True, "attrs": "[]"},
+        ]
+        fake = self._stale_builtin_graph(
+            monkeypatch,
+            existing,
+            {"host": 0, "aix": 0, "hpux": 0},
+            delete_errors={"aix-1": RuntimeError("delete failed")},
+        )
+
+        m.migrate_models()
+
+        deletes = [call for call in fake.calls if call[0] == "batch_delete_entity"]
+        assert (MODEL, ["aix-1"]) in [call[1] for call in deletes]
+        assert (MODEL, ["hpux-1"]) in [call[1] for call in deletes]
 
     def test_main_orchestrates_all(self, monkeypatch):
         cfg = {
@@ -736,9 +1116,7 @@ class TestDisplayFieldInitializer:
         models = [
             {
                 "model_id": "host",
-                "attrs": json.dumps(
-                    [{"attr_id": "status", "attr_type": "enum", "option": [{"id": "1", "name": "运行中"}]}]
-                ),
+                "attrs": json.dumps([{"attr_id": "status", "attr_type": "enum", "option": [{"id": "1", "name": "运行中"}]}]),
             }
         ]
         init._preload_mappings(models)
@@ -980,8 +1358,9 @@ class TestExcludeFieldsCache:
         assert "org" in ExcludeFieldsCache.get_exclude_fields()
 
     def test_get_model_attrs_cache_hit_and_miss(self, monkeypatch):
-        from apps.cmdb.display_field.cache import ExcludeFieldsCache
         from django.core.cache import cache as dj_cache
+
+        from apps.cmdb.display_field.cache import ExcludeFieldsCache
 
         # miss -> 调用 ModelManage.search_model_attr 并缓存
         monkeypatch.setattr(
@@ -1001,22 +1380,95 @@ class TestExcludeFieldsCache:
         assert ExcludeFieldsCache.get_model_attrs("host") == [{"attr_id": "x"}]
 
     def test_update_on_model_change(self, monkeypatch):
+        from django.core.cache import cache as dj_cache
+
         from apps.cmdb.display_field.cache import ExcludeFieldsCache
 
-        _patch_graph(monkeypatch, "apps.cmdb.display_field.cache", query_entity=([], 0))
+        host_key = f"{ExcludeFieldsCache.MODEL_ATTRS_KEY_PREFIX}host"
+        dj_cache.set(host_key, [{"attr_id": "stale"}])
+        fake = _patch_graph(monkeypatch, "apps.cmdb.display_field.cache", query_entity=([], 0))
+
         assert ExcludeFieldsCache.update_on_model_change("host") is True
+        assert dj_cache.get(host_key) is None
+        assert fake.calls == []
+
+    # -----------------------------------------------------------------
+    # P2-2.6 — clear_cache 必须真的清掉 model attrs 缓存,不能只 log 一句 warning
+    # -----------------------------------------------------------------
+
+    def test_clear_cache_removes_model_attrs_entries(self, monkeypatch):
+        """P2-2.6: 原 _clear_all_caches 的 cache.delete_pattern 在本仓所有 cache 后端
+        (locmem / Django 内置 RedisCache) 都不存在,实际什么都不做。
+        模型被删除后,其 attrs 缓存键会留 1h TTL,期间所有 get_model_attrs(model_id)
+        仍返回已删模型的数据。
+
+        修复:_build_and_cache_model_attrs 维护 model_id 索引,refresh 时比对新旧
+        索引,删掉已下线的 model 的 attrs 缓存键。"""
+        from django.core.cache import cache as dj_cache
+
+        from apps.cmdb.display_field.cache import ExcludeFieldsCache
+
+        # 模拟生产路径:第一次 build 含 host / switch,索引写入这两个 model
+        models_v1 = [
+            {"model_id": "host", "attrs": json.dumps([{"attr_id": "ip", "attr_type": "str"}])},
+            {"model_id": "switch", "attrs": json.dumps([{"attr_id": "port", "attr_type": "int"}])},
+        ]
+        _patch_graph(monkeypatch, "apps.cmdb.display_field.cache", query_entity=(models_v1, len(models_v1)))
+        assert ExcludeFieldsCache.refresh_cache() is True
+        host_key = f"{ExcludeFieldsCache.MODEL_ATTRS_KEY_PREFIX}host"
+        assert dj_cache.get(host_key) is not None, "precondition: refresh 后 host attrs 已缓存"
+
+        # 第二次 refresh:host 被删,只剩 switch
+        models_v2 = [
+            {"model_id": "switch", "attrs": json.dumps([{"attr_id": "port", "attr_type": "int"}])},
+        ]
+        _patch_graph(monkeypatch, "apps.cmdb.display_field.cache", query_entity=(models_v2, len(models_v2)))
+        assert ExcludeFieldsCache.refresh_cache() is True
+
+        # host 的 attrs 缓存键必须被精准删(否则会留 1h TTL 持续返回陈旧数据)
+        assert dj_cache.get(host_key) is None, f"{host_key} 必须被精准清掉,实际保留说明模型被删后缓存未同步"
+
+    def test_update_on_model_change_purges_only_target_model_attrs(self, monkeypatch):
+        """模型变更只失效该 model 的 attrs 缓存，不拉全量模型预热。下次读取回源查询。"""
+        from django.core.cache import cache as dj_cache
+
+        from apps.cmdb.display_field.cache import ExcludeFieldsCache
+
+        target_key = f"{ExcludeFieldsCache.MODEL_ATTRS_KEY_PREFIX}host"
+        other_key = f"{ExcludeFieldsCache.MODEL_ATTRS_KEY_PREFIX}switch"
+        dj_cache.set(target_key, [{"stale": True}])
+        dj_cache.set(other_key, [{"stale": True}])
+        dj_cache.set(ExcludeFieldsCache.EXCLUDE_FIELDS_KEY, ["organization"])
+        dj_cache.set(ExcludeFieldsCache.MODEL_FIELDS_MAPPING_KEY, {"host": {"organization": ["organization"]}})
+
+        fake = _patch_graph(monkeypatch, "apps.cmdb.display_field.cache", query_entity=([], 0))
+        ExcludeFieldsCache.update_on_model_change("host")
+
+        assert dj_cache.get(target_key) is None, "目标 model 的 attrs 缓存必须被清掉"
+        assert dj_cache.get(other_key) == [{"stale": True}]
+        assert dj_cache.get(ExcludeFieldsCache.EXCLUDE_FIELDS_KEY) == ["organization"]
+        assert dj_cache.get(ExcludeFieldsCache.MODEL_FIELDS_MAPPING_KEY) == {"host": {"organization": ["organization"]}}
+        assert fake.calls == []
+
+        monkeypatch.setattr(
+            "apps.cmdb.services.model.ModelManage.search_model_attr",
+            staticmethod(lambda model_id, *a, **k: [{"attr_id": "ip_addr"}]),
+        )
+        assert ExcludeFieldsCache.get_model_attrs("host") == [{"attr_id": "ip_addr"}]
 
     def test_clear_cache(self, monkeypatch):
-        from apps.cmdb.display_field.cache import ExcludeFieldsCache
         from django.core.cache import cache as dj_cache
+
+        from apps.cmdb.display_field.cache import ExcludeFieldsCache
 
         dj_cache.set(ExcludeFieldsCache.EXCLUDE_FIELDS_KEY, ["a"])
         assert ExcludeFieldsCache.clear_cache() is True
         assert dj_cache.get(ExcludeFieldsCache.EXCLUDE_FIELDS_KEY) is None
 
     def test_get_cache_info(self, monkeypatch):
-        from apps.cmdb.display_field.cache import ExcludeFieldsCache
         from django.core.cache import cache as dj_cache
+
+        from apps.cmdb.display_field.cache import ExcludeFieldsCache
 
         dj_cache.set(ExcludeFieldsCache.EXCLUDE_FIELDS_KEY, ["organization", "pwd"])
         dj_cache.set(ExcludeFieldsCache.MODEL_FIELDS_MAPPING_KEY, {"host": {}})
@@ -1041,6 +1493,72 @@ class TestExcludeFieldsCache:
         assert cache_mod.initialize_exclude_fields_cache() is True
         assert cache_mod.initialize_model_fields_mapping_cache() is True
 
+    def test_startup_init_skip_when_global_cache_exists(self, monkeypatch):
+        from django.core.cache import cache as dj_cache
+
+        from apps.cmdb.display_field import cache as cache_mod
+        from apps.cmdb.display_field.cache import ExcludeFieldsCache
+
+        dj_cache.set(ExcludeFieldsCache.EXCLUDE_FIELDS_KEY, ["organization"])
+        dj_cache.set(ExcludeFieldsCache.MODEL_FIELDS_MAPPING_KEY, {"host": {"organization": ["organization"], "user": []}})
+        fake = _patch_graph(monkeypatch, "apps.cmdb.display_field.cache", query_entity=([], 0))
+
+        assert cache_mod.init_all_caches_on_startup() is True
+        assert fake.calls == []
+
+    def test_startup_init_refresh_when_global_cache_missing(self, monkeypatch):
+        from django.core.cache import cache as dj_cache
+
+        from apps.cmdb.display_field import cache as cache_mod
+        from apps.cmdb.display_field.cache import ExcludeFieldsCache
+
+        dj_cache.delete(ExcludeFieldsCache.EXCLUDE_FIELDS_KEY)
+        dj_cache.delete(ExcludeFieldsCache.MODEL_FIELDS_MAPPING_KEY)
+        models = [{"model_id": "host", "attrs": json.dumps([{"attr_id": "org", "attr_type": "organization"}])}]
+        fake = _patch_graph(monkeypatch, "apps.cmdb.display_field.cache", query_entity=(models, 1))
+
+        assert cache_mod.init_all_caches_on_startup() is True
+        assert ("query_entity", ("model", []), {}) in fake.calls
+        assert "org" in ExcludeFieldsCache.get_exclude_fields()
+
+    def test_startup_init_skip_when_lock_exists(self, monkeypatch):
+        from django.core.cache import cache as dj_cache
+
+        from apps.cmdb.display_field import cache as cache_mod
+        from apps.cmdb.display_field.cache import ExcludeFieldsCache
+
+        dj_cache.delete(ExcludeFieldsCache.EXCLUDE_FIELDS_KEY)
+        dj_cache.delete(ExcludeFieldsCache.MODEL_FIELDS_MAPPING_KEY)
+        dj_cache.set(ExcludeFieldsCache.STARTUP_INIT_LOCK_KEY, "1", timeout=ExcludeFieldsCache.STARTUP_INIT_LOCK_TTL)
+        fake = _patch_graph(monkeypatch, "apps.cmdb.display_field.cache", query_entity=([], 0))
+
+        assert cache_mod.init_all_caches_on_startup() is True
+        assert fake.calls == []
+
+    def test_cmdb_ready_skips_startup_cache_for_management(self, monkeypatch):
+        import apps.cmdb as cmdb_module
+        from apps.cmdb.apps import CmdbConfig
+
+        calls = []
+        monkeypatch.setattr(sys, "argv", ["manage.py", "migrate"])
+        monkeypatch.setattr("apps.cmdb.display_field.init_all_caches_on_startup", lambda: calls.append("init"))
+
+        CmdbConfig("apps.cmdb", cmdb_module).ready()
+
+        assert calls == []
+
+    def test_cmdb_ready_initializes_startup_cache_for_runserver(self, monkeypatch):
+        import apps.cmdb as cmdb_module
+        from apps.cmdb.apps import CmdbConfig
+
+        calls = []
+        monkeypatch.setattr(sys, "argv", ["manage.py", "runserver", "0.0.0.0:8011"])
+        monkeypatch.setattr("apps.cmdb.display_field.init_all_caches_on_startup", lambda: calls.append("init"))
+
+        CmdbConfig("apps.cmdb", cmdb_module).ready()
+
+        assert calls == ["init"]
+
 
 # ===========================================================================
 # migrate_field_constraints management command
@@ -1048,8 +1566,9 @@ class TestExcludeFieldsCache:
 @pytest.mark.django_db
 class TestMigrateFieldConstraintsCommand:
     def _run(self, monkeypatch, models, **opts):
-        from django.core.management import call_command
         from io import StringIO
+
+        from django.core.management import call_command
 
         _patch_graph(
             monkeypatch,
@@ -1074,7 +1593,6 @@ class TestMigrateFieldConstraintsCommand:
                 "attrs": json.dumps([{"attr_id": "ip", "attr_type": "str", "option": {}}]),
             }
         ]
-        captured = {}
 
         from apps.cmdb.management.commands import migrate_field_constraints as cmd_mod
 
@@ -1084,8 +1602,9 @@ class TestMigrateFieldConstraintsCommand:
             "apps.cmdb.display_field.ExcludeFieldsCache.update_on_model_change",
             classmethod(lambda cls, model_id: True),
         )
-        from django.core.management import call_command
         from io import StringIO
+
+        from django.core.management import call_command
 
         out = StringIO()
         call_command("migrate_field_constraints", "--dry-run", stdout=out, stderr=out)
@@ -1117,8 +1636,9 @@ class TestMigrateFieldConstraintsCommand:
             "apps.cmdb.display_field.ExcludeFieldsCache.update_on_model_change",
             classmethod(lambda cls, model_id: refreshed.append(model_id) or True),
         )
-        from django.core.management import call_command
         from io import StringIO
+
+        from django.core.management import call_command
 
         out = StringIO()
         call_command("migrate_field_constraints", stdout=out, stderr=out)
@@ -1135,6 +1655,52 @@ class TestMigrateFieldConstraintsCommand:
         assert all("user_prompt" in a for a in written)
         assert refreshed == ["host"]
 
+    def test_migrate_model_preserves_table_option_when_other_field_triggers_save(self, monkeypatch):
+        from apps.cmdb.management.commands.migrate_field_constraints import Command
+
+        table_option = [
+            {
+                "column_id": "pid",
+                "column_name": "PID",
+                "column_type": "number",
+                "order": 1,
+            }
+        ]
+        model = {
+            "_id": "n1",
+            "model_id": "host",
+            "attrs": json.dumps(
+                [
+                    {
+                        "attr_id": "proc",
+                        "attr_type": "table",
+                        "option": table_option,
+                        "user_prompt": "",
+                    },
+                    {
+                        "attr_id": "legacy",
+                        "attr_type": "str",
+                        "option": {},
+                        "user_prompt": "",
+                    },
+                ]
+            ),
+        }
+        fake = FakeGraph(set_entity_properties={"ok": True})
+        monkeypatch.setattr(
+            "apps.cmdb.display_field.ExcludeFieldsCache.update_on_model_change",
+            classmethod(lambda cls, model_id: True),
+        )
+
+        updated, count = Command()._migrate_model(fake, model, dry_run=False)
+
+        assert updated is True
+        assert count == 1
+        write_call = next(c for c in fake.calls if c[0] == "set_entity_properties")
+        written = json.loads(write_call[1][2]["attrs"])
+        proc = next(attr for attr in written if attr["attr_id"] == "proc")
+        assert proc["option"] == table_option
+
     def test_target_model_not_found(self, monkeypatch):
         text = self._run(monkeypatch, [], model_id="nope")
         assert "未找到模型" in text
@@ -1146,9 +1712,11 @@ class TestMigrateFieldConstraintsCommand:
     def test_per_model_error_counted(self, monkeypatch):
         # attrs 无法解析 -> _migrate_model 抛错 -> errors+1，命令不崩溃
         models = [{"_id": "n1", "model_id": "host", "attrs": "not-json"}]
-        from apps.cmdb.management.commands import migrate_field_constraints as cmd_mod
-        from django.core.management import call_command
         from io import StringIO
+
+        from django.core.management import call_command
+
+        from apps.cmdb.management.commands import migrate_field_constraints as cmd_mod
 
         fake = FakeGraph(query_entity=(models, 1))
         monkeypatch.setattr(cmd_mod, "GraphClient", lambda *a, **k: fake)
@@ -1159,13 +1727,16 @@ class TestMigrateFieldConstraintsCommand:
         assert "1 个错误" in text
 
     def test_outer_query_error_handled(self, monkeypatch):
-        from apps.cmdb.management.commands import migrate_field_constraints as cmd_mod
-        from django.core.management import call_command
         from io import StringIO
+
+        from django.core.management import call_command
+
+        from apps.cmdb.management.commands import migrate_field_constraints as cmd_mod
 
         class _Boom(FakeGraph):
             def __getattr__(self, name):
                 if name == "query_entity":
+
                     def _q(*a, **k):
                         raise RuntimeError("connection refused")
 

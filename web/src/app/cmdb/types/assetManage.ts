@@ -56,7 +56,11 @@ export interface AssoTypeItem {
 export interface AssoFieldType {
   asst_id: string;
   src_model_id: string;
+  src_model_name?: string;
+  src_model_icn?: string;
   dst_model_id: string;
+  dst_model_name?: string;
+  dst_model_icn?: string;
   mapping: string;
   _id?: string;
   [key: string]: unknown;
@@ -219,8 +223,12 @@ export interface AssoInstItem {
 export interface AssoDetailItem {
   asst_id: string;
   src_model_id: string;
+  src_model_name?: string;
+  src_model_icn?: string;
   model_asst_id: string;
   dst_model_id: string;
+  dst_model_name?: string;
+  dst_model_icn?: string;
   inst_list: InstDetail[];
   [key: string]: unknown;
 }
@@ -236,8 +244,12 @@ export interface CrentialsAssoInstItem {
 export interface CrentialsAssoDetailItem {
   credential_type: string;
   name?: string;
+  inst_uuid?: string;
   _id?: number | string | undefined;
   inst_asst_id?: number | string | undefined;
+  src_inst_uuid?: string;
+  dst_inst_uuid?: string;
+  model_asst_id?: string;
   [key: string]: unknown;
 }
 
@@ -253,15 +265,17 @@ export interface ListItem {
 }
 
 export interface RelationListInstItem {
-  id: string | number | undefined;
-  inst_asst_id: string | number | undefined;
+  id: string;
+  src_inst_uuid: string;
+  dst_inst_uuid: string;
+  model_asst_id: string;
 }
 
 export interface RelationInstanceConfig {
   model_id: string;
   list: RelationListInstItem[];
   title: string;
-  instId: string;
+  instUuid: string;
 }
 export interface RelationInstanceRef {
   showModal: (config: RelationInstanceConfig) => void;
@@ -276,6 +290,8 @@ export interface FieldConfig {
   model_id: string;
   list: Array<any>;
   source?: 'create' | 'copy' | 'edit' | 'batchEdit';
+  lockedAttrIds?: string[];
+  hideAssociate?: boolean;
 }
 
 export interface FieldModalRef {

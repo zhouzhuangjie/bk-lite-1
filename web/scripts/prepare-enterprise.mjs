@@ -21,6 +21,43 @@ const createJunction = (linkPath, targetPath) => {
   }
 };
 
+export const prepareEnterpriseDependencyLink = async ({
+  webRoot: targetWebRoot = webRoot,
+  enterpriseWebRoot: targetEnterpriseWebRoot = enterpriseWebRoot,
+} = {}) => {
+  const sourceNodeModules = path.join(targetWebRoot, 'node_modules');
+  const enterpriseNodeModules = path.join(
+    targetEnterpriseWebRoot,
+    'node_modules'
+  );
+  if (!(await fs.pathExists(sourceNodeModules))) return false;
+
+  try {
+    const existing = await fs.lstat(enterpriseNodeModules);
+    if (!existing.isSymbolicLink()) {
+      throw new Error(
+        `Enterprise dependency directory must be a generated symbolic link: ${enterpriseNodeModules}. `
+        + 'Remove that directory and run pnpm prepare-enterprise again.'
+      );
+    }
+    try {
+      const [existingTarget, expectedTarget] = await Promise.all([
+        fs.realpath(enterpriseNodeModules),
+        fs.realpath(sourceNodeModules),
+      ]);
+      if (existingTarget === expectedTarget) return true;
+    } catch {
+      // Broken generated link: replace it below.
+    }
+    await fs.remove(enterpriseNodeModules);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+
+  createJunction(enterpriseNodeModules, sourceNodeModules);
+  return true;
+};
+
 /* ── cleanup ── */
 
 const cleanupGenerated = async () => {
@@ -36,6 +73,84 @@ const cleanupGenerated = async () => {
     // Remove (enterprise) route shims inside each module's (pages)
     await fs.remove(path.join(appRoot, entry.name, '(pages)', '(enterprise)'));
   }
+  // Remove generated monitor dashboard overlay files.
+  await fs.remove(path.join(appRoot, 'monitor', 'dashboards', 'objects', '(enterprise)'));
+  await fs.remove(path.join(appRoot, 'monitor', 'dashboards', 'objects', '(enterprise)-registry.ts'));
+  await fs.remove(path.join(appRoot, 'monitor', 'dashboards', 'objects', '(enterprise)-metadata.ts'));
+  await fs.remove(path.join(appRoot, 'monitor', 'dashboards', 'objects', '(enterprise)-loaders.ts'));
+};
+
+/* ── public assets: copy enterprise icons into the served CE public tree ── */
+
+const ENTERPRISE_ICONS_SNAPSHOT = path.join(webRoot, '.enterprise-icons.snapshot.json');
+
+/**
+ * 读取上次注入的 svg 文件名列表（sentinel file）。
+ * 启动 community 模式或重置时按此列表清掉 web/public/assets/icons/ 里的 EE 副本，
+ * 避免 enterprise 资源残留在 community 仓 working tree。
+ */
+const readInjectedIconSnapshot = async () => {
+  if (!(await fs.pathExists(ENTERPRISE_ICONS_SNAPSHOT))) return [];
+  try {
+    const raw = await fs.readJSON(ENTERPRISE_ICONS_SNAPSHOT);
+    return Array.isArray(raw) ? raw : [];
+  } catch {
+    return [];
+  }
+};
+
+const writeInjectedIconSnapshot = async (names) => {
+  await fs.writeJSON(ENTERPRISE_ICONS_SNAPSHOT, names, { spaces: 2 });
+};
+
+const removeInjectedEnterpriseIcons = async () => {
+  const targetIconsRoot = path.join(webRoot, 'public', 'assets', 'icons');
+  const names = await readInjectedIconSnapshot();
+  if (!names.length) return [];
+  const removed = [];
+  for (const name of names) {
+    const target = path.join(targetIconsRoot, name);
+    if (await fs.pathExists(target)) {
+      await fs.remove(target);
+      removed.push(name);
+    }
+  }
+  // 清理 sentinel
+  if (await fs.pathExists(ENTERPRISE_ICONS_SNAPSHOT)) {
+    await fs.remove(ENTERPRISE_ICONS_SNAPSHOT);
+  }
+  return removed;
+};
+
+export const prepareEnterprisePublicAssets = async ({
+  webRoot: targetWebRoot = webRoot,
+  enterpriseWebRoot: sourceEnterpriseWebRoot = enterpriseWebRoot,
+} = {}) => {
+  const sourceIconsRoot = path.join(sourceEnterpriseWebRoot, 'public', 'assets', 'icons');
+  const targetIconsRoot = path.join(targetWebRoot, 'public', 'assets', 'icons');
+
+  if (!(await fs.pathExists(sourceIconsRoot))) return [];
+
+  await fs.ensureDir(targetIconsRoot);
+
+  // 先清掉上次注入的副本（无论 community 还是 enterprise，都应先回到干净基线）
+  await removeInjectedEnterpriseIcons();
+
+  const copiedIconNames = [];
+  const entries = await fs.readdir(sourceIconsRoot, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.svg')) continue;
+    const sourceIcon = path.join(sourceIconsRoot, entry.name);
+    const targetIcon = path.join(targetIconsRoot, entry.name);
+    // 永远从 EE 源覆盖到 CE 目标，保证 enterprise 模式下图标始终是最新版
+    await fs.copy(sourceIcon, targetIcon, {
+      dereference: true,
+      overwrite: true,
+    });
+    copiedIconNames.push(entry.name);
+  }
+  await writeInjectedIconSnapshot(copiedIconNames);
+  return copiedIconNames;
 };
 
 /* ── routes: copy EE page source into CE route tree ── */
@@ -96,6 +211,163 @@ const generateRouteShims = async (routes) => {
 };
 
 /* ── junctions: link EE app dirs into {module}/(enterprise)/ ── */
+
+/* ── monitor dashboards: link (enterprise) subtree + generate -registry shim ── */
+
+const monitorDashboardsEnterpriseSrc = path.join(
+  enterpriseAppRoot, 'monitor', 'dashboards', 'objects', '(enterprise)'
+);
+const monitorDashboardsObjectsRoot = path.join(
+  appRoot, 'monitor', 'dashboards', 'objects'
+);
+const monitorDashboardsEnterpriseDst = path.join(
+  monitorDashboardsObjectsRoot, '(enterprise)'
+);
+const monitorDashboardsRegistryShimPath = path.join(
+  monitorDashboardsObjectsRoot, '(enterprise)-registry.ts'
+);
+
+const linkMonitorDashboardsEnterprise = async () => {
+  if (!(await fs.pathExists(monitorDashboardsEnterpriseSrc))) return false;
+
+  await fs.ensureDir(monitorDashboardsObjectsRoot);
+
+  // Junction: src/app/monitor/dashboards/objects/(enterprise)/
+  //   -> <enterprise>/src/app/monitor/dashboards/objects/(enterprise)/
+  if (await fs.pathExists(monitorDashboardsEnterpriseDst)) {
+    await fs.remove(monitorDashboardsEnterpriseDst);
+  }
+  createJunction(monitorDashboardsEnterpriseDst, monitorDashboardsEnterpriseSrc);
+  console.log(`  🔗 Junction: monitor/dashboards/objects/(enterprise)/ → enterprise/src/app/monitor/dashboards/objects/(enterprise)/`);
+  return true;
+};
+
+const dashboardsManifestPath = path.join(enterpriseWebRoot, 'manifests', 'dashboards.json');
+const monitorDashboardsMetadataShimPath = path.join(
+  monitorDashboardsObjectsRoot, '(enterprise)-metadata.ts'
+);
+const monitorDashboardsLoadersShimPath = path.join(
+  monitorDashboardsObjectsRoot, '(enterprise)-loaders.ts'
+);
+
+const buildMonitorDashboardsMetadataContent = (exportEntries = []) => `/* Generated by scripts/prepare-enterprise.mjs -- DO NOT EDIT BY HAND */
+
+import type { ProfessionalDashboardMetaItem } from '../shared/types';
+
+export const ENTERPRISE_PROFESSIONAL_DASHBOARD_METADATA: ProfessionalDashboardMetaItem[] = [
+${exportEntries.join(',\n')}
+];
+`;
+
+const buildMonitorDashboardsLoadersContent = (loaderEntries = []) => `/* Generated by scripts/prepare-enterprise.mjs -- DO NOT EDIT BY HAND */
+
+import type { ComponentType } from 'react';
+
+type DashboardComponentLoader = () => Promise<{ default: ComponentType }>;
+
+export const ENTERPRISE_DASHBOARD_COMPONENT_LOADERS: Record<string, DashboardComponentLoader> = {
+${loaderEntries.join(',\n')}${loaderEntries.length ? ',' : ''}
+};
+`;
+
+const writeMonitorDashboardsShims = async ({ metadataContent, loadersContent }) => {
+  await fs.ensureDir(monitorDashboardsObjectsRoot);
+  await fs.writeFile(monitorDashboardsMetadataShimPath, metadataContent, 'utf8');
+  await fs.writeFile(monitorDashboardsLoadersShimPath, loadersContent, 'utf8');
+  // 兼容旧文件名：保留空 registry，避免历史引用/清理脚本报错。
+  await fs.writeFile(
+    monitorDashboardsRegistryShimPath,
+    `/* Generated by scripts/prepare-enterprise.mjs -- DO NOT EDIT BY HAND */\nexport const ENTERPRISE_PROFESSIONAL_DASHBOARDS = [];\n`,
+    'utf8'
+  );
+  console.log(`  📄 Dashboard metadata: ${path.relative(webRoot, monitorDashboardsMetadataShimPath)}`);
+  console.log(`  📄 Dashboard loaders: ${path.relative(webRoot, monitorDashboardsLoadersShimPath)}`);
+};
+
+const writeEmptyMonitorDashboardsRegistry = async () => {
+  await writeMonitorDashboardsShims({
+    metadataContent: buildMonitorDashboardsMetadataContent(),
+    loadersContent: buildMonitorDashboardsLoadersContent()
+  });
+};
+
+const generateMonitorDashboardsRegistry = async () => {
+  if (!(await fs.pathExists(dashboardsManifestPath))) {
+    await writeEmptyMonitorDashboardsRegistry();
+    return;
+  }
+
+  if (!(await fs.pathExists(monitorDashboardsEnterpriseDst)) &&
+      !(await fs.pathExists(monitorDashboardsEnterpriseSrc))) {
+    await writeEmptyMonitorDashboardsRegistry();
+    return;
+  }
+
+  const manifest = await fs.readJSON(dashboardsManifestPath);
+  const entries = manifest?.['monitor/dashboards'];
+  if (!Array.isArray(entries) || entries.length === 0) {
+    await writeEmptyMonitorDashboardsRegistry();
+    return;
+  }
+
+  // Required field validation
+  for (const entry of entries) {
+    if (!entry.key || typeof entry.key !== 'string') {
+      throw new Error(`manifests/dashboards.json: entry missing "key"`);
+    }
+    if (!entry.source || typeof entry.source !== 'string') {
+      throw new Error(`manifests/dashboards.json: entry "${entry.key}" missing "source"`);
+    }
+    if (!entry.groupKey || !entry.objectName || !entry.objectDisplayName) {
+      throw new Error(`manifests/dashboards.json: entry "${entry.key}" missing one of groupKey/objectName/objectDisplayName`);
+    }
+    const entryAbsPath = path.resolve(enterpriseWebRoot, entry.source);
+    if (!(await fs.pathExists(path.join(entryAbsPath, 'dashboard.tsx')))) {
+      throw new Error(`manifests/dashboards.json: entry "${entry.key}" source has no dashboard.tsx at ${entryAbsPath}`);
+    }
+  }
+
+  const entryToImportName = (entry) => path.basename(entry.source);
+
+  const metadataEntries = entries.map((entry) => {
+    const props = [
+      `key: ${JSON.stringify(entry.key)}`,
+      `groupKey: ${JSON.stringify(entry.groupKey)}`,
+      `objectName: ${JSON.stringify(entry.objectName)}`,
+      `objectDisplayName: ${JSON.stringify(entry.objectDisplayName)}`,
+      `inheritedPermissionPath: ${JSON.stringify(entry.inheritedPermissionPath || '/monitor/view')}`
+    ];
+    if (entry.aliases && entry.aliases.length > 0) {
+      props.push(`aliases: ${JSON.stringify(entry.aliases)}`);
+    }
+    return `  {\n    ${props.join(',\n    ')},\n  }`;
+  });
+
+  const loaderEntries = entries.map((entry) => {
+    return `  ${JSON.stringify(entry.key)}: () => import('./(enterprise)/${entryToImportName(entry)}')`;
+  });
+
+  await writeMonitorDashboardsShims({
+    metadataContent: buildMonitorDashboardsMetadataContent(metadataEntries),
+    loadersContent: buildMonitorDashboardsLoadersContent(loaderEntries)
+  });
+
+  // Smoke test: every generated import path must resolve to a real file.
+  const shimDir = path.dirname(monitorDashboardsLoadersShimPath);
+  for (const loaderEntry of loaderEntries) {
+    const match = loaderEntry.match(/import\(['"]([^'"]+)['"]\)/);
+    if (!match) continue;
+    const importTarget = match[1].replace(/^\.\//, '');
+    const resolvedPath = path.join(shimDir, importTarget);
+    if (!(await fs.pathExists(resolvedPath))) {
+      throw new Error(
+        `Generated shim import does not resolve: ${loaderEntry}\n` +
+        `Expected at: ${resolvedPath}\n` +
+        `Check the template string in generateMonitorDashboardsRegistry.`
+      );
+    }
+  }
+};
 
 const generateEnterpriseJunctions = async () => {
   if (!(await fs.pathExists(enterpriseAppRoot))) return [];
@@ -182,8 +454,25 @@ const updateTsconfigPaths = async (moduleNames) => {
 /* ── main ── */
 
 export const prepareEnterpriseRoutes = async () => {
+  // Page-context pilots: always regenerate (community + enterprise).
+  try {
+    const { generateAiPilots } = await import('./generate-ai-pilots.mjs');
+    const pilots = generateAiPilots();
+    if (pilots.ok) {
+      console.log(`  ✓ ai-pilots: ${pilots.count} file(s)${pilots.changed ? ' (updated)' : ' (unchanged)'}`);
+    }
+  } catch (error) {
+    console.warn('  ⚠️ ai-pilots generation failed (non-blocking):', error);
+  }
+
   if (!(await fs.pathExists(enterpriseWebRoot))) {
     await cleanupGenerated();
+    // community 模式：清掉上次 enterprise 启动注入到 web/public/assets/icons/ 的 EE 副本
+    const removedIcons = await removeInjectedEnterpriseIcons();
+    if (removedIcons.length) {
+      console.log(`  🧹 Public icons: ${removedIcons.length} enterprise icons removed (community mode)`);
+    }
+    await writeEmptyMonitorDashboardsRegistry();
     await updateTsconfigPaths([]);
     console.log('ℹ️ No web/enterprise link found, skipping enterprise preparation.');
     return;
@@ -191,8 +480,28 @@ export const prepareEnterpriseRoutes = async () => {
 
   await cleanupGenerated();
 
+  // EE source directories are linked into this Next.js app, but module
+  // resolution follows their real path. Reuse the CE Web dependency tree so
+  // linked EE components do not need a second React/Ant Design installation.
+  if (await prepareEnterpriseDependencyLink()) {
+    console.log('  🔗 Dependencies: enterprise/web/node_modules → web/node_modules');
+  }
+
+  // 0.5) Copy EE public icons into CE public, because Next.js only serves
+  // assets from the current app's public/ directory.
+  const copiedIconNames = await prepareEnterprisePublicAssets();
+  if (copiedIconNames.length) {
+    console.log(`  🖼️ Public icons: ${copiedIconNames.length} enterprise icons copied`);
+  }
+
   // 1) Junctions for api/types/etc under {module}/(enterprise)/
   const linkedModules = await generateEnterpriseJunctions();
+
+  // 1.5) Link monitor dashboards (enterprise) subtree
+  await linkMonitorDashboardsEnterprise();
+
+  // 1.6) Generate monitor dashboards registry shim
+  await generateMonitorDashboardsRegistry();
 
   // 2) Route shims: copy page source into CE route tree
   if (await fs.pathExists(routesManifestPath)) {
@@ -205,7 +514,48 @@ export const prepareEnterpriseRoutes = async () => {
   // 3) Update tsconfig.json paths for enterprise modules
   await updateTsconfigPaths(linkedModules);
 
+  // 4) Inject enterpriseBrands → public/__enterprise-brands.js
+  await injectEnterpriseBrands();
+
   console.log('✅ Enterprise modules prepared successfully.');
+};
+
+/* ── 运行时 BRANDS 注入 ── */
+
+/**
+ * 解析 EE 端 web/src/app/monitor/utils/common.tsx 的 `export const enterpriseBrands`
+ * 数组,写 CE 端 web/public/__enterprise-brands.js。运行时由 next layout.tsx
+ * 注入 <Script src="/__enterprise-brands.js" strategy="beforeInteractive" />,
+ * 加载后 window.__ENTERPRISE_BRANDS = [...]。CE 端 utils/common.tsx 的
+ * getPluginBrandIcon/getBrandLabel 拼接该数组。
+ * 失败降级:文件不存在 / 解析失败 → 写空数组,getPluginBrandIcon 走纯 CE BRANDS。
+ */
+const injectEnterpriseBrands = async () => {
+  const eeSource = path.join(enterpriseWebRoot, 'src', 'app', 'monitor', 'utils', 'common.tsx');
+  const ceTarget = path.join(webRoot, 'public', '__enterprise-brands.js');
+  const emptyPayload = '/* Generated by scripts/prepare-enterprise.mjs -- DO NOT EDIT BY HAND */\nwindow.__ENTERPRISE_BRANDS = [];\n';
+
+  if (!(await fs.pathExists(eeSource))) {
+    console.log(`  ⚠️ injectEnterpriseBrands: EE 端 ${eeSource} 不存在,写入空数组`);
+    await fs.writeFile(ceTarget, emptyPayload, 'utf8');
+    return;
+  }
+
+  const content = await fs.readFile(eeSource, 'utf8');
+  // 解析 export const enterpriseBrands: ... = [ ... ]; 块
+  // 使用 `\n\]` 锚定数组结束,避免非贪婪匹配在注释 `]` 或注释行 `];` 上提前终止
+  const match = content.match(/export\s+const\s+enterpriseBrands[\s\S]*?=\s*(\[[\s\S]*?\n\]);/);
+  if (!match) {
+    console.log('  ⚠️ injectEnterpriseBrands: 未能解析 enterpriseBrands 数组,写入空数组');
+    await fs.writeFile(ceTarget, emptyPayload, 'utf8');
+    return;
+  }
+
+  // match[1] 是数组字面量字符串(不含 export/类型),直接包成 window 赋值
+  const arrLiteral = match[1];
+  const js = `/* Generated by scripts/prepare-enterprise.mjs -- DO NOT EDIT BY HAND */\nwindow.__ENTERPRISE_BRANDS = ${arrLiteral};\n`;
+  await fs.writeFile(ceTarget, js, 'utf8');
+  console.log(`  ✓ 注入 ${path.relative(webRoot, ceTarget)} (${arrLiteral.split('\n').length} 行)`);
 };
 
 if (process.argv[1] === __filename) {

@@ -1,10 +1,14 @@
 from rest_framework import serializers
-from apps.log.models.policy import Policy, Alert, Event, EventRawData
+
+from apps.log.models.policy import Alert, Event, EventRawData, Policy
 from apps.log.services.access_scope import LogAccessScopeService
 from apps.log.utils.log_group import LogGroupQueryBuilder
+from apps.log.utils.policy_config import validate_timing_config
 
 
 class PolicySerializer(serializers.ModelSerializer):
+    schedule = serializers.JSONField(required=True)
+    period = serializers.JSONField(required=True)
     organizations = serializers.SerializerMethodField()
     log_groups = serializers.ListField(
         child=serializers.CharField(),
@@ -20,7 +24,11 @@ class PolicySerializer(serializers.ModelSerializer):
 
     def get_organizations(self, obj):
         """通过外键关系获取组织列表"""
-        return [org.organization for org in obj.policyorganization_set.all()]
+        organizations = [org.organization for org in obj.policyorganization_set.all()]
+        visible_organizations = self.context.get("data_team_ids")
+        if visible_organizations is None:
+            return organizations
+        return [organization for organization in organizations if organization in visible_organizations]
 
     def _get_collect_type_scope(self):
         if self.instance:
@@ -65,6 +73,18 @@ class PolicySerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(error_msg)
         return value
 
+    def validate_schedule(self, value):
+        try:
+            return validate_timing_config(value, "schedule")
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+    def validate_period(self, value):
+        try:
+            return validate_timing_config(value, "period")
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
 
 class AlertSerializer(serializers.ModelSerializer):
     policy_name = serializers.CharField(source="policy.name", read_only=True)
@@ -83,7 +103,11 @@ class AlertSerializer(serializers.ModelSerializer):
 
     def get_organizations(self, obj):
         """通过外键关系获取策略的组织列表"""
-        return [org.organization for org in obj.policy.policyorganization_set.all()]
+        organizations = [org.organization for org in obj.policy.policyorganization_set.all()]
+        visible_organizations = self.context.get("data_team_ids")
+        if visible_organizations is None:
+            return organizations
+        return [organization for organization in organizations if organization in visible_organizations]
 
     def get_collect_type_name(self, obj):
         if not obj.collect_type:

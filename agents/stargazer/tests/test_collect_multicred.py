@@ -3,8 +3,8 @@ import importlib
 import sys
 import types
 from pathlib import Path
-import pytest
 
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -58,6 +58,7 @@ def _import_snmp_facts_with_stubbed_deps(monkeypatch):
     proto_module = types.ModuleType("pysnmp.proto")
     rfc1905_module = types.ModuleType("pysnmp.proto.rfc1905")
     rfc1905_module.EndOfMibView = type("EndOfMibView", (), {})
+    rfc1905_module.endOfMibView = object()
 
     hlapi_module = types.ModuleType("pysnmp.hlapi")
     hlapi_module.usmHMACSHAAuthProtocol = object()
@@ -391,13 +392,11 @@ def test_failed_metrics_payload_detected_and_classified():
     from tasks.handlers.plugin_handler import _build_credential_execution_result
 
     prom_unreachable = (
-        '# HELP docker_info Auto-generated help for docker_info\n# TYPE docker_info gauge\n'
+        "# HELP docker_info Auto-generated help for docker_info\n# TYPE docker_info gauge\n"
         'docker_info{bk_obj_id="docker",collect_error="TCP connect timed out after 2.999995535s",'
         'collect_status="failed",host="10.11.27.115",model_id="docker"} 1 1749470000000\n'
     )
-    res = _build_credential_execution_result(
-        {"host": "10.11.27.115", "credential_id": "cred-1", "model_id": "docker"}, prom_unreachable
-    )
+    res = _build_credential_execution_result({"host": "10.11.27.115", "credential_id": "cred-1", "model_id": "docker"}, prom_unreachable)
     assert res["success"] is False
     assert res["failure_kind"] == "unreachable"
     assert "timed out" in res["error_message"].lower()
@@ -406,9 +405,7 @@ def test_failed_metrics_payload_detected_and_classified():
         'docker_info{bk_obj_id="docker",collect_error="SSH authentication failed: ssh: handshake failed: '
         'ssh: unable to authenticate",collect_status="failed",host="10.11.27.113",model_id="docker"} 1 1749470000000\n'
     )
-    res2 = _build_credential_execution_result(
-        {"host": "10.11.27.113", "credential_id": "cred-1", "model_id": "docker"}, prom_auth
-    )
+    res2 = _build_credential_execution_result({"host": "10.11.27.113", "credential_id": "cred-1", "model_id": "docker"}, prom_auth)
     assert res2["success"] is False
     assert res2["failure_kind"] == "credential"
 
@@ -416,9 +413,7 @@ def test_failed_metrics_payload_detected_and_classified():
         'docker_info{bk_obj_id="docker",collect_status="success",host="10.11.27.120",'
         'inst_name="10.11.27.120_abc",model_id="docker"} 1 1749470000000\n'
     )
-    res3 = _build_credential_execution_result(
-        {"host": "10.11.27.120", "credential_id": "cred-1", "model_id": "docker"}, prom_ok
-    )
+    res3 = _build_credential_execution_result({"host": "10.11.27.120", "credential_id": "cred-1", "model_id": "docker"}, prom_ok)
     assert res3["success"] is True
 
 
@@ -436,8 +431,7 @@ class _RecordingCache:
     async def clear_success(self, collect_task_id, host):
         pass
 
-    async def mark_failure(self, collect_task_id, host, credential_id, error_message,
-                           cooldown_level, consecutive_failures, next_retry_at):
+    async def mark_failure(self, collect_task_id, host, credential_id, error_message, cooldown_level, consecutive_failures, next_retry_at):
         self.mark_failure_calls.append((host, credential_id, cooldown_level))
 
     async def get_failure_state(self, collect_task_id, host, credential_id):
@@ -463,9 +457,7 @@ def test_handle_multicred_post_execute_cools_unreachable_failure():
         "failure_kind": "unreachable",
         "error_message": "TCP connect timed out after 5s",
     }
-    asyncio.run(
-        _handle_multicred_post_execute(params, "tid", execution_result, cache, lambda: None)
-    )
+    asyncio.run(_handle_multicred_post_execute(params, "tid", execution_result, cache, lambda: None))
     assert cache.mark_failure_calls == [("10.0.0.99", "cred-1", 1)]
 
 
@@ -498,11 +490,15 @@ def test_handle_multicred_post_execute_logs_cooldown_write():
             "credential_index": 0,
             "credentials_pool": [{"credential_id": "cred-1"}],
         }
-        asyncio.run(plugin_handler._handle_multicred_post_execute(
-            params, "tid",
-            {"success": False, "failure_kind": "unreachable", "error_message": "connection refused"},
-            cache, lambda: None,
-        ))
+        asyncio.run(
+            plugin_handler._handle_multicred_post_execute(
+                params,
+                "tid",
+                {"success": False, "failure_kind": "unreachable", "error_message": "connection refused"},
+                cache,
+                lambda: None,
+            )
+        )
     finally:
         plugin_handler.logger = original_logger
 
@@ -529,21 +525,29 @@ def test_handle_multicred_post_execute_cools_single_credential_without_pool():
 
     # 失败 → 写冷却，且不链式入队（无凭据可换）
     cache = _RecordingCache()
-    asyncio.run(_handle_multicred_post_execute(
-        params, "tid",
-        {"success": False, "failure_kind": "unreachable", "error_message": "TCP connect timed out after 5s"},
-        cache, lambda: _FakeQueue(),
-    ))
+    asyncio.run(
+        _handle_multicred_post_execute(
+            params,
+            "tid",
+            {"success": False, "failure_kind": "unreachable", "error_message": "TCP connect timed out after 5s"},
+            cache,
+            lambda: _FakeQueue(),
+        )
+    )
     assert cache.mark_failure_calls == [("10.0.0.50", "cred-1", 1)]
     assert enqueued == []
 
     # 成功 → 记录成功凭据
     cache2 = _RecordingCache()
-    asyncio.run(_handle_multicred_post_execute(
-        params, "tid",
-        {"success": True, "failure_kind": "", "error_message": ""},
-        cache2, lambda: _FakeQueue(),
-    ))
+    asyncio.run(
+        _handle_multicred_post_execute(
+            params,
+            "tid",
+            {"success": True, "failure_kind": "", "error_message": ""},
+            cache2,
+            lambda: _FakeQueue(),
+        )
+    )
     assert cache2.mark_success_calls == [("10.0.0.50", "cred-1")]
 
 
@@ -586,6 +590,7 @@ def test_build_credential_results_payload_returns_next_since():
 
 def test_collect_endpoint_enqueues_selected_tasks_from_flattened_multicred_headers(monkeypatch):
     from types import SimpleNamespace
+
     from api.collect import collect
 
     enqueued_tasks = []
@@ -635,6 +640,7 @@ def test_collect_endpoint_enqueues_selected_tasks_from_flattened_multicred_heade
         "cmdbcollect_task_id": "131",
         "cmdbcredential_result_subject": "receive_collect_credential_result",
     }
+
     async def fake_receive_body():
         return None
 
@@ -668,6 +674,7 @@ def test_collect_endpoint_enqueues_selected_tasks_from_flattened_multicred_heade
 
 def test_collect_endpoint_accepts_legacy_single_credential_headers(monkeypatch):
     from types import SimpleNamespace
+
     from api.collect import collect
 
     enqueued_tasks = []
@@ -726,6 +733,73 @@ def test_collect_endpoint_accepts_legacy_single_credential_headers(monkeypatch):
     assert "credential_count" not in queued_task
     assert "credentials_pool" not in queued_task
     assert "collect_task_id" not in queued_task
+
+
+@pytest.mark.parametrize(
+    "identity_headers",
+    [
+        {"cmdbprotocol_version": "1", "cmdbtarget_instance_uuid": "123e4567-e89b-42d3-a456-426614174000"},
+        {"cmdbprotocol_version": "2", "cmdbtarget_instance_id": "101"},
+        {"cmdbprotocol_version": "2", "cmdbtarget_instance_uuid": "101"},
+    ],
+)
+def test_config_collection_endpoint_rejects_old_identity_protocol(monkeypatch, identity_headers):
+    from types import SimpleNamespace
+
+    from api.collect import collect
+
+    async def fake_receive_body():
+        return None
+
+    headers = {
+        "cmdbplugin_name": "config_file_info",
+        "cmdbmodel_id": "config_file",
+        "cmdbhosts": "10.0.0.1",
+        **identity_headers,
+    }
+    request = SimpleNamespace(headers=headers, query_args=[], receive_body=fake_receive_body)
+
+    response = asyncio.run(collect(request))
+
+    assert response.status == 400
+
+
+def test_config_collection_endpoint_preserves_uuid_identity_when_splitting(monkeypatch):
+    from types import SimpleNamespace
+
+    from api.collect import collect
+
+    target_uuid = "123e4567-e89b-42d3-a456-426614174000"
+    enqueued_tasks = []
+
+    async def fake_receive_body():
+        return None
+
+    request = SimpleNamespace(
+        headers={
+            "cmdbplugin_name": "config_file_info",
+            "cmdbmodel_id": "config_file",
+            "cmdbhosts": "10.0.0.1",
+            "cmdbprotocol_version": "2",
+            "cmdbtarget_instance_uuid": target_uuid,
+        },
+        query_args=[],
+        receive_body=fake_receive_body,
+    )
+
+    async def fake_submit(request, task_params, model_id):
+        enqueued_tasks.append(task_params)
+        from sanic import response as sanic_response
+
+        return sanic_response.json({"ok": True}, status=200)
+
+    monkeypatch.setattr("api.collect._submit_collection_run", fake_submit)
+
+    response = asyncio.run(collect(request))
+
+    assert response.status == 200
+    assert enqueued_tasks[0]["target_instance_uuid"] == target_uuid
+    assert "target_instance_id" not in enqueued_tasks[0]
 
 
 def test_network_topology_protocol_registry_contains_expected_groups():
@@ -935,16 +1009,18 @@ def test_snmp_topo_format_result_preserves_raw_row_shape_after_registry_refactor
         def prettyPrint(self):
             return self.value
 
-    varbinds = [[
-        (
-            FakeValue("1.3.6.1.2.1.4.22.1.1.192.168.1.10"),
-            FakeValue("7"),
-        ),
-        (
-            FakeValue("1.3.6.1.2.1.2.2.1.2.7"),
-            FakeValue("GigabitEthernet1/0/7"),
-        ),
-    ]]
+    varbinds = [
+        [
+            (
+                FakeValue("1.3.6.1.2.1.4.22.1.1.192.168.1.10"),
+                FakeValue("7"),
+            ),
+            (
+                FakeValue("1.3.6.1.2.1.2.2.1.2.7"),
+                FakeValue("GigabitEthernet1/0/7"),
+            ),
+        ]
+    ]
 
     result = SnmpTopo._format_result(varbinds, eval_oids=NETWORK_TOPO_OIDS)
 
@@ -981,7 +1057,7 @@ def test_snmp_topo_format_result_prefers_longest_matching_eval_oid(monkeypatch):
             return self.value
 
     def parse_suffix(oid, root_oid):
-        return oid[len(root_oid) + 1:] if oid != root_oid else None
+        return oid[len(root_oid) + 1 :] if oid != root_oid else None
 
     fake_oid_meta = {
         "1.2.3": {
@@ -1147,220 +1223,25 @@ def test_snmp_topo_default_oid_collection_includes_fdb_fallback_without_duplicat
     SnmpTopo = snmp_topo_module.SnmpTopo
 
     default_oids = SnmpTopo._build_oids()
-    expected_fdb_oids = [
-        entry["key"] for entry in snmp_topo_module.flatten_oid_registry(("fdb",))
-    ]
+    expected_fdb_oids = [entry["key"] for entry in snmp_topo_module.flatten_oid_registry(("fdb",))]
 
     assert set(expected_fdb_oids).issubset(default_oids)
     assert len(default_oids) == len(set(default_oids))
 
 
-def test_snmp_facts_list_all_resources_adds_network_topology_facts_without_changing_raw_topo(monkeypatch):
-    snmp_facts_module = _import_snmp_facts_with_stubbed_deps(monkeypatch)
+def test_snmp_facts_hardcodes_timeout_10_retries_1():
+    from plugins.inputs.network.snmp_facts import SnmpFacts
 
-    raw_topology_rows = [
-        {"tag": "ARP-IfIndex", "ifindex": "192.168.1.10", "val": "7"},
-    ]
-    topology_facts = [
-        {"source_protocol": "lldp", "remote_device_id": "dist-sw-1"},
-    ]
-
-    class FakeSnmpTopo:
-        def __init__(self, kwargs):
-            self.kwargs = kwargs
-
-        def bulkCmd(self):
-            return raw_topology_rows
-
-        @staticmethod
-        def build_topology_facts(snmp_rows, enabled_protocols=None):
-            assert snmp_rows == raw_topology_rows
-            assert enabled_protocols == ("lldp", "cdp")
-            return topology_facts
-
-    monkeypatch.setattr(snmp_facts_module, "SnmpTopo", FakeSnmpTopo)
-    monkeypatch.setattr(
-        snmp_facts_module.SnmpFacts,
-        "collect",
-        lambda self: {"system": {"sysname": "edge-sw-1"}, "interfaces": [{"index": "7"}]},
-    )
-
-    result = snmp_facts_module.SnmpFacts(
+    facts = SnmpFacts(
         {
             "host": "127.0.0.1",
             "version": "v2c",
             "community": "public",
-            "has_network_topo": "True",
-            "topology_protocols": ("lldp", "cdp"),
+            "timeout": 99,
+            "retries": 9,
         }
-    ).list_all_resources()
-
-    assert result["success"] is True
-    assert result["result"]["network_topo"] == raw_topology_rows
-    assert result["result"]["network_topology_facts"] == topology_facts
-    assert result["result"]["network_system"] == [{"sysname": "edge-sw-1"}]
-
-
-def test_snmp_facts_list_all_resources_uses_default_neighbor_protocols_when_topology_protocols_omitted(monkeypatch):
-    snmp_facts_module = _import_snmp_facts_with_stubbed_deps(monkeypatch)
-    snmp_topo_module = _import_snmp_topo_with_stubbed_sanic_log(monkeypatch)
-
-    raw_topology_rows = [
-        {"tag": "LLDP-LocPortId", "ifindex": "101", "val": "GigabitEthernet1/0/1"},
-        {"tag": "LLDP-RemSysName", "ifindex": "8457.101.1", "val": "dist-sw-1"},
-        {"tag": "LLDP-RemPortId", "ifindex": "8457.101.1", "val": "GigabitEthernet1/0/24"},
-    ]
-
-    class FakeSnmpTopo:
-        def __init__(self, kwargs):
-            self.kwargs = kwargs
-
-        def bulkCmd(self):
-            return raw_topology_rows
-
-        @staticmethod
-        def build_topology_facts(snmp_rows, enabled_protocols=None):
-            assert snmp_rows == raw_topology_rows
-            assert enabled_protocols is None
-            return snmp_topo_module.SnmpTopo.build_topology_facts(snmp_rows, enabled_protocols=enabled_protocols)
-
-    monkeypatch.setattr(snmp_facts_module, "SnmpTopo", FakeSnmpTopo)
-    monkeypatch.setattr(
-        snmp_facts_module.SnmpFacts,
-        "collect",
-        lambda self: {"system": {"sysname": "edge-sw-1"}, "interfaces": [{"index": "7"}]},
     )
-
-    result = snmp_facts_module.SnmpFacts(
-        {
-            "host": "127.0.0.1",
-            "version": "v2c",
-            "community": "public",
-            "has_network_topo": "True",
-        }
-    ).list_all_resources()
-
-    assert result["success"] is True
-    assert result["result"]["network_topology_facts"] == [
-        {
-            "source_protocol": "lldp",
-            "confidence": 0.95,
-            "local_device_id": None,
-            "local_port_id": "101",
-            "local_port_name": "GigabitEthernet1/0/1",
-            "remote_device_id": "dist-sw-1",
-            "remote_port_id": "GigabitEthernet1/0/24",
-            "remote_port_name": "GigabitEthernet1/0/24",
-            "raw_evidence": {
-                "local_port": raw_topology_rows[0],
-                "remote_system": raw_topology_rows[1],
-                "remote_port": raw_topology_rows[2],
-            },
-        }
-    ]
-
-
-def test_snmp_facts_list_all_resources_uses_fdb_default_fallback_when_topology_protocols_omitted(monkeypatch):
-    snmp_facts_module = _import_snmp_facts_with_stubbed_deps(monkeypatch)
-    snmp_topo_module = _import_snmp_topo_with_stubbed_sanic_log(monkeypatch)
-
-    raw_topology_rows = [
-        {"tag": "FDB-MacAddress", "ifindex": "0.17.34.51.68.85", "val": "00:11:22:33:44:55"},
-        {"tag": "FDB-Port", "ifindex": "0.17.34.51.68.85", "val": "10"},
-        {"tag": "BRIDGE-BasePortIfIndex", "ifindex": "10", "val": "15"},
-        {"tag": "IFTable-IfDescr", "ifindex": "15", "val": "GigabitEthernet1/0/15"},
-        {"tag": "IFTable-IfAlias", "ifindex": "15", "val": "server-uplink"},
-    ]
-
-    class FakeSnmpTopo:
-        def __init__(self, kwargs):
-            self.kwargs = kwargs
-
-        def bulkCmd(self):
-            return raw_topology_rows
-
-        @staticmethod
-        def build_topology_facts(snmp_rows, enabled_protocols=None):
-            assert snmp_rows == raw_topology_rows
-            assert enabled_protocols is None
-            return snmp_topo_module.SnmpTopo.build_topology_facts(snmp_rows, enabled_protocols=enabled_protocols)
-
-    monkeypatch.setattr(snmp_facts_module, "SnmpTopo", FakeSnmpTopo)
-    monkeypatch.setattr(
-        snmp_facts_module.SnmpFacts,
-        "collect",
-        lambda self: {"system": {"sysname": "edge-sw-1"}, "interfaces": [{"index": "15"}]},
-    )
-
-    result = snmp_facts_module.SnmpFacts(
-        {
-            "host": "127.0.0.1",
-            "version": "v2c",
-            "community": "public",
-            "has_network_topo": "True",
-        }
-    ).list_all_resources()
-
-    assert result["success"] is True
-    assert result["result"]["network_topology_facts"] == [
-        {
-            "source_protocol": "fdb",
-            "confidence": 0.7,
-            "local_device_id": None,
-            "local_port_id": "15",
-            "local_port_name": "server-uplink",
-            "remote_device_id": "00:11:22:33:44:55",
-            "remote_port_id": None,
-            "remote_port_name": None,
-            "raw_evidence": {
-                "local_port": raw_topology_rows[3],
-                "local_port_alias": raw_topology_rows[4],
-                "bridge_port": raw_topology_rows[2],
-                "fdb_mac": raw_topology_rows[0],
-                "fdb_port": raw_topology_rows[1],
-            },
-        }
-    ]
-
-
-def test_snmp_facts_list_all_resources_preserves_raw_topology_when_fact_building_fails(monkeypatch):
-    snmp_facts_module = _import_snmp_facts_with_stubbed_deps(monkeypatch)
-
-    raw_topology_rows = [
-        {"tag": "LLDP-RemSysName", "ifindex": "8457.101.1", "val": "dist-sw-1"},
-    ]
-
-    class FakeSnmpTopo:
-        def __init__(self, kwargs):
-            self.kwargs = kwargs
-
-        def bulkCmd(self):
-            return raw_topology_rows
-
-        @staticmethod
-        def build_topology_facts(snmp_rows, enabled_protocols=None):
-            assert snmp_rows == raw_topology_rows
-            raise ValueError("invalid topology fact payload")
-
-    monkeypatch.setattr(snmp_facts_module, "SnmpTopo", FakeSnmpTopo)
-    monkeypatch.setattr(
-        snmp_facts_module.SnmpFacts,
-        "collect",
-        lambda self: {"system": {"sysname": "edge-sw-1"}, "interfaces": [{"index": "7"}]},
-    )
-
-    result = snmp_facts_module.SnmpFacts(
-        {
-            "host": "127.0.0.1",
-            "version": "v2c",
-            "community": "public",
-            "has_network_topo": "True",
-        }
-    ).list_all_resources()
-
-    assert result["success"] is True
-    assert result["result"]["network_topo"] == raw_topology_rows
-    assert result["result"]["network_topology_facts"] == []
+    assert (facts.timeout, facts.retries) == (10, 1)
 
 
 # ============================================================================
@@ -1371,7 +1252,7 @@ class _FakeCredCache:
 
     def __init__(self, cooled=None):
         self.events = []
-        self.failures = []        # mark_failure 调用
+        self.failures = []  # mark_failure 调用
         self.successes = []
         self.cleared = []
         self._cooled = set(cooled or set())  # 已冷却的 (task,host,cred_id)
@@ -1404,18 +1285,29 @@ class _FakeQueue:
 
 def _exec_result(failure_kind, error_message, success=False):
     return {
-        "collect_task_id": 293, "host": "10.10.69.246", "credential_id": "cred-v2c",
-        "credential_index": 0, "model_id": "network", "plugin_name": "snmp_facts",
-        "success": success, "failure_kind": failure_kind, "error_message": error_message,
-        "finished_at": "2026-06-12T00:00:00Z", "snapshot": {},
+        "collect_task_id": 293,
+        "host": "10.10.69.246",
+        "credential_id": "cred-v2c",
+        "credential_index": 0,
+        "model_id": "network",
+        "plugin_name": "snmp_facts",
+        "success": success,
+        "failure_kind": failure_kind,
+        "error_message": error_message,
+        "finished_at": "2026-06-12T00:00:00Z",
+        "snapshot": {},
     }
 
 
 def _mc_params(pool):
     return {
-        "collect_task_id": 293, "host": "10.10.69.246",
-        "credential_id": "cred-v2c", "credential_index": 0, "credentials_pool": pool,
-        "model_id": "network", "plugin_name": "snmp_facts",
+        "collect_task_id": 293,
+        "host": "10.10.69.246",
+        "credential_id": "cred-v2c",
+        "credential_index": 0,
+        "credentials_pool": pool,
+        "model_id": "network",
+        "plugin_name": "snmp_facts",
     }
 
 
@@ -1429,12 +1321,13 @@ _POOL = [
 async def test_multicred_snmp_timeout_cools_and_rotates_to_v3():
     """246 场景：v2c 在 v3 设备上静默超时（failure_kind=task）→ 多凭据池下应冷却 v2c 并换到 v3。"""
     from tasks.handlers.plugin_handler import _handle_multicred_post_execute
+
     cache = _FakeCredCache()
     queue = _FakeQueue()
     er = _exec_result("task", "No SNMP response received before timeout")
     await _handle_multicred_post_execute(_mc_params(_POOL), "t", er, cache, lambda: queue)
-    assert [f["cred"] for f in cache.failures] == ["cred-v2c"]          # v2c 被冷却
-    assert len(queue.enqueued) == 1                                      # 换下一个
+    assert [f["cred"] for f in cache.failures] == ["cred-v2c"]  # v2c 被冷却
+    assert len(queue.enqueued) == 1  # 换下一个
     assert queue.enqueued[0]["credential_id"] == "cred-v3"
 
 
@@ -1442,12 +1335,13 @@ async def test_multicred_snmp_timeout_cools_and_rotates_to_v3():
 async def test_multicred_generic_task_failure_rotates_without_cooldown():
     """非 SNMP 的瞬时 task 失败：多凭据池下仍换下一个，但不冷却当前凭据（下一轮仍可重试）。"""
     from tasks.handlers.plugin_handler import _handle_multicred_post_execute
+
     cache = _FakeCredCache()
     queue = _FakeQueue()
     er = _exec_result("task", "docker command not found")
     await _handle_multicred_post_execute(_mc_params(_POOL), "t", er, cache, lambda: queue)
-    assert cache.failures == []                                          # 不冷却
-    assert len(queue.enqueued) == 1                                      # 仍换下一个
+    assert cache.failures == []  # 不冷却
+    assert len(queue.enqueued) == 1  # 仍换下一个
     assert queue.enqueued[0]["credential_id"] == "cred-v3"
 
 
@@ -1455,18 +1349,20 @@ async def test_multicred_generic_task_failure_rotates_without_cooldown():
 async def test_single_credential_snmp_timeout_unchanged():
     """单凭据 SNMP 超时：保持原行为——不冷却、不换（下一轮重试），零回归。"""
     from tasks.handlers.plugin_handler import _handle_multicred_post_execute
+
     cache = _FakeCredCache()
     queue = _FakeQueue()
     er = _exec_result("task", "No SNMP response received before timeout")
     await _handle_multicred_post_execute(_mc_params([]), "t", er, cache, lambda: queue)
-    assert cache.failures == []                                          # 单凭据不冷却
-    assert queue.enqueued == []                                          # 无可换
+    assert cache.failures == []  # 单凭据不冷却
+    assert queue.enqueued == []  # 无可换
 
 
 @pytest.mark.asyncio
 async def test_multicred_credential_failure_still_cools_and_rotates():
     """既有行为：明确 credential 失败仍冷却 + 换下一个（不回归）。"""
     from tasks.handlers.plugin_handler import _handle_multicred_post_execute
+
     cache = _FakeCredCache()
     queue = _FakeQueue()
     er = _exec_result("credential", "SSH authentication failed")
@@ -1479,8 +1375,9 @@ async def test_multicred_credential_failure_still_cools_and_rotates():
 async def test_multicred_no_next_when_remaining_cooled():
     """下一个凭据已冷却 → 不再 enqueue（避免空转）。"""
     from tasks.handlers.plugin_handler import _handle_multicred_post_execute
+
     cache = _FakeCredCache(cooled={("293", "10.10.69.246", "cred-v3")})
     queue = _FakeQueue()
     er = _exec_result("task", "No SNMP response received before timeout")
     await _handle_multicred_post_execute(_mc_params(_POOL), "t", er, cache, lambda: queue)
-    assert queue.enqueued == []                                         # v3 已冷却，无可换
+    assert queue.enqueued == []  # v3 已冷却，无可换

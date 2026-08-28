@@ -3,11 +3,11 @@
 # @Time: 2025/11/13 14:16
 # @Author: windyzhao
 import os
-import json
-from abc import abstractmethod, ABCMeta
+from abc import ABCMeta, abstractmethod
 
 from django.conf import settings
-from jinja2 import FileSystemLoader, DebugUndefined
+from jinja2 import DebugUndefined, FileSystemLoader
+
 from apps.core.logger import cmdb_logger as logger
 from apps.core.utils.safe_template import build_sandboxed_env
 
@@ -19,6 +19,7 @@ class BaseNodeParams(metaclass=ABCMeta):
     # 同一个 model（例如 physcial_server）可以同时存在 SSH/job 和 IPMI/protocol 两条下发链路。
     _registry = {}  # 自动收集支持的 model_id 对应的子类
     interval = 300  # 默认的采集间隔时间（秒）
+    MIN_INTERVAL_SECONDS = 60
 
     @classmethod
     def build_registry_key(cls, model_id, driver_type=None):
@@ -40,9 +41,7 @@ class BaseNodeParams(metaclass=ABCMeta):
             BaseNodeParams._registry[registry_key] = cls
             BaseNodeParams.PLUGIN_MAP.update({registry_key: plugin_name})
         else:
-            logger.warning(
-                f"子类 {cls.__name__} 未正确设置 'supported_model_id' 或 'plugin_name' 属性，将不会被注册到 BaseNodeParams 中。"
-            )
+            logger.warning(f"子类 {cls.__name__} 未正确设置 'supported_model_id' 或 'plugin_name' 属性，将不会被注册到 BaseNodeParams 中。")
 
     def __init__(self, instance):
         self.instance = instance
@@ -55,12 +54,15 @@ class BaseNodeParams(metaclass=ABCMeta):
         self.credential = raw_credential
         self.base_path = "${STARGAZER_URL}/api/collect/collect_info"
         # 只有当子类没有定义 host_field 类属性时才设置默认值,避免覆盖子类定义
-        if not hasattr(self.__class__, 'host_field'):
+        if not hasattr(self.__class__, "host_field"):
             self.host_field = "ip_addr"  # 默认的 ip字段 若不一样重新定义
         self.timeout = instance.timeout
-        self.response_timeout = 10
+        self.response_timeout = 30
+        self.telegraf_timeout = self.response_timeout
         self.executor_type = "protocol"  # 默认执行器类型
         self.has_network_topo = bool(self.instance.params.get("has_network_topo"))  # 是否包含网络拓扑采集
+        self.collection_role = "device"
+        self.channel_config_version = 1
 
     def get_hosts(self):
         """
@@ -71,6 +73,16 @@ class BaseNodeParams(metaclass=ABCMeta):
         else:
             hosts = self.instance.ip_range
         return "hosts", hosts
+
+    @property
+    def metric_scope_id(self):
+        """指标关联范围：CMDB 对账/关联使用的稳定 instance_id。"""
+        return f"cmdb_{self.instance.id}"
+
+    @property
+    def config_id(self):
+        """节点管理子配置 ID：全局唯一，可与 metric_scope_id 不同。"""
+        return self.metric_scope_id
 
     @property
     def model_plugin_name(self):
@@ -90,8 +102,7 @@ class BaseNodeParams(metaclass=ABCMeta):
             if plugin_name:
                 return plugin_name
 
-        raise KeyError(
-            f"未在 PLUGIN_MAP 中找到对应 {self.model_id} / {self.instance.driver_type} 的插件配置")
+        raise KeyError(f"未在 PLUGIN_MAP 中找到对应 {self.model_id} / {self.instance.driver_type} 的插件配置")
 
     @abstractmethod
     def set_credential(self, *args, **kwargs):
@@ -104,6 +115,12 @@ class BaseNodeParams(metaclass=ABCMeta):
     @classmethod
     def build_region_credential(cls, raw_credential):
         return raw_credential or {}
+
+    @staticmethod
+    def primary_credential(raw_credential):
+        if isinstance(raw_credential, list):
+            return raw_credential[0] if raw_credential and isinstance(raw_credential[0], dict) else {}
+        return raw_credential if isinstance(raw_credential, dict) else {}
 
     def env_config(self, *args, **kwargs):
         """
@@ -148,10 +165,12 @@ class BaseNodeParams(metaclass=ABCMeta):
     @property
     def tags(self):
         tags = {
-            "instance_id": self._instance_id,
+            "instance_id": self.metric_scope_id,
             "instance_type": self.get_instance_type,
             "collect_type": "http",
             "config_type": self.model_id,
+            "collection_role": self.collection_role,
+            "channel_config_version": str(self.channel_config_version),
         }
         return tags
 
@@ -173,9 +192,18 @@ class BaseNodeParams(metaclass=ABCMeta):
                 "model_id": _model_id,
                 "timeout": self.timeout,
                 "collect_task_id": self.instance.id,
+                "collection_role": self.collection_role,
+                "channel_config_version": self.channel_config_version,
                 "credential_result_subject": "receive_collect_credential_result",
             }
         )
+        task_params = getattr(self.instance, "params", None) or {}
+        if isinstance(task_params, dict) and "ip_precheck" in task_params:
+            params["ip_precheck"] = bool(task_params.get("ip_precheck"))
+        access_point = (getattr(self.instance, "access_point", None) or [{}])[0] or {}
+        executor_node_ip = str(access_point.get("ip") or "").strip()
+        if executor_node_ip:
+            params["executor_node_ip"] = executor_node_ip
         credentials_pool = self.build_credentials_pool()
         if credentials_pool:
             if self.has_multiple_credentials:
@@ -196,11 +224,22 @@ class BaseNodeParams(metaclass=ABCMeta):
 
     @property
     def _instance_id(self):
-        """
-        实例ID
-        采集配置在节点管理中的唯一标识
-        """
-        return f"cmdb_{self.instance.id}"
+        """兼容旧调用：等同于节点配置 ID（config_id）。"""
+        return self.config_id
+
+    @property
+    def resolved_interval(self) -> int:
+        """节点侧采集间隔：优先跟随任务周期，异常时回退类默认值。"""
+        cycle_value_type = getattr(self.instance, "cycle_value_type", "")
+        cycle_value = getattr(self.instance, "cycle_value", None)
+        if cycle_value_type == "cycle":
+            try:
+                interval_seconds = int(cycle_value) * 60
+            except (TypeError, ValueError):
+                interval_seconds = 0
+            if interval_seconds >= self.MIN_INTERVAL_SECONDS:
+                return interval_seconds
+        return self.interval
 
     def push_params(self):
         """
@@ -212,24 +251,27 @@ class BaseNodeParams(metaclass=ABCMeta):
         nodes = []
         node = self.instance.access_point[0]
         content = {
-            "instance_id": self._instance_id,
-            "interval": self.interval,
+            "instance_id": self.config_id,
+            "interval": self.resolved_interval,
             "instance_type": self.get_instance_type,
             "timeout": self.timeout,
+            "telegraf_timeout": self.telegraf_timeout,
             "response_timeout": self.response_timeout,
             "headers": self.custom_headers(),
-            "config_type": self.model_id,
+            "config_type": getattr(self, "supported_model_id", self.model_id),
         }
         jinja_context = self.render_template(context=content)
-        nodes.append({
-            "id": self._instance_id,
-            "collect_type": "http",
-            "type": self.model_id,
-            "content": jinja_context,
-            "node_id": node["id"],
-            "collector_name": "Telegraf",
-            "env_config": self.env_config()
-        })
+        nodes.append(
+            {
+                "id": self.config_id,
+                "collect_type": "http",
+                "type": getattr(self, "supported_model_id", self.model_id),
+                "content": jinja_context,
+                "node_id": node["id"],
+                "collector_name": "Telegraf",
+                "env_config": self.env_config(),
+            }
+        )
         return nodes
 
     # 类级别缓存沙箱环境
@@ -252,7 +294,7 @@ class BaseNodeParams(metaclass=ABCMeta):
         """转义 TOML 字符串中的特殊字符"""
         if not isinstance(s, str):
             s = str(s)
-        return s.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+        return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 
     @staticmethod
     def to_toml_dict(d):

@@ -4,16 +4,26 @@
 # @Author: windyzhao
 
 import socket
-from pysnmp.entity.rfc3413.oneliner import cmdgen
-from pysnmp.hlapi import (
-    usmHMACSHAAuthProtocol,
-    usmHMACMD5AuthProtocol,
+
+from core.plugin.error_logging import log_plugin_exception
+from pysnmp.hlapi.asyncio import (
+    CommunityData,
+    ContextData,
+    ObjectIdentity,
+    ObjectType,
+    SnmpEngine,
+    UdpTransportTarget,
+    UsmUserData,
+    getCmd,
+    nextCmd,
     usmAesCfb128Protocol,
     usmDESPrivProtocol,
+    usmHMACMD5AuthProtocol,
+    usmHMACSHAAuthProtocol,
 )
+from pysnmp.proto.rfc1902 import Null
+from pysnmp.proto.rfc1905 import EndOfMibView, endOfMibView
 from sanic.log import logger
-
-from plugins.inputs.network_topo.snmp_topo import SnmpTopo
 
 
 class DefineOid:
@@ -42,6 +52,29 @@ class DefineOid:
         self.ifAlias = dp + "1.3.6.1.2.1.31.1.1.1.18"
 
 
+def _oid_text(oid) -> str:
+    pretty = getattr(oid, "prettyPrint", None)
+    text = pretty() if callable(pretty) else str(oid)
+    return str(text).lstrip(".")
+
+
+def _is_prefix_of(root: str, oid) -> bool:
+    root = root.lstrip(".")
+    oid_text = _oid_text(oid)
+    return oid_text == root or oid_text.startswith(root + ".")
+
+
+def _as_object_types(oids):
+    return [ObjectType(ObjectIdentity(str(oid).lstrip("."))) for oid in oids]
+
+
+def _close_snmp_engine(engine) -> None:
+    dispatcher = getattr(engine, "transportDispatcher", None)
+    close = getattr(dispatcher, "closeDispatcher", None)
+    if callable(close):
+        close()
+
+
 class SnmpFacts:
     """
     SNMP 数据采集类，支持 SNMP v2 和 v3 协议。
@@ -59,27 +92,12 @@ class SnmpFacts:
         self.privacy = kwargs.get("privacy")
         self.authkey = kwargs.get("authkey")
         self.privkey = kwargs.get("privkey")
-        self.timeout = int(kwargs.get("timeout", 1))
-        self.retries = int(kwargs.get("retries", 2))
+        self.timeout = 10
+        self.retries = 1
         self.snmp_port = int(kwargs.get("snmp_port", 161))  # 默认 SNMP 端口为 161
-        # 支持 has_network_topo 和 topo 两个参数名，保持向后兼容
-        self.has_network_topo = kwargs.get("has_network_topo", "False") == "True" or kwargs.get("topo",
-                                                                                                "False") == "true"
-        self.topology_protocols = self._normalize_topology_protocols(kwargs.get("topology_protocols"))
 
         # 校验参数
         self._validate_params()
-
-    @staticmethod
-    def _normalize_topology_protocols(enabled_protocols=None):
-        if enabled_protocols is None:
-            return None
-        normalizer = getattr(SnmpTopo, "normalize_enabled_protocols", None)
-        if callable(normalizer):
-            return normalizer(enabled_protocols)
-        if isinstance(enabled_protocols, str):
-            return tuple(item.strip().lower() for item in enabled_protocols.split(",") if item.strip())
-        return tuple(str(item).strip().lower() for item in enabled_protocols if str(item).strip())
 
     def _validate_params(self):
         """
@@ -101,9 +119,7 @@ class SnmpFacts:
             if self.level == "authPriv" and not self.privacy:
                 raise ValueError("Privacy algorithm is required for authPriv level.")
             if len(self.authkey) < 8 or len(self.privkey) < 8:
-                raise ValueError(
-                    "authkey and privkey must be at least 8 characters long."
-                )
+                raise ValueError("authkey and privkey must be at least 8 characters long.")
         if not (1 <= self.snmp_port <= 65535):
             raise ValueError("Invalid SNMP port. Must be between 1 and 65535.")
 
@@ -112,15 +128,15 @@ class SnmpFacts:
         根据 SNMP 版本和认证参数生成认证对象。
         """
         if self.version in ["v2", "v2c"]:
-            return cmdgen.CommunityData(self.community)
+            return CommunityData(self.community)
         elif self.level == "authNoPriv":
-            return cmdgen.UsmUserData(
+            return UsmUserData(
                 self.username,
                 authKey=self.authkey,
                 authProtocol=self._get_integrity_proto(),
             )
         else:
-            return cmdgen.UsmUserData(
+            return UsmUserData(
                 self.username,
                 authKey=self.authkey,
                 privKey=self.privkey,
@@ -148,13 +164,80 @@ class SnmpFacts:
             return usmDESPrivProtocol
         return None
 
-    def collect(self):
+    def _transport_target(self, timeout=None, retries=None):
+        return UdpTransportTarget(
+            (self.host, self.snmp_port),
+            timeout=self.timeout if timeout is None else timeout,
+            retries=self.retries if retries is None else retries,
+        )
+
+    async def _next_walk(self, oids, *, timeout=None, retries=None, lexicographic_mode=False):
+        """
+        原生异步 GETNEXT 遍历，行为对齐 oneliner CommandGenerator.nextCmd
+        （默认 lexicographicMode=False）。
+        """
+        engine = SnmpEngine()
+        auth = self._get_snmp_auth()
+        target = self._transport_target(timeout=timeout, retries=retries)
+        context = ContextData()
+        var_binds = _as_object_types(oids)
+        initial_roots = [str(oid).lstrip(".") for oid in oids]
+        var_bind_table = []
+
+        try:
+            while var_binds:
+                previous_var_binds = var_binds
+                (
+                    error_indication,
+                    error_status,
+                    error_index,
+                    response_table,
+                ) = await nextCmd(
+                    engine,
+                    auth,
+                    target,
+                    context,
+                    *var_binds,
+                    lookupMib=False,
+                )
+                if error_indication:
+                    return error_indication, error_status, error_index, var_bind_table
+                if error_status:
+                    return error_indication, error_status, error_index, var_bind_table
+
+                row = list(response_table[0]) if response_table else []
+                if not row:
+                    break
+
+                stop_flag = True
+                for col, var_bind in enumerate(row):
+                    name, val = var_bind
+                    if isinstance(val, Null):
+                        row[col] = (previous_var_binds[col][0], endOfMibView)
+                    elif not lexicographic_mode and not _is_prefix_of(initial_roots[col], name):
+                        row[col] = (previous_var_binds[col][0], endOfMibView)
+                    cell_val = row[col][1]
+                    if cell_val is not endOfMibView and not isinstance(cell_val, EndOfMibView):
+                        stop_flag = False
+
+                if stop_flag:
+                    break
+
+                var_bind_table.append(row)
+                var_binds = row
+
+            return None, 0, 0, var_bind_table
+        finally:
+            _close_snmp_engine(engine)
+
+    async def collect(self):  # noqa: C901
         """
         采集 SNMP 数据，包括系统信息、接口信息和 IP 信息。
         """
-        cmdGen = cmdgen.CommandGenerator()
-        transport_opts = {"timeout": self.timeout, "retries": self.retries}
+        probe_timeout = min(self.timeout, 10)
         snmp_auth = self._get_snmp_auth()
+        engine = SnmpEngine()
+        context = ContextData()
 
         # 定义 OID
         p = DefineOid(dotprefix=True)
@@ -168,17 +251,16 @@ class SnmpFacts:
 
         # 采集系统信息
         try:
-            errorIndication, errorStatus, errorIndex, varBinds = cmdGen.getCmd(
+            errorIndication, errorStatus, errorIndex, varBinds = await getCmd(
+                engine,
                 snmp_auth,
-                cmdgen.UdpTransportTarget(
-                    (self.host, self.snmp_port), **transport_opts
-                ),
-                cmdgen.MibVariable(p.sysDescr),
-                cmdgen.MibVariable(p.sysObjectId),
-                # cmdgen.MibVariable(p.sysUpTime),
-                cmdgen.MibVariable(p.sysContact),
-                cmdgen.MibVariable(p.sysName),
-                cmdgen.MibVariable(p.sysLocation),
+                self._transport_target(timeout=probe_timeout, retries=self.retries),
+                context,
+                ObjectType(ObjectIdentity(p.sysDescr.lstrip("."))),
+                ObjectType(ObjectIdentity(p.sysObjectId.lstrip("."))),
+                ObjectType(ObjectIdentity(p.sysContact.lstrip("."))),
+                ObjectType(ObjectIdentity(p.sysName.lstrip("."))),
+                ObjectType(ObjectIdentity(p.sysLocation.lstrip("."))),
                 lookupMib=False,
             )
             if errorIndication:
@@ -195,8 +277,6 @@ class SnmpFacts:
                     results["system"]["sysdescr"] = current_val
                 elif current_oid == v.sysObjectId:
                     results["system"]["sysobjectid"] = current_val
-                # elif current_oid == v.sysUpTime:
-                #     results['system']['sysuptime'] = current_val
                 elif current_oid == v.sysContact:
                     results["system"]["syscontact"] = current_val
                 elif current_oid == v.sysName:
@@ -207,26 +287,26 @@ class SnmpFacts:
             results["system"]["ip_addr"] = self.host
             results["system"]["port"] = self.snmp_port
         except Exception as e:
-            raise RuntimeError(
-                f"Error during SNMP system information collection: {str(e)}"
-            )
+            raise RuntimeError(f"Error during SNMP system information collection: {str(e)}")
+        finally:
+            _close_snmp_engine(engine)
 
         # 采集接口和 IP 信息
         try:
-            errorIndication, errorStatus, errorIndex, varTable = cmdGen.nextCmd(
-                snmp_auth,
-                cmdgen.UdpTransportTarget(
-                    (self.host, self.snmp_port), **transport_opts
-                ),
-                cmdgen.MibVariable(p.ifIndex),
-                cmdgen.MibVariable(p.ifDescr),
-                cmdgen.MibVariable(p.ifMtu),
-                cmdgen.MibVariable(p.ifSpeed),
-                cmdgen.MibVariable(p.ifPhysAddress),
-                cmdgen.MibVariable(p.ifAdminStatus),
-                cmdgen.MibVariable(p.ifOperStatus),
-                cmdgen.MibVariable(p.ifAlias),
-                lookupMib=False,
+            errorIndication, errorStatus, errorIndex, varTable = await self._next_walk(
+                [
+                    p.ifIndex,
+                    p.ifDescr,
+                    p.ifMtu,
+                    p.ifSpeed,
+                    p.ifPhysAddress,
+                    p.ifAdminStatus,
+                    p.ifOperStatus,
+                    p.ifAlias,
+                ],
+                timeout=self.timeout,
+                retries=self.retries,
+                lexicographic_mode=False,
             )
             if errorIndication:
                 raise RuntimeError(f"SNMP nextCmd failed: {errorIndication}")
@@ -255,19 +335,74 @@ class SnmpFacts:
                 if interface:
                     results["interfaces"].append(interface)
         except Exception as e:
-            raise RuntimeError(
-                f"Error during SNMP interface information collection: {str(e)}"
-            )
+            raise RuntimeError(f"Error during SNMP interface information collection: {str(e)}")
 
         return results
 
-    def list_all_resources(self):
-        """
-        将采集到的 SNMP 数据转换为标准格式。
-        当 has_network_topo=True 时，同时采集网络拓扑数据。
-        """
+    async def probe(self):
+        """最小只读 SNMP GET（sysName），用于 CredentialAttempt。"""
+        from core.collection.contracts import AccessProbeResult, AccessProbeStatus
+
+        oid = DefineOid(dotprefix=True)
+        # access_probe：固定 10 秒超时、重试 1 次（与正式采集 timeout 解耦）
+        engine = SnmpEngine()
         try:
-            snmp_data = self.collect()
+            error_indication, error_status, _error_index, var_binds = await getCmd(
+                engine,
+                self._get_snmp_auth(),
+                self._transport_target(timeout=10, retries=1),
+                ContextData(),
+                ObjectType(ObjectIdentity(oid.sysName.lstrip("."))),
+                lookupMib=False,
+            )
+        except Exception:  # noqa: BLE001 - 不把 SDK 异常正文写入结果
+            return AccessProbeResult(
+                status=AccessProbeStatus.NO_RESPONSE,
+                error_code="snmp_probe_error",
+            )
+        finally:
+            _close_snmp_engine(engine)
+        if error_indication:
+            indication = str(error_indication).lower()
+            if "timeout" in indication or "no response" in indication:
+                return AccessProbeResult(
+                    status=AccessProbeStatus.NO_RESPONSE,
+                    error_code="protocol_no_response",
+                )
+            if any(token in indication for token in ("authorization", "authentication", "community")):
+                return AccessProbeResult(
+                    status=AccessProbeStatus.AUTH_FAILED,
+                    error_code="snmp_authorization_failed",
+                )
+            return AccessProbeResult(
+                status=AccessProbeStatus.NO_RESPONSE,
+                error_code="protocol_no_response",
+            )
+        if error_status:
+            return AccessProbeResult(
+                status=AccessProbeStatus.AUTH_FAILED,
+                error_code="snmp_error_status",
+            )
+        if not var_binds:
+            return AccessProbeResult(
+                status=AccessProbeStatus.NO_RESPONSE,
+                error_code="empty_snmp_response",
+            )
+        return AccessProbeResult(status=AccessProbeStatus.READY)
+
+    async def list_all_resources(self):
+        """将设备与接口 SNMP 数据转换为标准格式。"""
+        logger.info(
+            "event=snmp_facts_collection_started task_id=%s plugin_ref=%s " "model_id=%s plugin_name=%s target=%s | SNMP采集开始 IP=%s",
+            self.kwargs.get("collection_task_id") or "-",
+            self.kwargs.get("collection_plugin_ref") or "network.config",
+            self.kwargs.get("model_id") or "network",
+            self.kwargs.get("plugin_name") or "snmp_facts",
+            self.host,
+            self.host,
+        )
+        try:
+            snmp_data = await self.collect()
             system_data = snmp_data.get("system", {})
             interfaces_data = snmp_data.get("interfaces", [])
             model_data = {
@@ -275,41 +410,17 @@ class SnmpFacts:
                 "network_interfaces": interfaces_data,
             }
 
-            # 当启用网络拓扑采集时，同时采集拓扑数据
-            if self.has_network_topo:
-                try:
-                    topo_collector = SnmpTopo(self.kwargs)
-                    topo_data = topo_collector.bulkCmd()
-                    model_data["network_topo"] = topo_data
-                    try:
-                        model_data["network_topology_facts"] = topo_collector.build_topology_facts(
-                            topo_data,
-                            enabled_protocols=self.topology_protocols,
-                        )
-                    except Exception:  # noqa
-                        import traceback
-
-                        logger.error(
-                            f"Network topology fact build failed: {traceback.format_exc()}"
-                        )
-                        model_data["network_topology_facts"] = []
-                    logger.info(
-                        f"Network topo collection completed, {len(topo_data)} records collected"
-                    )
-                except Exception as topo_err:  # noqa
-                    import traceback
-                    logger.error(
-                        f"Network topo collection failed: {traceback.format_exc()}"
-                    )
-                    # 拓扑采集失败不影响设备采集结果，返回空列表
-                    model_data["network_topo"] = []
-                    model_data["network_topology_facts"] = []
-
             inst_data = {"result": model_data, "success": True}
         except Exception as err:
-            import traceback
-
-            logger.error(f"snmp_facts collect error! {traceback.format_exc()}")
+            log_plugin_exception(
+                logger,
+                error=err,
+                task_id=self.kwargs.get("collection_task_id"),
+                plugin_ref=self.kwargs.get("collection_plugin_ref") or "network.config",
+                model_id=self.kwargs.get("model_id") or "network",
+                plugin_name=self.kwargs.get("plugin_name") or "snmp_facts",
+                target=self.host,
+            )
             inst_data = {"result": {"cmdb_collect_error": str(err)}, "success": False}
 
         return inst_data

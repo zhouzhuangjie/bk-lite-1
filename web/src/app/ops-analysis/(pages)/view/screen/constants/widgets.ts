@@ -17,6 +17,13 @@ export const SCREEN_WIDGET_DEFINITIONS: ScreenWidgetDefinition[] = [
     defaultHeight: 150,
   },
   {
+    chartType: 'multiValue',
+    titleKey: 'opsAnalysis.screen.widgets.multiValue',
+    descriptionKey: 'opsAnalysis.screen.widgetDescriptions.multiValue',
+    defaultWidth: 360,
+    defaultHeight: 260,
+  },
+  {
     chartType: 'gauge',
     titleKey: 'opsAnalysis.screen.widgets.gauge',
     descriptionKey: 'opsAnalysis.screen.widgetDescriptions.gauge',
@@ -66,11 +73,53 @@ export const SCREEN_WIDGET_DEFINITIONS: ScreenWidgetDefinition[] = [
     defaultHeight: 360,
   },
   {
+    chartType: 'eventTimeline',
+    titleKey: 'opsAnalysis.screen.widgets.eventTimeline',
+    descriptionKey: 'opsAnalysis.screen.widgetDescriptions.eventTimeline',
+    defaultWidth: 520,
+    defaultHeight: 360,
+  },
+  {
+    chartType: 'cardList',
+    titleKey: 'opsAnalysis.screen.widgets.cardList',
+    descriptionKey: 'opsAnalysis.screen.widgetDescriptions.cardList',
+    defaultWidth: 520,
+    defaultHeight: 360,
+  },
+  {
+    chartType: 'radar',
+    titleKey: 'opsAnalysis.screen.widgets.radar',
+    descriptionKey: 'opsAnalysis.screen.widgetDescriptions.radar',
+    defaultWidth: 360,
+    defaultHeight: 300,
+  },
+  {
+    chartType: 'topologyMap',
+    titleKey: 'opsAnalysis.screen.widgets.topologyMap',
+    descriptionKey: 'opsAnalysis.screen.widgetDescriptions.topologyMap',
+    defaultWidth: 620,
+    defaultHeight: 420,
+  },
+  {
+    chartType: 'room3D',
+    titleKey: 'dataSource.room3D',
+    descriptionKey: 'opsAnalysis.screen.widgetDescriptions.room3D',
+    defaultWidth: 640,
+    defaultHeight: 420,
+  },
+  {
     chartType: 'networkStatusTopology',
     titleKey: 'opsAnalysis.screen.widgets.networkStatusTopology',
     descriptionKey: 'opsAnalysis.screen.widgetDescriptions.networkStatusTopology',
     defaultWidth: 620,
     defaultHeight: 420,
+  },
+  {
+    chartType: 'application3D',
+    titleKey: 'opsAnalysis.screen.widgets.application3D',
+    descriptionKey: 'opsAnalysis.screen.widgetDescriptions.application3D',
+    defaultWidth: 720,
+    defaultHeight: 460,
   },
 ];
 

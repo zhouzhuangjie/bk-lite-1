@@ -2,7 +2,9 @@
   "object_name": "MongoDB",
   "instance_type": "mongodb",
   "collect_type": "database",
-  "config_type": ["mongodb"],
+  "config_type": [
+    "mongodb"
+  ],
   "collector": "Telegraf",
   "instance_id": "{{cloud_region}}_{{host}}_{{port}}",
   "form_fields": [
@@ -13,15 +15,20 @@
       "required": false,
       "editable": false,
       "description": "用于访问接口的用户名",
+      "guide_short": "未启用鉴权可留空；启用鉴权时建议使用只读监控账号，至少具备 clusterMonitor 角色。",
+      "guide_short_en": "Leave this empty when authentication is disabled. When authentication is enabled, use a read-only monitoring account with at least the clusterMonitor role.",
       "widget_props": {
-        "placeholder": "用户名"
+        "placeholder": "用户名",
+        "placeholder_en": "Username"
       },
       "transform_on_edit": {
         "origin_path": "child.content.config.servers[0]",
         "to_form": {
           "regex": "://([^:]+):"
         }
-      }
+      },
+      "label_en": "Username",
+      "description_en": "Username for accessing the interface"
     },
     {
       "name": "ENV_PASSWORD",
@@ -31,12 +38,17 @@
       "editable": false,
       "encrypted": true,
       "description": "对应的登录密码",
+      "guide_short": "填写与用户名对应的登录密码，注意不要带入首尾空格；未启用鉴权时与用户名一并留空。",
+      "guide_short_en": "Enter the password for the username without leading or trailing spaces. Leave both fields empty when authentication is disabled.",
       "widget_props": {
-        "placeholder": "密码"
+        "placeholder": "密码",
+        "placeholder_en": "Password"
       },
       "transform_on_edit": {
         "origin_path": "child.env_config.PASSWORD__{{config_id}}"
-      }
+      },
+      "label_en": "Password",
+      "description_en": "Corresponding login password"
     },
     {
       "name": "host",
@@ -46,6 +58,8 @@
       "visible_in": "edit",
       "editable": false,
       "description": "与设备进行通信的主机",
+      "guide_short": "填写 MongoDB 服务的 IP 或域名，不包含协议或连接参数；当前模板固定使用 connect=direct，仅支持单地址直连。",
+      "guide_short_en": "Enter the MongoDB service IP address or hostname without a scheme or connection parameters. The current template fixes connect=direct and supports one direct address.",
       "widget_props": {
         "placeholder": "主机地址"
       },
@@ -54,7 +68,8 @@
         "to_form": {
           "regex": "@([^:]+):"
         }
-      }
+      },
+      "label_en": "Host"
     },
     {
       "name": "port",
@@ -64,30 +79,37 @@
       "visible_in": "edit",
       "editable": false,
       "description": "与设备进行通信的端口",
+      "guide_short": "填写 MongoDB 实际监听端口，常见为 27017；当前模板固定单地址直连，不提供副本集或分片集群参数。",
+      "guide_short_en": "Enter the actual MongoDB listener port, commonly 27017. The current template uses one direct address and exposes no replica-set or sharded-cluster parameters.",
       "widget_props": {
         "min": 1,
         "precision": 0,
-        "placeholder": "端口"
+        "placeholder": "端口",
+        "placeholder_en": "Port"
       },
       "transform_on_edit": {
         "origin_path": "child.content.config.servers[0]",
         "to_form": {
           "regex": ":(\\d+)/"
         }
-      }
+      },
+      "label_en": "Port"
     },
     {
       "name": "interval",
       "label": "间隔",
       "type": "inputNumber",
       "required": true,
-      "default_value": 10,
+      "default_value": 60,
       "description": "监控数据的采集时间间隔（单位：秒）",
+      "guide_short": "默认 60 秒；过低会增加 MongoDB 服务端压力，过高会延误告警，建议不低于 30 秒。",
+      "guide_short_en": "The default is 60 seconds. Short intervals increase MongoDB load, while long intervals delay alerts; use at least 30 seconds.",
       "widget_props": {
         "min": 1,
         "precision": 0,
         "placeholder": "间隔",
-        "addonAfter": "s"
+        "addonAfter": "s",
+        "placeholder_en": "Interval"
       },
       "transform_on_edit": {
         "origin_path": "child.content.config.interval",
@@ -97,7 +119,9 @@
         "to_api": {
           "suffix": "s"
         }
-      }
+      },
+      "label_en": "Interval",
+      "description_en": "Collection time interval (unit: seconds)"
     }
   ],
   "table_columns": [
@@ -107,9 +131,11 @@
       "type": "select",
       "required": true,
       "widget_props": {
-        "placeholder": "请选择节点"
+        "placeholder": "请选择节点",
+        "placeholder_en": "Please select node"
       },
-      "enable_row_filter": false
+      "enable_row_filter": false,
+      "label_en": "Node"
     },
     {
       "name": "host",
@@ -121,10 +147,14 @@
       },
       "change_handler": {
         "type": "combine",
-        "source_fields": ["host", "port"],
+        "source_fields": [
+          "host",
+          "port"
+        ],
         "target_field": "instance_name",
         "separator": ":"
-      }
+      },
+      "label_en": "Host"
     },
     {
       "name": "port",
@@ -134,14 +164,19 @@
       "widget_props": {
         "min": 1,
         "precision": 0,
-        "placeholder": "端口"
+        "placeholder": "端口",
+        "placeholder_en": "Port"
       },
       "change_handler": {
         "type": "combine",
-        "source_fields": ["host", "port"],
+        "source_fields": [
+          "host",
+          "port"
+        ],
         "target_field": "instance_name",
         "separator": ":"
-      }
+      },
+      "label_en": "Port"
     },
     {
       "name": "instance_name",
@@ -150,8 +185,10 @@
       "required": true,
       "widget_props": {
         "placeholder": "实例名称",
-        "disabled": false
-      }
+        "disabled": false,
+        "placeholder_en": "Instance Name"
+      },
+      "label_en": "Instance Name"
     },
     {
       "name": "group_ids",
@@ -159,8 +196,10 @@
       "type": "group_select",
       "required": false,
       "widget_props": {
-        "placeholder": "请选择组"
-      }
+        "placeholder": "请选择组",
+        "placeholder_en": "Please select group"
+      },
+      "label_en": "Group"
     }
   ]
 }

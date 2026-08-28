@@ -21,7 +21,7 @@ def test_list_scripts_returns_team_scripts_via_local_rpc():
     # 另一团队的脚本不应出现
     Script.objects.create(name="别人家的脚本", script_type="shell", content="echo no", params=[], timeout=60, team=[99])
 
-    result = JobMgmt(is_local_client=True).list_scripts(group_id=7)
+    result = JobMgmt(is_local_client=True).list_scripts(group_id=7, team=[7])
 
     names = [it["name"] for it in result["items"]]
     assert "重启nginx" in names
@@ -34,7 +34,7 @@ def test_get_script_returns_full_detail_via_local_rpc():
         name="清理磁盘", script_type="shell", content="echo {{svc}}", params=[{"name": "svc", "default": ""}], timeout=120, team=[7],
     )
 
-    detail = JobMgmt(is_local_client=True).get_script(script.id)
+    detail = JobMgmt(is_local_client=True).get_script(script.id, team=[7])
 
     assert detail is not None
     assert detail["content"] == "echo {{svc}}"
@@ -45,4 +45,4 @@ def test_get_script_returns_full_detail_via_local_rpc():
 
 @pytest.mark.django_db
 def test_get_script_missing_returns_none():
-    assert JobMgmt(is_local_client=True).get_script(999999) is None
+    assert JobMgmt(is_local_client=True).get_script(999999, team=[7]) is None

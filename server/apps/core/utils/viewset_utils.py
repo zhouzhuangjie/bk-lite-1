@@ -1,3 +1,4 @@
+from django.db import connection
 from django.db.models import Q
 from django.http import JsonResponse
 from rest_framework import viewsets
@@ -8,8 +9,54 @@ from apps.core.logger import logger
 from apps.core.utils.loader import LanguageLoader
 from apps.core.utils.permission_utils import delete_instance_rules, get_permission_rules
 from apps.core.utils.team_utils import get_current_team
-from apps.core.utils.user_group import normalize_user_group_ids
 from apps.system_mgmt.models import Group
+
+
+def build_json_membership_query(queryset, field_name, expected_values):
+    """构造跨数据库 JSON 数组成员查询。
+
+    支持 JSON contains 的数据库走原生查询；SQLite 等不支持 contains 的
+    后端只物化主键和目标字段，再返回等价的主键条件。
+    """
+    normalized_values = []
+    for value in expected_values or []:
+        if value in (None, ""):
+            continue
+        normalized_values.append(value)
+        try:
+            normalized_values.append(int(value))
+        except (TypeError, ValueError):
+            pass
+        normalized_values.append(str(value))
+    normalized_values = list(dict.fromkeys(normalized_values))
+    if not normalized_values:
+        return Q(pk__in=[])
+
+    if connection.features.supports_json_field_contains:
+        query = Q()
+        for value in normalized_values:
+            query |= Q(**{f"{field_name}__contains": [value]})
+        return query
+
+    expected_set = set(normalized_values)
+    matched_ids = []
+    # values_list 会清除 select_related 的字段装载要求，避免 only() 将关联
+    # 外键延迟后与调用方已有的 select_related 冲突。
+    for item_id, field_value in queryset.order_by().values_list("pk", field_name):
+        current_values = field_value or []
+        if not isinstance(current_values, (list, tuple, set)):
+            current_values = [current_values]
+        comparable_values = set()
+        for value in current_values:
+            comparable_values.add(value)
+            comparable_values.add(str(value))
+            try:
+                comparable_values.add(int(value))
+            except (TypeError, ValueError):
+                pass
+        if expected_set.intersection(comparable_values):
+            matched_ids.append(item_id)
+    return Q(pk__in=matched_ids)
 
 
 class GenericViewSetFun(object):
@@ -32,12 +79,16 @@ class GenericViewSetFun(object):
 
     def get_has_permission(self, user, instance, current_team, is_list=False, is_check=False, include_children=False):
         """获取规则实例ID"""
-        user_groups = normalize_user_group_ids(getattr(user, "group_list", []))
+        try:
+            normalized_current_team = int(current_team)
+        except (TypeError, ValueError):
+            normalized_current_team = current_team
+        scoped_groups = {normalized_current_team}
         if include_children:
             group_tree = getattr(user, "group_tree", [])
             child_groups = self.extract_child_group_ids(group_tree, current_team)
             if child_groups:
-                user_groups = child_groups
+                scoped_groups = set(child_groups)
         org_field = getattr(self, "ORGANIZATION_FIELD", "team")
         if is_list:
             instance_id = list(instance.values_list("id", flat=True))
@@ -45,12 +96,12 @@ class GenericViewSetFun(object):
                 if hasattr(i, org_field):
                     # 判断两个集合是否有交集
                     org_value = getattr(i, org_field)
-                    if not set(org_value).intersection(set(user_groups)):
+                    if not set(org_value).intersection(scoped_groups):
                         return False
         else:
             if hasattr(instance, org_field):
                 org_value = getattr(instance, org_field)
-                if not set(org_value).intersection(set(user_groups)):
+                if not set(org_value).intersection(scoped_groups):
                     return False
             instance_id = [instance.id]
         try:
@@ -64,7 +115,7 @@ class GenericViewSetFun(object):
                 # "对象属于当前组织树即放行"，造成子组织任务越权（issue #3037）。
                 # current_team 自身已授权的情况已由上方 current_team in permission_rules["team"] 覆盖。
                 allowed_teams = {i for i in permission_rules.get("team", [])}
-                if allowed_teams & set(user_groups):
+                if allowed_teams & scoped_groups:
                     return True
 
             operate = "View" if is_check else "Operate"
@@ -124,12 +175,15 @@ class GenericViewSetFun(object):
             permission_data = get_permission_rules(user, current_team, app_name, permission_key, include_children)
             instance_ids = [i["id"] for i in permission_data.get("instance", [])]
             team = permission_data.get("team", [])
+            permission_query = Q()
             if instance_ids:
-                query |= Q(id__in=instance_ids)
-            for i in team:
-                query |= Q(**{f"{org_field}__contains": int(i)})
+                permission_query |= Q(id__in=instance_ids)
+            permission_query |= build_json_membership_query(queryset, org_field, team)
             if not instance_ids and not team:
                 return queryset.filter(id=0)
+            # 实例级规则只在当前组织范围内生效。团队移除后即使远程规则清理
+            # 暂时失败，旧规则也不能绕过本地组织边界重新暴露实例。
+            query &= permission_query
         return queryset.filter(query)
 
     @classmethod
@@ -153,15 +207,13 @@ class GenericViewSetFun(object):
 
                 if team_ids:
                     # 查询组织 ID 在子组列表中
-                    query = Q()
-                    for team_id in team_ids:
-                        query |= Q(**{f"{org_field}__contains": team_id})
+                    query = build_json_membership_query(queryset, org_field, team_ids)
                 else:
                     # 没有找到子组，使用当前组
-                    query = Q(**{f"{org_field}__contains": current_team})
+                    query = build_json_membership_query(queryset, org_field, [current_team])
             else:
                 # 不包含子组，team包含当前组
-                query = Q(**{f"{org_field}__contains": current_team})
+                query = build_json_membership_query(queryset, org_field, [current_team])
         else:
             query = Q()
         return current_team, include_children, org_field, query
@@ -473,8 +525,10 @@ class AuthViewSet(MaintainerViewSet):
         return normalized
 
     def retrieve(self, request, *args, **kwargs):
-        serializer = self.get_detail(request, *args, **kwargs)
-        return Response(serializer.data)
+        detail = self.get_detail(request, *args, **kwargs)
+        if isinstance(detail, (JsonResponse, Response)):
+            return detail
+        return Response(detail.data)
 
     def get_detail(self, request, *args, **kwargs):
         """获取详情"""
@@ -497,10 +551,19 @@ class AuthViewSet(MaintainerViewSet):
         return serializer
 
     def destroy(self, request, *args, **kwargs):
-        user = getattr(request, "user", None)
         instance = self.get_object()
+        destroy_access_prechecked = kwargs.pop("_destroy_access_prechecked", False)
+        if not destroy_access_prechecked:
+            access_error = self._validate_destroy_access(request, instance)
+            if access_error is not None:
+                return access_error
+        return super().destroy(request, *args, **kwargs)
+
+    def _validate_destroy_access(self, request, instance):
+        """在删除产生外部副作用前执行完整、无副作用的实例授权校验。"""
+        user = getattr(request, "user", None)
         if getattr(user, "is_superuser", False):
-            return super().destroy(request, *args, **kwargs)
+            return None
         # 验证 current_team 权限
         current_team = self._parse_current_team_cookie(request)
         user_group_ids = {g["id"] for g in getattr(user, "group_list", [])}
@@ -512,12 +575,44 @@ class AuthViewSet(MaintainerViewSet):
             if not has_permission:
                 message = self.loader.get("error.no_permission_delete") if self.loader else "User does not have permission to delete this instance"
                 return self.value_error(message)
-        return super().destroy(request, *args, **kwargs)
+        return None
+
+    def _validate_update_access(self, request, instance, data):
+        """在更新产生外部副作用前执行完整、无副作用的实例授权校验。"""
+        user = getattr(request, "user", None)
+        if getattr(user, "is_superuser", False):
+            return None
+
+        org_field = self.ORGANIZATION_FIELD
+        instance_org_value = getattr(instance, org_field, [])
+        if not isinstance(instance_org_value, list):
+            instance_org_value = []
+
+        current_team = self._parse_current_team_cookie(request, default=None)
+        if current_team is None:
+            message = self.loader.get("error.invalid_current_team") if self.loader else "Invalid current_team cookie"
+            return self.value_error(message)
+        if current_team not in instance_org_value:
+            message = self.loader.get("error.no_permission_update") if self.loader else "User does not have permission to update this instance"
+            return self.value_error(message)
+        if hasattr(self, "permission_key"):
+            include_children = request.COOKIES.get("include_children", "0") == "1"
+            if not self.get_has_permission(user, instance, current_team, include_children=include_children):
+                message = self.loader.get("error.no_permission_update") if self.loader else "User does not have permission to update this instance"
+                return self.value_error(message)
+        if org_field in data:
+            org_values = self._normalize_org_values(data, org_field)
+            new_groups = set(org_values) - set(instance_org_value)
+            if new_groups:
+                self._validate_org_field_permission(request, list(new_groups))
+        return None
 
     def update(self, request, *args, **kwargs):
         """重写更新方法以支持权限控制"""
         try:
             user = getattr(request, "user", None)
+            update_access_prechecked = kwargs.pop("_update_access_prechecked", False)
+            skip_rule_cleanup = kwargs.pop("_skip_rule_cleanup", False)
             partial = kwargs.pop("partial", False)
             data = request.data
             instance = self.get_object()
@@ -530,32 +625,20 @@ class AuthViewSet(MaintainerViewSet):
                 if org_field in data:
                     org_values = self._normalize_org_values(data, org_field)
                     delete_team = [i for i in instance_org_value if i not in org_values]
-                    self.delete_rules(instance.id, delete_team)
-                return super().update(request, *args, **kwargs)
+                    if not skip_rule_cleanup:
+                        self.delete_rules(instance.id, delete_team)
+                # 必须回传 partial，否则 PATCH 会被当成全量更新，必填字段误报
+                return super().update(request, *args, partial=partial, **kwargs)
 
-            current_team = self._parse_current_team_cookie(request, default=None)
-            if current_team is None:
-                message = self.loader.get("error.invalid_current_team") if self.loader else "Invalid current_team cookie"
-                return self.value_error(message)
-            if current_team not in instance_org_value:
-                message = self.loader.get("error.no_permission_update") if self.loader else "User does not have permission to update this instance"
-                return self.value_error(message)
-            if hasattr(self, "permission_key"):
-                include_children = request.COOKIES.get("include_children", "0") == "1"
-                has_permission = self.get_has_permission(user, instance, current_team, include_children=include_children)
-                if not has_permission:
-                    message = (
-                        self.loader.get("error.no_permission_update") if self.loader else "User does not have permission to update this instance"
-                    )
-                    return self.value_error(message)
+            if not update_access_prechecked:
+                access_error = self._validate_update_access(request, instance, data)
+                if access_error is not None:
+                    return access_error
             if org_field in data:
                 org_values = self._normalize_org_values(data, org_field)
-                # 校验新增的组织是否在用户可管理范围内
-                new_groups = set(org_values) - set(instance_org_value)
-                if new_groups:
-                    self._validate_org_field_permission(request, list(new_groups))
                 delete_team = [i for i in instance_org_value if i not in org_values]
-                self.delete_rules(instance.id, delete_team)
+                if not skip_rule_cleanup:
+                    self.delete_rules(instance.id, delete_team)
             serializer = self.get_serializer(instance, data=data, partial=partial)
             serializer.is_valid(raise_exception=True)
             self.perform_update(serializer)

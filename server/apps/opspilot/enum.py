@@ -11,6 +11,29 @@ class ChannelChoices(models.TextChoices):
     GITLAB = ("gitlab", _("GitLab"))
 
 
+class SkillChannelChoices(models.TextChoices):
+    """智能体独立发布渠道类型（与 ChatFlow 入口类型对齐，另增 platform）。"""
+
+    PLATFORM = ("platform", _("Platform"))
+    WEB_CHAT = ("web_chat", _("Web Chat"))
+    EMBEDDED_CHAT = ("embedded_chat", _("Embedded Chat"))
+    ENTERPRISE_WECHAT = ("enterprise_wechat", _("Enterprise WeChat"))
+    ENTERPRISE_WECHAT_AIBOT = ("enterprise_wechat_aibot", _("Enterprise WeChat AI Bot"))
+    DINGTALK = ("dingtalk", _("Ding Talk"))
+    WECHAT_OFFICIAL = ("wechat_official", _("WeChat Official Account"))
+
+
+# 这些渠道对话时不校验 BK-Lite 组织（尚未做用户/组织同步）。
+SKILL_CHANNEL_SKIP_ORG_CHECK = frozenset(
+    {
+        SkillChannelChoices.ENTERPRISE_WECHAT,
+        SkillChannelChoices.ENTERPRISE_WECHAT_AIBOT,
+        SkillChannelChoices.DINGTALK,
+        SkillChannelChoices.WECHAT_OFFICIAL,
+    }
+)
+
+
 class BotTypeChoice(models.IntegerChoices):
     PILOT = (1, _("Pilot"))
     LOBE = (2, _("LobeChat"))
@@ -32,28 +55,6 @@ class LLMModelChoices(models.TextChoices):
     BAICHUAN = "Baichuan", "百川"
 
 
-class DocumentStatus(object):
-    TRAINING = 0
-    READY = 1
-    ERROR = 2
-    PENDING = 3
-    CHUNKING = 4
-
-    CHOICE = (
-        (TRAINING, _("Training")),
-        (READY, _("Ready")),
-        (ERROR, _("Error")),
-        (PENDING, _("Pending")),
-        (CHUNKING, _("Chunking")),
-    )
-
-
-class ActionChoice(object):
-    USE_KNOWLEDGE = 0
-
-    CHOICE = ((USE_KNOWLEDGE, _("Use specified knowledge base")),)
-
-
 class WorkFlowExecuteType(models.TextChoices):
     """工作流执行类型枚举"""
 
@@ -61,6 +62,7 @@ class WorkFlowExecuteType(models.TextChoices):
     RESTFUL = "restful", _("RESTful")
     CELERY = "celery", _("Celery")
     ENTERPRISE_WECHAT = "enterprise_wechat", _("Enterprise WeChat")
+    ENTERPRISE_WECHAT_AIBOT = "enterprise_wechat_aibot", _("Enterprise WeChat AI Bot")
     WECHAT_OFFICIAL_ACCOUNT = "wechat_official", _("WeChat Official Account")
     DINGTALK = "dingtalk", _("Ding Talk")
     EMBEDDED_CHAT = "embedded_chat", _("Embedded Chat")
@@ -78,11 +80,3 @@ class WorkFlowTaskStatus(models.TextChoices):
     INTERRUPTED = "interrupted", _("Interrupted")
     SUCCESS = "success", _("Success")
     FAIL = "fail", _("Fail")
-
-
-class KnowledgeTaskStatus(models.TextChoices):
-    """知识任务状态枚举"""
-
-    RUNNING = "running", _("Running")
-    SUCCESS = "success", _("Success")
-    FAILED = "failed", _("Failed")

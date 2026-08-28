@@ -1,21 +1,37 @@
 'use client';
 
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Form, Input, Select, Switch, Button, InputNumber, Slider, Spin, message, Modal, Checkbox, Empty } from 'antd';
+import { Form, Input, Select, Switch, Button, InputNumber, Slider, Spin, message, Modal, Checkbox } from 'antd';
 import { useTranslation } from '@/utils/i18n';
-import useGroups from '@/app/opspilot/hooks/useGroups';
 import styles from './index.module.scss';
 import { useSearchParams } from 'next/navigation';
 import CustomChatSSE from '@/app/opspilot/components/custom-chat-sse';
+import CompactEmptyState from '@/components/compact-empty-state';
+import SearchActionBar from '@/components/search-action-bar';
 import PermissionWrapper from '@/components/permission';
-import KnowledgeBaseSelector from '@/app/opspilot/components/skill/knowledgeBaseSelector';
-import { KnowledgeBase, RagScoreThresholdItem, KnowledgeBaseRagSource, SkillPackage } from '@/app/opspilot/types/skill';
+import GroupTreeSelect from '@/components/group-tree-select';
+import { SkillPackage, SkillPackageParam } from '@/app/opspilot/types/skill';
 import { SelectTool } from '@/app/opspilot/types/tool';
 import ToolSelector from '@/app/opspilot/components/skill/toolSelector';
+import SkillPackageParamsModal, {
+  countFilledParams,
+  listMissingRequiredParams,
+  mergeDeclaredParams,
+  resolvePackageVariables,
+  withResolvedVariables,
+} from '@/app/opspilot/components/skill/skillPackageParamsModal';
 import EditablePasswordField from '@/components/dynamic-form/editPasswordField';
 import { useSkillApi } from '@/app/opspilot/api/skill';
+import { useWikiApi } from '@/app/opspilot/api/wiki';
+import { WikiKnowledgeBase } from '@/app/opspilot/types/wiki';
 import { useSkill } from '@/app/opspilot/context/skillContext';
+import { notifyWebchatAppsChanged } from '@/app/(core)/components/global-webchat/apps-changed';
 import { getModelOptionText, renderModelOptionLabel } from '@/app/opspilot/utils/modelOption';
+import {
+  buildSkillSaveTools,
+  buildStudioRuntimeTools,
+  normalizeMonitorToolConfigs,
+} from '@/app/opspilot/utils/monitorToolConfig';
 import { DeleteOutlined } from '@ant-design/icons';
 import Icon from '@/components/icon';
 
@@ -28,44 +44,40 @@ const getPackageRequiredTools = (pkg: SkillPackage) => pkg.required_tools || [];
 
 const SkillSettingsPage: React.FC = () => {
   const [form] = Form.useForm();
-  const { groups, loading: groupsLoading } = useGroups();
   const { t } = useTranslation();
-  const { fetchSkillDetail, fetchKnowledgeBases, fetchLlmModels, fetchSkillPackages, saveSkillDetail } = useSkillApi();
+  const { fetchSkillDetail, fetchLlmModels, fetchSkillPackages, saveSkillDetail } = useSkillApi();
+  const { fetchKnowledgeBases } = useWikiApi();
   const { refreshSkillInfo } = useSkill();
   const searchParams = useSearchParams();
   const id = searchParams ? searchParams.get('id') : null;
+  // 管理组织（group 字段）当前值：自动并入使用组织、且在使用组织里锁定不可删
+  const manageGroup: number[] = Form.useWatch('group', form) || [];
 
   const [temperature, setTemperature] = useState(0.7);
   const [initialMessages] = useState<any[]>([]); // 稳定的空数组引用
 
   const [chatHistoryEnabled, setChatHistoryEnabled] = useState(true);
-  const [ragEnabled, setRagEnabled] = useState(true);
-  const [showRagSource, setRagSourceStatus] = useState(false);
   const [showToolEnabled, setToolEnabled] = useState(false);
-  const [ragStrictMode, setRagStrictMode] = useState(false);
-  const [ragSources, setRagSources] = useState<KnowledgeBaseRagSource[]>([]);
-  const [selectedKnowledgeBases, setSelectedKnowledgeBases] = useState<number[]>([]);
   const [llmModels, setLlmModels] = useState<{ id: number, name: string, enabled: boolean, llm_model_type: string, vendor_name?: string }[]>([]);
-  const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([]);
   const [pageLoading, setPageLoading] = useState({
     llmModelsLoading: true,
-    knowledgeBasesLoading: true,
     formDataLoading: true,
   });
   const [saveLoading, setSaveLoading] = useState(false);
   const [quantity, setQuantity] = useState<number>(10);
   const [selectedTools, setSelectedTools] = useState<SelectTool[]>([]);
-  const [skillType, setSkillType] = useState<number | null>(null);
   const [skillPermissions, setSkillPermissions] = useState<string[]>([]);
-  const [enableKmRoute, setEnableKmRoute] = useState(true);
-  const [kmLlmModel, setKmLlmModel] = useState<number | null>(null);
   const [guideValue, setGuideValue] = useState<string>('');
   const [hasInvalidParamKeys, setHasInvalidParamKeys] = useState(false);
+  const [wikiKbs, setWikiKbs] = useState<WikiKnowledgeBase[]>([]);
   const [availableSkillAssets, setAvailableSkillAssets] = useState<SkillPackage[]>([]);
   const [selectedSkillAssetKeys, setSelectedSkillAssetKeys] = useState<string[]>([]);
   const [isSkillPickerOpen, setIsSkillPickerOpen] = useState(false);
   const [skillPickerKeyword, setSkillPickerKeyword] = useState('');
   const [draftSkillAssetKeys, setDraftSkillAssetKeys] = useState<string[]>([]);
+  const [skillPackageParams, setSkillPackageParams] = useState<Record<string, SkillPackageParam[]>>({});
+  const [editingSkillPackage, setEditingSkillPackage] = useState<SkillPackage | null>(null);
+  const [pendingRemoveAsset, setPendingRemoveAsset] = useState<SkillPackage | null>(null);
 
   const syncSkillParamsFromPrompt = useCallback((promptText: string) => {
     const validRegex = /\{\{([a-zA-Z][a-zA-Z0-9_]*)\}\}/g;
@@ -94,13 +106,17 @@ const SkillSettingsPage: React.FC = () => {
   }, [form]);
 
   useEffect(() => {
-    const fetchFormData = async (knowledgeBases: KnowledgeBase[]) => {
+    const fetchFormData = async () => {
       try {
         const data = await fetchSkillDetail(id);
         const initialGuide = '您好，请问有什么可以帮助您的吗？可以点击如下问题进行快速提问。\n[问题1]\n[问题2]'
         form.setFieldsValue({
           name: data.name,
           group: data.team,
+          // 空数组不能用 ?? 回退；保证管理组织至少进入使用组织
+          usage_team: (Array.isArray(data.usage_team) && data.usage_team.length > 0)
+            ? data.usage_team
+            : (data.team || []),
           introduction: data.introduction,
           llmModel: data.llm_model,
           temperature: data.temperature || 0.7,
@@ -110,33 +126,21 @@ const SkillSettingsPage: React.FC = () => {
           show_think: data.show_think,
           enable_suggest: data.enable_suggest,
           enable_query_rewrite: data.enable_query_rewrite,
+          wiki_knowledge_bases: data.wiki_knowledge_bases || [],
         });
         setGuideValue(data.guide || initialGuide);
         setChatHistoryEnabled(data.enable_conversation_history);
-        setRagEnabled(data.enable_rag);
-        setRagStrictMode(data.enable_rag_strict_mode);
-        setRagSourceStatus(data.enable_rag_knowledge_source);
 
         setTemperature(data.temperature || 0.7);
 
-        const initialRagSources = data.rag_score_threshold.map((item: RagScoreThresholdItem) => {
-          const base = knowledgeBases.find((base) => base.id === Number(item.knowledge_base));
-          return base ? { id: base.id, name: base.name, introduction: base.introduction || '', score: item.score } : null;
-        }).filter(Boolean) as KnowledgeBaseRagSource[];
-        setRagSources(initialRagSources);
         setQuantity(data.conversation_window_size !== undefined ? data.conversation_window_size : 10);
 
-        const initialSelectedKnowledgeBases = data.rag_score_threshold.map((item: RagScoreThresholdItem) => Number(item.knowledge_base));
-        setSelectedKnowledgeBases(initialSelectedKnowledgeBases);
-        setSelectedTools(data.tools as SelectTool[]);
+        setSelectedTools(normalizeMonitorToolConfigs(data.tools as SelectTool[]));
         setToolEnabled(!!data.tools.length);
         setSelectedSkillAssetKeys((data.skill_packages || []).map((pkg: SkillPackage) => getPackageKey(pkg)));
+        setSkillPackageParams(data.skill_package_params || {});
 
-        setSkillType(data.skill_type);
         setSkillPermissions(data.permissions || []);
-
-        setEnableKmRoute(data.enable_km_route !== undefined ? data.enable_km_route : true);
-        setKmLlmModel(data.km_llm_model || data.llm_model);
       } catch (error) {
         console.error(t('common.fetchFailed'), error);
       } finally {
@@ -147,68 +151,62 @@ const SkillSettingsPage: React.FC = () => {
     const fetchInitialData = async () => {
       if (!id) return;
       try {
-        const [llmModelsData, knowledgeBasesData, skillPackageData] = await Promise.all([
+        const [llmModelsData, skillPackageData] = await Promise.all([
           fetchLlmModels(),
-          fetchKnowledgeBases(),
           fetchSkillPackages({ is_enabled: 1 }),
         ]);
         setLlmModels(llmModelsData as { id: number; name: string; enabled: boolean; llm_model_type: string; vendor_name?: string; }[]);
-        setKnowledgeBases(knowledgeBasesData);
-        setAvailableSkillAssets(skillPackageData.items || []);
-        fetchFormData(knowledgeBasesData);
+        setAvailableSkillAssets((skillPackageData.items || []).map(withResolvedVariables));
+        fetchKnowledgeBases()
+          .then(setWikiKbs)
+          .catch(() => undefined);
+        fetchFormData();
       } catch (error) {
         console.error(t('common.fetchFailed'), error);
       } finally {
-        setPageLoading(prev => ({ ...prev, llmModelsLoading: false, knowledgeBasesLoading: false }));
+        setPageLoading(prev => ({ ...prev, llmModelsLoading: false }));
       }
     };
 
     fetchInitialData();
   }, [id]);
 
-  const allLoading = Object.values(pageLoading).some(loading => loading) || groupsLoading;
+  const allLoading = Object.values(pageLoading).some(loading => loading);
+
+  useEffect(() => {
+    const current = (form.getFieldValue('usage_team') || []).map(Number).filter((n: number) => !Number.isNaN(n));
+    const manage = (manageGroup || []).map(Number).filter((n: number) => !Number.isNaN(n));
+    const merged = Array.from(new Set([...manage, ...current]));
+    if (JSON.stringify(merged) !== JSON.stringify(current)) {
+      form.setFieldsValue({ usage_team: merged });
+    }
+  }, [JSON.stringify(manageGroup)]);
 
   const handleSave = async () => {
     try {
       const values = await form.validateFields();
-      if (ragEnabled && ragSources.length === 0) {
-        message.error(t('skill.ragKnowledgeBaseRequired'));
-        return;
-      }
       if (showToolEnabled && selectedTools.length === 0) {
         message.error(t('skill.ragToolRequired'));
         return;
       }
-      const ragScoreThreshold = ragSources.map((source) => ({
-        knowledge_base: knowledgeBases.find(base => base.name === source.name)?.id,
-        score: source.score
-      }));
       const payload = {
         name: values.name,
         team: values.group,
+        usage_team: values.usage_team,
         introduction: values.introduction,
         llm_model: values.llmModel,
         skill_prompt: values.prompt,
         enable_conversation_history: chatHistoryEnabled,
-        enable_rag: ragEnabled,
-        enable_rag_knowledge_source: showRagSource,
-        enable_rag_strict_mode: ragStrictMode,
-        rag_score_threshold: ragScoreThreshold,
         conversation_window_size: chatHistoryEnabled ? quantity : undefined,
         temperature: temperature,
         show_think: values.show_think,
-        enable_km_route: enableKmRoute,
-        km_llm_model: enableKmRoute ? kmLlmModel : undefined,
         guide: values.guide,
-        tools: selectedTools.map((tool: any) => ({
-          id: tool.id,
-          name: tool.rawName || tool.name,
-          icon: tool.icon,
-          kwargs: tool.kwargs.filter((kwarg: any) => kwarg.key),
-        })),
+        tools: buildSkillSaveTools(selectedTools),
         enable_suggest: values.enable_suggest,
         enable_query_rewrite: values.enable_query_rewrite,
         skill_params: (values.skill_params || []).filter((p: any) => p && p.key),
+        wiki_knowledge_bases: values.wiki_knowledge_bases || [],
+        skill_package_params: skillPackageParams,
         skill_packages: effectiveSkillCapabilityProfiles.map((pkg) => ({
           id: pkg.id,
           package_id: pkg.package_id,
@@ -222,8 +220,16 @@ const SkillSettingsPage: React.FC = () => {
       };
       setSaveLoading(true);
       await saveSkillDetail(id, payload);
-      message.success(t('common.saveSuccess'));
+      const missingOnSave = effectiveSkillCapabilityProfiles.flatMap((pkg) =>
+        listMissingRequiredParams(pkg, skillPackageParams[pkg.package_id]).map((name) => `${pkg.name} / ${name}`)
+      );
+      if (missingOnSave.length > 0) {
+        message.warning(t('skill.skillPackageParams.saveWarning', '以下技能包缺少必填变量，运行时将不可用：{names}', { names: missingOnSave.join('；') }));
+      } else {
+        message.success(t('common.saveSuccess'));
+      }
       refreshSkillInfo();
+      notifyWebchatAppsChanged();
     } catch (error) {
       console.error(t('common.saveFailed'), error);
     } finally {
@@ -243,22 +249,11 @@ const SkillSettingsPage: React.FC = () => {
     try {
       const values = await form.validateFields();
 
-      // Check if knowledge base is selected when RAG is enabled
-      if (ragEnabled && ragSources.length === 0) {
-        message.error(t('skill.ragKnowledgeBaseRequired'));
-        return null;
-      }
-
       // Check if tool is selected when tool functionality is enabled
       if (showToolEnabled && selectedTools.length === 0) {
         message.error(t('skill.ragToolRequired'));
         return null;
       }
-
-      const ragScoreThreshold = selectedKnowledgeBases.map(id => ({
-        knowledge_base: id,
-        score: ragSources.find(base => base.id === id)?.score || 0.7,
-      }));
 
       const chatHistory = chatHistoryEnabled && quantity
         ? currentMessages.slice(-quantity).map(msg => ({
@@ -293,6 +288,12 @@ const SkillSettingsPage: React.FC = () => {
         user_message: userMessageArray,
         llm_model: values.llmModel,
         skill_prompt: values.prompt,
+        skill_name: values.name,
+        skill_id: id,
+        enable_suggest: values.enable_suggest,
+        enable_query_rewrite: values.enable_query_rewrite,
+        skill_params: (values.skill_params || []).filter((p: any) => p && p.key),
+        skill_package_params: skillPackageParams,
         skill_packages: effectiveSkillCapabilityProfiles.map((pkg) => ({
           id: pkg.id,
           package_id: pkg.package_id,
@@ -303,24 +304,13 @@ const SkillSettingsPage: React.FC = () => {
           required_tools: pkg.required_tools || [],
           triggers: pkg.triggers || [],
         })),
-        enable_rag: ragEnabled,
-        enable_rag_knowledge_source: showRagSource,
-        enable_rag_strict_mode: ragStrictMode,
-        rag_score_threshold: ragScoreThreshold,
         chat_history: chatHistory,
         conversation_window_size: chatHistoryEnabled ? quantity : undefined,
         temperature: temperature,
         show_think: values.show_think,
-        tools: selectedTools,
-        skill_type: skillType,
+        tools: buildStudioRuntimeTools(selectedTools),
+        skill_type: 1,
         group: values.group?.[0],
-        skill_name: values.name,
-        skill_id: id,
-        enable_km_route: enableKmRoute,
-        km_llm_model: enableKmRoute ? kmLlmModel : undefined,
-        enable_suggest: values.enable_suggest,
-        enable_query_rewrite: values.enable_query_rewrite,
-        skill_params: (values.skill_params || []).filter((p: any) => p && p.key),
       };
 
       return {
@@ -358,16 +348,6 @@ const SkillSettingsPage: React.FC = () => {
     !checked && setSelectedTools([])
   }
 
-  const handleKmRouteChange = (checked: boolean) => {
-    setEnableKmRoute(checked);
-    if (checked && !kmLlmModel) {
-      const currentLlmModel = form.getFieldValue('llmModel');
-      if (currentLlmModel) {
-        setKmLlmModel(currentLlmModel);
-      }
-    }
-  }
-
   const effectiveSkillCapabilityProfiles = useMemo(() => {
     return selectedSkillAssetKeys
       .map((key) => availableSkillAssets.find((pkg) => getPackageKey(pkg) === key))
@@ -395,11 +375,52 @@ const SkillSettingsPage: React.FC = () => {
 
   const handleConfirmSkillPicker = () => {
     setSelectedSkillAssetKeys(draftSkillAssetKeys);
+    // 新挂载的包立刻按声明预填空行，避免打开弹窗时看起来像「0 个内置参数」
+    setSkillPackageParams((prev) => {
+      const next = { ...prev };
+      for (const key of draftSkillAssetKeys) {
+        const pkg = availableSkillAssets.find((item) => getPackageKey(item) === key);
+        if (!pkg?.package_id) continue;
+        const existing = next[pkg.package_id];
+        if (existing && existing.length > 0) continue;
+        const declared = resolvePackageVariables(pkg);
+        if (!declared.length) continue;
+        next[pkg.package_id] = mergeDeclaredParams(withResolvedVariables(pkg), existing || []);
+      }
+      return next;
+    });
     setIsSkillPickerOpen(false);
   };
 
-  const handleRemoveSkillAsset = (assetKey: string) => {
+  const handleRemoveSkillAsset = (asset: SkillPackage) => {
+    if (countFilledParams(skillPackageParams[asset.package_id]) === 0) {
+      setSelectedSkillAssetKeys((prev) => prev.filter((key) => key !== getPackageKey(asset)));
+      if (asset.package_id) {
+        setSkillPackageParams((prev) => {
+          if (!(asset.package_id in prev)) return prev;
+          const next = { ...prev };
+          delete next[asset.package_id];
+          return next;
+        });
+      }
+      return;
+    }
+    setPendingRemoveAsset(asset);
+  };
+
+  const confirmRemoveSkillAsset = (dropParams: boolean) => {
+    if (!pendingRemoveAsset) return;
+    const assetKey = getPackageKey(pendingRemoveAsset);
+    const packageId = pendingRemoveAsset.package_id;
     setSelectedSkillAssetKeys((prev) => prev.filter((key) => key !== assetKey));
+    if (dropParams && packageId) {
+      setSkillPackageParams((prev) => {
+        const next = { ...prev };
+        delete next[packageId];
+        return next;
+      });
+    }
+    setPendingRemoveAsset(null);
   };
 
   const toggleDraftSkillAsset = (assetKey: string, checked: boolean) => {
@@ -422,20 +443,49 @@ const SkillSettingsPage: React.FC = () => {
           <span className="col-span-full text-xs text-[var(--color-text-4)]">未选择</span>
         ) : (
           effectiveSkillCapabilityProfiles.map((asset) => {
-            const assetKey = getPackageKey(asset);
+            const resolvedAsset = withResolvedVariables(asset);
+            const assetKey = getPackageKey(resolvedAsset);
+            const params = skillPackageParams[resolvedAsset.package_id] || [];
+            const missing = listMissingRequiredParams(resolvedAsset, params);
+            const filled = countFilledParams(params);
+            const declaredCount = resolvePackageVariables(resolvedAsset).length;
+            const hasIssue = missing.length > 0;
+            const hint = declaredCount > 0
+              ? t('skill.skillPackageParams.buttonHint', '技能包声明 {declared} 项，已配置 {filled} 项', { declared: declaredCount, filled })
+              : t('skill.skillPackageParams.buttonHintCustom', '自定义变量 {filled} 项', { filled });
             return (
               <div
                 key={assetKey}
-                className="flex w-full items-center justify-between rounded-md border border-[var(--color-border)] bg-[var(--color-bg-1)] px-4 py-2"
+                className="flex w-full flex-col rounded-md border border-[var(--color-border)] bg-[var(--color-bg-1)] px-4 py-2"
               >
-                <div className="flex min-w-0 items-center">
-                  <Icon type="jinengpeixun" className="mr-1 shrink-0 text-xl" />
-                  <span className="truncate text-sm font-medium text-[var(--color-text-1)]">{asset.name}</span>
+                <div className="flex w-full items-center justify-between">
+                  <div className="flex min-w-0 items-center">
+                    <Icon type="jinengpeixun" className="mr-1 shrink-0 text-xl" />
+                    <span className="truncate text-sm font-medium text-[var(--color-text-1)]">{resolvedAsset.name}</span>
+                  </div>
+                  <div className="ml-3 flex shrink-0 items-center gap-1">
+                    <Button
+                      type="link"
+                      size="small"
+                      className={hasIssue ? 'px-1 text-orange-500' : 'px-1'}
+                      title={hasIssue ? t('skill.skillPackageParams.missingRequired', '缺少必填变量：{names}', { names: missing.join('、') }) : hint}
+                      onClick={() => setEditingSkillPackage(resolvedAsset)}
+                    >
+                      {hasIssue
+                        ? t('skill.skillPackageParams.buttonMissing', '变量 缺 {count} 项必填', { count: missing.length })
+                        : t('skill.skillPackageParams.button', '变量 {count}', { count: filled })}
+                    </Button>
+                    <DeleteOutlined
+                      className="cursor-pointer text-[var(--color-text-3)] transition-colors hover:text-[var(--color-primary)]"
+                      onClick={() => handleRemoveSkillAsset(asset)}
+                    />
+                  </div>
                 </div>
-                <DeleteOutlined
-                  className="ml-3 cursor-pointer text-[var(--color-text-3)] transition-colors hover:text-[var(--color-primary)]"
-                  onClick={() => handleRemoveSkillAsset(assetKey)}
-                />
+                {hasIssue && (
+                  <div className="mt-1 text-xs text-orange-500">
+                    {t('skill.skillPackageParams.missingRequired', '缺少必填变量：{names}', { names: missing.join('、') })}
+                  </div>
+                )}
               </div>
             );
           })
@@ -454,17 +504,20 @@ const SkillSettingsPage: React.FC = () => {
       cancelText="取消"
       width={640}
     >
-      <Input.Search
-        allowClear
+      <SearchActionBar
+        spacing="flush"
         className="mb-3"
-        placeholder="搜索技能包"
-        value={skillPickerKeyword}
-        onChange={(event) => setSkillPickerKeyword(event.target.value)}
+        searchProps={{
+          allowClear: true,
+          placeholder: '搜索技能包',
+          value: skillPickerKeyword,
+          onChange: (event) => setSkillPickerKeyword(event.target.value),
+        }}
       />
       <div className="grid max-h-[420px] grid-cols-1 gap-3 overflow-y-auto pr-1 lg:grid-cols-2">
         {filteredAvailableSkillAssets.length === 0 ? (
           <div className="col-span-full">
-            <Empty description="没有匹配的技能包" />
+            <CompactEmptyState description="没有匹配的技能包" />
           </div>
         ) : (
           filteredAvailableSkillAssets.map((asset) => {
@@ -509,6 +562,50 @@ const SkillSettingsPage: React.FC = () => {
   return (
     <div className="relative">
       {renderSkillPickerModal()}
+      <SkillPackageParamsModal
+        open={!!editingSkillPackage}
+        pkg={editingSkillPackage}
+        items={editingSkillPackage ? (skillPackageParams[editingSkillPackage.package_id] || []) : []}
+        onCancel={() => setEditingSkillPackage(null)}
+        onOk={(nextItems) => {
+          if (editingSkillPackage?.package_id) {
+            setSkillPackageParams((prev) => ({
+              ...prev,
+              [editingSkillPackage.package_id]: nextItems,
+            }));
+          }
+          setEditingSkillPackage(null);
+        }}
+      />
+      <Modal
+        title={t('skill.skillPackageParams.removeTitle')}
+        open={!!pendingRemoveAsset}
+        onCancel={() => setPendingRemoveAsset(null)}
+        footer={[
+          <Button key="cancel" onClick={() => setPendingRemoveAsset(null)}>
+            {t('common.cancel')}
+          </Button>,
+          <Button key="keep" onClick={() => confirmRemoveSkillAsset(false)}>
+            {t('skill.skillPackageParams.removeKeep')}
+          </Button>,
+          <Button key="drop" type="primary" danger onClick={() => confirmRemoveSkillAsset(true)}>
+            {t('skill.skillPackageParams.removeDrop')}
+          </Button>,
+        ]}
+      >
+        {pendingRemoveAsset && (
+          <p>
+            {t(
+              'skill.skillPackageParams.removeContent',
+              '确认从本智能体移除 {name}？该技能包下已配置 {count} 个变量。',
+              {
+                name: pendingRemoveAsset.name,
+                count: countFilledParams(skillPackageParams[pendingRemoveAsset.package_id]),
+              },
+            )}
+          </p>
+        )}
+      </Modal>
       {allLoading && (
         <div className="absolute inset-0 min-h-[500px] bg-opacity-50 z-50 flex items-center justify-center">
           <Spin spinning={allLoading} />
@@ -530,12 +627,23 @@ const SkillSettingsPage: React.FC = () => {
                     <Form.Item label={t('common.name')} name="name" rules={[{ required: true, message: `${t('common.input')} ${t('common.name')}` }]}>
                       <Input />
                     </Form.Item>
-                    <Form.Item label={t('common.organization')} name="group" rules={[{ required: true, message: `${t('common.input')} ${t('common.organization')}` }]}>
-                      <Select mode="multiple">
-                        {groups.map(group => (
-                          <Option key={group.id} value={group.id}>{group.name}</Option>
-                        ))}
-                      </Select>
+                    <Form.Item
+                      label={t('skill.form.manageGroup')}
+                      name="group"
+                      rules={[{ required: true, message: `${t('common.selectMsg')}${t('skill.form.manageGroup')}` }]}
+                    >
+                      <GroupTreeSelect placeholder={`${t('common.selectMsg')}${t('skill.form.manageGroup')}`} />
+                    </Form.Item>
+                    <Form.Item
+                      label={t('skill.form.usageGroup')}
+                      name="usage_team"
+                      tooltip={t('skill.form.usageGroupTip')}
+                      rules={[{ required: true, message: `${t('common.selectMsg')}${t('skill.form.usageGroup')}` }]}
+                    >
+                      <GroupTreeSelect
+                        placeholder={`${t('common.selectMsg')}${t('skill.form.usageGroup')}`}
+                        lockedValues={manageGroup}
+                      />
                     </Form.Item>
                     <Form.Item label={t('skill.form.introduction')} name="introduction" rules={[{ required: true, message: `${t('common.input')} ${t('skill.form.introduction')}` }]}>
                       <TextArea rows={4} />
@@ -545,18 +653,21 @@ const SkillSettingsPage: React.FC = () => {
                       name="llmModel"
                       rules={[{ required: true, message: `${t('common.input')} ${t('skill.form.llmModel')}` }]}
                     >
-                      <Select
-                        onChange={(value: number) => {
-                          const selected = llmModels.find(model => model.id === value);
-                          form.setFieldsValue({ show_think: selected && selected.llm_model_type === 'deep-seek' ? false : true });
-                        }}
-                      >
+                      <Select>
                         {llmModels.map(model => (
                           <Option key={model.id} value={model.id} disabled={!model.enabled} title={getModelOptionText(model)}>
                             {renderModelOptionLabel(model)}
                           </Option>
                         ))}
                       </Select>
+                    </Form.Item>
+                    <Form.Item label={t('wiki.title')} name="wiki_knowledge_bases">
+                      <Select
+                        mode="multiple"
+                        allowClear
+                        placeholder={t('wiki.title')}
+                        options={wikiKbs.map((kb) => ({ value: kb.id, label: kb.name }))}
+                      />
                     </Form.Item>
                     <Form.Item
                       label={t('skill.form.showThought')}
@@ -729,79 +840,22 @@ const SkillSettingsPage: React.FC = () => {
                     )}
                   </Form>
                 </div>
+                {renderSkillPackageSelector()}
                 <div className={`p-4 rounded-md pb-0 ${styles.contentWrapper}`}>
                   <Form labelCol={{flex: '0 0 135px'}} wrapperCol={{flex: '1'}}>
                     <div className="flex justify-between">
-                      <h3 className="font-medium text-sm mb-4">{t('skill.rag')}</h3>
-                      <Switch size="small" className="ml-2" checked={ragEnabled} onChange={setRagEnabled}/>
+                      <h3 className="font-medium text-sm mb-4">{t('skill.tool')}</h3>
+                      <Switch size="small" className="ml-2" checked={showToolEnabled} onChange={changeToolEnable} />
                     </div>
-                    <p className="pb-4 text-xs text-[var(--color-text-4)]">{t('skill.ragTip')}</p>
-                    {ragEnabled && (
-                      <div className="pb-2">
-                        <Form.Item
-                          label={t('skill.ragSource')}
-                          tooltip={t('skill.ragSourceTip')}>
-                          <Switch size="small" className="ml-2" checked={showRagSource} onChange={setRagSourceStatus}/>
-                        </Form.Item>
-                        <Form.Item
-                          label={t('skill.ragStrictMode')}
-                          tooltip={t('skill.ragStrictModeTip')}>
-                          <Switch size="small" className="ml-2" checked={ragStrictMode} onChange={setRagStrictMode}/>
-                        </Form.Item>
-                        <Form.Item
-                          label={t('skill.knowledgeRoute')}
-                          tooltip={t('skill.knowledgeRouteTip')}>
-                          <Switch size="small" className="ml-2" checked={enableKmRoute} onChange={handleKmRouteChange}/>
-                        </Form.Item>
-                        {enableKmRoute && (
-                          <Form.Item
-                            label={t('skill.kmLlmModel')}>
-                            <Select
-                              value={kmLlmModel}
-                              onChange={(value: number) => setKmLlmModel(value)}
-                              placeholder={t('common.select')}
-                            >
-                              {llmModels.map(model => (
-                                <Option key={model.id} value={model.id} disabled={!model.enabled} title={getModelOptionText(model)}>
-                                  {renderModelOptionLabel(model)}
-                                </Option>
-                              ))}
-                            </Select>
-                          </Form.Item>
-                        )}
-                        <Form.Item label={t('skill.knowledgeBase')} tooltip={t('skill.knowledgeBaseTip')}>
-                          <KnowledgeBaseSelector
-                            ragSources={ragSources}
-                            setRagSources={setRagSources}
-                            knowledgeBases={knowledgeBases}
-                            selectedKnowledgeBases={selectedKnowledgeBases}
-                            setSelectedKnowledgeBases={setSelectedKnowledgeBases}
-                          />
-                        </Form.Item>
-                      </div>
+                    <p className="pb-4 text-xs text-[var(--color-text-4)]">{t('skill.toolTip')}</p>
+                    {showToolEnabled && (
+                      <ToolSelector
+                        defaultTools={selectedTools}
+                        onChange={(selected: SelectTool[]) => setSelectedTools(normalizeMonitorToolConfigs(selected))}
+                      />
                     )}
                   </Form>
                 </div>
-                {skillType !== 2 && (
-                  renderSkillPackageSelector()
-                )}
-                {skillType !== 2 && (
-                  <div className={`p-4 rounded-md pb-0 ${styles.contentWrapper}`}>
-                    <Form labelCol={{flex: '0 0 135px'}} wrapperCol={{flex: '1'}}>
-                      <div className="flex justify-between">
-                        <h3 className="font-medium text-sm mb-4">{t('skill.tool')}</h3>
-                        <Switch size="small" className="ml-2" checked={showToolEnabled} onChange={changeToolEnable} />
-                      </div>
-                      <p className="pb-4 text-xs text-[var(--color-text-4)]">{t('skill.toolTip')}</p>
-                      {showToolEnabled && (
-                        <ToolSelector
-                          defaultTools={selectedTools}
-                          onChange={(selected: SelectTool[]) => setSelectedTools(selected)}
-                        />
-                      )}
-                    </Form>
-                  </div>
-                )}
               </div>
             </section>
             <div>

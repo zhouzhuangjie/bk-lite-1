@@ -35,6 +35,17 @@ _SENSITIVE_INVENTORY_PATTERNS = (
     "ansible_become_password",
 )
 
+_SSH_KNOWN_HOSTS_FILE_ENV = "SSH_KNOWN_HOSTS_FILE"
+_LEGACY_PASSWORD_SSH_COMMON_ARGS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+
+def _redact_cli_command(args: list[str]) -> list[str]:
+    redacted = [str(arg) for arg in args]
+    for index, arg in enumerate(redacted[:-1]):
+        if arg == "--extra-vars":
+            redacted[index + 1] = "***"
+    return redacted
+
 
 def _looks_like_utf16le(output: bytes) -> bool:
     if b"\x00" not in output:
@@ -82,12 +93,15 @@ class AdhocRequest:
     module: str = "ping"
     module_args: str = ""
     extra_vars: dict[str, Any] | None = None
+    extra_vars_file: str | None = None
     execute_timeout: int = 60
     task_id: str | None = None
     callback: dict[str, Any] | None = None
     private_key_content: str | None = None
     private_key_passphrase: str | None = None
     host_credentials: list[dict[str, Any]] | None = None
+    stream_remote_output: bool = False
+    stream_remote_type: str | None = None
 
 
 @dataclass
@@ -97,6 +111,7 @@ class PlaybookRequest:
     inventory: str = ""
     inventory_content: str | None = None
     extra_vars: dict[str, Any] | None = None
+    extra_vars_file: str | None = None
     execute_timeout: int = 600
     task_id: str | None = None
     callback: dict[str, Any] | None = None
@@ -150,6 +165,10 @@ def to_adhoc_request(payload: dict[str, Any]) -> AdhocRequest:
     if private_key_passphrase is not None and not isinstance(private_key_passphrase, str):
         raise ValueError("private_key_passphrase must be string")
 
+    stream_remote_type = str(payload.get("stream_remote_type") or "").strip().lower()
+    if stream_remote_type and stream_remote_type not in {"bat", "powershell"}:
+        raise ValueError("stream_remote_type must be bat or powershell")
+
     return AdhocRequest(
         inventory=inventory,
         inventory_content=inventory_content,
@@ -163,6 +182,8 @@ def to_adhoc_request(payload: dict[str, Any]) -> AdhocRequest:
         private_key_content=private_key_content,
         private_key_passphrase=private_key_passphrase,
         host_credentials=host_credentials,
+        stream_remote_output=payload.get("stream_remote_output") is True,
+        stream_remote_type=stream_remote_type or None,
     )
 
 
@@ -381,13 +402,29 @@ def _materialize_private_key(workspace: Path, key_content: str) -> str:
     return str(key_file)
 
 
+def _materialize_extra_vars(workspace: Path, extra_vars: dict[str, Any]) -> str | None:
+    if not extra_vars:
+        return None
+    extra_vars_file = workspace / "extra-vars.json"
+    descriptor = os.open(extra_vars_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, stat.S_IRUSR | stat.S_IWUSR)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as file_obj:
+        json.dump(extra_vars, file_obj, ensure_ascii=False)
+    return str(extra_vars_file)
+
+
+def _write_restricted_text(path: Path, content: str) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, stat.S_IRUSR | stat.S_IWUSR)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as file_obj:
+        file_obj.write(content)
+
+
 def _quote_inventory_value(value: Any) -> str:
     text = str(value)
     escaped = text.replace("\\", "\\\\").replace('"', '\\"')
     # ansible 的 ini inventory 用 shlex.split(comments=True) 解析主机行：
     # 未加引号的 '#' 会被当行内注释，'#' 及其后内容（含其它连接参数）被丢弃，
     # 导致带 '#' 的密码被静默截断。含空格、'#'、';' 或引号时一律加引号包裹。
-    needs_quote = any(ch.isspace() for ch in text) or any(ch in text for ch in '#;"\'')
+    needs_quote = any(ch.isspace() for ch in text) or any(ch in text for ch in "#;\"'")
     if needs_quote:
         return f'"{escaped}"'
     return escaped
@@ -400,11 +437,34 @@ def _mask_sensitive_inventory_content(content: str) -> str:
     return masked
 
 
-def _get_password_auth_ssh_common_args(item: dict[str, Any]) -> str:
+def _get_explicit_ssh_common_args(item: dict[str, Any]) -> str | None:
     explicit_args = item.get("ansible_ssh_common_args") or item.get("ssh_common_args")
     if explicit_args:
         return str(explicit_args)
-    return "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    return None
+
+
+def _validate_known_hosts_file(known_hosts_file: str) -> None:
+    path = Path(known_hosts_file)
+    try:
+        if not stat.S_ISREG(path.stat().st_mode):
+            raise ValueError(f"{_SSH_KNOWN_HOSTS_FILE_ENV} must reference a readable regular file")
+        with path.open("rb"):
+            pass
+    except OSError as exc:
+        raise ValueError(f"{_SSH_KNOWN_HOSTS_FILE_ENV} must reference a readable regular file ({type(exc).__name__})") from exc
+
+
+def _get_password_auth_ssh_common_args(item: dict[str, Any]) -> str:
+    explicit_args = _get_explicit_ssh_common_args(item)
+    if explicit_args:
+        return explicit_args
+
+    known_hosts_file = os.getenv(_SSH_KNOWN_HOSTS_FILE_ENV, "").strip()
+    if known_hosts_file:
+        return f"-o StrictHostKeyChecking=yes -o UserKnownHostsFile={shlex.quote(known_hosts_file)}"
+
+    return _LEGACY_PASSWORD_SSH_COMMON_ARGS
 
 
 def _normalize_ansible_host_status(raw_status: str) -> str:
@@ -620,6 +680,16 @@ def _extract_meaningful_output(raw_output: str) -> str:
 
 def _build_host_credentials_inventory(workspace: Path, host_credentials: list[dict[str, Any]]) -> str:
     lines: list[str] = []
+    legacy_password_ssh_host_count = 0
+    known_hosts_file = os.getenv(_SSH_KNOWN_HOSTS_FILE_ENV, "").strip()
+    if known_hosts_file and any(
+        item.get("password")
+        and str(item.get("connection", "")).strip().lower() == "ssh"
+        and not _get_explicit_ssh_common_args(item)
+        for item in host_credentials
+    ):
+        _validate_known_hosts_file(known_hosts_file)
+
     for idx, item in enumerate(host_credentials):
         host = str(item.get("host", "")).strip()
         parts = [host]
@@ -651,7 +721,11 @@ def _build_host_credentials_inventory(workspace: Path, host_credentials: list[di
         if password:
             parts.append(f"ansible_password={_quote_inventory_value(password)}")
             if str(connection).strip().lower() == "ssh":
-                parts.append(f"ansible_ssh_common_args={_quote_inventory_value(_get_password_auth_ssh_common_args(item))}")
+                ssh_common_args = _get_password_auth_ssh_common_args(item)
+                parts.append(f"ansible_ssh_common_args={_quote_inventory_value(ssh_common_args)}")
+                explicit_args = _get_explicit_ssh_common_args(item)
+                if not explicit_args and ssh_common_args == _LEGACY_PASSWORD_SSH_COMMON_ARGS:
+                    legacy_password_ssh_host_count += 1
 
         private_key_file = item.get("private_key_file")
         private_key_content = item.get("private_key_content")
@@ -668,6 +742,13 @@ def _build_host_credentials_inventory(workspace: Path, host_credentials: list[di
             parts.append(f"ansible_ssh_passphrase={_quote_inventory_value(passphrase)}")
 
         lines.append(" ".join(parts))
+
+    if legacy_password_ssh_host_count:
+        logger.warning(
+            "password SSH host key verification is disabled: host_count=%d; set %s to enable strict verification",
+            legacy_password_ssh_host_count,
+            _SSH_KNOWN_HOSTS_FILE_ENV,
+        )
 
     if not lines:
         return ""
@@ -723,9 +804,10 @@ def prepare_adhoc_execution(payload: AdhocRequest) -> tuple[list[str], Path]:
             parts.append(payload.inventory_content.rstrip("\n"))
         if payload.host_credentials:
             parts.append(_build_host_credentials_inventory(workspace, payload.host_credentials).rstrip("\n"))
-        inventory_file.write_text("\n".join([p for p in parts if p]) + "\n", encoding="utf-8")
+        _write_restricted_text(inventory_file, "\n".join([p for p in parts if p]) + "\n")
         inventory_value = str(inventory_file)
 
+    extra_vars_file = _materialize_extra_vars(workspace, extra_vars)
     cmd = build_adhoc_command(
         AdhocRequest(
             inventory=inventory_value,
@@ -734,12 +816,15 @@ def prepare_adhoc_execution(payload: AdhocRequest) -> tuple[list[str], Path]:
             module=payload.module,
             module_args=payload.module_args,
             extra_vars=extra_vars,
+            extra_vars_file=extra_vars_file,
             execute_timeout=payload.execute_timeout,
             task_id=payload.task_id,
             callback=payload.callback,
             private_key_content=None,
             private_key_passphrase=None,
             host_credentials=None,
+            stream_remote_output=payload.stream_remote_output,
+            stream_remote_type=payload.stream_remote_type,
         )
     )
     return cmd, workspace
@@ -842,7 +927,7 @@ async def prepare_playbook_execution(
         if payload.host_credentials:
             logger.info("[prepare_playbook] 构建 host_credentials inventory: %d 个主机", len(payload.host_credentials))
             parts.append(_build_host_credentials_inventory(workspace, payload.host_credentials).rstrip("\n"))
-        inventory_file.write_text("\n".join([p for p in parts if p]) + "\n", encoding="utf-8")
+        _write_restricted_text(inventory_file, "\n".join([p for p in parts if p]) + "\n")
         inventory_value = str(inventory_file)
         logger.info("[prepare_playbook] inventory 已写入: %s", inventory_file)
 
@@ -852,6 +937,7 @@ async def prepare_playbook_execution(
         inventory=inventory_value,
         inventory_content=None,
         extra_vars=extra_vars,
+        extra_vars_file=_materialize_extra_vars(workspace, extra_vars),
         execute_timeout=payload.execute_timeout,
         task_id=payload.task_id,
         callback=payload.callback,
@@ -862,7 +948,7 @@ async def prepare_playbook_execution(
         file_distribution=None,
     )
     cmd = build_playbook_command(prepared_payload)
-    logger.info("[prepare_playbook] 最终命令: %s", " ".join(cmd))
+    logger.info("[prepare_playbook] 最终命令: %s", " ".join(_redact_cli_command(cmd)))
     logger.info(
         "[prepare_playbook] 最终参数: playbook_path=%s inventory=%s extra_vars_keys=%s",
         prepared_payload.playbook_path,
@@ -889,7 +975,9 @@ def build_adhoc_command(payload: AdhocRequest) -> list[str]:
     ]
     if payload.module_args:
         cli_args.extend(["-a", payload.module_args])
-    if extra_vars:
+    if payload.extra_vars_file:
+        cli_args.extend(["--extra-vars", f"@{payload.extra_vars_file}"])
+    elif extra_vars:
         cli_args.extend(["--extra-vars", json.dumps(extra_vars, ensure_ascii=False)])
     return [
         *current_entrypoint_command(),
@@ -907,7 +995,9 @@ def build_playbook_command(payload: PlaybookRequest) -> list[str]:
         payload.inventory,
         "-vvv",
     ]
-    if payload.extra_vars:
+    if payload.extra_vars_file:
+        cli_args.extend(["--extra-vars", f"@{payload.extra_vars_file}"])
+    elif payload.extra_vars:
         cli_args.extend(["--extra-vars", json.dumps(payload.extra_vars, ensure_ascii=False)])
     return [
         *current_entrypoint_command(),
@@ -926,7 +1016,9 @@ def build_playbook_list_hosts_command(payload: PlaybookRequest) -> list[str]:
         "--list-hosts",
         "-vvv",
     ]
-    if payload.extra_vars:
+    if payload.extra_vars_file:
+        cli_args.extend(["--extra-vars", f"@{payload.extra_vars_file}"])
+    elif payload.extra_vars:
         cli_args.extend(["--extra-vars", json.dumps(payload.extra_vars, ensure_ascii=False)])
     return [
         *current_entrypoint_command(),
@@ -945,7 +1037,9 @@ def build_playbook_winrm_preflight_command(payload: PlaybookRequest) -> list[str
         "-m",
         "ansible.windows.win_ping",
     ]
-    if payload.extra_vars:
+    if payload.extra_vars_file:
+        cli_args.extend(["--extra-vars", f"@{payload.extra_vars_file}"])
+    elif payload.extra_vars:
         cli_args.extend(["--extra-vars", json.dumps(payload.extra_vars, ensure_ascii=False)])
     return [
         *current_entrypoint_command(),
@@ -997,7 +1091,7 @@ class LineEventStreamer:
 StreamPublish = Callable[[str, bytes], Awaitable[None]]
 
 
-def _build_stream_log_payload(execution_id: str, line: str) -> bytes:
+def build_stream_log_payload(execution_id: str, line: str) -> bytes:
     payload = {
         "execution_id": execution_id,
         "stream": "stdout",
@@ -1032,7 +1126,7 @@ async def run_command(
     async def _publish_line(line: str) -> None:
         # Streaming is best-effort: a publish failure must never break the run.
         try:
-            data = _build_stream_log_payload(execution_id, line)
+            data = build_stream_log_payload(execution_id, line)
             await stream_publish(stream_log_topic, data)
         except Exception as publish_err:  # noqa: BLE001 - intentionally swallowed
             logger.warning("stream log publish failed: %s", publish_err)

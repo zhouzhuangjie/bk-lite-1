@@ -2,13 +2,15 @@
 
 import React, { useMemo, useCallback, useRef } from 'react';
 import dayjs, { Dayjs } from 'dayjs';
-import { Empty, Spin } from 'antd';
+import { Spin } from 'antd';
+import ChartEmptyState from '@/components/chart-empty-state';
 import { ChartData, MetricItem } from '@/app/monitor/types';
 import { useECharts } from './useECharts';
 import { formatMetricValue } from '../utils/format';
 import { MetricUnit } from '../types';
 import { normalizeGapIntervals } from '@/app/monitor/utils/gapIntervals';
 import { CHART_COLORS } from '@/app/monitor/constants';
+import { roundChartValueToDisplayPrecision } from './chart-display-precision';
 
 export interface EChartsLineChartProps {
   data: ChartData[];
@@ -56,6 +58,7 @@ const BINARY_SCALE_CONFIG: Record<string, string[]> = {
   gibibytes: ['GiB', 'TiB', 'PiB'],
   tebibytes: ['TiB', 'PiB'],
   byteps: ['B/s', 'KiB/s', 'MiB/s', 'GiB/s', 'TiB/s', 'PiB/s'],
+  Bps: ['B/s', 'KiB/s', 'MiB/s', 'GiB/s', 'TiB/s', 'PiB/s'],
   kibyteps: ['KiB/s', 'MiB/s', 'GiB/s', 'TiB/s', 'PiB/s'],
   mibyteps: ['MiB/s', 'GiB/s', 'TiB/s', 'PiB/s'],
   gibyteps: ['GiB/s', 'TiB/s', 'PiB/s'],
@@ -103,6 +106,9 @@ const EChartsLineChart: React.FC<EChartsLineChartProps> = ({
 
     const yAxisUnit = seriesStyles[0]?.unit || unit || '';
     const needsBinaryScale = yAxisUnit in BINARY_SCALE_CONFIG;
+    const displayValues = data.flatMap((point) => areaKeys.map((key) => point[key] as number | null));
+    const allSeriesValuesAreZero = displayValues.some((value) => value != null)
+      && displayValues.every((value) => value == null || roundChartValueToDisplayPrecision(value) === 0);
 
     let scaleDivisor = 1;
     let scaleDisplayUnit = yAxisUnit;
@@ -151,7 +157,8 @@ const EChartsLineChart: React.FC<EChartsLineChartProps> = ({
         data: data.map((d) => {
           const v = d[key] as number | null;
           if (v == null) return [d.time, null];
-          return [d.time, scaleDivisor > 1 ? v / scaleDivisor : v];
+          const scaledValue = scaleDivisor > 1 ? v / scaleDivisor : v;
+          return [d.time, roundChartValueToDisplayPrecision(scaledValue)];
         }),
         smooth: false,
         symbol: 'none',
@@ -202,8 +209,10 @@ const EChartsLineChart: React.FC<EChartsLineChartProps> = ({
       },
       yAxis: {
         type: 'value' as const,
+        min: allSeriesValuesAreZero ? 0 : undefined,
+        max: allSeriesValuesAreZero ? 1 : undefined,
         axisLabel: {
-          formatter: (val: number) => formatAxisNumber(val),
+          formatter: (val: number) => allSeriesValuesAreZero && val !== 0 ? '' : formatAxisNumber(val),
           fontSize: 11,
           color: '#8c8c8c'
         },
@@ -305,16 +314,16 @@ const EChartsLineChart: React.FC<EChartsLineChartProps> = ({
   const showLoading = isEmpty && loading;
 
   return (
-    <div style={{ width: '100%', height: '100%', position: 'relative' }}>
-      <div ref={containerRef} style={{ width: '100%', height: '100%' }} />
+    <div className="relative h-full w-full">
+      <div ref={containerRef} className="h-full w-full" />
       {showLoading && (
-        <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <div className="absolute inset-0 flex items-center justify-center">
           <Spin size="small" />
         </div>
       )}
       {!showLoading && isEmpty && (
-        <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} />
+        <div className="absolute inset-0 flex items-center justify-center">
+          <ChartEmptyState compact />
         </div>
       )}
     </div>

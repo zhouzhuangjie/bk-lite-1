@@ -1,17 +1,18 @@
 """采集服务 V2 - 基于 YAML 配置的新版本采集服务"""
 
+import asyncio
 import importlib
 import json
 import ntpath
 import posixpath
 import time
-import traceback
-from typing import Dict, Any, Optional
-from sanic.log import logger
+from typing import Any, Dict, Optional
 
-from core.nats_utils import nats_request
-from core.yaml_reader import yaml_reader
-from core.plugin_executor import PluginExecutor
+from core.collection.contracts import AccessProbeResult, StructuredMetricsPayload
+from core.logger import logger
+from core.plugin.error_logging import log_plugin_exception, should_log_plugin_exception
+from core.plugin.executor import PluginExecutor
+from core.plugin.yaml_reader import yaml_reader
 from plugins.base_utils import convert_to_prometheus_format
 
 
@@ -20,9 +21,9 @@ class CollectionService:
     采集服务 - 基于 YAML 配置的新架构
 
     设计说明：
-    - API层已完成IP拆分，每个CollectionService实例只处理单个host（或无host）
+    - 统一运行时按 IP 调度，每个 CollectionService 实例只处理单个 host（或无 host）
     - host字段可能为None（云采集使用默认endpoint）
-    - 不再需要内部并发，并发在Worker Pool层实现
+    - 不在服务内部并发；跨 IP 并发由统一异步运行时控制
 
     工作流程：
     1. 根据 plugin_name 推断 model（或直接传入 model）
@@ -31,15 +32,18 @@ class CollectionService:
     4. 通过 PluginExecutor 执行单次采集
     """
 
-    def __init__(self, params: Optional[dict] = None):
-        self._node_info = None  # 单个节点信息
-        self.namespace = "bklite"
-        self.yaml_reader = yaml_reader
-        self.params = params
+    def __init__(
+        self,
+        params: Optional[dict] = None,
+        *,
+        config_provider=None,
+    ):
+        self.yaml_reader = config_provider or yaml_reader
+        # 运行期会补充 node_info/script_path，不能污染 HTTP 请求或其他目标复用的参数。
+        self.params = dict(params or {})
         self.plugin_name = self.params.pop("plugin_name", None)
         self.model_id = self.params["model_id"]
         self.host = self.params.get("host")  # 可能为None（云采集）
-        self.connect_ip = self.params.get("connect_ip") or self.host
 
     @staticmethod
     def _get_bool_param(params: Dict[str, Any], key: str, default: bool) -> bool:
@@ -51,24 +55,22 @@ class CollectionService:
         return bool(value)
 
     def _is_config_file_callback(self) -> bool:
+        plugin_name = str(self.plugin_name or "")
+        model_id = str(self.model_id or "")
         return (
             str(self.params.get("callback_subject") or "") == "receive_config_file_result"
-            or str(self.plugin_name or "") == "config_file_info"
-            or str(self.model_id or "") == "config_file"
+            or plugin_name in {"config_file_info", "network_config_file_info"}
+            or model_id in {"config_file", "network_config_file"}
         )
 
     def _get_callback_instance_name(self) -> str:
         return str(self.params.get("host") or self.params.get("instance_name") or "")
 
-    def _get_callback_instance_id(self) -> str:
-        return self._get_callback_instance_name()
+    def _get_callback_instance_uuid(self) -> str:
+        return str(self.params.get("target_instance_uuid") or "")
 
     def _get_callback_model_id(self) -> str:
-        return str(
-            self.params.get("target_model_id")
-            or self.params.get("model_id")
-            or "host"
-        )
+        return str(self.params.get("target_model_id") or self.params.get("model_id") or "host")
 
     @staticmethod
     def _extract_file_name(file_path: str) -> str:
@@ -86,47 +88,34 @@ class CollectionService:
         Returns:
             采集结果（Prometheus 格式字符串 或 字典）
         """
-        logger.info(f"{'=' * 30}")
-        logger.info(
-            f"🎯 Starting collection V2: model={self.model_id} Plugin: {self.plugin_name}"
-        )
-        if self.host:
-            logger.info(f"📍 Host: {self.host}")
-        else:
-            logger.info(f"📍 No host specified (cloud collection or default endpoint)")
-
         try:
             # 根据参数确定执行器类型（job 或 protocol）
             executor_type = self.params["executor_type"]
-            logger.info(f"🔧 Executor type: {executor_type}")
+            instance_id = self.params.get("instance_id", "")
+            logger.debug(
+                "start collect.  instance_id=%s task_id=%s model_id=%s plugin_name=%s target=%s executor=%s",
+                instance_id,
+                self.params.get("collection_task_id") or "-",
+                self.model_id,
+                self.plugin_name or "-",
+                self.host or "logical",
+                executor_type,
+            )
 
-            prefer_enterprise = self._get_bool_param(
-                self.params, "prefer_enterprise", True
-            )
-            strict_enterprise = self._get_bool_param(
-                self.params, "strict_enterprise", False
-            )
+            prefer_enterprise = self._get_bool_param(self.params, "prefer_enterprise", True)
+            strict_enterprise = self._get_bool_param(self.params, "strict_enterprise", False)
 
             # 插件来源解析入口：先判断 enterprise 能力是否可用，再按
             # enterprise/plugins/inputs/{model}/plugin.yml -> plugins/inputs/{model}/plugin.yml
             # 的顺序选中最终 plugin.yml；若命中 enterprise 且后续 import 失败，executor 会按 strict_enterprise
             # 决定是直接报错还是回退到同名 oss 插件。
-            resolved_executor = self.yaml_reader.get_executor_config_with_resolution(
-                self.model_id, executor_type, prefer_enterprise=prefer_enterprise
+            resolved_executor = await self.yaml_reader.get_executor_config_with_resolution_async(
+                self.model_id,
+                executor_type,
+                prefer_enterprise=prefer_enterprise,
             )
             executor_config = resolved_executor.executor_config
             plugin_resolution = resolved_executor.plugin_resolution
-
-            logger.info(
-                f"Plugin source selected: model_id={self.model_id}, selected_source={plugin_resolution.source}, "
-                f"selected_plugin_path={plugin_resolution.plugin_path}, has_fallback={plugin_resolution.has_oss_fallback}"
-            )
-
-            # 对于job类型且有host，获取节点信息
-            if executor_config.is_job and self.host:
-                await self.set_node_info()
-                if self._node_info:
-                    self.params["node_info"] = self._node_info
 
             # 执行单次采集
             executor = PluginExecutor(
@@ -138,18 +127,17 @@ class CollectionService:
                 strict_enterprise=strict_enterprise,
             )
             result = await executor.execute()
-            logger.info("Raw collection result: {}".format(result))
 
             if self.params.get("callback_subject"):
-                logger.info("✅ Collection completed successfully (callback mode)")
-                logger.info("=" * 60)
                 return (
                     result.get("result", {})
                     if result.get("success")
                     else (
                         {
                             "collect_task_id": self.params.get("collect_task_id"),
-                            "instance_id": self._get_callback_instance_id(),
+                            "execution_id": self.params.get("execution_id"),
+                            "protocol_version": self.params.get("protocol_version"),
+                            "instance_uuid": self._get_callback_instance_uuid(),
                             "instance_name": self._get_callback_instance_name(),
                             "model_id": self._get_callback_model_id(),
                             "file_path": self.params.get("config_file_path", ""),
@@ -158,13 +146,15 @@ class CollectionService:
                             "status": "error",
                             "size": 0,
                             "error": result.get("result", {}).get(
-                                "cmdb_collect_error", result.get("error", "Unknown error")
+                                "cmdb_collect_error",
+                                result.get("error", "Unknown error"),
                             ),
                             "content_base64": "",
                         }
                         if self._is_config_file_callback()
                         else {
                             "collect_task_id": self.params.get("collect_task_id"),
+                            "execution_id": self.params.get("execution_id"),
                             "instance_id": self.params.get("instance_id") or self.host or "",
                             "model_id": self.params.get("target_model_id") or self.params.get("model_id"),
                             "file_path": self.params.get("config_file_path", ""),
@@ -173,32 +163,70 @@ class CollectionService:
                             "status": "error",
                             "size": 0,
                             "error": result.get("result", {}).get(
-                                "cmdb_collect_error", result.get("error", "Unknown error")
+                                "cmdb_collect_error",
+                                result.get("error", "Unknown error"),
                             ),
                             "content_base64": "",
                         }
                     )
                 )
 
-            # 处理结果并转换为 Prometheus 格式
-            processed_data = self._process_result(result)
-            final_result = convert_to_prometheus_format(processed_data)
+            processed = await asyncio.to_thread(self._process_result, result)
+            if self.params.get("_runtime_structured_metrics"):
+                result_data = result.get("result", {})
+                error = ""
+                if not result.get("success", True):
+                    error = str(result_data.get("cmdb_collect_error", result.get("error", "Unknown error")))
+                final_result = StructuredMetricsPayload(data=processed, error=error)
+            else:
+                final_result = await asyncio.to_thread(convert_to_prometheus_format, processed)
 
-            logger.info(f"✅ Collection completed successfully")
-            logger.info("=" * 60)
             return final_result
 
-        except FileNotFoundError as e:
-            logger.error(f"❌ YAML config not found: {e}")
-            logger.info(f"{'=' * 60}")
-            return self._generate_error_response(
-                f"Plugin config not found for model '{self.model_id}'"
-            )
+        except FileNotFoundError as error:
+            self._log_plugin_exception(error)
+            return self._generate_error_response(f"Plugin config not found for model '{self.model_id}'")
 
         except Exception as e:
-            logger.error(f"❌ Collection failed: {traceback.format_exc()}")
-            logger.info(f"{'=' * 60}")
+            self._log_plugin_exception(e)
             return self._generate_error_response(str(e))
+
+    def _log_plugin_exception(self, error: BaseException) -> None:
+        if not should_log_plugin_exception(self.params):
+            return
+        log_plugin_exception(
+            logger,
+            error=error,
+            task_id=self.params.get("collection_task_id"),
+            plugin_ref=self.params.get("collection_plugin_ref"),
+            model_id=self.model_id,
+            plugin_name=self.plugin_name,
+            target=self.host,
+        )
+
+    async def probe(self) -> AccessProbeResult:
+        """通过当前解析出的协议 Adapter 执行最小凭据感知预检。"""
+        executor_type = self.params["executor_type"]
+        prefer_enterprise = self._get_bool_param(self.params, "prefer_enterprise", True)
+        strict_enterprise = self._get_bool_param(self.params, "strict_enterprise", False)
+        resolved_executor = await self.yaml_reader.get_executor_config_with_resolution_async(
+            self.model_id,
+            executor_type,
+            prefer_enterprise=prefer_enterprise,
+        )
+        executor = PluginExecutor(
+            self.model_id,
+            resolved_executor.executor_config,
+            self.params,
+            plugin_resolution=resolved_executor.plugin_resolution,
+            fallback_executor_config=resolved_executor.fallback_executor_config,
+            strict_enterprise=strict_enterprise,
+        )
+        return await executor.probe()
+
+    def _format_result(self, result: Dict[str, Any]) -> str:
+        """在线程中完成可能随结果规模增长的转换，保持事件循环只负责编排。"""
+        return convert_to_prometheus_format(self._process_result(result))
 
     def _process_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -210,15 +238,9 @@ class CollectionService:
 
         # 处理采集失败的情况
         if not result.get("success", True):
-            logger.warning(
-                f"⚠️  Collection failed for {self.host or 'default endpoint'}"
-            )
-
             # 提取错误信息
             result_data = result.get("result", {})
-            error_msg = result_data.get(
-                "cmdb_collect_error", result.get("error", "Unknown error")
-            )
+            error_msg = result_data.get("cmdb_collect_error", result.get("error", "Unknown error"))
 
             # 创建错误记录
             error_record = {
@@ -234,15 +256,29 @@ class CollectionService:
 
         # 处理采集成功的情况
         result_data = result.get("result", {})
+        snapshot_meta = {}
+        if result.get("snapshot_id"):
+            snapshot_meta["snapshot_id"] = result["snapshot_id"]
+        if result.get("snapshot_status"):
+            snapshot_meta["snapshot_status"] = result["snapshot_status"]
+        snapshot_manifest = result.get("snapshot_manifest")
         for model_id, items in result_data.items():
             if model_id not in processed:
                 processed[model_id] = []
+            model_snapshot_meta = dict(snapshot_meta)
+            if model_id == "winsphere" and snapshot_manifest:
+                model_snapshot_meta["snapshot_manifest"] = snapshot_manifest
 
             if not items:
                 # 空结果也标记为成功
                 processed[model_id].append(
-                    {"bk_obj_id": model_id, "collect_status": "success"}
+                    {
+                        "bk_obj_id": model_id,
+                        "collect_status": "success",
+                        **model_snapshot_meta,
+                    }
                 )
+                self._encode_winsphere_metric_labels(processed[model_id][-1])
                 continue
 
             # 为每个item添加状态和host标签
@@ -252,7 +288,9 @@ class CollectionService:
                         if self.host:
                             item["host"] = self.host
                         item["bk_obj_id"] = model_id
-                        item["collect_status"] = "success"
+                        item.setdefault("collect_status", "success")
+                        item.update(model_snapshot_meta)
+                        self._encode_winsphere_metric_labels(item)
                 processed[model_id].extend(items)
             elif isinstance(items, dict):
                 # 单个字典的情况
@@ -260,11 +298,35 @@ class CollectionService:
                     items["host"] = self.host
                 items["collect_status"] = "success"
                 items["bk_obj_id"] = model_id
+                items.update(model_snapshot_meta)
+                self._encode_winsphere_metric_labels(items)
                 processed[model_id].append(items)
 
         return processed
 
+    def _encode_winsphere_metric_labels(self, item):
+        """仅在 Prometheus 传输边界编码 WinSphere 的结构化标签。"""
+        if self.model_id != "winsphere":
+            return
+        for key, value in list(item.items()):
+            if isinstance(value, (list, dict)):
+                item[key] = json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+
     def _generate_error_response(self, error_message: str):
+        if self.model_id == "winsphere":
+            processed = self._process_result(
+                {
+                    "success": False,
+                    "result": {
+                        "cmdb_collect_error": error_message,
+                    },
+                }
+            )
+            return convert_to_prometheus_format(processed)
         return self._generate_error_metrics(Exception(error_message), self.model_id)
 
     def _generate_error_metrics(self, error: Exception, model: str) -> str:
@@ -285,7 +347,11 @@ class CollectionService:
 
         return "\n".join(prometheus_lines) + "\n"
 
-    def list_regions(self):
+    async def list_regions(self):
+        """异步边界：云 SDK 的区域查询整体在线程中执行。"""
+        return await asyncio.to_thread(self._list_regions_sync)
+
+    def _list_regions_sync(self):
         """
         列出区域（保留向后兼容接口）
 
@@ -295,16 +361,12 @@ class CollectionService:
             return {"result": [], "success": False, "message": "model_id is required"}
 
         try:
-            resolved_executor = self.yaml_reader.get_executor_config_with_resolution(
-                self.model_id, "protocol"
-            )
+            resolved_executor = self.yaml_reader.get_executor_config_with_resolution(self.model_id, "protocol")
             executor_config = resolved_executor.executor_config
 
             # 只有 protocol 类型支持 list_regions
             if not executor_config.is_cloud_protocol:
-                logger.warning(
-                    f"list_regions not supported for executor type: {executor_config.executor_type}"
-                )
+                logger.warning(f"list_regions not supported for executor type: {executor_config.executor_type}")
                 return {
                     "result": [],
                     "success": False,
@@ -336,40 +398,5 @@ class CollectionService:
         except Exception as e:  # noqa
             import traceback
 
-            logger.error(
-                f"Error list_regions for {self.plugin_name or self.model_id}: {traceback.format_exc()}"
-            )
+            logger.error(f"Error list_regions for {self.plugin_name or self.model_id}: {traceback.format_exc()}")
             return {"result": [], "success": False, "message": str(e)}
-
-    async def set_node_info(self):
-        """查询单个节点信息"""
-        if not self.connect_ip:
-            return
-
-        try:
-            # 优先使用任务上下文中携带的 organization_id 限定查询范围，
-            # 避免跨租户拉取全量节点数据。仅当调用方未提供组织上下文时，
-            # 才回退到 skip_permission=True（单租户或无多租户隔离的部署场景）。
-            organization_id = self.params.get("organization_id")
-            query: dict = {"ip": self.connect_ip, "page_size": 1}
-            if organization_id:
-                query["organization_ids"] = [organization_id]
-            else:
-                query["skip_permission"] = True
-
-            exec_params = {"args": [query], "kwargs": {}}
-            subject = f"{self.namespace}.node_list"
-            payload = json.dumps(exec_params).encode()
-
-            response = await nats_request(subject, payload=payload, timeout=10.0)
-
-            if response.get("success") and response["result"]["nodes"]:
-                for node in response["result"]["nodes"]:
-                    if node["ip"] == self.connect_ip:
-                        self._node_info = node
-                        logger.info(f"✅ Found node info for {self.connect_ip}")
-                        break
-                else:
-                    logger.warning(f"⚠️  Node info not found for {self.connect_ip}")
-        except Exception as e:
-            logger.warning(f"⚠️  Failed to get node info for {self.connect_ip}: {e}")

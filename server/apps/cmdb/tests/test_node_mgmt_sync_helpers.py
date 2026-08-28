@@ -10,15 +10,19 @@
 - RPC 封装：_cloud_region_name_map / _fetch_non_container_nodes / _pick_access_point；
 - DB 序列化：serialize_task / serialize_run（None 与有值）/ get_task 建档。
 """
-import pydantic.root_model  # noqa
-
+import json
 import types
 
+import pydantic.root_model  # noqa
 import pytest
+from django.utils import timezone
 
 from apps.cmdb.constants.constants import CollectRunStatusType
 from apps.cmdb.models.node_mgmt_sync import NodeMgmtSyncConfig, NodeMgmtSyncRun
-from apps.cmdb.services.node_mgmt_sync_service import NodeMgmtSyncService as S
+from apps.cmdb.services.node_mgmt_sync_service import (
+    NodeMgmtSyncService as S,
+    _get_bounded_positive_int_env,
+)
 
 
 class TestPureHelpers:
@@ -28,6 +32,12 @@ class TestPureHelpers:
         assert S._safe_count("3") == 3
         assert S._safe_count(None) == 0
         assert S._safe_count("bad") == 0
+
+    def test_node_budget_env_只能降低不能突破硬上限(self, monkeypatch):
+        monkeypatch.setenv("TEST_NODE_BUDGET", "999999")
+        assert _get_bounded_positive_int_env("TEST_NODE_BUDGET", 100, 100) == 100
+        monkeypatch.setenv("TEST_NODE_BUDGET", "40")
+        assert _get_bounded_positive_int_env("TEST_NODE_BUDGET", 100, 100) == 40
 
     def test_safe_int(self):
         assert S._safe_int("9") == 9
@@ -66,6 +76,7 @@ class TestPureHelpers:
 
     def test_collect_status_to_text(self):
         assert S._collect_status_to_text(CollectRunStatusType.SUCCESS) == "success"
+        assert S._collect_status_to_text(CollectRunStatusType.PARTIAL_SUCCESS) == "partial_success"
         assert S._collect_status_to_text(CollectRunStatusType.ERROR) == "error"
         assert S._collect_status_to_text(999) == "unknown"
 
@@ -189,44 +200,334 @@ class TestRpcWrappers:
     def test_fetch_non_container_nodes_过滤无云区域(self, mocker):
         rpc = mocker.MagicMock()
         rpc.cloud_region_list.return_value = [{"id": 1, "name": "华东"}]
-        rpc.node_list.return_value = {
-            "nodes": [
-                {"id": "n1", "name": "host1", "ip": "1.1.1.1", "cloud_region_id": 1,
-                 "operating_system": "linux", "organization": [10]},
-                {"id": "n2", "name": "host2", "ip": "2.2.2.2"},  # 无云区域被跳过
-            ]
-        }
+        rpc.node_list.side_effect = [
+            {
+                "count": 3,
+                "nodes": [
+                    {"id": "n1", "name": "host1", "ip": "1.1.1.1", "cloud_region_id": 1,
+                     "operating_system": "linux", "organization": [10]},
+                    {"id": "n2", "name": "host2", "ip": "2.2.2.2", "cloud_region_id": 1,
+                     "operating_system": "linux", "organization": [10]},
+                ],
+            },
+            {
+                "count": 3,
+                "nodes": [
+                    {"id": "n3", "name": "host3", "ip": "3.3.3.3"},  # 无云区域被跳过
+                ],
+            },
+        ]
+        mocker.patch.object(S, "NODE_MGMT_SYNC_PAGE_SIZE", 2)
         mocker.patch.object(S, "_node_mgmt_client", return_value=rpc)
         out = S._fetch_non_container_nodes()
-        assert len(out) == 1
+        assert len(out) == 2
         node = out[0]
         assert node["id"] == "n1"
         assert node["cloud_region_name"] == "华东"
         assert node["os_type"] == "linux"
         assert node["organization_ids"] == [10]
         assert node["model_id"] == "host"
+        assert rpc.node_list.call_args_list == [
+            mocker.call(
+                {
+                    "is_container": False,
+                    "skip_permission": True,
+                    "legacy_callsite": "cmdb.node_sync",
+                    "page": 1,
+                    "page_size": 2,
+                }
+            ),
+            mocker.call(
+                {
+                    "is_container": False,
+                    "skip_permission": True,
+                    "legacy_callsite": "cmdb.node_sync",
+                    "page": 2,
+                    "page_size": 2,
+                }
+            ),
+        ]
+
+    def test_fetch_node_mgmt_pages_按count继续翻页(self, mocker):
+        rpc = mocker.MagicMock()
+        rpc.node_list.side_effect = [
+            {"count": 1200, "nodes": [{"id": f"n-{idx}"} for idx in range(500)]},
+            {"count": 1200, "nodes": [{"id": f"n-{idx}"} for idx in range(500, 1000)]},
+            {"count": 1200, "nodes": [{"id": f"n-{idx}"} for idx in range(1000, 1200)]},
+        ]
+        mocker.patch.object(S, "NODE_MGMT_SYNC_PAGE_SIZE", 1000)
+        mocker.patch.object(S, "_node_mgmt_client", return_value=rpc)
+
+        nodes = S._fetch_node_mgmt_pages({"is_container": False})
+
+        assert len(nodes) == 1200
+        assert rpc.node_list.call_args_list == [
+            mocker.call(
+                {
+                    "is_container": False,
+                    "skip_permission": True,
+                    "legacy_callsite": "cmdb.node_sync",
+                    "page": 1,
+                    "page_size": 500,
+                }
+            ),
+            mocker.call(
+                {
+                    "is_container": False,
+                    "skip_permission": True,
+                    "legacy_callsite": "cmdb.node_sync",
+                    "page": 2,
+                    "page_size": 500,
+                }
+            ),
+            mocker.call(
+                {
+                    "is_container": False,
+                    "skip_permission": True,
+                    "legacy_callsite": "cmdb.node_sync",
+                    "page": 3,
+                    "page_size": 500,
+                }
+            ),
+        ]
+
+    def test_fetch_node_mgmt_pages_系统身份不可被调用参数覆盖(self, mocker):
+        rpc = mocker.MagicMock()
+        rpc.node_list.return_value = {"count": 0, "nodes": []}
+        mocker.patch.object(S, "_node_mgmt_client", return_value=rpc)
+
+        S._fetch_node_mgmt_pages({"skip_permission": False, "page_size": 999999})
+
+        assert rpc.node_list.call_args == mocker.call(
+            {
+                "skip_permission": True,
+                "legacy_callsite": "cmdb.node_sync",
+                "page_size": 500,
+                "page": 1,
+            }
+        )
+
+    def test_fetch_node_mgmt_pages_非法页大小回退到硬上限(self, mocker):
+        rpc = mocker.MagicMock()
+        rpc.node_list.return_value = {"count": 0, "nodes": []}
+        mocker.patch.object(S, "_node_mgmt_client", return_value=rpc)
+
+        S._fetch_node_mgmt_pages({"page_size": "invalid"})
+
+        assert rpc.node_list.call_args == mocker.call(
+            {
+                "page_size": 500,
+                "skip_permission": True,
+                "legacy_callsite": "cmdb.node_sync",
+                "page": 1,
+            }
+        )
+
+    @pytest.mark.parametrize(
+        ("response", "error_code"),
+        [
+            ({"result": False, "message": "raw-sensitive-value"}, "remote_rejected"),
+            ("raw-sensitive-value", "invalid_response"),
+        ],
+    )
+    def test_fetch_node_mgmt_pages_异常响应只暴露稳定摘要(
+        self, mocker, caplog, response, error_code
+    ):
+        rpc = mocker.MagicMock()
+        rpc.node_list.return_value = response
+        mocker.patch.object(S, "_node_mgmt_client", return_value=rpc)
+
+        with pytest.raises(RuntimeError, match=f"^NODE_QUERY_FAILED: {error_code}$"):
+            S._fetch_node_mgmt_pages({})
+
+        assert "raw-sensitive-value" not in caplog.text
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            {},
+            {"count": 0},
+            {"nodes": []},
+            {"count": -1, "nodes": []},
+            {"count": True, "nodes": []},
+            {"count": 1.0, "nodes": []},
+            {"count": "1", "nodes": []},
+            {"count": 0, "nodes": None},
+            {"count": 0, "nodes": {}},
+            {"count": 0, "nodes": ()},
+            {"count": 1, "nodes": ["raw-sensitive-value"]},
+            {"count": 2, "nodes": [{"id": "valid"}, "raw-sensitive-value"]},
+            {"count": 1, "nodes": [[{"id": "nested"}]]},
+            [],
+            {"result": True, "data": {"items": [], "count": 0}},
+        ],
+    )
+    def test_fetch_node_mgmt_pages_拒绝畸形真实响应合同(self, mocker, caplog, response):
+        rpc = mocker.MagicMock()
+        rpc.node_list.return_value = response
+        mocker.patch.object(S, "_node_mgmt_client", return_value=rpc)
+
+        with pytest.raises(RuntimeError, match="^NODE_QUERY_FAILED: invalid_response$"):
+            S._fetch_node_mgmt_pages({})
+
+        assert repr(response) not in caplog.text
+
+    def test_fetch_node_mgmt_pages_接受合法真实响应合同(self, mocker):
+        rpc = mocker.MagicMock()
+        rpc.node_list.return_value = {"count": 0, "nodes": []}
+        mocker.patch.object(S, "_node_mgmt_client", return_value=rpc)
+
+        assert S._fetch_node_mgmt_pages({}) == []
+
+    def test_fetch_node_mgmt_pages_达到分页预算抛稳定错误码(self, mocker):
+        rpc = mocker.MagicMock()
+        rpc.node_list.return_value = {
+            "count": 999999,
+            "nodes": [{"id": f"n-{idx}"} for idx in range(500)],
+        }
+        mocker.patch.object(S, "_node_mgmt_client", return_value=rpc)
+
+        with pytest.raises(RuntimeError, match="^NODE_PAGE_LIMIT_EXCEEDED$"):
+            S._fetch_node_mgmt_pages({}, max_pages=2)
+
+        assert rpc.node_list.call_count == 2
+
+    def test_fetch_node_mgmt_pages_单页节点数超预算时拒绝结果(self, mocker):
+        rpc = mocker.MagicMock()
+        rpc.node_list.return_value = {
+            "count": 3,
+            "nodes": [{"id": "n-1"}, {"id": "n-2"}, {"id": "n-3"}],
+        }
+        mocker.patch.object(S, "MAX_NODE_COUNT", 2)
+        mocker.patch.object(S, "_node_mgmt_client", return_value=rpc)
+
+        with pytest.raises(RuntimeError, match="^NODE_COUNT_LIMIT_EXCEEDED$"):
+            S._fetch_node_mgmt_pages({"page_size": 3})
+
+    def test_fetch_node_mgmt_pages_节点数等于预算时允许(self, mocker):
+        rpc = mocker.MagicMock()
+        rpc.node_list.return_value = {
+            "count": 2,
+            "nodes": [{"id": "n-1"}, {"id": "n-2"}],
+        }
+        mocker.patch.object(S, "MAX_NODE_COUNT", 2)
+        mocker.patch.object(S, "_node_mgmt_client", return_value=rpc)
+
+        assert len(S._fetch_node_mgmt_pages({"page_size": 2})) == 2
+
+    def test_fetch_node_mgmt_pages_跨页累计节点数超预算时停止翻页(self, mocker):
+        rpc = mocker.MagicMock()
+        rpc.node_list.side_effect = [
+            {"count": 4, "nodes": [{"id": "n-1"}, {"id": "n-2"}]},
+            {"count": 4, "nodes": [{"id": "n-3"}, {"id": "n-4"}]},
+        ]
+        mocker.patch.object(S, "MAX_NODE_COUNT", 3)
+        mocker.patch.object(S, "_node_mgmt_client", return_value=rpc)
+
+        with pytest.raises(RuntimeError, match="^NODE_COUNT_LIMIT_EXCEEDED$"):
+            S._fetch_node_mgmt_pages({"page_size": 2})
+
+        assert rpc.node_list.call_count == 2
+
+    def test_fetch_node_mgmt_pages_单节点字节超预算时拒绝结果(self, mocker):
+        rpc = mocker.MagicMock()
+        rpc.node_list.return_value = {
+            "count": 1,
+            "nodes": [{"id": "n-1", "name": "超大节点" * 20}],
+        }
+        mocker.patch.object(S, "MAX_NODE_BYTES", 32)
+        mocker.patch.object(S, "_node_mgmt_client", return_value=rpc)
+
+        with pytest.raises(RuntimeError, match="^NODE_BYTES_LIMIT_EXCEEDED$"):
+            S._fetch_node_mgmt_pages({})
+
+    def test_fetch_node_mgmt_pages_字节数等于预算时允许(self, mocker):
+        node = {"id": "n-1", "name": "节点"}
+        exact_bytes = len(
+            json.dumps([node], ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+        rpc = mocker.MagicMock()
+        rpc.node_list.return_value = {"count": 1, "nodes": [node]}
+        mocker.patch.object(S, "MAX_NODE_BYTES", exact_bytes)
+        mocker.patch.object(S, "_node_mgmt_client", return_value=rpc)
+
+        assert S._fetch_node_mgmt_pages({}) == [node]
+
+    def test_fetch_node_mgmt_pages_跨页累计字节超预算(self, mocker):
+        nodes = [{"id": "n-1", "name": "甲"}, {"id": "n-2", "name": "乙"}]
+        exact_bytes = len(
+            json.dumps(nodes, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+        rpc = mocker.MagicMock()
+        rpc.node_list.side_effect = [
+            {"count": 2, "nodes": [nodes[0]]},
+            {"count": 2, "nodes": [nodes[1]]},
+        ]
+        mocker.patch.object(S, "MAX_NODE_BYTES", exact_bytes - 1)
+        mocker.patch.object(S, "_node_mgmt_client", return_value=rpc)
+
+        with pytest.raises(RuntimeError, match="^NODE_BYTES_LIMIT_EXCEEDED$"):
+            S._fetch_node_mgmt_pages({"page_size": 1})
+
+        assert rpc.node_list.call_count == 2
+
+    def test_fetch_node_mgmt_pages_截止时间到期不发起RPC(self, mocker):
+        rpc = mocker.MagicMock()
+        mocker.patch.object(S, "_node_mgmt_client", return_value=rpc)
+
+        with pytest.raises(RuntimeError, match="^NODE_QUERY_TIMEOUT$"):
+            S._fetch_node_mgmt_pages({}, deadline_at=timezone.now())
+
+        rpc.node_list.assert_not_called()
 
     def test_pick_access_point_无容器节点返回None(self, mocker):
         rpc = mocker.MagicMock()
         rpc.cloud_region_list.return_value = [{"id": 1, "name": "华东"}]
-        rpc.node_list.return_value = {"nodes": []}
+        rpc.node_list.return_value = {"count": 0, "nodes": []}
         mocker.patch.object(S, "_node_mgmt_client", return_value=rpc)
         assert S._pick_access_point(1) is None
 
     def test_pick_access_point_选最新updated_at(self, mocker):
         rpc = mocker.MagicMock()
         rpc.cloud_region_list.return_value = [{"id": 1, "name": "华东"}]
-        rpc.node_list.return_value = {
-            "nodes": [
-                {"id": "c1", "name": "old", "updated_at": "2026-01-01"},
-                {"id": "c2", "name": "new", "updated_at": "2026-06-01"},
-            ]
-        }
+        rpc.node_list.side_effect = [
+            {
+                "count": 3,
+                "nodes": [
+                    {"id": "c1", "name": "old", "updated_at": "2026-01-01"},
+                    {"id": "c2", "name": "middle", "updated_at": "2026-06-01"},
+                ],
+            },
+            {"count": 3, "nodes": [{"id": "c3", "name": "new", "updated_at": "2026-07-01"}]},
+        ]
+        mocker.patch.object(S, "NODE_MGMT_SYNC_PAGE_SIZE", 2)
         mocker.patch.object(S, "_node_mgmt_client", return_value=rpc)
         ap = S._pick_access_point(1)
-        assert ap["id"] == "c2"
+        assert ap["id"] == "c3"
         assert ap["cloud"] == 1
         assert ap["cloud_name"] == "华东"
+        assert rpc.node_list.call_args_list == [
+            mocker.call(
+                {
+                    "cloud_region_id": 1,
+                    "is_container": True,
+                    "skip_permission": True,
+                    "legacy_callsite": "cmdb.node_sync",
+                    "page": 1,
+                    "page_size": 2,
+                }
+            ),
+            mocker.call(
+                {
+                    "cloud_region_id": 1,
+                    "is_container": True,
+                    "skip_permission": True,
+                    "legacy_callsite": "cmdb.node_sync",
+                    "page": 2,
+                    "page_size": 2,
+                }
+            ),
+        ]
 
 
 class TestDbSerialization:
@@ -238,6 +539,43 @@ class TestDbSerialization:
         assert task.name == S.TASK_NAME
         # 幂等：第二次返回同一条
         assert S.get_task().id == task.id
+
+    def test_get_task_空库唯一冲突后回读并复用赢家(self, mocker):
+        from django.db import IntegrityError
+
+        winner = NodeMgmtSyncConfig.objects.create(
+            singleton_key="default", name="节点管理同步", is_builtin=True,
+        )
+        get_or_create = mocker.patch.object(
+            NodeMgmtSyncConfig.objects,
+            "get_or_create",
+            side_effect=[IntegrityError("simulated singleton race"), (winner, False)],
+        )
+
+        first = S.get_task()
+        second = S.get_task()
+
+        assert first.pk == winner.pk
+        assert second.pk == winner.pk
+        assert get_or_create.call_count == 2
+
+    def test_get_task_非单例完整性错误保留原异常(self, mocker):
+        from django.db import IntegrityError
+
+        original = IntegrityError("another unique constraint failed")
+        mocker.patch.object(
+            NodeMgmtSyncConfig.objects, "get_or_create", side_effect=original,
+        )
+        mocker.patch.object(
+            NodeMgmtSyncConfig.objects,
+            "get",
+            side_effect=NodeMgmtSyncConfig.DoesNotExist,
+        )
+
+        with pytest.raises(IntegrityError) as caught:
+            S.get_task()
+
+        assert caught.value is original
 
     def test_serialize_task_字段完整(self):
         task = NodeMgmtSyncConfig.objects.create(
@@ -291,5 +629,6 @@ class TestDbSerialization:
         run.refresh_from_db()
         assert run.status == NodeMgmtSyncRun.STATUS_FAILED
         assert "采集失败" in run.error_message
-        assert "接口超时" in run.error_message
+        assert "RuntimeError" in run.error_message
+        assert "接口超时" not in run.error_message
         assert run.finished_at is not None

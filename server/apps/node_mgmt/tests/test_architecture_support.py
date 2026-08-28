@@ -1,20 +1,28 @@
 import base64
 import json
+import os
+import shlex
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 from queue import Queue
+from threading import Barrier
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from django.core.cache import cache
 from django.core.management import call_command
+from django.db import IntegrityError, close_old_connections, connection, transaction
+from django.test.utils import CaptureQueriesContext
 from rest_framework.test import APIRequestFactory, force_authenticate
 
 from apps.base.models import User
-from apps.node_mgmt.constants.controller import ControllerConstants
-from apps.node_mgmt.constants.installer import InstallerConstants
 from apps.core.exceptions.base_app_exception import BaseAppException
 from apps.core.utils.crypto.aes_crypto import AESCryptor
 from apps.core.utils.web_utils import WebUtils
+from apps.node_mgmt.constants.controller import ControllerConstants
+from apps.node_mgmt.constants.installer import InstallerConstants
 from apps.node_mgmt.constants.node import NodeConstants
 from apps.node_mgmt.filters.package import PackageVersionFilter
 from apps.node_mgmt.management.commands.backfill_node_cpu_architecture import Command as BackfillNodeCpuArchitectureCommand
@@ -27,16 +35,16 @@ from apps.node_mgmt.management.services.node_init.collector_init import import_c
 from apps.node_mgmt.management.services.node_init.controller_init import controller_init
 from apps.node_mgmt.management.services.node_init.definition_loader import load_definition_records
 from apps.node_mgmt.models import CloudRegion, Collector, CollectorConfiguration, Controller, Node, NodeComponentVersion, PackageVersion, SidecarEnv
-from apps.node_mgmt.models.sidecar import ChildConfig, NodeOrganization
 from apps.node_mgmt.models.installer import ControllerTask, ControllerTaskNode
+from apps.node_mgmt.models.sidecar import ChildConfig, NodeCollectorConfiguration, NodeOrganization
 from apps.node_mgmt.nats.node import NatsService
 from apps.node_mgmt.serializers.collector import CollectorSerializer
 from apps.node_mgmt.serializers.package import PackageVersionSerializer
+from apps.node_mgmt.services import node as node_service
+from apps.node_mgmt.services.cloudregion import RegionService
 from apps.node_mgmt.services.installer import InstallerService
 from apps.node_mgmt.services.installer_session import InstallerSessionService
-from apps.node_mgmt.services import node as node_service
 from apps.node_mgmt.services.package import PackageService
-from apps.node_mgmt.services.cloudregion import RegionService
 from apps.node_mgmt.services.sidecar import Sidecar
 from apps.node_mgmt.services.version_upgrade import VersionUpgradeService
 from apps.node_mgmt.tasks import installer as installer_tasks
@@ -45,7 +53,8 @@ from apps.node_mgmt.tasks.version_discovery import _calculate_upgrade_info, _dis
 from apps.node_mgmt.utils import permission as node_permission
 from apps.node_mgmt.utils.architecture import normalize_cpu_architecture
 from apps.node_mgmt.utils.token_auth import generate_node_token
-from apps.node_mgmt.views import collector_configuration, node as node_view
+from apps.node_mgmt.views import collector_configuration
+from apps.node_mgmt.views import node as node_view
 from apps.node_mgmt.views.collector import CollectorViewSet
 from apps.node_mgmt.views.installer import InstallerViewSet
 from apps.node_mgmt.views.sidecar import OpenSidecarViewSet
@@ -151,7 +160,9 @@ def _make_node_request(data=None, method="post"):
     request = request_factory("/node-mgmt/test", data=data or {}, format="json")
     request.COOKIES["current_team"] = "1"
     request.COOKIES["include_children"] = "0"
-    force_authenticate(request, user=_build_admin_user())
+    user = _build_admin_user()
+    force_authenticate(request, user=user)
+    request.user = user
     return request
 
 
@@ -161,8 +172,23 @@ def _make_permission_request(data=None, method="post", permissions=()):
     request = request_factory("/node-mgmt/test", data=data or {}, format="json")
     request.COOKIES["current_team"] = "1"
     request.COOKIES["include_children"] = "0"
-    force_authenticate(request, user=_build_permission_user(*permissions))
+    user = _build_permission_user(*permissions)
+    force_authenticate(request, user=user)
+    request.user = user
     return request
+
+
+def _patch_node_data_scope(monkeypatch, data_team_ids=(1,), assignable_team_ids=(1,)):
+    monkeypatch.setattr(
+        node_permission,
+        "resolve_current_team_data_scope",
+        lambda request: SimpleNamespace(data_team_ids=frozenset(data_team_ids)),
+    )
+    monkeypatch.setattr(
+        node_permission,
+        "resolve_assignable_organization_ids",
+        lambda request: frozenset(assignable_team_ids),
+    )
 
 
 def _build_sidecar_request(method, path, *, query_params=None, headers=None):
@@ -198,6 +224,11 @@ def test_authorize_node_ids_requires_operate_permission(monkeypatch):
     monkeypatch.setattr(node_permission.Node.objects, "filter", lambda **kwargs: _FakeNodeQuerySet([node]))
     monkeypatch.setattr(
         node_permission,
+        "get_authorized_node_queryset",
+        lambda request, permission=None: _FakeNodeQuerySet([node]),
+    )
+    monkeypatch.setattr(
+        node_permission,
         "get_node_permission",
         lambda request: {"instance": [{"id": node.id, "permission": ["View"]}], "team": []},
     )
@@ -210,15 +241,11 @@ def test_authorize_node_ids_requires_operate_permission(monkeypatch):
 
 def test_authorize_target_organizations_allows_in_scope_team_org(monkeypatch):
     node = _FakeNode(organizations=[2])
-
-    class _ScopedSystemMgmt:
-        def __init__(self, is_local_client=True):
-            pass
-
-        def get_authorized_groups_scoped(self, actor_context, include_children=False):
-            return {"data": [2]}
-
-    monkeypatch.setattr(node_permission, "SystemMgmt", _ScopedSystemMgmt)
+    monkeypatch.setattr(
+        node_permission,
+        "validate_assignable_organizations",
+        lambda request, organizations: frozenset({2}),
+    )
 
     response = node_permission.authorize_target_organizations(_make_node_request(), node, [2])
 
@@ -228,9 +255,14 @@ def test_authorize_target_organizations_allows_in_scope_team_org(monkeypatch):
 def test_authorize_target_organizations_rejects_org_outside_user_group_scope(monkeypatch):
     node = _FakeNode(organizations=[2])
 
-    from apps.system_mgmt.utils.group_utils import GroupUtils
+    def _reject_assignable_organizations(request, organizations):
+        raise BaseAppException("organization_ids 包含无权分配的组织")
 
-    monkeypatch.setattr(GroupUtils, "get_group_with_descendants", staticmethod(lambda group_ids: [1]))
+    monkeypatch.setattr(
+        node_permission,
+        "validate_assignable_organizations",
+        _reject_assignable_organizations,
+    )
 
     response = node_permission.authorize_target_organizations(_make_permission_request(), node, [2, 3])
 
@@ -239,29 +271,30 @@ def test_authorize_target_organizations_rejects_org_outside_user_group_scope(mon
 
 def test_authorize_target_organizations_allows_org_inside_user_group_scope(monkeypatch):
     node = _FakeNode(organizations=[2])
-
-    from apps.system_mgmt.utils.group_utils import GroupUtils
-
-    monkeypatch.setattr(GroupUtils, "get_group_with_descendants", staticmethod(lambda group_ids: [1, 2, 3]))
+    monkeypatch.setattr(
+        node_permission,
+        "validate_assignable_organizations",
+        lambda request, organizations: frozenset({2, 3}),
+    )
 
     response = node_permission.authorize_target_organizations(_make_permission_request(), node, [2, 3])
 
     assert response is None
 
 
-def test_authorize_target_organizations_superuser_bypasses_group_scope(monkeypatch):
+def test_authorize_target_organizations_superuser_uses_assignable_scope(monkeypatch):
     node = _FakeNode(organizations=[2])
-
-    from apps.system_mgmt.utils.group_utils import GroupUtils
-
-    def _unexpected(group_ids):
-        raise AssertionError("superuser should not consult group scope")
-
-    monkeypatch.setattr(GroupUtils, "get_group_with_descendants", staticmethod(_unexpected))
+    captured = []
+    monkeypatch.setattr(
+        node_permission,
+        "validate_assignable_organizations",
+        lambda request, organizations: captured.append(organizations),
+    )
 
     response = node_permission.authorize_target_organizations(_make_node_request(), node, [99])
 
     assert response is None
+    assert captured == [[99]]
 
 
 def test_get_node_permission_rejects_forged_current_team(monkeypatch):
@@ -446,6 +479,7 @@ def test_get_authorized_collector_configuration_queryset_includes_authorized_nod
         created_by="permission-test-user",
     )
 
+    _patch_node_data_scope(monkeypatch)
     monkeypatch.setattr(node_permission, "get_node_permission", lambda request: {"team": [1], "instance": []})
 
     result_ids = set(node_permission.get_authorized_collector_configuration_queryset(_make_permission_request()).values_list("id", flat=True))
@@ -477,6 +511,7 @@ def test_get_authorized_collector_configuration_queryset_excludes_creator_owned_
         bind_nodes=[denied_node],
     )
 
+    _patch_node_data_scope(monkeypatch)
     monkeypatch.setattr(node_permission, "get_node_permission", lambda request: {"team": [1], "instance": []})
 
     result_ids = set(node_permission.get_authorized_collector_configuration_queryset(_make_permission_request()).values_list("id", flat=True))
@@ -526,6 +561,7 @@ def test_authorize_child_config_ids_rejects_out_of_scope_config(monkeypatch):
         updated_by_domain="domain.com",
     )
 
+    _patch_node_data_scope(monkeypatch)
     monkeypatch.setattr(node_permission, "get_node_permission", lambda request: {"team": [1], "instance": []})
 
     child_configs, response = node_permission.authorize_child_config_ids(_make_permission_request(), [denied_child.id])
@@ -553,6 +589,7 @@ def test_authorize_mutable_collector_configuration_ids_rejects_shared_config_wit
     denied_node = _create_node_mgmt_node(region, node_id="node-mutable-2", organization=2)
     shared_config = _create_node_mgmt_configuration(region, collector, "cfg-mutable-1", bind_nodes=[allowed_node, denied_node])
 
+    _patch_node_data_scope(monkeypatch)
     monkeypatch.setattr(node_permission, "get_node_permission", lambda request: {"team": [1], "instance": []})
 
     configurations, response = node_permission.authorize_mutable_collector_configuration_ids(_make_permission_request(), [shared_config.id])
@@ -583,6 +620,7 @@ def test_authorize_mutable_collector_configuration_ids_allows_unbound_creator_dr
         created_by="permission-test-user",
     )
 
+    _patch_node_data_scope(monkeypatch)
     monkeypatch.setattr(node_permission, "get_node_permission", lambda request: {"team": [1], "instance": []})
 
     configurations, response = node_permission.authorize_mutable_collector_configuration_ids(_make_permission_request(), [draft_config.id])
@@ -621,6 +659,7 @@ def test_authorize_mutable_child_config_ids_rejects_shared_parent_with_unauthori
         updated_by_domain="domain.com",
     )
 
+    _patch_node_data_scope(monkeypatch)
     monkeypatch.setattr(node_permission, "get_node_permission", lambda request: {"team": [1], "instance": []})
 
     child_configs, response = node_permission.authorize_mutable_child_config_ids(_make_permission_request(), [child_config.id])
@@ -722,7 +761,7 @@ def test_node_write_endpoints_require_explicit_action_permission(monkeypatch, vi
         else:
             monkeypatch.setattr(target, service_attr, lambda *args, **kwargs: called.__setitem__("value", True) or (True, "ok"))
     elif action == "cancel_apply_to_node":
-        config = SimpleNamespace(nodes=SimpleNamespace(remove=lambda node: called.__setitem__("value", True)))
+        pass
     elif action == "destroy":
         monkeypatch.setattr(node_view.NodeViewSet, "perform_destroy", lambda self, instance: called.__setitem__("value", True))
 
@@ -766,6 +805,43 @@ def test_config_node_asso_hides_unauthorized_nodes(monkeypatch):
             "operating_system": "linux",
         }
     ]
+
+
+def test_controller_install_nodes_passes_authorized_queryset(monkeypatch):
+    authorized_nodes = _FakeNodeQuerySet([_FakeNode("node-allowed")])
+    captured = {}
+
+    monkeypatch.setattr(
+        "apps.node_mgmt.views.installer.get_authorized_node_queryset",
+        lambda request: authorized_nodes,
+    )
+    scope = SimpleNamespace(data_team_ids=frozenset({1}))
+    monkeypatch.setattr(
+        "apps.node_mgmt.views.installer.resolve_current_team_data_scope",
+        lambda request: scope,
+    )
+
+    def fake_install_controller_nodes(task_id, authorized_nodes=None, scope=None):
+        captured["task_id"] = task_id
+        captured["authorized_nodes"] = authorized_nodes
+        captured["scope"] = scope
+        return []
+
+    monkeypatch.setattr(
+        "apps.node_mgmt.views.installer.InstallerService.install_controller_nodes",
+        fake_install_controller_nodes,
+    )
+
+    view = InstallerViewSet.as_view({"post": "controller_install_nodes"})
+    response = view(
+        _make_permission_request(permissions=("cloud_region_node-Edit",)),
+        task_id="task-3923",
+    )
+
+    assert response.status_code != 403
+    assert captured["task_id"] == "task-3923"
+    assert captured["authorized_nodes"] is authorized_nodes
+    assert captured["scope"] is scope
 
 
 def test_apply_to_node_prevalidates_permissions_before_mutation(monkeypatch):
@@ -916,7 +992,15 @@ def test_get_authorized_nodes_by_ids_uses_scoped_current_team(monkeypatch):
         },
     )
 
-    assert result == [{"id": "node-scoped", "node_type": "os", "organization_ids": [1]}]
+    assert result == [
+        {
+            "id": "node-scoped",
+            "name": "name-node-scoped",
+            "ip": "127.0.0.1",
+            "node_type": "os",
+            "organization_ids": [1],
+        }
+    ]
     assert captured == {
         "is_local_client": True,
         "actor_context": {
@@ -1200,6 +1284,10 @@ def test_build_session_config_resolves_package_and_installer_by_architecture(mon
         "apps.node_mgmt.services.installer_session.PackageService.resolve_existing_file_path",
         lambda obj: PackageService.build_file_path(obj),
     )
+    monkeypatch.setattr(
+        "apps.node_mgmt.services.installer_session.time.time_ns",
+        lambda: 1785168000123456789,
+    )
 
     config = InstallerSessionService.build_session_config(token_value, NodeConstants.ARM64_ARCH)
 
@@ -1207,7 +1295,15 @@ def test_build_session_config_resolves_package_and_installer_by_architecture(mon
     assert config["storage"]["file_key"] == PackageService.build_file_path(arm_package)
     assert config["installer"]["architecture"] == NodeConstants.ARM64_ARCH
     assert f"/{NodeConstants.ARM64_ARCH}/" in config["installer"]["object_key"]
+    assert config["clock_validation"] == {
+        "server_time_unix_ms": 1785168000123,
+        "max_skew_seconds": 300,
+    }
     assert x86_package.id != arm_package.id
+
+    monkeypatch.setattr(InstallerConstants, "CONTROLLER_INSTALL_MAX_CLOCK_SKEW_SECONDS", 0)
+    with pytest.raises(BaseAppException, match="must be a positive integer"):
+        InstallerSessionService.build_session_config(token_value, NodeConstants.ARM64_ARCH)
 
 
 @pytest.mark.django_db
@@ -1491,6 +1587,7 @@ def test_install_controller_on_nodes_detects_arch_and_resolves_package(monkeypat
     )
 
     install_call = {}
+    stream_call = {}
 
     def fake_exec_command_to_remote(*args, **kwargs):
         return "aarch64"
@@ -1500,8 +1597,12 @@ def test_install_controller_on_nodes_detects_arch_and_resolves_package(monkeypat
         install_call["kwargs"] = kwargs
         return "echo install"
 
+    def fake_exec_command_to_remote_stream(*args, **kwargs):
+        stream_call["command"] = args[4]
+        return ""
+
     monkeypatch.setattr(installer_tasks, "exec_command_to_remote", fake_exec_command_to_remote)
-    monkeypatch.setattr(installer_tasks, "exec_command_to_remote_stream", lambda *args, **kwargs: "")
+    monkeypatch.setattr(installer_tasks, "exec_command_to_remote_stream", fake_exec_command_to_remote_stream)
     monkeypatch.setattr(installer_tasks, "subscribe_lines_sync", lambda *args, **kwargs: (Queue(), lambda: None))
     monkeypatch.setattr(installer_tasks.InstallerService, "get_install_command", fake_get_install_command)
     monkeypatch.setattr(installer_tasks, "_dispatch_or_finalize_controller_task", lambda task_id: None)
@@ -1513,6 +1614,8 @@ def test_install_controller_on_nodes_detects_arch_and_resolves_package(monkeypat
     assert task_node.resolved_package_version_id == arm_package.id
     assert install_call["args"][4] == arm_package.id
     assert install_call["kwargs"]["cpu_architecture"] == NodeConstants.ARM64_ARCH
+    assert stream_call["command"] == "echo install"
+    assert "sh -lc" not in stream_call["command"]
 
 
 @pytest.mark.django_db
@@ -1550,6 +1653,58 @@ def test_update_node_client_persists_normalized_cpu_architecture(monkeypatch):
     assert response.status_code == 202
     assert node.cpu_architecture == NodeConstants.ARM64_ARCH
     assert node.operating_system == NodeConstants.LINUX_OS
+
+
+@pytest.mark.django_db
+def test_update_node_client_uses_install_target_ip_for_windows_link_local_report(monkeypatch):
+    cloud_region = CloudRegion.objects.create(
+        name="sidecar-windows-link-local-region",
+        introduction="test",
+        created_by="tester",
+        updated_by="tester",
+    )
+    install_task = ControllerTask.objects.create(
+        type="install",
+        package_version_id=1,
+        status="running",
+        cloud_region=cloud_region,
+        work_node="worker-1",
+        created_by="tester",
+        updated_by="tester",
+    )
+    ControllerTaskNode.objects.create(
+        task=install_task,
+        ip="10.0.0.57",
+        os=NodeConstants.WINDOWS_OS,
+        port=5986,
+        username="Administrator",
+        password="",
+        status="running",
+        result={InstallerConstants.INSTALL_NODE_ID_KEY: "node-sidecar-windows"},
+        cpu_architecture=NodeConstants.X86_64_ARCH,
+    )
+    monkeypatch.setattr(Sidecar, "create_default_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(Sidecar, "trigger_converge_tasks_if_needed", lambda *args, **kwargs: None)
+    request = SimpleNamespace(
+        headers={},
+        META={},
+        data={
+            "node_name": "windows-node",
+            "node_details": {
+                "ip": "169.254.1.5",
+                "operating_system": "Windows",
+                "collector_configuration_directory": r"C:\fusion-collectors\generated",
+                "metrics": {},
+                "status": {},
+                "tags": [f"zone:{cloud_region.id}"],
+                "log_file_list": [],
+            },
+        },
+    )
+
+    Sidecar.update_node_client(request, "node-sidecar-windows")
+
+    assert Node.objects.get(id="node-sidecar-windows").ip == "10.0.0.57"
 
 
 @pytest.mark.django_db
@@ -2093,6 +2248,7 @@ def test_sidecar_configuration_endpoint_rejects_old_configuration_after_unbind()
         created_by="tester",
         updated_by="tester",
     )
+
     config = CollectorConfiguration.objects.create(
         id="cfg-sidecar-unbind",
         name="cfg-sidecar-unbind",
@@ -2622,7 +2778,6 @@ def test_repair_node_config_rebinds_defaults_by_node_architecture(monkeypatch):
         created_by="tester",
         updated_by="tester",
     )
-
     config = CollectorConfiguration.objects.create(
         id="cfg-repair-node-config-arch",
         name=f"Telegraf-{node.id}",
@@ -2698,21 +2853,26 @@ def test_installer_download_endpoint_passes_architecture_to_service(monkeypatch)
 def test_open_api_installer_session_uses_arch_query_param(monkeypatch):
     factory = APIRequestFactory()
     view = OpenSidecarViewSet.as_view({"get": "installer_session"})
+    token_data = {
+        "node_id": "node-1",
+        "ip": "10.0.0.1",
+        "user": "tester",
+        "os": NodeConstants.LINUX_OS,
+        "package_id": "1",
+        "cloud_region_id": "1",
+        "organizations": [1],
+        "node_name": "node-1",
+        "cpu_architecture": NodeConstants.ARM64_ARCH,
+        "remaining_usage": 3,
+    }
 
     monkeypatch.setattr(
         "apps.node_mgmt.views.sidecar.InstallTokenService.validate_and_get_token_data",
-        lambda token: {
-            "node_id": "node-1",
-            "ip": "10.0.0.1",
-            "user": "tester",
-            "os": NodeConstants.LINUX_OS,
-            "package_id": "1",
-            "cloud_region_id": "1",
-            "organizations": [1],
-            "node_name": "node-1",
-            "cpu_architecture": NodeConstants.ARM64_ARCH,
-            "remaining_usage": 3,
-        },
+        lambda token: token_data,
+    )
+    monkeypatch.setattr(
+        "apps.node_mgmt.views.sidecar.InstallTokenService.inspect_token_data",
+        lambda token: token_data,
     )
     monkeypatch.setattr(
         InstallerSessionService,
@@ -2757,6 +2917,21 @@ def test_open_api_installer_session_consumes_token_once(monkeypatch):
     monkeypatch.setattr(
         "apps.node_mgmt.views.sidecar.InstallTokenService.validate_and_get_token_data",
         fake_validate,
+    )
+    monkeypatch.setattr(
+        "apps.node_mgmt.views.sidecar.InstallTokenService.inspect_token_data",
+        lambda token: {
+            "node_id": "node-1",
+            "ip": "10.0.0.1",
+            "user": "tester",
+            "os": NodeConstants.LINUX_OS,
+            "package_id": "1",
+            "cloud_region_id": "1",
+            "organizations": [1],
+            "node_name": "node-1",
+            "cpu_architecture": NodeConstants.ARM64_ARCH,
+            "remaining_usage": 5,
+        },
     )
     monkeypatch.setattr(
         InstallerSessionService,
@@ -2811,6 +2986,10 @@ def test_open_api_linux_bootstrap_contains_arch_detection_and_routed_urls(monkey
         lambda token: {"cpu_architecture": NodeConstants.ARM64_ARCH},
     )
     monkeypatch.setattr(
+        "apps.node_mgmt.views.sidecar.InstallTokenService.inspect_token_data",
+        lambda token: {"cpu_architecture": NodeConstants.ARM64_ARCH},
+    )
+    monkeypatch.setattr(
         InstallerSessionService,
         "build_session_config",
         lambda token, arch="", token_data=None: {
@@ -2825,10 +3004,120 @@ def test_open_api_linux_bootstrap_contains_arch_detection_and_routed_urls(monkey
     content = response.content.decode("utf-8")
 
     assert response.status_code == 200
+    assert content.startswith("#!/bin/sh\n")
+    assert "set -eu\n" in content
+    assert "pipefail" not in content
+    assert "trap cleanup 0" in content
+    assert "trap 'exit 1' 1 2 15" in content
+    assert 'exec "$INSTALLER_PATH"' not in content
+    assert 'exit "$installer_status"' in content
+    assert 'curl -fsSLk "$INSTALLER_URL"' in content
     assert 'DETECTED_ARCH="$(uname -m' in content
-    assert 'EXPECTED_ARCH="arm64"' in content
-    assert "installer/linux/download?token=abc&arch=$DETECTED_ARCH" in content
-    assert "installer/session?token=abc&arch=$DETECTED_ARCH" in content
+    assert f"EXPECTED_ARCH={shlex.quote('arm64')}" in content
+    assert (
+        f"INSTALLER_URL={shlex.quote('https://example.com/api/v1/node_mgmt/open_api/installer/linux/download?token=abc&arch=')}" '"$DETECTED_ARCH"'
+    ) in content
+    assert (
+        f"CONFIG_URL={shlex.quote('https://example.com/api/v1/node_mgmt/open_api/installer/session?token=abc&arch=')}" '"$DETECTED_ARCH"'
+    ) in content
+    syntax_check = subprocess.run(["sh", "-n"], input=content, text=True, capture_output=True, check=False)
+    assert syntax_check.returncode == 0, syntax_check.stderr
+
+
+@pytest.mark.django_db
+def test_open_api_linux_bootstrap_shell_quotes_dynamic_values(monkeypatch):
+    factory = APIRequestFactory()
+    view = OpenSidecarViewSet.as_view({"get": "linux_bootstrap"})
+    install_dir = "/opt/fusion path/it's"
+    installer_name = "controller installer's binary"
+
+    monkeypatch.setattr(
+        "apps.node_mgmt.views.sidecar.InstallTokenService.validate_and_get_token_data",
+        lambda token: {"cpu_architecture": NodeConstants.ARM64_ARCH},
+    )
+    monkeypatch.setattr(
+        "apps.node_mgmt.views.sidecar.InstallTokenService.inspect_token_data",
+        lambda token: {"cpu_architecture": NodeConstants.ARM64_ARCH},
+    )
+    monkeypatch.setattr(
+        InstallerSessionService,
+        "build_session_config",
+        lambda token, arch="", token_data=None: {
+            "installer": {"filename": installer_name},
+            "install_dir": install_dir,
+            "server_url": "https://example.com/api/v1/node_mgmt/open_api/node",
+        },
+    )
+
+    response = view(factory.get("/node_mgmt/open_api/installer/linux_bootstrap", {"token": "abc"}))
+    content = response.content.decode("utf-8")
+
+    assert f"INSTALL_DIR={shlex.quote(install_dir)}" in content
+    assert f"INSTALLER_NAME={shlex.quote(installer_name)}" in content
+    syntax_check = subprocess.run(["sh", "-n"], input=content, text=True, capture_output=True, check=False)
+    assert syntax_check.returncode == 0, syntax_check.stderr
+
+
+@pytest.mark.django_db
+def test_open_api_linux_bootstrap_preserves_installer_failure_and_cleans_temp_dir(monkeypatch, tmp_path):
+    factory = APIRequestFactory()
+    view = OpenSidecarViewSet.as_view({"get": "linux_bootstrap"})
+    install_dir = tmp_path / "install"
+    bootstrap_temp = tmp_path / "bootstrap-temp"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+
+    monkeypatch.setattr(
+        "apps.node_mgmt.views.sidecar.InstallTokenService.validate_and_get_token_data",
+        lambda token: {"cpu_architecture": NodeConstants.X86_64_ARCH},
+    )
+    monkeypatch.setattr(
+        "apps.node_mgmt.views.sidecar.InstallTokenService.inspect_token_data",
+        lambda token: {"cpu_architecture": NodeConstants.X86_64_ARCH},
+    )
+    monkeypatch.setattr(
+        InstallerSessionService,
+        "build_session_config",
+        lambda token, arch="", token_data=None: {
+            "installer": {"filename": "installer.bin"},
+            "install_dir": str(install_dir),
+            "server_url": "https://example.com/api/v1/node_mgmt/open_api/node",
+        },
+    )
+
+    scripts = {
+        "mktemp": '#!/bin/sh\n/bin/mkdir -p "$BOOTSTRAP_TEMP"\nprintf "%s\\n" "$BOOTSTRAP_TEMP"\n',
+        "uname": "#!/bin/sh\nprintf 'x86_64\\n'\n",
+        "curl": """#!/bin/sh
+output=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then output="$2"; shift 2; else shift; fi
+done
+printf '%s\n' '#!/bin/sh' 'exit 7' > "$output"
+""",
+        "rm": '#!/bin/sh\nexec /bin/rm "$@"\n',
+        "mkdir": '#!/bin/sh\nexec /bin/mkdir "$@"\n',
+        "chmod": '#!/bin/sh\nexec /bin/chmod "$@"\n',
+    }
+    for name, script in scripts.items():
+        path = bin_dir / name
+        path.write_text(script, encoding="utf-8")
+        path.chmod(0o755)
+    (bin_dir / "tr").symlink_to("/usr/bin/tr")
+
+    response = view(factory.get("/node_mgmt/open_api/installer/linux_bootstrap", {"token": "abc"}))
+    env = os.environ.copy()
+    env.update({"PATH": str(bin_dir), "BOOTSTRAP_TEMP": str(bootstrap_temp)})
+    result = subprocess.run(
+        ["/bin/sh", "-c", response.content.decode("utf-8")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 7, result.stderr
+    assert not bootstrap_temp.exists()
 
 
 @pytest.mark.django_db
@@ -2844,6 +3133,10 @@ def test_open_api_linux_bootstrap_consumes_token_once(monkeypatch):
     monkeypatch.setattr(
         "apps.node_mgmt.views.sidecar.InstallTokenService.validate_and_get_token_data",
         fake_validate,
+    )
+    monkeypatch.setattr(
+        "apps.node_mgmt.views.sidecar.InstallTokenService.inspect_token_data",
+        lambda token: {"cpu_architecture": NodeConstants.ARM64_ARCH},
     )
     monkeypatch.setattr(
         InstallerSessionService,
@@ -2875,6 +3168,10 @@ def test_get_install_command_view_passes_cpu_architecture(monkeypatch):
         return "curl command"
 
     monkeypatch.setattr(InstallerService, "get_install_command", fake_get_install_command)
+    monkeypatch.setattr(
+        "apps.node_mgmt.views.installer.validate_assignable_organizations",
+        lambda request, organizations: frozenset(organizations),
+    )
 
     request = factory.post(
         "/node_mgmt/api/installer/get_install_command/",
@@ -2900,9 +3197,13 @@ def test_get_install_command_view_passes_cpu_architecture(monkeypatch):
 
 
 @pytest.mark.django_db
-def test_controller_manual_install_includes_normalized_cpu_architecture():
+def test_controller_manual_install_includes_normalized_cpu_architecture(monkeypatch):
     factory = APIRequestFactory()
     view = InstallerViewSet.as_view({"post": "controller_manual_install"})
+    monkeypatch.setattr(
+        "apps.node_mgmt.views.installer.validate_assignable_organizations",
+        lambda request, organizations: frozenset(organizations),
+    )
     request = factory.post(
         "/node_mgmt/api/installer/controller/manual_install/",
         {
@@ -2976,8 +3277,8 @@ def test_controller_install_view_rejects_windows_arm64_payload():
                     "node_name": "windows-arm",
                     "os": NodeConstants.WINDOWS_OS,
                     "organizations": [1],
-                    "port": 22,
-                    "username": "root",
+                    "port": 5986,
+                    "username": "Administrator",
                     "password": "secret",
                     "private_key": "",
                     "passphrase": "",
@@ -3395,6 +3696,64 @@ def test_package_version_upload_force_reuploads_existing_version(monkeypatch, tm
 
     assert uploaded["name"] == "fusion-collectors-linux-amd64.zip"
     assert uploaded["path"] == "linux/x86_64/Controller/1.0.1/fusion-collectors-linux-amd64.zip"
+
+
+@pytest.mark.django_db
+def test_package_version_upload_streams_file_without_unbounded_read(monkeypatch, tmp_path):
+    file_path = tmp_path / "fusion-collectors-windows-amd64.zip"
+    file_path.write_bytes(b"controller-package")
+    original_open = type(file_path).open
+    uploaded = {}
+
+    class RejectUnboundedRead:
+        def __init__(self, raw_file):
+            self.raw_file = raw_file
+            self.name = raw_file.name
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self.raw_file.close()
+
+        def read(self, size=-1):
+            if size is None or size < 0:
+                raise AssertionError("controller package must not be read into memory at once")
+            return self.raw_file.read(size)
+
+        def seek(self, *args):
+            return self.raw_file.seek(*args)
+
+        def tell(self):
+            return self.raw_file.tell()
+
+    def guarded_open(path, mode="r", *args, **kwargs):
+        return RejectUnboundedRead(original_open(path, mode, *args, **kwargs))
+
+    def fake_upload(file, data):
+        uploaded["name"] = file.name
+        uploaded["content"] = file.read(4) + file.read(64)
+
+    monkeypatch.setattr(type(file_path), "open", guarded_open)
+    monkeypatch.setattr("apps.node_mgmt.management.utils.PackageService.upload_file", fake_upload)
+
+    from apps.node_mgmt.management.utils import package_version_upload
+
+    package_version_upload(
+        "controller",
+        {
+            "os": "windows",
+            "object": "Controller",
+            "cpu_architecture": NodeConstants.X86_64_ARCH,
+            "pk_version": "streaming-test",
+            "file_path": str(file_path),
+        },
+    )
+
+    assert uploaded == {
+        "name": "fusion-collectors-windows-amd64.zip",
+        "content": b"controller-package",
+    }
 
 
 @pytest.mark.django_db
@@ -4101,8 +4460,20 @@ def test_nats_batch_create_child_configs_rejects_ambiguous_generic_collector_con
         )
 
 
+@pytest.mark.integration
 @pytest.mark.django_db
-def test_nats_batch_create_child_configs_auto_creates_missing_default_parent_configuration():
+@pytest.mark.parametrize(
+    ("node_architecture", "collector_architecture"),
+    [
+        (NodeConstants.X86_64_ARCH, ""),
+        (NodeConstants.ARM64_ARCH, NodeConstants.ARM64_ARCH),
+    ],
+)
+def test_nats_batch_create_child_configs_auto_creates_missing_default_parent_configuration(
+    node_architecture,
+    collector_architecture,
+    django_capture_on_commit_callbacks,
+):
     cloud_region = CloudRegion.objects.create(
         name="region-nats-child-autocreate",
         introduction="test",
@@ -4120,7 +4491,7 @@ def test_nats_batch_create_child_configs_auto_creates_missing_default_parent_con
         name="node-child-autocreate",
         ip="10.0.0.26",
         operating_system=NodeConstants.LINUX_OS,
-        cpu_architecture=NodeConstants.X86_64_ARCH,
+        cpu_architecture=node_architecture,
         collector_configuration_directory="/etc/collector",
         metrics={},
         status={},
@@ -4131,11 +4502,11 @@ def test_nats_batch_create_child_configs_auto_creates_missing_default_parent_con
         updated_by="tester",
     )
     Collector.objects.create(
-        id="telegraf_linux_autocreate",
+        id=f"telegraf_linux_autocreate_{node_architecture}",
         name="Telegraf",
         service_type="exec",
         node_operating_system=NodeConstants.LINUX_OS,
-        cpu_architecture="",
+        cpu_architecture=collector_architecture,
         executable_path="/opt/telegraf",
         execute_parameters="--config %s",
         introduction="generic",
@@ -4148,26 +4519,379 @@ def test_nats_batch_create_child_configs_auto_creates_missing_default_parent_con
         updated_by="tester",
     )
 
-    NatsService().batch_create_child_configs(
-        [
-            {
-                "id": "child-autocreate-telegraf",
-                "collect_type": "host",
-                "type": "cpu",
-                "content": "[[inputs.cpu]]",
-                "node_id": node.id,
-                "collector_name": "Telegraf",
-                "env_config": {},
-            }
-        ]
-    )
+    node_etag_key = f"node_etag_{node.id}"
+    cache.set(node_etag_key, "stale")
+    with django_capture_on_commit_callbacks(execute=True):
+        NatsService().batch_create_child_configs(
+            [
+                {
+                    "id": "child-autocreate-telegraf",
+                    "collect_type": "host",
+                    "type": "cpu",
+                    "content": "[[inputs.cpu]]",
+                    "node_id": node.id,
+                    "collector_name": "Telegraf",
+                    "env_config": {},
+                }
+            ]
+        )
 
     parent_config = CollectorConfiguration.objects.get(nodes=node, collector__name="Telegraf")
     child = parent_config.childconfig_set.get(id="child-autocreate-telegraf")
     assert parent_config.is_pre is True
     assert child.collector_config_id == parent_config.id
+    assert cache.get(node_etag_key) is None
 
 
+@pytest.mark.integration
+@pytest.mark.django_db
+def test_nats_ensure_parent_configs_batches_database_queries():
+    cloud_region = CloudRegion.objects.create(
+        name="region-nats-child-batch-queries",
+        introduction="test",
+        created_by="tester",
+        updated_by="tester",
+    )
+    SidecarEnv.objects.create(
+        cloud_region=cloud_region,
+        key="SIDECAR_INPUT_MODE",
+        value="nats",
+        type="text",
+    )
+    Collector.objects.create(
+        id="telegraf_linux_batch_queries",
+        name="Telegraf",
+        service_type="exec",
+        node_operating_system=NodeConstants.LINUX_OS,
+        cpu_architecture=NodeConstants.X86_64_ARCH,
+        executable_path="/opt/telegraf",
+        execute_parameters="--config %s",
+        introduction="x86_64",
+        icon="telegraf",
+        controller_default_run=True,
+        default_config={
+            "nats": "[[inputs.cpu]]\n  interval = '10s'",
+            "cached": "[[inputs.mem]]\n  interval = '10s'",
+        },
+        tags=[],
+        package_name="telegraf",
+        created_by="tester",
+        updated_by="tester",
+    )
+
+    def ensure_parent_configs(prefix, count):
+        configs = []
+        for index in range(count):
+            node = Node.objects.create(
+                id=f"node-{prefix}-{index}",
+                name=f"node-{prefix}-{index}",
+                ip=f"10.20.{count}.{index + 1}",
+                operating_system=NodeConstants.LINUX_OS,
+                cpu_architecture=NodeConstants.X86_64_ARCH,
+                collector_configuration_directory="/etc/collector",
+                metrics={},
+                status={},
+                tags=[],
+                log_file_list=[],
+                cloud_region=cloud_region,
+                created_by="tester",
+                updated_by="tester",
+            )
+            configs.append({"node_id": node.id, "collector_name": "Telegraf"})
+
+        cached_env_rows = [{"key": "SIDECAR_INPUT_MODE", "value": "cached", "type": "text"}]
+        with patch("apps.node_mgmt.services.cloudregion.cache.get", return_value=cached_env_rows):
+            with patch("apps.node_mgmt.nats.node.invalidate_bulk_config_node_etags") as invalidate_etags:
+                with CaptureQueriesContext(connection) as queries:
+                    NatsService()._ensure_parent_configs_for_child_configs(configs + configs)
+        invalidated_node_ids = {config["node_id"] for config in invalidate_etags.call_args.args[0]}
+        return len(queries), invalidated_node_ids
+
+    single_queries, single_invalidated_node_ids = ensure_parent_configs("single", 1)
+    batch_queries, batch_invalidated_node_ids = ensure_parent_configs("batch", 8)
+
+    parent_configs = CollectorConfiguration.objects.filter(collector__name="Telegraf")
+    parent_templates = set(parent_configs.values_list("config_template", flat=True))
+    assert parent_configs.count() == 9
+    assert len(parent_templates) == 1
+    assert parent_templates == {"[[inputs.mem]]\n  interval = '10s'"}
+    assert batch_queries <= single_queries + 2
+    assert single_invalidated_node_ids == {"node-single-0"}
+    assert batch_invalidated_node_ids == {f"node-batch-{index}" for index in range(8)}
+
+
+@pytest.mark.integration
+@pytest.mark.django_db
+def test_cloud_region_env_batch_loader_uses_one_query_for_cache_misses():
+    cloud_regions = CloudRegion.objects.bulk_create(
+        [
+            CloudRegion(
+                name=f"region-env-batch-{index}",
+                introduction="test",
+                created_by="tester",
+                updated_by="tester",
+            )
+            for index in range(8)
+        ]
+    )
+    SidecarEnv.objects.bulk_create(
+        [
+            SidecarEnv(
+                cloud_region=cloud_region,
+                key="SIDECAR_INPUT_MODE",
+                value="nats",
+                type="text",
+            )
+            for cloud_region in cloud_regions
+        ]
+    )
+
+    with patch("apps.node_mgmt.services.cloudregion.cache.get", return_value=None):
+        with patch("apps.node_mgmt.services.cloudregion.cache.set"):
+            with CaptureQueriesContext(connection) as queries:
+                variables_by_region = RegionService.get_cloud_regions_envconfig({cloud_region.id for cloud_region in cloud_regions})
+
+    assert len(queries) == 1
+    assert variables_by_region == {cloud_region.id: {"SIDECAR_INPUT_MODE": "nats"} for cloud_region in cloud_regions}
+
+
+@pytest.mark.integration
+@pytest.mark.django_db
+def test_nats_ensure_parent_configs_wraps_template_errors_and_rolls_back():
+    cloud_region = CloudRegion.objects.create(name="region-invalid-template", created_by="tester", updated_by="tester")
+    node = Node.objects.create(
+        id="node-invalid-template",
+        name="node-invalid-template",
+        ip="10.30.0.1",
+        operating_system=NodeConstants.LINUX_OS,
+        cpu_architecture=NodeConstants.X86_64_ARCH,
+        collector_configuration_directory="/etc/collector",
+        cloud_region=cloud_region,
+        created_by="tester",
+        updated_by="tester",
+    )
+    Collector.objects.create(
+        id="telegraf_linux_invalid_template",
+        name="Telegraf",
+        service_type="exec",
+        node_operating_system=NodeConstants.LINUX_OS,
+        cpu_architecture=NodeConstants.X86_64_ARCH,
+        executable_path="/opt/telegraf",
+        execute_parameters="--config %s",
+        controller_default_run=True,
+        default_config={"nats": "{% invalid-template %}"},
+        package_name="telegraf",
+        created_by="tester",
+        updated_by="tester",
+    )
+
+    with pytest.raises(BaseAppException, match=f"节点 {node.id} 自动创建 Telegraf 父配置失败"):
+        NatsService()._ensure_parent_configs_for_child_configs([{"node_id": node.id, "collector_name": "Telegraf"}])
+
+    assert not CollectorConfiguration.objects.filter(name=f"Telegraf-{node.id}").exists()
+
+
+@pytest.mark.integration
+@pytest.mark.django_db
+def test_nats_ensure_parent_configs_rejects_unbound_name_collision():
+    cloud_region = CloudRegion.objects.create(name="region-parent-name-collision", created_by="tester", updated_by="tester")
+    node = Node.objects.create(
+        id="node-parent-name-collision",
+        name="node-parent-name-collision",
+        ip="10.30.0.2",
+        operating_system=NodeConstants.LINUX_OS,
+        cpu_architecture=NodeConstants.X86_64_ARCH,
+        collector_configuration_directory="/etc/collector",
+        cloud_region=cloud_region,
+        created_by="tester",
+        updated_by="tester",
+    )
+    collector = Collector.objects.create(
+        id="telegraf_linux_parent_name_collision",
+        name="Telegraf",
+        service_type="exec",
+        node_operating_system=NodeConstants.LINUX_OS,
+        cpu_architecture=NodeConstants.X86_64_ARCH,
+        executable_path="/opt/telegraf",
+        execute_parameters="--config %s",
+        controller_default_run=True,
+        default_config={"nats": "[[inputs.cpu]]"},
+        package_name="telegraf",
+        created_by="tester",
+        updated_by="tester",
+    )
+    occupied_config = CollectorConfiguration.objects.create(
+        name=f"Telegraf-{node.id}",
+        collector=collector,
+        config_template="occupied",
+        cloud_region=cloud_region,
+    )
+
+    with pytest.raises(BaseAppException, match="已被其他配置占用"):
+        NatsService()._ensure_parent_configs_for_child_configs([{"node_id": node.id, "collector_name": "Telegraf"}])
+
+    assert not occupied_config.nodes.filter(id=node.id).exists()
+
+
+@pytest.mark.integration
+@pytest.mark.django_db
+def test_nats_ensure_parent_configs_ignores_noncanonical_architecture_alias():
+    cloud_region = CloudRegion.objects.create(name="region-parent-arch-alias", created_by="tester", updated_by="tester")
+    node = Node.objects.create(
+        id="node-parent-arch-alias",
+        name="node-parent-arch-alias",
+        ip="10.30.0.3",
+        operating_system=NodeConstants.LINUX_OS,
+        cpu_architecture=NodeConstants.X86_64_ARCH,
+        collector_configuration_directory="/etc/collector",
+        cloud_region=cloud_region,
+        created_by="tester",
+        updated_by="tester",
+    )
+    for collector_id, architecture in (("telegraf_linux_amd64_alias", "amd64"), ("telegraf_linux_x86_canonical", NodeConstants.X86_64_ARCH)):
+        Collector.objects.create(
+            id=collector_id,
+            name="Telegraf",
+            service_type="exec",
+            node_operating_system=NodeConstants.LINUX_OS,
+            cpu_architecture=architecture,
+            executable_path="/opt/telegraf",
+            execute_parameters="--config %s",
+            controller_default_run=True,
+            default_config={"nats": f"architecture = '{architecture}'"},
+            package_name="telegraf",
+            created_by="tester",
+            updated_by="tester",
+        )
+
+    NatsService()._ensure_parent_configs_for_child_configs([{"node_id": node.id, "collector_name": "Telegraf"}])
+
+    parent_config = CollectorConfiguration.objects.get(nodes=node, collector__name="Telegraf")
+    assert parent_config.collector_id == "telegraf_linux_x86_canonical"
+    assert parent_config.config_template == "architecture = 'x86_64'"
+
+
+@pytest.mark.integration
+@pytest.mark.django_db
+def test_nats_ensure_parent_configs_retries_non_native_bulk_conflicts():
+    cloud_region = CloudRegion.objects.create(name="region-parent-conflict-retry", created_by="tester", updated_by="tester")
+    nodes = [
+        Node.objects.create(
+            id=f"node-parent-conflict-retry-{index}",
+            name=f"node-parent-conflict-retry-{index}",
+            ip=f"10.30.1.{index + 1}",
+            operating_system=NodeConstants.LINUX_OS,
+            cpu_architecture=NodeConstants.X86_64_ARCH,
+            collector_configuration_directory="/etc/collector",
+            cloud_region=cloud_region,
+            created_by="tester",
+            updated_by="tester",
+        )
+        for index in range(2)
+    ]
+    Collector.objects.create(
+        id="telegraf_linux_parent_conflict_retry",
+        name="Telegraf",
+        service_type="exec",
+        node_operating_system=NodeConstants.LINUX_OS,
+        cpu_architecture=NodeConstants.X86_64_ARCH,
+        executable_path="/opt/telegraf",
+        execute_parameters="--config %s",
+        controller_default_run=True,
+        default_config={"nats": "[[inputs.cpu]]"},
+        package_name="telegraf",
+        created_by="tester",
+        updated_by="tester",
+    )
+    config_bulk_create = CollectorConfiguration.objects.bulk_create
+    association_bulk_create = NodeCollectorConfiguration.objects.bulk_create
+    config_attempts = []
+    association_attempts = []
+
+    def flaky_config_bulk_create(objects, **kwargs):
+        config_attempts.append([obj.name for obj in objects])
+        if len(config_attempts) == 1:
+            raise IntegrityError("simulated concurrent configuration conflict")
+        return config_bulk_create(objects, **kwargs)
+
+    def flaky_association_bulk_create(objects, **kwargs):
+        association_attempts.append([(obj.node_id, obj.collector_config_id) for obj in objects])
+        if len(association_attempts) == 1:
+            raise IntegrityError("simulated concurrent association conflict")
+        return association_bulk_create(objects, **kwargs)
+
+    with patch("apps.node_mgmt.nats.node.connection", SimpleNamespace(features=SimpleNamespace(supports_ignore_conflicts=False))):
+        with patch.object(CollectorConfiguration.objects, "bulk_create", side_effect=flaky_config_bulk_create):
+            with patch.object(NodeCollectorConfiguration.objects, "bulk_create", side_effect=flaky_association_bulk_create):
+                NatsService()._ensure_parent_configs_for_child_configs(
+                    [{"node_id": node.id, "collector_name": "Telegraf"} for node in nodes]
+                )
+
+    assert len(config_attempts) == 2
+    assert len(association_attempts) == 2
+    assert CollectorConfiguration.objects.filter(nodes__in=nodes, collector__name="Telegraf").distinct().count() == 2
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+def test_nats_ensure_parent_configs_converges_native_unique_conflict():
+    if not connection.features.supports_ignore_conflicts:
+        pytest.skip("需要原生 ignore_conflicts 语义")
+
+    cloud_region = CloudRegion.objects.create(name="region-parent-native-conflict", created_by="tester", updated_by="tester")
+    node = Node.objects.create(
+        id="node-parent-native-conflict",
+        name="node-parent-native-conflict",
+        ip="10.30.1.10",
+        operating_system=NodeConstants.LINUX_OS,
+        cpu_architecture=NodeConstants.X86_64_ARCH,
+        collector_configuration_directory="/etc/collector",
+        cloud_region=cloud_region,
+        created_by="tester",
+        updated_by="tester",
+    )
+    Collector.objects.create(
+        id="telegraf_linux_parent_native_conflict",
+        name="Telegraf",
+        service_type="exec",
+        node_operating_system=NodeConstants.LINUX_OS,
+        cpu_architecture=NodeConstants.X86_64_ARCH,
+        executable_path="/opt/telegraf",
+        execute_parameters="--config %s",
+        controller_default_run=True,
+        default_config={"nats": "[[inputs.cpu]]"},
+        package_name="telegraf",
+        created_by="tester",
+        updated_by="tester",
+    )
+    configs = [{"node_id": node.id, "collector_name": "Telegraf"}]
+    ready_to_resolve = Barrier(2)
+    real_resolver = NatsService._resolve_collector_from_candidates
+
+    def synchronized_resolver(node_obj, collectors):
+        resolved = real_resolver(node_obj, collectors)
+        ready_to_resolve.wait(timeout=10)
+        return resolved
+
+    def ensure_once():
+        close_old_connections()
+        try:
+            with transaction.atomic():
+                NatsService()._ensure_parent_configs_for_child_configs(configs)
+        finally:
+            close_old_connections()
+
+    with patch.object(NatsService, "_resolve_collector_from_candidates", side_effect=synchronized_resolver):
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(ensure_once) for _ in range(2)]
+            for future in futures:
+                future.result(timeout=20)
+
+    assert CollectorConfiguration.objects.filter(name=f"Telegraf-{node.id}").count() == 1
+    assert NodeCollectorConfiguration.objects.filter(node_id=node.id, collector_config__collector__name="Telegraf").count() == 1
+
+
+@pytest.mark.integration
 @pytest.mark.django_db
 def test_nats_batch_create_child_configs_reports_missing_default_config_for_parent_creation():
     cloud_region = CloudRegion.objects.create(
@@ -4225,6 +4949,7 @@ def test_nats_batch_create_child_configs_reports_missing_default_config_for_pare
         )
 
 
+@pytest.mark.integration
 @pytest.mark.django_db
 def test_nats_batch_create_child_configs_reports_bulk_create_failures():
     cloud_region = CloudRegion.objects.create(
@@ -4258,22 +4983,13 @@ def test_nats_batch_create_child_configs_reports_bulk_create_failures():
         execute_parameters="--config %s",
         introduction="generic",
         icon="telegraf",
-        default_config={},
+        controller_default_run=True,
+        default_config={"nats": "[[inputs.cpu]]"},
         tags=[],
         package_name="telegraf",
         created_by="tester",
         updated_by="tester",
     )
-    parent_config = collector.collectorconfiguration_set.create(
-        id="cfg-bulk-failure",
-        name="cfg-bulk-failure",
-        config_template="[[inputs.cpu]]",
-        cloud_region=cloud_region,
-        created_by="tester",
-        updated_by="tester",
-    )
-    parent_config.nodes.add(node)
-
     with patch("apps.node_mgmt.nats.node.ChildConfig.objects.bulk_create", side_effect=Exception("db write failed")):
         with pytest.raises(BaseAppException, match="批量创建子配置失败"):
             NatsService().batch_create_child_configs(
@@ -4289,6 +5005,11 @@ def test_nats_batch_create_child_configs_reports_bulk_create_failures():
                     }
                 ]
             )
+
+    parent_name = f"{collector.name}-{node.id}"
+    assert not CollectorConfiguration.objects.filter(name=parent_name).exists()
+    assert not NodeCollectorConfiguration.objects.filter(node_id=node.id).exists()
+    assert not ChildConfig.objects.filter(id="child-bulk-failure-telegraf").exists()
 
 
 @pytest.mark.django_db
@@ -4629,7 +5350,54 @@ def test_trigger_converge_tasks_if_needed_schedules_legacy_install_task_without_
 
 
 @pytest.mark.django_db
-def test_converge_controller_install_connectivity_for_node_prefers_install_node_id_with_shared_ip():
+def test_trigger_converge_matches_generated_node_id_when_reported_ip_differs(monkeypatch):
+    cloud_region = CloudRegion.objects.create(
+        name="generated-id-converge-trigger-region",
+        introduction="test",
+        created_by="tester",
+        updated_by="tester",
+    )
+    task = installer_tasks.ControllerTask.objects.create(
+        cloud_region=cloud_region,
+        type="install",
+        status="running",
+        work_node="worker-1",
+        package_version_id=1,
+        created_by="tester",
+        updated_by="tester",
+    )
+    ControllerTaskNode.objects.create(
+        task=task,
+        ip="10.0.0.57",
+        node_name="windows-node",
+        os=NodeConstants.WINDOWS_OS,
+        organizations=[1],
+        port=5986,
+        username="Administrator",
+        password="",
+        status=InstallerConstants.STEP_STATUS_RUNNING,
+        result={
+            InstallerConstants.INSTALL_NODE_ID_KEY: "generated-windows-node",
+            InstallerConstants.EXECUTION_PHASE_KEY: InstallerConstants.EXECUTION_PHASE_CONNECTIVITY_WAITING,
+            "steps": [{"action": "connectivity_check", "status": "running", "message": "Wait for node connection"}],
+        },
+    )
+    called = []
+    monkeypatch.setattr(Sidecar, "_is_debounce_elapsed", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        "apps.node_mgmt.services.sidecar.converge_controller_install_connectivity_for_node.delay",
+        lambda node_id: called.append(node_id),
+    )
+
+    Sidecar.trigger_converge_tasks_if_needed("generated-windows-node", "169.254.1.5", {})
+
+    assert called == ["generated-windows-node"]
+
+
+@pytest.mark.django_db
+def test_converge_controller_install_connectivity_for_node_prefers_install_node_id_with_shared_ip(
+    monkeypatch,
+):
     cloud_region = CloudRegion.objects.create(
         name="shared-ip-converge-region",
         introduction="test",
@@ -4693,6 +5461,7 @@ def test_converge_controller_install_connectivity_for_node_prefers_install_node_
         created_by="tester",
         updated_by="tester",
     )
+    monkeypatch.setattr(installer_tasks.discover_node_versions, "delay", lambda: None)
 
     installer_tasks.converge_controller_install_connectivity_for_node("current-install-node")
 
@@ -4758,7 +5527,9 @@ def test_converge_controller_install_connectivity_triggers_version_discovery_whe
 
 
 @pytest.mark.django_db
-def test_converge_controller_install_connectivity_for_node_falls_back_for_legacy_task_without_install_node_id():
+def test_converge_controller_install_connectivity_for_node_falls_back_for_legacy_task_without_install_node_id(
+    monkeypatch,
+):
     cloud_region = CloudRegion.objects.create(
         name="legacy-converge-region",
         introduction="test",
@@ -4822,6 +5593,7 @@ def test_converge_controller_install_connectivity_for_node_falls_back_for_legacy
         created_by="tester",
         updated_by="tester",
     )
+    monkeypatch.setattr(installer_tasks.discover_node_versions, "delay", lambda: None)
 
     installer_tasks.converge_controller_install_connectivity_for_node("legacy-install-node")
 
@@ -4832,7 +5604,7 @@ def test_converge_controller_install_connectivity_for_node_falls_back_for_legacy
 
 
 @pytest.mark.django_db
-def test_install_connectivity_converge_matches_generated_node_id_not_ip():
+def test_install_connectivity_converge_matches_generated_node_id_not_ip(monkeypatch):
     cloud_region = CloudRegion.objects.create(
         name="connectivity-region",
         introduction="test",
@@ -4888,7 +5660,7 @@ def test_install_connectivity_converge_matches_generated_node_id_not_ip():
     Node.objects.create(
         id="current-install-node",
         name="current-node",
-        ip="10.0.0.88",
+        ip="169.254.1.5",
         operating_system=NodeConstants.LINUX_OS,
         cpu_architecture=NodeConstants.X86_64_ARCH,
         collector_configuration_directory="/tmp/config",
@@ -4896,6 +5668,7 @@ def test_install_connectivity_converge_matches_generated_node_id_not_ip():
         created_by="tester",
         updated_by="tester",
     )
+    monkeypatch.setattr(installer_tasks.discover_node_versions, "delay", lambda: None)
 
     installer_tasks.converge_controller_install_connectivity_for_node("current-install-node")
 

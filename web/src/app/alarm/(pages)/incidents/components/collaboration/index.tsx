@@ -1,7 +1,8 @@
 'use client';
 
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Spin, Empty, Tag, Button, Avatar, Tooltip, message, Modal, Drawer, Select, Input, Checkbox, Dropdown } from 'antd';
+import { Spin, Tag, Button, Avatar, Tooltip, message, Modal, Drawer, Select, Input, Checkbox } from 'antd';
+import CompactEmptyState from '@/components/compact-empty-state';
 import {
   PlusOutlined,
   StarOutlined,
@@ -13,19 +14,24 @@ import {
   MessageOutlined,
   DownOutlined,
   UpOutlined,
-  MoreOutlined,
 } from '@ant-design/icons';
 import { useTranslation } from '@/utils/i18n';
 import { useIncidentsApi } from '@/app/alarm/api/incidents';
 import { useCommon } from '@/app/alarm/context/common';
 import { useLocalizedTime } from '@/hooks/useLocalizedTime';
 import PermissionWrapper from '@/components/permission';
+import MoreActionsDropdown from '@/components/more-actions-dropdown';
+import type { MoreActionsDropdownItem } from '@/components/more-actions-dropdown';
 import type {
   IncidentTableDataItem,
   IncidentUpdateItem,
   IncidentUpdateReply,
 } from '@/app/alarm/types/incidents';
 import type { UserItem } from '@/app/alarm/types/types';
+import {
+  IncidentCollaborationExtension,
+  INCIDENT_COLLABORATION_SIDEBAR_WIDTH_CLASS,
+} from '@/app/alarm/(enterprise)/incidents/im-group';
 
 /** Avatar background colors, cycled by first char of username */
 const AVATAR_COLORS = [
@@ -76,6 +82,7 @@ const CollaborationTab: React.FC<CollaborationTabProps> = ({
 
   const [inviteUsers, setInviteUsers] = useState<string[]>([]);
   const [inviteLoading, setInviteLoading] = useState(false);
+  const [imGroupRefreshVersion, setImGroupRefreshVersion] = useState(0);
 
   const [filterType, setFilterType] = useState<string | undefined>(undefined);
   const [searchKeyword, setSearchKeyword] = useState('');
@@ -209,6 +216,7 @@ const CollaborationTab: React.FC<CollaborationTabProps> = ({
       setInviteVisible(false);
       setInviteUsers([]);
       onRefresh();
+      setImGroupRefreshVersion(value => value + 1);
     } catch {
       message.error(t('common.saveFailed'));
     } finally {
@@ -216,15 +224,25 @@ const CollaborationTab: React.FC<CollaborationTabProps> = ({
     }
   };
 
-  const handleRemoveCollaborator = async (username: string) => {
-    try {
-      const newCollaborators = collaborators.filter((u: string) => u !== username);
-      await modifyIncidentDetail(incidentPk, { collaborators: newCollaborators });
-      message.success(t('common.saveSuccess'));
-      onRefresh();
-    } catch {
-      message.error(t('common.saveFailed'));
-    }
+  const handleRemoveCollaborator = (username: string) => {
+    Modal.confirm({
+      title: t('incidents.removeCollaborator'),
+      content: t('incidents.imGroup.removeCollaboratorWarning'),
+      okText: t('common.confirm'),
+      cancelText: t('common.cancel'),
+      centered: true,
+      onOk: async () => {
+        try {
+          const newCollaborators = collaborators.filter((u: string) => u !== username);
+          await modifyIncidentDetail(incidentPk, { collaborators: newCollaborators });
+          message.success(t('common.saveSuccess'));
+          onRefresh();
+          setImGroupRefreshVersion(value => value + 1);
+        } catch {
+          message.error(t('common.saveFailed'));
+        }
+      },
+    });
   };
 
   const toggleRepliesExpanded = (updateId: number) => {
@@ -276,7 +294,8 @@ const CollaborationTab: React.FC<CollaborationTabProps> = ({
       <div key={reply.id} className="flex gap-3 py-2 first:pt-0">
         <Avatar
           size={28}
-          style={{ backgroundColor: getAvatarColor(reply.author), fontSize: 13, flexShrink: 0 }}
+          style={{ backgroundColor: getAvatarColor(reply.author) }}
+          className="shrink-0 text-[13px]"
         >
           {displayName[0]?.toUpperCase()}
         </Avatar>
@@ -309,7 +328,7 @@ const CollaborationTab: React.FC<CollaborationTabProps> = ({
     const isExpanded = expandedReplies.has(item.id);
     const isReplying = replyingTo === item.id;
 
-    const moreMenuItems = [
+    const moreMenuItems: MoreActionsDropdownItem[] = [
       {
         key: 'delete',
         label: t('common.delete'),
@@ -326,7 +345,8 @@ const CollaborationTab: React.FC<CollaborationTabProps> = ({
           {/* Avatar */}
           <Avatar
             size={36}
-            style={{ backgroundColor: getAvatarColor(item.author), fontSize: 15, flexShrink: 0 }}
+            style={{ backgroundColor: getAvatarColor(item.author) }}
+            className="shrink-0 text-[15px]"
           >
             {displayName[0]?.toUpperCase()}
           </Avatar>
@@ -374,8 +394,8 @@ const CollaborationTab: React.FC<CollaborationTabProps> = ({
                 size="small"
                 className="text-xs text-gray-500 hover:text-blue-500 px-1.5"
                 icon={item.is_key_info
-                  ? <StarFilled className="text-yellow-500" style={{ fontSize: 13 }} />
-                  : <StarOutlined style={{ fontSize: 13 }} />}
+                  ? <StarFilled className="text-[13px] text-yellow-500" />
+                  : <StarOutlined className="text-[13px]" />}
                 onClick={() => handleToggleKeyInfo(item.id)}
               >
                 {t('incidents.markAsKeyInfo')}
@@ -386,7 +406,7 @@ const CollaborationTab: React.FC<CollaborationTabProps> = ({
                 type="text"
                 size="small"
                 className="text-xs text-gray-500 hover:text-blue-500 px-1.5"
-                icon={<MessageOutlined style={{ fontSize: 13 }} />}
+                icon={<MessageOutlined className="text-[13px]" />}
                 onClick={() => {
                   setReplyingTo(isReplying ? null : item.id);
                   setReplyContent('');
@@ -396,9 +416,13 @@ const CollaborationTab: React.FC<CollaborationTabProps> = ({
               </Button>
             </PermissionWrapper>
             <PermissionWrapper requiredPermissions={['Edit']}>
-              <Dropdown menu={{ items: moreMenuItems }} trigger={['click']} placement="bottomRight">
-                <Button type="text" size="small" className="px-1" aria-label={t('common.more')} icon={<MoreOutlined aria-hidden="true" style={{ fontSize: 14 }} />} />
-              </Dropdown>
+              <MoreActionsDropdown
+                items={moreMenuItems}
+                ariaLabel={t('common.more')}
+                placement="bottomRight"
+                buttonClassName="px-1"
+                iconStyle={{ fontSize: 14 }}
+              />
             </PermissionWrapper>
           </div>
         </div>
@@ -464,9 +488,9 @@ const CollaborationTab: React.FC<CollaborationTabProps> = ({
   /* ── Main render ────────────────────────────────── */
 
   return (
-    <div className="flex gap-0 h-full">
+    <div className="flex flex-col gap-0 h-full lg:flex-row">
       {/* Left: Updates list */}
-      <div className="flex-1 min-w-0 overflow-auto pr-4">
+      <div className="flex-1 min-w-0 overflow-auto lg:pr-4">
         <Spin spinning={loading}>
           {/* Header */}
           <div className="flex justify-between items-center mb-3">
@@ -510,7 +534,7 @@ const CollaborationTab: React.FC<CollaborationTabProps> = ({
 
           {/* Update list */}
           {filteredUpdates.length === 0 ? (
-            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('common.noData')} />
+            <CompactEmptyState description={t('common.noData')} />
           ) : (
             <div>{filteredUpdates.map(renderUpdateRow)}</div>
           )}
@@ -518,8 +542,15 @@ const CollaborationTab: React.FC<CollaborationTabProps> = ({
       </div>
 
       {/* Right: Collaborator panel */}
-      <div className="w-[220px] shrink-0 border-l border-gray-200 pl-4">
-        <div className="flex justify-between items-center mb-4">
+      <div className={`${INCIDENT_COLLABORATION_SIDEBAR_WIDTH_CLASS} min-w-0 shrink-0 border-t border-gray-200 pt-4 lg:border-l lg:border-t-0 lg:pl-4 lg:pt-0`}>
+        {IncidentCollaborationExtension && (
+          <IncidentCollaborationExtension
+            incidentPk={incidentPk}
+            incidentDetail={incidentDetail}
+            refreshVersion={imGroupRefreshVersion}
+          />
+        )}
+        <div className="flex justify-between items-center mb-2">
           <h4 className="text-sm font-semibold m-0">{t('incidents.collaborators')}</h4>
           <PermissionWrapper requiredPermissions={['Edit']}>
             <Tooltip title={t('incidents.inviteCollaborator')}>
@@ -534,14 +565,14 @@ const CollaborationTab: React.FC<CollaborationTabProps> = ({
         </div>
 
         {/* Owner */}
-        <div className="mb-4">
-          <div className="text-xs text-gray-400 mb-2 font-medium">{t('incidents.owner')}</div>
+        <div className="mb-3">
+          <div className="text-xs text-gray-400 mb-1 font-medium">{t('incidents.owner')}</div>
           {operators.map((username: string) => {
             const user = userList.find((u: UserItem) => u.username === username);
             const displayName = (user?.display_name as string) || username;
             return (
-              <div key={username} className="flex items-center gap-2.5 mb-3">
-                <Avatar size={32} style={{ backgroundColor: getAvatarColor(username), fontSize: 14 }}>
+              <div key={username} className="flex items-center gap-2 mb-2">
+                <Avatar size={28} className="text-xs" style={{ backgroundColor: getAvatarColor(username) }}>
                   {displayName[0]?.toUpperCase()}
                 </Avatar>
                 <div className="flex-1 min-w-0">
@@ -555,7 +586,7 @@ const CollaborationTab: React.FC<CollaborationTabProps> = ({
 
         {/* Collaborators */}
         <div>
-          <div className="text-xs text-gray-400 mb-2 font-medium">
+          <div className="text-xs text-gray-400 mb-1 font-medium">
             {t('incidents.collaborator')} ({collaborators.length})
           </div>
           {collaborators.length === 0 ? (
@@ -565,8 +596,8 @@ const CollaborationTab: React.FC<CollaborationTabProps> = ({
               const user = userList.find((u: UserItem) => u.username === username);
               const displayName = (user?.display_name as string) || username;
               return (
-                <div key={username} className="flex items-center gap-2.5 mb-3 group">
-                  <Avatar size={32} style={{ backgroundColor: getAvatarColor(username), fontSize: 14 }}>
+                <div key={username} className="flex items-center gap-2 mb-2 group">
+                  <Avatar size={28} className="text-xs" style={{ backgroundColor: getAvatarColor(username) }}>
                     {displayName[0]?.toUpperCase()}
                   </Avatar>
                   <div className="flex-1 min-w-0">
@@ -578,7 +609,7 @@ const CollaborationTab: React.FC<CollaborationTabProps> = ({
                       size="small"
                       danger
                       className="opacity-0 group-hover:opacity-100 transition-opacity"
-                      icon={<DeleteOutlined style={{ fontSize: 12 }} />}
+                      icon={<DeleteOutlined className="text-xs" />}
                       onClick={() => handleRemoveCollaborator(username)}
                     />
                   </PermissionWrapper>
@@ -593,7 +624,7 @@ const CollaborationTab: React.FC<CollaborationTabProps> = ({
               type="dashed"
               size="small"
               block
-              className="mt-2"
+              className="mt-1"
               icon={<UserAddOutlined />}
               onClick={() => setInviteVisible(true)}
             >

@@ -1,7 +1,7 @@
-from rest_framework import serializers
-from django.db.models import Prefetch
-from apps.node_mgmt.models.sidecar import Node
 from apps.node_mgmt.models.node_version import NodeComponentVersion
+from apps.node_mgmt.models.sidecar import Node
+from django.db.models import Prefetch
+from rest_framework import serializers
 
 
 class NodeSerializer(serializers.ModelSerializer):
@@ -23,6 +23,9 @@ class NodeSerializer(serializers.ModelSerializer):
             "install_method",
             "node_type",
             "versions",
+            "cmdb_id",
+            "monitor_id",
+            "push_status",
         ]
 
     @classmethod
@@ -79,11 +82,44 @@ class BatchOperateNodeCollectorSerializer(serializers.Serializer):
     operation = serializers.ChoiceField(choices=["start", "restart", "stop"], required=True)
 
 
+class BatchUpdateNodeOrganizationsSerializer(serializers.Serializer):
+    node_ids = serializers.ListField(
+        child=serializers.CharField(max_length=100),
+        required=True,
+        allow_empty=False,
+        max_length=100,
+    )
+    organizations = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        required=True,
+        allow_empty=False,
+        max_length=100,
+    )
+
+    def validate_node_ids(self, value):
+        if len(value) != len(set(value)):
+            raise serializers.ValidationError("node_ids must not contain duplicates")
+        return value
+
+    def validate_organizations(self, value):
+        if len(value) != len(set(value)):
+            raise serializers.ValidationError("organizations must not contain duplicates")
+        return value
+
+
 class TaskNodesQuerySerializer(serializers.Serializer):
     page = serializers.IntegerField(required=False, default=1, min_value=1)
     page_size = serializers.IntegerField(required=False, default=20, min_value=1, max_value=500)
     status = serializers.ListField(
         child=serializers.ChoiceField(choices=["waiting", "running", "success", "error"]),
         required=False,
+        allow_empty=False,
+    )
+
+
+class ModulePushSerializer(serializers.Serializer):
+    targets = serializers.ListField(
+        child=serializers.CharField(allow_blank=False),
+        required=True,
         allow_empty=False,
     )

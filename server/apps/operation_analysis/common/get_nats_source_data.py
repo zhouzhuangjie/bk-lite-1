@@ -2,11 +2,22 @@
 # @File: get_nats_source_data.py
 # @Time: 2025/7/22 18:24
 # @Author: windyzhao
+import os
+
+from django.utils import translation
 from rest_framework.exceptions import ValidationError
 
 from apps.core.logger import operation_analysis_logger as logger
-from apps.operation_analysis.nats.nats_client import DefaultNastClient
 from apps.core.utils.team_utils import get_current_team
+from apps.operation_analysis.nats.nats_client import DefaultNastClient
+from apps.rpc.base import AppClient
+
+# 连远端共享 NATS 时，旧 worker 可能没有叠色 handler。本地开发 IS_LOCAL_RPC=1 走本进程。
+_LOCAL_RPC_OVERLAY_MODULES = {
+    ("cmdb", "get_monitor_ids_by_inst_uuids"): "apps.cmdb.nats.nats",
+    ("monitor", "query_latest_active_alerts"): "apps.monitor.nats.monitor",
+    ("monitor", "query_latest_interface_metrics"): "apps.monitor.nats.monitor",
+}
 
 
 class GetNatsData:
@@ -54,6 +65,7 @@ class GetNatsData:
             "team": team,
             "user": username,
             "domain": self.request.user.domain,
+            "locale": translation.get_language() or getattr(self.request.user, "locale", None),
             "timezone": getattr(self.request.user, "timezone", None),
             "permission": permission,
             "group_tree": getattr(self.request.user, "group_tree", []),
@@ -63,7 +75,7 @@ class GetNatsData:
 
     def set_namespace_servers(self):
         """
-        构建NATS服务器连接URL
+        构建不含凭据的 NATS 服务器连接 URL
         根据enable_tls字段决定使用nats://或tls://协议
         """
         result = {}
@@ -71,13 +83,13 @@ class GetNatsData:
             # 根据enable_tls字段确定协议
             protocol = "tls" if namespace.enable_tls else "nats"
 
-            # 构建完整的服务器URL
+            # 凭据只在发起连接时单独传递，避免明文密码驻留在实例属性中。
             if ":" not in namespace.domain:
                 # 域名不包含端口,使用默认端口4222
-                server_url = f"{protocol}://{namespace.account}:{namespace.decrypt_password}@{namespace.domain}:4222"
+                server_url = f"{protocol}://{namespace.domain}:4222"
             else:
                 # 域名已包含端口,直接使用
-                server_url = f"{protocol}://{namespace.account}:{namespace.decrypt_password}@{namespace.domain}"
+                server_url = f"{protocol}://{namespace.domain}"
 
             result[namespace.id] = server_url
         return result
@@ -116,6 +128,16 @@ class GetNatsData:
         """
         获取单个 namespace 的 NATS 数据源数据，保留下游返回体语义。
         """
+        local_module = _LOCAL_RPC_OVERLAY_MODULES.get((self.namespace, self.path))
+        if local_module and os.getenv("IS_LOCAL_RPC", "0") == "1":
+            self.params.pop("namespace_id", None)
+            logger.debug(
+                "[DataSourceQuery] IS_LOCAL_RPC 本进程取数 namespace=%s path=%s",
+                self.namespace,
+                self.path,
+            )
+            return AppClient(local_module).run(self.path, **self.params)
+
         namespace = self._get_target_namespace()
         if namespace is None:
             raise RuntimeError("未找到可用的命名空间")
@@ -134,12 +156,23 @@ class GetNatsData:
         if fun is None:
             logger.warning(
                 "[DataSourceQuery] 未找到接口实现 namespace=%s nats_namespace=%s path=%s",
-                self.namespace, nats_namespace, self.path,
+                self.namespace,
+                nats_namespace,
+                self.path,
             )
             raise RuntimeError(f"NamePaces({self.namespace}) Module not found func({self.path})!")
 
         logger.debug(
             "[DataSourceQuery] 调用 NATS 取数 namespace=%s(id=%s) nats_namespace=%s path=%s",
-            namespace.name, namespace.id, nats_namespace, self.path,
+            namespace.name,
+            namespace.id,
+            nats_namespace,
+            self.path,
         )
+        if hasattr(nats_client, "DEFAULT_NATS"):
+            return fun(
+                _nats_user=namespace.account,
+                _nats_password=namespace.decrypt_password,
+                **self.params,
+            )
         return fun(**self.params)

@@ -1,5 +1,7 @@
 import json
 import re
+import traceback
+from copy import deepcopy
 from pathlib import Path
 
 from apps.core.logger import monitor_logger as logger
@@ -11,6 +13,9 @@ from apps.monitor.management.utils import (
     parse_template_filename,
 )
 from apps.monitor.services.plugin import MonitorPluginService
+from apps.monitor.services.plugin_import_bulk import prepare_plugin_import_plan
+from apps.monitor.utils.snmp_ifmib_capability import IFMIB_METRIC_CATALOG, is_ifmib_capable_plugin_data
+from apps.monitor.utils.snmp_interface_template import COMMON_IFMIB_TABLE_PATH
 from apps.rpc.node_mgmt import NodeMgmt
 
 TEMPLATE_COLLECT_TYPE_PATTERN = re.compile(r"""collect_type\s*=\s*["']([^"']+)["']""")
@@ -18,10 +23,126 @@ REMOTE_HOST_METRICS_MODULES = ("cpu", "mem", "disk", "diskio", "net", "processes
 REMOTE_HOST_METRICS_MODULES_CSV = ",".join(REMOTE_HOST_METRICS_MODULES)
 REMOTE_HOST_CONFIG_TYPES = ("host", "windows_wmi")
 METRICS_MODULES_TOML_LINE_PATTERN = re.compile(r'(?m)^(\s*metrics_modules\s*=\s*)"[^"\n]*"')
+LOCAL_TEMPLATE_ASSET_PATTERN = re.compile(
+    r"(?m)^[ \t]*# @bk_include_file (?P<path>\S+)[ \t]*$"
+)
+COMMON_IFMIB_TABLE_DIRECTIVE = "# @bk_include_ifmib_table"
+
+
+# IF-MIB 是所有 Network Device SNMP 模板共享的采集契约。此处只维护一次指标目录，
+# 导入时合并到每个厂商模板，避免为了显示指标而新增一个可被用户接入的公共插件。
+_IFMIB_METRICS_BY_INSTANCE_TYPE = {}
+
+
+def _build_common_ifmib_metrics(instance_type):
+    """Build the complete public IF-MIB metric catalog for one runtime object."""
+    cached = _IFMIB_METRICS_BY_INSTANCE_TYPE.get(instance_type)
+    if cached is not None:
+        return deepcopy(cached)
+    metrics = []
+    interface_dimensions = [
+        {"name": "ifIndex", "description": "ifIndex"},
+        {"name": "ifDescr", "description": "ifDescr"},
+    ]
+    for group, name, display_name, data_type, unit, description in IFMIB_METRIC_CATALOG:
+        if name.startswith("device_total_"):
+            direction = "In" if name.endswith("incoming_traffic") else "Out"
+            query = (
+                f"sum(rate(interface_ifHC{direction}Octets{{instance_type='{instance_type}', __$labels__}}[5m]) "
+                f"or rate(interface_if{direction}Octets{{instance_type='{instance_type}', __$labels__}}[5m])) by (instance_id)"
+            )
+            dimensions = []
+        elif name == "interface_ifSpeed":
+            query = (
+                f"(interface_ifHighSpeed{{instance_type='{instance_type}', __$labels__}} > 0) * 1000000 "
+                f"or interface_ifSpeed{{instance_type='{instance_type}', __$labels__}}"
+            )
+            dimensions = interface_dimensions
+        elif name in {"interface_ifAdminStatus", "interface_ifOperStatus"}:
+            query = f"{name}{{instance_type='{instance_type}', __$labels__}}"
+            dimensions = interface_dimensions
+        elif name in {"interface_ifInUcastPkts", "interface_ifOutUcastPkts"}:
+            direction = "In" if "InUcast" in name else "Out"
+            query = (
+                f"rate(interface_ifHC{direction}UcastPkts{{instance_type='{instance_type}', __$labels__}}[5m]) "
+                f"or rate({name}{{instance_type='{instance_type}', __$labels__}}[5m])"
+            )
+            dimensions = interface_dimensions
+        else:
+            query = f"rate({name}{{instance_type='{instance_type}', __$labels__}}[5m])"
+            dimensions = interface_dimensions
+        metrics.append(
+            {
+                "metric_group": group,
+                "name": name,
+                "query": query,
+                "display_name": display_name,
+                "data_type": data_type,
+                "unit": unit,
+                "dimensions": dimensions,
+                "instance_id_keys": ["instance_id"],
+                "description": description,
+                "is_ifmib": True,
+            }
+        )
+    _IFMIB_METRICS_BY_INSTANCE_TYPE[instance_type] = metrics
+    return deepcopy(metrics)
+
+
+def merge_common_ifmib_metrics(plugin_data):
+    """Inject the internal IF-MIB metric catalog into every Network Device SNMP template."""
+    result = deepcopy(plugin_data)
+    if not is_ifmib_capable_plugin_data(result):
+        return result
+
+    common_metrics = _build_common_ifmib_metrics(
+        re.sub(r"(?<!^)(?=[A-Z])", "_", result["name"]).lower()
+    )
+    common_metrics_by_name = {metric["name"]: metric for metric in common_metrics}
+    merged_metrics = []
+    existing_common_names = set()
+    for metric in result.get("metrics", []):
+        metric_name = metric.get("name")
+        if metric_name in common_metrics_by_name:
+            if metric_name in existing_common_names:
+                continue
+            metric = {**common_metrics_by_name[metric_name]}
+            existing_common_names.add(metric_name)
+        merged_metrics.append(metric)
+    merged_metrics.extend(
+        metric
+        for metric in common_metrics
+        if metric["name"] not in existing_common_names
+    )
+    result["metrics"] = merged_metrics
+    return result
 
 
 class PluginIdentityValidationError(ValueError):
     """Raised when plugin metadata and local template identity disagree."""
+
+
+def _expand_local_template_assets(content: str, plugin_dir: Path) -> str:
+    """将插件同目录资源嵌入配置，保持下发给采集端的配置自包含。"""
+    plugin_root = plugin_dir.resolve()
+
+    def replace(match):
+        relative_path = Path(match.group("path"))
+        asset_path = (plugin_root / relative_path).resolve()
+        if relative_path.is_absolute() or not asset_path.is_relative_to(plugin_root):
+            raise ValueError(f"非法的插件资源路径: {relative_path}")
+        if not asset_path.is_file():
+            raise ValueError(f"插件资源不存在: {relative_path}")
+        return asset_path.read_text(encoding="utf-8").rstrip("\n")
+
+    expanded = LOCAL_TEMPLATE_ASSET_PATTERN.sub(replace, content)
+    if COMMON_IFMIB_TABLE_DIRECTIVE not in expanded:
+        return expanded
+    try:
+        common_ifmib_table = COMMON_IFMIB_TABLE_PATH.read_text(encoding="utf-8").rstrip("\n")
+    except OSError as exc:
+        raise ValueError(f"通用 IF-MIB 模板不存在: {COMMON_IFMIB_TABLE_PATH}") from exc
+    return expanded.replace(COMMON_IFMIB_TABLE_DIRECTIVE, common_ifmib_table)
 
 
 def _clean_identity_value(value):
@@ -108,6 +229,7 @@ def _import_plugins_from_files(path_list):
     success_count = 0
     error_count = 0
     supplementary_map = {}
+    documents = []
 
     for file_path in path_list:
         try:
@@ -116,18 +238,32 @@ def _import_plugins_from_files(path_list):
 
             collector, collect_type = _resolve_plugin_identity(file_path, plugin_data)
             _validate_plugin_identity(file_path, collector, collect_type)
+            plugin_data = merge_common_ifmib_metrics(plugin_data)
 
             plugin_name = plugin_data.get("plugin")
-            MonitorPluginService.import_monitor_plugin(plugin_data)
+            plugin_data["_mark_objects_builtin"] = True
+            # 新 plugin 首次导入时,自动生成 language/ 空骨架(check_plugin_languages CI 要求)
+            MonitorPluginService._ensure_language_skeleton(Path(file_path).parent, plugin_name)
+            prepare_plugin_import_plan(plugin_data)
+            documents.append(plugin_data)
             logger.info(f"导入插件成功: {plugin_name} ({collector}/{collect_type})")
             success_count += 1
 
         except Exception as e:
             logger.error(f"导入插件失败: {file_path}, 错误: {e}")
-            import traceback
-
             logger.error(traceback.format_exc())
             error_count += 1
+
+    if documents:
+        try:
+            MonitorPluginService.import_monitor_plugins(documents)
+        except Exception as e:
+            logger.error("批量导入插件失败，已回滚本次插件写入: %s", e)
+            logger.error(traceback.format_exc())
+            error_count += success_count
+            success_count = 0
+            # 整批 atomic 写失败不得伪装成初始化成功，否则 batch_init 绿但插件仍旧。
+            raise
 
     return success_count, error_count, supplementary_map
 
@@ -243,7 +379,7 @@ def _load_templates_to_memory():
     # 按插件 ID 分组的 UI 模板
     all_ui_templates = {tpl.plugin_id: tpl for tpl in MonitorPluginUITemplate.objects.select_related("plugin").all()}
 
-    logger.info(f"已加载配置模板和 UI 模板到内存")
+    logger.info("已加载配置模板和 UI 模板到内存")
     return all_config_templates, all_ui_templates
 
 
@@ -254,21 +390,29 @@ def _process_config_templates(plugin_dir, plugin_obj, db_templates):
     to_create = []
     to_update = []
     file_templates = {}
+    failed_template_keys = set()
 
     # 收集文件中的模板
     for j2_file in plugin_dir.glob("*.j2"):
         if not j2_file.is_file():
             continue
+        template_key = None
         try:
             type_name, config_type, file_type = parse_template_filename(j2_file.name)
             if not type_name or not config_type or not file_type:
                 continue
 
-            content = j2_file.read_text(encoding="utf-8")
             template_key = (type_name, config_type, file_type)
+            content = _expand_local_template_assets(
+                j2_file.read_text(encoding="utf-8"),
+                plugin_dir,
+            )
             file_templates[template_key] = content
         except Exception as e:
             logger.error(f"读取模板文件失败: {j2_file}, 错误: {e}")
+            if template_key:
+                # 单个文件失败时保留数据库中的最后可用版本，避免初始化过程产生破坏性删除。
+                failed_template_keys.add(template_key)
 
     # 对比数据库模板
     for template_key, content in file_templates.items():
@@ -291,7 +435,11 @@ def _process_config_templates(plugin_dir, plugin_obj, db_templates):
             )
 
     # 找出需要删除的模板
-    to_delete = [db_template for template_key, db_template in db_templates.items() if template_key not in file_templates]
+    to_delete = [
+        db_template
+        for template_key, db_template in db_templates.items()
+        if template_key not in file_templates and template_key not in failed_template_keys
+    ]
 
     return to_create, to_update, to_delete
 
@@ -309,6 +457,14 @@ def _process_ui_templates(plugin_dir, plugin_obj, db_ui_template):
     if ui_file.exists() and ui_file.is_file():
         try:
             ui_data = json.loads(ui_file.read_text(encoding="utf-8"))
+            # SNMP：入库前合并接口过滤字段，避免仅依赖读时 enrich
+            if (
+                getattr(plugin_obj, "collect_type", None) == "snmp"
+                or plugin_dir.parent.name == "snmp"
+            ):
+                from apps.monitor.utils.snmp_interface_template import merge_snmp_interface_filter_ui
+
+                ui_data = merge_snmp_interface_filter_ui(ui_data, plugin=plugin_obj) or ui_data
 
             if db_ui_template:
                 if db_ui_template.content != ui_data:
@@ -464,7 +620,7 @@ def _cleanup_removed_plugins(path_list):
             removed_plugins.delete()
 
         logger.info(f"已删除 {removed_count} 个从内置目录中移除的插件: {removed_names}")
-        logger.info(f"关联的配置模板和 UI 模板已自动级联删除")
+        logger.info("关联的配置模板和 UI 模板已自动级联删除")
 
 
 def _cleanup_orphan_objects():
@@ -483,7 +639,7 @@ def _cleanup_orphan_objects():
             orphan_objects.delete()
 
         logger.info(f"已删除 {orphan_count} 个没有关联插件的监控对象: {orphan_names}")
-        logger.info(f"关联的指标组、指标、监控实例已自动级联删除")
+        logger.info("关联的指标组、指标、监控实例已自动级联删除")
 
 
 def _cleanup_empty_builtin_metric_groups():
@@ -553,3 +709,11 @@ def migrate_plugin():
     # 第八阶段：清理空的内置指标分组
     _cleanup_empty_builtin_metric_groups()
     logger.info(f"补充指标重算完成: 更新={reconciled_count}")
+
+    # 插件目录 / UI.json 变更后使进程内读盘缓存失效。
+    from apps.monitor.services.plugin_guide import PluginGuideService
+    from apps.monitor.services.ui_template_locale import clear_ui_file_overlay_cache
+
+    PluginGuideService.clear_plugin_dir_cache()
+    clear_ui_file_overlay_cache()
+    logger.info("插件目录与 UI 模板磁盘缓存已清理")

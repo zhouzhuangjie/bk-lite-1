@@ -2,8 +2,11 @@
 import React, { useEffect, useState, useRef, useMemo } from 'react';
 import assetSearchStyle from './index.module.scss';
 import { useTranslation } from '@/utils/i18n';
-import { SearchOutlined } from '@ant-design/icons';
-import { ArrowRightOutlined } from '@ant-design/icons';
+import {
+  ArrowLeftOutlined,
+  ArrowRightOutlined,
+  SearchOutlined,
+} from '@ant-design/icons';
 import { AttrFieldType, UserItem } from '@/app/cmdb/types/assetManage';
 import {
   AssetListItem,
@@ -18,22 +21,23 @@ import {
   Input,
   Tabs,
   Button,
-  Empty,
   Pagination,
   Checkbox,
   message,
 } from 'antd';
+import CompactEmptyState from '@/components/compact-empty-state';
 import useApiClient from '@/utils/request';
 import { useCommon } from '@/app/cmdb/context/common';
-import { deepClone, getFieldItem, getIconUrl } from '@/app/cmdb/utils/common';
+import { deepClone, getFieldItem } from '@/app/cmdb/utils/common';
 import {
   useChangeRecordApi,
   useClassificationApi,
   useModelApi,
   useInstanceApi,
 } from '@/app/cmdb/api';
-import TagCapsuleGroup from '@/app/cmdb/components/tag-capsule-group';
+import TagCapsuleGroup from '@/components/tag-capsule-group';
 import { normalizeTagValues } from '@/app/cmdb/utils/tag';
+import { resolveCmdbInstUuid } from '@/app/cmdb/utils/instUuid';
 import { useRouter } from 'next/navigation';
 import { useUserInfoContext } from '@/context/userInfo';
 import dayjs from 'dayjs';
@@ -44,6 +48,7 @@ import AssetSearchLanding, {
   RecentChangeItem,
 } from './landing';
 import { useFollowedAssets } from '@/app/cmdb/hooks/useFollowedAssets';
+import { resolveVisibleFollowedAssets } from '@/app/cmdb/utils/followedAssets';
 import { getChangeOperationTone } from '@/app/cmdb/utils/assetSearchDisplay';
 import {
   buildCategoryEntries,
@@ -67,15 +72,14 @@ interface ChangeRecordListResponse {
   count: number;
 }
 
-interface FollowedAssetDetailResponse {
-  model_id?: string;
+interface FollowedAssetDetailResponse extends AssetListItem {
+  inst_uuid: string;
   model_name?: string;
   inst_name?: string;
   ip_addr?: string;
   classification_id?: string;
   icn?: string;
   organization_display?: string;
-  organization?: string[];
 }
 
 const AssetSearch = () => {
@@ -87,9 +91,9 @@ const AssetSearch = () => {
 
   const { getModelAttrList } = useModelApi();
   const {
+    searchInstances,
     fulltextSearchStats,
     fulltextSearchByModel,
-    getInstanceDetail,
     getModelInstanceCount,
   } = useInstanceApi();
   const { getClassificationList } = useClassificationApi();
@@ -283,35 +287,38 @@ const AssetSearch = () => {
   const loadFollowedAssets = async (sourceItems = followedItems) => {
     setFollowedLoading(true);
     try {
-      const visibleItems = sourceItems.slice(0, FOLLOWED_ASSET_LIMIT);
-      const settled = await Promise.allSettled(
-        visibleItems.map(async (item) => {
-          const detail = await getInstanceDetail(String(item.inst_id)) as FollowedAssetDetailResponse;
-          if (!detail || typeof detail !== 'object') {
-            throw new Error('Invalid followed asset detail');
-          }
-          const model =
-            modelList.find((modelItem) => modelItem.model_id === item.model_id) ||
-            modelList.find((modelItem) => modelItem.model_id === detail.model_id);
+      const resolvedAssets = await resolveVisibleFollowedAssets<FollowedAssetDetailResponse>(
+        sourceItems,
+        async (modelId, instanceUuids) => {
+          const response = await searchInstances({
+            model_id: modelId,
+            query_list: [{ field: 'inst_uuid', type: 'str[]', value: instanceUuids }],
+            page: 1,
+            page_size: instanceUuids.length,
+          }) as { insts?: FollowedAssetDetailResponse[] };
+          return response.insts || [];
+        },
+        FOLLOWED_ASSET_LIMIT
+      );
+      const modelById = new Map(
+        modelList.map((modelItem) => [modelItem.model_id, modelItem])
+      );
+      setFollowedAssets(
+        resolvedAssets.map(({ item, detail }) => {
+          const model = modelById.get(item.model_id) || modelById.get(detail.model_id);
           const modelId = item.model_id;
           return {
-            key: `${modelId}-${item.inst_id}`,
-            inst_id: item.inst_id,
+            key: `${modelId}-${item.inst_uuid}`,
+            inst_uuid: item.inst_uuid,
             model_id: modelId,
             model_name: model?.model_name || detail.model_name || modelId,
-            inst_name: detail.inst_name || detail.ip_addr || String(item.inst_id),
+            inst_name: detail.inst_name || detail.ip_addr || String(item.inst_uuid),
             classification_id: model?.classification_id || detail.classification_id || '',
             icn: model?.icn || detail.icn || '',
             organization: detail.organization_display || (Array.isArray(detail.organization) ? detail.organization.join(' / ') : ''),
-            icon: getIconUrl({ icn: model?.icn || detail.icn || '', model_id: modelId }),
             followed: true,
           } as FollowedAssetViewItem;
         })
-      );
-      setFollowedAssets(
-        settled
-          .filter((result): result is PromiseFulfilledResult<FollowedAssetViewItem> => result.status === 'fulfilled')
-          .map((result) => result.value)
       );
     } catch {
       setFollowedAssets([]);
@@ -331,27 +338,43 @@ const AssetSearch = () => {
         modelList,
         instanceCount: instCount,
         limit: 6,
-      }).map((entry) => ({
-        ...entry,
-        icon: entry.target_model_id
-          ? getIconUrl({ icn: entry.target_icn || '', model_id: entry.target_model_id })
-          : '',
-      }));
+      });
       setCategoryEntries(entries);
     } catch {
       setCategoryEntries([]);
     }
   };
 
+  const resetToLanding = () => {
+    setSearchText('');
+    setShowSearch(true);
+    setModelStats([]);
+    setCurrentModelData([]);
+    setItems([]);
+    setPropertyList([]);
+    setActiveTab('');
+    setActiveInstItem(-1);
+    setCurrentPage(1);
+    setTotalCount(0);
+    setPageLoading(false);
+  };
+
   const handleTextChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setSearchText(e.target.value);
+    const nextSearchText = e.target.value;
+    setSearchText(nextSearchText);
+    if (!nextSearchText) {
+      resetToLanding();
+    }
   };
 
   const handleSearch = async (keyword?: string) => {
     const nextSearchText = typeof keyword === 'string' ? keyword : searchText;
+    if (!nextSearchText) {
+      resetToLanding();
+      return;
+    }
     setSearchText(nextSearchText);
-    setShowSearch(!nextSearchText);
-    if (!nextSearchText) return;
+    setShowSearch(false);
 
     const histories = deepClone(historyList);
     if (
@@ -450,7 +473,8 @@ const AssetSearch = () => {
             key: key,
             label: properties.find((item) => item.attr_id === key)?.attr_name,
             children: value,
-            id: desc._id,
+            id: resolveCmdbInstUuid(desc.inst_uuid) || '',
+            inst_uuid: resolveCmdbInstUuid(desc.inst_uuid) || undefined,
           };
         })
         .filter((desc) => !!desc.label);
@@ -664,13 +688,21 @@ const AssetSearch = () => {
         key: key,
         label: propertyList.find((item) => item.attr_id === key)?.attr_name,
         children: value,
-        id: currentInst._id,
+        id: resolveCmdbInstUuid(currentInst.inst_uuid) || '',
+        inst_uuid: resolveCmdbInstUuid(currentInst.inst_uuid) || undefined,
       }))
       .filter((desc) => !!desc.label);
   }, [activeInstItem, currentModelData, propertyList]);
 
   const linkToDetail = () => {
     if (currentInstDetail.length === 0) return;
+    const instUuid = resolveCmdbInstUuid(
+      currentInstDetail[0]?.inst_uuid || currentInstDetail[0]?.id
+    );
+    if (!instUuid) {
+      message.warning('实例缺少合法 inst_uuid，请先完成 UUID 存量清洗');
+      return;
+    }
     const params: any = {
       icn: '',
       model_name:
@@ -678,7 +710,7 @@ const AssetSearch = () => {
         '--',
       model_id: activeTab,
       classification_id: '',
-      inst_id: currentInstDetail[0]?.id || '',
+      inst_uuid: instUuid,
       inst_name: currentInstDetail.find(
         (title: InstDetailItem) => title.key === 'inst_name'
       )?.children,
@@ -716,12 +748,17 @@ const AssetSearch = () => {
   };
 
   const openFollowedAsset = (item: FollowedAssetViewItem) => {
+    const instUuid = resolveCmdbInstUuid(item.inst_uuid);
+    if (!instUuid) {
+      message.warning('实例缺少合法 inst_uuid，请先完成 UUID 存量清洗');
+      return;
+    }
     const params: any = {
       icn: item.icn || '',
       model_name: item.model_name || '',
       model_id: item.model_id,
       classification_id: item.classification_id || '',
-      inst_id: item.inst_id,
+      inst_uuid: instUuid,
       inst_name: item.inst_name,
     };
     router.push(`/cmdb/assetData/detail/baseInfo?${new URLSearchParams(params).toString()}`);
@@ -729,7 +766,7 @@ const AssetSearch = () => {
 
   const toggleFollowedAsset = async (item: FollowedAssetViewItem) => {
     if (item.followed === false) {
-      await followAsset({ model_id: item.model_id, inst_id: item.inst_id });
+      await followAsset({ model_id: item.model_id, inst_uuid: item.inst_uuid });
       message.success(t('AssetSearch.followSuccess'));
       setFollowedAssets((prev) =>
         prev.map((asset) =>
@@ -739,7 +776,7 @@ const AssetSearch = () => {
       return;
     }
 
-    await unfollowAsset(item.model_id, item.inst_id);
+    await unfollowAsset(item.model_id, item.inst_uuid);
     message.success(t('AssetSearch.unfollowSuccess'));
     setFollowedAssets((prev) =>
       prev.map((asset) =>
@@ -843,6 +880,13 @@ const AssetSearch = () => {
                 marginBottom: '12px',
               }}
             >
+              <Button
+                type="text"
+                icon={<ArrowLeftOutlined />}
+                onClick={resetToLanding}
+              >
+                {t('common.backToHome')}
+              </Button>
               <Search
                 className={assetSearchStyle.input}
                 value={searchText}
@@ -889,7 +933,7 @@ const AssetSearch = () => {
                   onChange={onTabChange}
                 />
               ) : (
-                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} />
+                <CompactEmptyState description={t('common.noData')} />
               )}
             </div>
           </div>

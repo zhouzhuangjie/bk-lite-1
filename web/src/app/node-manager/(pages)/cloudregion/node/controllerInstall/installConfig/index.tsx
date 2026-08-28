@@ -6,7 +6,7 @@ import React, {
   useCallback,
   useMemo
 } from 'react';
-import { Alert, Button, Form, Select, Segmented } from 'antd';
+import { Alert, Button, Checkbox, Form, Select, Segmented } from 'antd';
 import useApiClient from '@/utils/request';
 import { useTranslation } from '@/utils/i18n';
 import { TableDataItem } from '@/app/node-manager/types';
@@ -32,7 +32,27 @@ import useControllerApi from '@/app/node-manager/api/useControllerApi';
 import useCloudId from '@/app/node-manager/hooks/useCloudRegionId';
 import { useInstallWays } from '@/app/node-manager/hooks/node';
 import { useUserInfoContext } from '@/context/userInfo';
+import { useClientData } from '@/context/client';
+import { getSoldModulePushTargets } from '@/app/node-manager/utils/modulePush';
 import { message } from 'antd';
+import {
+  applyIpAsDefaultNodeName,
+  applyWinrmCertificateValidation,
+  DEFAULT_WINRM_CERTIFICATE_VALIDATION
+} from './utils';
+import { buildOrganizationOptions } from './excelImportUtils';
+import {
+  collectIpsFromRows,
+  findInstallIpUniquenessError
+} from './ipUniqueness';
+import WinrmCertificateValidationField from '@/app/node-manager/components/winrm-certificate-validation-field';
+import WinrmSchemeField from '@/app/node-manager/components/winrm-scheme-field';
+import {
+  applyWinrmScheme,
+  defaultWinrmPort,
+  isWinrmSchemePortMismatch,
+  type WinrmScheme
+} from '@/app/node-manager/utils/winrm';
 
 interface InstallConfigProps {
   onNext: (data: any) => void;
@@ -48,21 +68,13 @@ interface ControllerPlatformOption {
 const InstallConfig: React.FC<InstallConfigProps> = ({ onNext, cancel }) => {
   const { t } = useTranslation();
   const { isLoading } = useApiClient();
-  const { installController } = useNodeManagerApi();
+  const { installController, getNodeList } = useNodeManagerApi();
   const { manualInstallController, getControllerList } = useControllerApi();
   const commonContext = useUserInfoContext();
-  const INFO_ITEM = useMemo(
-    () => ({
-      key: uuidv4(),
-      ip: null,
-      organizations: [commonContext.selectedGroup?.id],
-      port: 22,
-      username: 'root',
-      auth_type: 'password',
-      password: null,
-      node_name: null
-    }),
-    [commonContext.selectedGroup?.id]
+  const { clientData } = useClientData();
+  const soldPushTargets = useMemo(
+    () => getSoldModulePushTargets(clientData),
+    [clientData]
   );
   const { getPackages } = useNodeManagerApi();
   const cloudId = useCloudId();
@@ -74,6 +86,15 @@ const InstallConfig: React.FC<InstallConfigProps> = ({ onNext, cancel }) => {
     label: item.name,
     value: item.id
   }));
+  const excelGroupList = useMemo(
+    () =>
+      buildOrganizationOptions(
+        commonContext?.groupTree?.length
+          ? commonContext.groupTree
+          : commonContext?.groups || []
+      ),
+    [commonContext?.groupTree, commonContext?.groups]
+  );
   const batchEditModalRef = useRef<any>(null);
   const excelImportModalRef = useRef<any>(null);
   const hasFetchedPlatformsRef = useRef<boolean>(false);
@@ -82,6 +103,9 @@ const InstallConfig: React.FC<InstallConfigProps> = ({ onNext, cancel }) => {
   const [versionLoading, setVersionLoading] = useState<boolean>(false);
   const [platformLoading, setPlatformLoading] = useState<boolean>(false);
   const [installMethod, setInstallMethod] = useState<string>('remoteInstall');
+  const [winrmCertValidation, setWinrmCertValidation] =
+    useState<boolean>(DEFAULT_WINRM_CERTIFICATE_VALIDATION);
+  const [winrmScheme, setWinrmScheme] = useState<WinrmScheme>('https');
   const [os, setOs] = useState<string>('');
   const [cpuArchitecture, setCpuArchitecture] = useState<string>('');
   const [controllerPlatforms, setControllerPlatforms] = useState<
@@ -95,13 +119,44 @@ const InstallConfig: React.FC<InstallConfigProps> = ({ onNext, cancel }) => {
   const { renderTableColumn, renderActionColumn } = useTableRenderer();
 
   useEffect(() => {
+    form.setFieldsValue({ push_targets: soldPushTargets });
+  }, [form, soldPushTargets]);
+  const createInfoItem = useCallback(
+    (
+      targetOS: string,
+      validateWinrmCertificate = DEFAULT_WINRM_CERTIFICATE_VALIDATION,
+      scheme: WinrmScheme = 'https'
+    ) => ({
+      key: uuidv4(),
+      ip: null,
+      organizations: [commonContext.selectedGroup?.id],
+      port: targetOS === 'windows' ? defaultWinrmPort(scheme) : 22,
+      username: targetOS === 'windows' ? 'Administrator' : 'root',
+      auth_type: 'password',
+      password: null,
+      winrm_scheme: targetOS === 'windows' ? scheme : 'https',
+      winrm_transport: 'ntlm',
+      winrm_cert_validation:
+        targetOS === 'windows' && scheme === 'https'
+          ? validateWinrmCertificate
+          : targetOS !== 'windows',
+      node_name: null
+    }),
+    [commonContext.selectedGroup?.id]
+  );
+  const INFO_ITEM = useMemo(
+    () => createInfoItem(os, winrmCertValidation, winrmScheme),
+    [createInfoItem, os, winrmCertValidation, winrmScheme]
+  );
+
+  useEffect(() => {
     if (tableData.length === 0) {
       setTableData([{ ...INFO_ITEM, key: uuidv4() }]);
     }
   }, [INFO_ITEM]);
 
   // 获取表格配置
-  const tableConfig = useTableConfig(installMethod);
+  const tableConfig = useTableConfig(installMethod, os);
 
   // 添加行
   const addInfoItem = useCallback(
@@ -179,14 +234,6 @@ const InstallConfig: React.FC<InstallConfigProps> = ({ onNext, cancel }) => {
       ) || null
     );
   }, [controllerPlatforms, cpuArchitecture, os]);
-
-  // Windows 系统只支持手动安装
-  const availableInstallWays = useMemo(() => {
-    if (os === 'windows') {
-      return installWays.filter((way) => way.value === 'manualInstall');
-    }
-    return installWays;
-  }, [os, installWays]);
 
   // 对当前查询结果做去重，接口已按操作系统和 CPU 架构精确过滤
   const filteredSidecarVersionList = useMemo(() => {
@@ -278,6 +325,19 @@ const InstallConfig: React.FC<InstallConfigProps> = ({ onNext, cancel }) => {
 
     if (nextOs !== os) {
       setOs(nextOs);
+      setWinrmScheme('https');
+      setWinrmCertValidation(DEFAULT_WINRM_CERTIFICATE_VALIDATION);
+      setTableData([
+        {
+          ...createInfoItem(
+            nextOs,
+            DEFAULT_WINRM_CERTIFICATE_VALIDATION,
+            'https'
+          ),
+          key: uuidv4()
+        }
+      ]);
+      setSelectedRowKeys([]);
     }
 
     if (nextArchitecture !== cpuArchitecture) {
@@ -288,7 +348,7 @@ const InstallConfig: React.FC<InstallConfigProps> = ({ onNext, cancel }) => {
       os: nextOs || undefined,
       cpu_architecture: nextArchitecture || undefined
     });
-  }, [availableOSOptions, controllerPlatforms, cpuArchitecture, form, os, platformLoading]);
+  }, [availableOSOptions, controllerPlatforms, cpuArchitecture, createInfoItem, form, os, platformLoading]);
 
   useEffect(() => {
     if (isLoading || hasFetchedPlatformsRef.current) {
@@ -308,14 +368,6 @@ const InstallConfig: React.FC<InstallConfigProps> = ({ onNext, cancel }) => {
   }, [isLoading, os, cpuArchitecture]);
 
   useEffect(() => {
-    if (os === 'windows' && installMethod !== 'manualInstall') {
-      setInstallMethod('manualInstall');
-      setTableData([{ ...INFO_ITEM, key: uuidv4() }]);
-      setSelectedRowKeys([]);
-    }
-  }, [INFO_ITEM, installMethod, os]);
-
-  useEffect(() => {
     form.setFieldValue('install', installMethod);
   }, [form, installMethod]);
 
@@ -333,10 +385,25 @@ const InstallConfig: React.FC<InstallConfigProps> = ({ onNext, cancel }) => {
   const handleBatchEditSuccess = (editedFields: any) => {
     const updatedData = tableData.map((item) => {
       if (selectedRowKeys.includes(item.key as string)) {
-        return {
-          ...item,
+        const rowWithIpDefault = Object.prototype.hasOwnProperty.call(
+          editedFields,
+          'ip'
+        )
+          ? applyIpAsDefaultNodeName(item, editedFields.ip)
+          : item;
+        const nodeNameWasSynced =
+          rowWithIpDefault.node_name !== item.node_name;
+        const updatedRow = {
+          ...rowWithIpDefault,
           ...editedFields
         };
+        if (
+          nodeNameWasSynced ||
+          Object.prototype.hasOwnProperty.call(editedFields, 'node_name')
+        ) {
+          updatedRow.node_name_error = null;
+        }
+        return updatedRow;
       }
       return item;
     });
@@ -363,19 +430,37 @@ const InstallConfig: React.FC<InstallConfigProps> = ({ onNext, cancel }) => {
     });
   };
 
-  const handleImport = () => {
+  const loadExistingNodeIps = useCallback(async (): Promise<string[]> => {
+    try {
+      const res = await getNodeList({
+        cloud_region_id: cloudId,
+        page: 1,
+        page_size: 500
+      });
+      return collectIpsFromRows(res?.items || []);
+    } catch {
+      return [];
+    }
+  }, [cloudId, getNodeList]);
+
+  const handleImport = async () => {
+    const nodeIps = await loadExistingNodeIps();
     excelImportModalRef.current?.showModal({
       title: t('node-manager.cloudregion.integrations.importData'),
       columns: tableConfig,
-      groupList
+      groupList: excelGroupList,
+      existingIps: nodeIps,
+      occupiedIps: collectIpsFromRows(tableData)
     });
   };
 
   const handleImportSuccess = (importedData: any[]) => {
-    const newRows = importedData.map((row) => ({
-      ...row,
-      key: uuidv4()
-    }));
+      const newRows = importedData.map((row) => ({
+        ...createInfoItem(os, winrmCertValidation, winrmScheme),
+        ...row,
+        winrm_scheme: winrmScheme,
+        key: uuidv4()
+      }));
     setTableData([...tableData, ...newRows]);
   };
 
@@ -399,7 +484,7 @@ const InstallConfig: React.FC<InstallConfigProps> = ({ onNext, cancel }) => {
     }
   };
 
-  const validateTableData = (): boolean => {
+  const validateTableData = (existingIps: string[] = []): boolean => {
     if (!tableConfig) return true;
     let hasError = false;
     const newData = [...tableData];
@@ -450,6 +535,14 @@ const InstallConfig: React.FC<InstallConfigProps> = ({ onNext, cancel }) => {
             }
           }
         }
+        if (
+          !errorMsg &&
+          name === 'port' &&
+          os === 'windows' &&
+          isWinrmSchemePortMismatch(row.winrm_scheme || winrmScheme, Number(value))
+        ) {
+          errorMsg = t('node-manager.cloudregion.node.winrmSchemePortMismatch');
+        }
         if (errorMsg) {
           hasError = true;
           newData[index] = {
@@ -459,6 +552,27 @@ const InstallConfig: React.FC<InstallConfigProps> = ({ onNext, cancel }) => {
         }
       });
     });
+    const ipUniquenessError = findInstallIpUniquenessError(newData, existingIps);
+    if (ipUniquenessError) {
+      hasError = true;
+      const errorMsg =
+        ipUniquenessError.kind === 'exists'
+          ? t('node-manager.cloudregion.node.ipExistsInCloudRegion', '', {
+            ip: ipUniquenessError.ip
+          })
+          : t('node-manager.cloudregion.node.duplicateIp', '', {
+            ip: ipUniquenessError.ip
+          });
+      newData.forEach((row, index) => {
+        if (String(row.ip || '').trim() === ipUniquenessError.ip) {
+          newData[index] = {
+            ...newData[index],
+            ip_error: errorMsg
+          };
+        }
+      });
+      message.error(errorMsg);
+    }
     // 更新数据源以显示错误状态
     setTableData(newData);
     if (hasError) {
@@ -476,8 +590,30 @@ const InstallConfig: React.FC<InstallConfigProps> = ({ onNext, cancel }) => {
 
   const changeCollectType = (id: string) => {
     setInstallMethod(id);
-    setTableData([{ ...INFO_ITEM, key: uuidv4() }]);
+    setWinrmScheme('https');
+    setWinrmCertValidation(DEFAULT_WINRM_CERTIFICATE_VALIDATION);
+    setTableData([
+      {
+        ...createInfoItem(os, DEFAULT_WINRM_CERTIFICATE_VALIDATION, 'https'),
+        key: uuidv4()
+      }
+    ]);
     setSelectedRowKeys([]);
+  };
+
+  const changeWinrmScheme = (scheme: WinrmScheme) => {
+    setWinrmScheme(scheme);
+    if (scheme === 'http') {
+      setWinrmCertValidation(false);
+    }
+    setTableData((rows) => applyWinrmScheme(rows, scheme));
+  };
+
+  const changeWinrmCertValidation = (enabled: boolean) => {
+    setWinrmCertValidation(enabled);
+    setTableData((rows) =>
+      applyWinrmCertificateValidation(rows, enabled)
+    );
   };
 
   const getSidecarList = async () => {
@@ -499,7 +635,8 @@ const InstallConfig: React.FC<InstallConfigProps> = ({ onNext, cancel }) => {
     setConfirmLoading(true);
     try {
       const values = await form.validateFields();
-      if (!validateTableData()) {
+      const existingIps = await loadExistingNodeIps();
+      if (!validateTableData(existingIps)) {
         setConfirmLoading(false);
         return;
       }
@@ -509,7 +646,8 @@ const InstallConfig: React.FC<InstallConfigProps> = ({ onNext, cancel }) => {
         cloud_region_id: cloudId,
         work_node: name,
         package_id: values.sidecar_package || '',
-        cpu_architecture: cpuArchitecture
+        cpu_architecture: cpuArchitecture,
+        push_targets: values.push_targets || []
       };
       if (isRemote) {
         params.nodes = tableData.map((item) => ({
@@ -521,6 +659,9 @@ const InstallConfig: React.FC<InstallConfigProps> = ({ onNext, cancel }) => {
           username: item.username,
           password: item.private_key ? '' : item.password,
           private_key: item.private_key || '',
+          winrm_scheme: item.winrm_scheme,
+          winrm_transport: item.winrm_transport,
+          winrm_cert_validation: item.winrm_cert_validation,
           node_name: item.node_name
         }));
       } else {
@@ -587,6 +728,19 @@ const InstallConfig: React.FC<InstallConfigProps> = ({ onNext, cancel }) => {
             value={os}
             onChange={(value) => {
               setOs(value);
+              setWinrmScheme('https');
+              setWinrmCertValidation(DEFAULT_WINRM_CERTIFICATE_VALIDATION);
+              setTableData([
+                {
+                  ...createInfoItem(
+                    value,
+                    DEFAULT_WINRM_CERTIFICATE_VALIDATION,
+                    'https'
+                  ),
+                  key: uuidv4()
+                }
+              ]);
+              setSelectedRowKeys([]);
               form.setFieldValue('sidecar_package', null);
             }}
             disabled={platformLoading || availableOSOptions.length <= 1}
@@ -615,17 +769,35 @@ const InstallConfig: React.FC<InstallConfigProps> = ({ onNext, cancel }) => {
         >
           <Form.Item name="install" noStyle>
             <Segmented
-              options={availableInstallWays}
+              options={installWays}
               value={installMethod}
               onChange={changeCollectType}
             />
           </Form.Item>
           <div className="mt-[8px] text-[12px] text-[var(--color-text-3)]">
             {isRemote
-              ? t('node-manager.cloudregion.node.installWayDes')
+              ? t(
+                os === 'windows'
+                  ? 'node-manager.cloudregion.node.windowsRemoteInstallDes'
+                  : 'node-manager.cloudregion.node.installWayDes'
+              )
               : t('node-manager.cloudregion.node.autoInstallDes')}
           </div>
         </Form.Item>
+        {isRemote && os === 'windows' && (
+          <>
+            <WinrmSchemeField
+              value={winrmScheme}
+              onChange={changeWinrmScheme}
+            />
+            {winrmScheme === 'https' && (
+              <WinrmCertificateValidationField
+                checked={winrmCertValidation}
+                onChange={changeWinrmCertValidation}
+              />
+            )}
+          </>
+        )}
         <Form.Item<ControllerInstallFields>
           required
           label={t('node-manager.cloudregion.node.sidecarVersion')}
@@ -673,6 +845,24 @@ const InstallConfig: React.FC<InstallConfigProps> = ({ onNext, cancel }) => {
             </div>
           )}
         </Form.Item>
+        {soldPushTargets.length > 0 && (
+          <Form.Item
+            name="push_targets"
+            label={t('node-manager.cloudregion.node.pushTargets')}
+            extra={t('node-manager.cloudregion.node.pushTargetsHint')}
+            initialValue={soldPushTargets}
+          >
+            <Checkbox.Group
+              options={soldPushTargets.map((target) => ({
+                label:
+                  target === 'cmdb'
+                    ? t('node-manager.cloudregion.node.pushTargetCmdb')
+                    : t('node-manager.cloudregion.node.pushTargetMonitor'),
+                value: target
+              }))}
+            />
+          </Form.Item>
+        )}
         <div className="flex items-center justify-between mb-[10px]">
           <span className="text-[14px]">
             {t('node-manager.cloudregion.node.installInfo')}

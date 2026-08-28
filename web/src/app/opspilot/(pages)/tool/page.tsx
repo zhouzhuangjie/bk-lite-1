@@ -1,6 +1,7 @@
 'use client';
 import React, { useState, useEffect } from 'react';
-import { Form, message, Button, Menu, Modal, Drawer, Switch, Tooltip, Segmented, Input, Empty, Upload, Space, Skeleton } from 'antd';
+import { Form, message, Button, Menu, Modal, Drawer, Switch, Tooltip, Segmented,  Upload, Skeleton } from 'antd';
+import CompactEmptyState from '@/components/compact-empty-state';
 import type { UploadFile } from 'antd/es/upload/interface';
 import { Store } from 'antd/lib/form/interface';
 import { useTranslation } from '@/utils/i18n';
@@ -8,6 +9,8 @@ import EntityList from '@/components/entity-list';
 import DynamicForm from '@/components/dynamic-form';
 import OperateModal from '@/components/operate-modal';
 import GroupTreeSelect from '@/components/group-tree-select';
+import SearchActionBar from '@/components/search-action-bar';
+import FilterToolbar from '@/components/filter-toolbar';
 import { useUserInfoContext } from '@/context/userInfo';
 import { Tool, TagOption, ToolPayload } from '@/app/opspilot/types/tool';
 import PermissionWrapper from "@/components/permission";
@@ -37,13 +40,14 @@ const ToolListPage: React.FC = () => {
   const [availableTools, setAvailableTools] = useState<any[]>([]);
   const [fetchingTools, setFetchingTools] = useState<boolean>(false);
   const [enableAuth, setEnableAuth] = useState<boolean>(false);
-  const [assetView, setAssetView] = useState<'builtin' | 'mcp' | 'skills'>('skills');
+  const [assetView, setAssetView] = useState<'builtin' | 'mcp' | 'skills'>('builtin');
   const [skillAssets, setSkillAssets] = useState<SkillPackage[]>([]);
   const [skillAssetsLoading, setSkillAssetsLoading] = useState<boolean>(false);
   const [skillSearchKeyword, setSkillSearchKeyword] = useState('');
   const [hoveredSkillAssetKey, setHoveredSkillAssetKey] = useState<string | null>(null);
   const [selectedSkillAssetForDetail, setSelectedSkillAssetForDetail] = useState<SkillPackage | null>(null);
   const [isImportSkillModalVisible, setIsImportSkillModalVisible] = useState(false);
+  const [isImporting, setIsImporting] = useState(false);
   const [skillPackageFileList, setSkillPackageFileList] = useState<UploadFile[]>([]);
 
   const iconTypes = ['yinliugongju-biaotiyouhua', 'yinliugongju-biaotifenxi', 'yinliugongju-dijiayinliu', 'gongjuqu', 'gongjuxiang', 'gongju1'];
@@ -449,11 +453,16 @@ const ToolListPage: React.FC = () => {
       message.warning('请选择包含 SKILL.md 的 ZIP 技能包');
       return;
     }
-    await importSkillPackageZip(file);
-    await fetchSkillPackageData();
-    setSkillPackageFileList([]);
-    setIsImportSkillModalVisible(false);
-    message.success('技能包已导入');
+    setIsImporting(true);
+    try {
+      await importSkillPackageZip(file);
+      await fetchSkillPackageData();
+      setSkillPackageFileList([]);
+      setIsImportSkillModalVisible(false);
+      message.success('技能包已导入');
+    } finally {
+      setIsImporting(false);
+    }
   };
 
   const handleDeleteSkillAsset = (asset: SkillPackage) => {
@@ -473,38 +482,37 @@ const ToolListPage: React.FC = () => {
       value={assetView}
       onChange={(value) => setAssetView(value as 'builtin' | 'mcp' | 'skills')}
       options={[
+        { label: '工具', value: 'builtin' },
         { label: '技能', value: 'skills' },
-        { label: '内置', value: 'builtin' },
         { label: 'MCP', value: 'mcp' },
       ]}
     />
   );
 
   const renderSkillAssetControls = () => (
-    <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
-      <Space.Compact>
-        <Input.Search
-          value={skillSearchKeyword}
-          onChange={(event) => setSkillSearchKeyword(event.target.value)}
-          onSearch={setSkillSearchKeyword}
-          placeholder="搜索技能名称或说明"
-          allowClear
-          enterButton
-          size="middle"
-          className="w-60"
-        />
-      </Space.Compact>
-      <Button onClick={() => setIsImportSkillModalVisible(true)}>导入技能包</Button>
-    </div>
+    <SearchActionBar
+      spacing="flush"
+      searchClassName="!w-60"
+      searchProps={{
+        value: skillSearchKeyword,
+        onChange: (event) => setSkillSearchKeyword(event.target.value),
+        onSearch: setSkillSearchKeyword,
+        placeholder: '搜索技能名称或说明',
+        allowClear: true,
+        enterButton: true,
+        size: 'middle',
+      }}
+      actions={<Button onClick={() => setIsImportSkillModalVisible(true)}>导入技能包</Button>}
+    />
   );
 
   const renderSkillAssetToolbar = () => (
-    <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+    <FilterToolbar align="between" spacing="default" className="w-full" contentClassName="w-full">
       <div className="flex min-w-0 items-center gap-2">
         {renderAssetSwitcher()}
       </div>
       {renderSkillAssetControls()}
-    </div>
+    </FilterToolbar>
   );
 
   const renderSkillAssetSkeleton = () => (
@@ -598,7 +606,7 @@ const ToolListPage: React.FC = () => {
           })}
         </div>
       ) : (
-        <Empty description="没有匹配的技能" />
+        <CompactEmptyState description="没有匹配的技能" />
       )}
     </div>
   );
@@ -696,6 +704,7 @@ const ToolListPage: React.FC = () => {
         }}
         okText="确认导入"
         cancelText="取消"
+        confirmLoading={isImporting}
         width={760}
       >
         <div>

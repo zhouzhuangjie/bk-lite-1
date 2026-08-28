@@ -1,0 +1,27 @@
+{
+  "client_id": "patch",
+  "name": "Patch",
+  "url": "/patch-manager/home",
+  "icon": "gongju",
+  "tags": ["tag.patch_scan", "tag.patch_install", "tag.patch_library"],
+  "description": "app.patch",
+  "menus": [
+    {"name": "Dashboard", "children": [{"id": "patch_dashboard", "name": "Dashboard", "operation": ["View"]}]},
+    {"name": "Risk", "children": [{"id": "patch_risk", "name": "Risk Governance", "operation": ["View", "Add"]}]},
+    {"name": "Execution", "children": [{"id": "patch_governance", "name": "Execution Records", "operation": ["View", "Add", "Edit"]}]},
+    {"name": "Library", "children": [{"id": "patch", "name": "Patch Library", "operation": ["View", "Add", "Edit", "Delete"]}]},
+    {"name": "Baseline", "children": [{"id": "patch_baseline", "name": "Baseline", "operation": ["View", "Add", "Edit", "Delete"]}]},
+    {"name": "Target", "children": [{"id": "patch_target", "name": "Target", "operation": ["View", "Add", "Edit", "Delete"]}]},
+    {"name": "Settings", "children": [
+      {"id": "patch_source", "name": "Patch Sources", "operation": ["View", "Add", "Edit", "Delete"]},
+      {"id": "patch_scan_setting", "name": "Scan Settings", "operation": ["View", "Edit"]}
+    ]}
+  ],
+  "roles": [
+    {"name": "admin", "role_name": "patch_admin", "menus": []},
+    {"name": "normal", "role_name": "patch_normal", "menus": [
+      "patch_dashboard-View", "patch_risk-View", "patch_governance-View", "patch-View",
+      "patch_baseline-View", "patch_target-View", "patch_source-View", "patch_scan_setting-View"
+    ]}
+  ]
+}

@@ -8,6 +8,19 @@ import { Studio } from '@/app/opspilot/types/studio';
 import { message, Modal } from 'antd';
 import { useTranslation } from '@/utils/i18n';
 import { useStudioApi } from '@/app/opspilot/api/studio';
+import { notifyWebchatAppsChanged } from '@/app/(core)/components/global-webchat/apps-changed';
+
+type StudioModifyModalProps = Omit<
+  React.ComponentProps<typeof GenericModifyModal>,
+  'formType'
+>;
+
+const StudioModifyModal: React.FC<StudioModifyModalProps> = (props) => (
+  <GenericModifyModal
+    {...props}
+    formType="studio"
+  />
+);
 
 const StudioPage: React.FC = () => {
   const { t } = useTranslation();
@@ -19,6 +32,7 @@ const StudioPage: React.FC = () => {
         await deleteStudio(studio.id);
         deleteCallback();
         message.success(t('common.delSuccess'));
+        notifyWebchatAppsChanged();
       } catch {
         message.error(t('common.delFailed'));
       }
@@ -51,21 +65,8 @@ const StudioPage: React.FC = () => {
     <EntityList<Studio>
       endpoint="/opspilot/bot_mgmt/bot/"
       CardComponent={StudioCard}
-      ModifyModalComponent={(props) => (
-        <GenericModifyModal
-          {...props}
-          formType="studio"
-        />
-      )}
+      ModifyModalComponent={StudioModifyModal}
       itemTypeSingle="studio"
-      typeConfig={{
-        options: [
-          { key: 1, title: t('studio.pilot') },
-          { key: 2, title: t('studio.lobeChat') },
-          { key: 3, title: t('studio.chatflow') },
-        ],
-        searchField: 'bot_type',
-      }}
       beforeDelete={beforeDelete}
       onTogglePin={beforePin}
     />

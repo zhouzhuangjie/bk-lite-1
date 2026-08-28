@@ -142,7 +142,10 @@ def test_model_init_reuses_shared_post_import_extras():
 
         mock_migrator_cls.assert_called_once_with()
         mock_migrator.main.assert_called_once_with()
-        mock_apply_extras.assert_called_once_with(mock_migrator.model_config)
+        mock_apply_extras.assert_called_once_with(
+            mock_migrator.model_config,
+            keep_existing_unique_rules_on_conflict=True,
+        )
 
 
 def test_instance_association_instance_list_denies_user_without_object_permission():
@@ -1357,7 +1360,11 @@ def test_node_mgmt_sync_service_fetch_non_container_nodes_uses_rpc_payload():
             "_error": "",
         }
     ]
-    node_mgmt.node_list.assert_called_once_with({"page": 1, "page_size": -1, "is_container": False})
+    node_mgmt.node_list.assert_called_once_with({
+        "page": 1,
+        "page_size": NodeMgmtSyncService.NODE_MGMT_SYNC_PAGE_SIZE,
+        "is_container": False,
+    })
 
 
 def test_node_mgmt_sync_service_pick_access_point_uses_rpc_payload():
@@ -1377,7 +1384,12 @@ def test_node_mgmt_sync_service_pick_access_point_uses_rpc_payload():
         result = NodeMgmtSyncService._pick_access_point(1)
 
     assert result == {"id": "container-new", "name": "new", "cloud": 1, "cloud_name": "default"}
-    node_mgmt.node_list.assert_called_once_with({"page": 1, "page_size": -1, "cloud_region_id": 1, "is_container": True})
+    node_mgmt.node_list.assert_called_once_with({
+        "page": 1,
+        "page_size": NodeMgmtSyncService.NODE_MGMT_SYNC_PAGE_SIZE,
+        "cloud_region_id": 1,
+        "is_container": True,
+    })
 
 
 def test_node_mgmt_sync_service_serialize_config_returns_defaults():
@@ -3090,71 +3102,3 @@ def test_config_file_collect_raises_when_stargazer_does_not_accept_trigger():
             assert "配置文件采集触发失败" in str(err)
         else:
             raise AssertionError("Expected BaseAppException when trigger was not accepted")
-
-
-def test_sync_collect_task_skips_pending_save_when_callback_already_wrote_data():
-    from apps.cmdb.constants.constants import CollectPluginTypes, CollectRunStatusType
-    from apps.cmdb.tasks import celery_tasks
-
-    instance = SimpleNamespace(
-        id=267,
-        is_job=True,
-        task_type=CollectPluginTypes.CONFIG_FILE,
-        exec_status=CollectRunStatusType.RUNNING,
-        exec_time=None,
-        collect_data={},
-        format_data={},
-        collect_digest={},
-        save=MagicMock(),
-    )
-    first_qs = MagicMock()
-    first_qs.first.return_value = instance
-    update_qs = MagicMock()
-    pending_qs = MagicMock()
-    pending_qs.update.return_value = 0
-    manager = MagicMock()
-    manager.filter.side_effect = [first_qs, update_qs, pending_qs]
-    collect_models = SimpleNamespace(_default_manager=manager)
-    collect = MagicMock()
-    collect.main.return_value = ({"config_file": {"status": "pending"}}, {})
-
-    collect_model_service = SimpleNamespace(repair_host_cloud_snapshot=MagicMock())
-
-    with (
-        patch.object(celery_tasks, "CollectModels", collect_models),
-        patch.object(celery_tasks, "JobCollect", return_value=collect),
-        patch.dict(
-            "sys.modules",
-            {"apps.cmdb.services.collect_service": SimpleNamespace(CollectModelService=collect_model_service)},
-        ),
-    ):
-        celery_tasks.sync_collect_task(instance.id)
-
-    update_qs.update.assert_called_once()
-    pending_qs.update.assert_called_once()
-    assert pending_qs.update.call_args.kwargs["collect_digest"]["message"] == "配置文件采集已触发，等待回传中"
-    instance.save.assert_not_called()
-
-
-def test_sync_periodic_update_task_status_sets_config_file_timeout_message():
-    from apps.cmdb.constants.constants import CollectRunStatusType
-    from apps.cmdb.tasks import celery_tasks
-
-    config_file_qs = MagicMock()
-    config_file_qs.update.return_value = 2
-    non_config_qs = MagicMock()
-    exclude_qs = MagicMock()
-    exclude_qs.update.return_value = 3
-    non_config_qs.exclude.return_value = exclude_qs
-    manager = MagicMock()
-    manager.filter.side_effect = [config_file_qs, non_config_qs]
-    collect_models = SimpleNamespace(_default_manager=manager)
-
-    with patch.object(celery_tasks, "CollectModels", collect_models):
-        celery_tasks.sync_periodic_update_task_status()
-
-    config_file_qs.update.assert_called_once_with(
-        exec_status=CollectRunStatusType.ERROR,
-        collect_digest={"message": "配置文件采集已触发，但在 5 分钟内未收到回传结果"},
-    )
-    exclude_qs.update.assert_called_once_with(exec_status=CollectRunStatusType.ERROR)

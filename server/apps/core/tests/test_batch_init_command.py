@@ -1,4 +1,5 @@
 import pydantic.root_model  # noqa
+
 """apps/core/management/commands/batch_init.py 的真实行为测试。
 
 被测对象是初始化编排命令 Command。它的核心逻辑是“按 app 分发到对应的
@@ -6,13 +7,18 @@ call_command 序列 + 错误处理策略（默认失败即中断，启用 contin
 后继续执行并汇总失败）”。
 """
 
+from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from django.core.management.base import CommandError
 
 import apps.core.management.commands.batch_init as bi
 
 pytestmark = pytest.mark.unit
+_verify_critical_schema = bi.Command._verify_critical_schema
+_any_admin_username_exists = bi.Command._any_admin_username_exists
 
 
 class _Style:
@@ -44,7 +50,63 @@ def calls(monkeypatch):
     return recorded
 
 
+@pytest.fixture(autouse=True)
+def _stub_critical_schema_gate(monkeypatch):
+    monkeypatch.setattr(bi.Command, "_verify_critical_schema", lambda self: None)
+    monkeypatch.setattr(bi.Command, "_any_admin_username_exists", lambda _self: False)
+    monkeypatch.setattr(bi.transaction, "atomic", nullcontext)
+    monkeypatch.setenv("BK_INIT_ADMIN_PASSWORD", "Managed-Secret-1!")
+    monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD_FILE", raising=False)
+    monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD_MIGRATE_EXISTING", raising=False)
+
+
 class TestHandleDispatch:
+    def test_critical_schema_is_verified_before_preload_and_dispatch(self, monkeypatch):
+        events = []
+        monkeypatch.setattr(bi.Command, "_verify_critical_schema", lambda self: events.append("schema"))
+        monkeypatch.setattr(
+            bi,
+            "preload_language_cache",
+            lambda: events.append("preload") or {"loaded": [], "skipped": [], "failed": []},
+        )
+        monkeypatch.setattr(bi, "call_command", lambda name, *args, **kwargs: events.append(name))
+
+        _make_command().handle(apps="node_mgmt", continue_on_error=False)
+
+        assert events == ["schema", "preload", "node_init"]
+
+    def test_critical_schema_failure_is_always_a_hard_gate(self, monkeypatch):
+        calls = []
+
+        def fail_schema():
+            calls.append("schema")
+            raise RuntimeError("permission version table missing")
+
+        cmd = _make_command()
+        monkeypatch.setattr(cmd, "_verify_critical_schema", fail_schema)
+        monkeypatch.setattr(bi, "preload_language_cache", lambda: calls.append("preload"))
+        monkeypatch.setattr(bi, "call_command", lambda *args, **kwargs: calls.append("dispatch"))
+
+        with pytest.raises(RuntimeError, match="permission version table missing"):
+            cmd.handle(apps="node_mgmt", continue_on_error=True)
+
+        assert calls == ["schema"]
+
+    def test_critical_schema_check_queries_permission_version_table(self, monkeypatch):
+        calls = []
+        queryset = SimpleNamespace(first=lambda: calls.append("first"))
+        manager = SimpleNamespace(values_list=lambda *args, **kwargs: calls.append(("values_list", args, kwargs)) or queryset)
+        model = SimpleNamespace(objects=manager)
+        monkeypatch.setattr(bi.django_apps, "get_model", lambda *args: calls.append(("get_model", args)) or model)
+
+        _verify_critical_schema()
+
+        assert calls == [
+            ("get_model", ("system_mgmt", "UserPermissionVersion")),
+            ("values_list", ("id",), {"flat": True}),
+            "first",
+        ]
+
     def test_single_known_app_runs_its_command_sequence(self, calls):
         cmd = _make_command()
         cmd.handle(apps="node_mgmt", continue_on_error=False)
@@ -55,6 +117,13 @@ class TestHandleDispatch:
         cmd = _make_command()
         cmd.handle(apps="monitor", continue_on_error=False)
         assert [c[0] for c in calls] == ["plugin_init"]
+
+    def test_patch_mgmt_migrates_settings_before_initializing_builtin_sources(self, calls):
+        cmd = _make_command()
+
+        cmd.handle(apps="patch_mgmt", continue_on_error=False)
+
+        assert [c[0] for c in calls] == ["migrate_patch_settings_split", "init_patch_sources"]
 
     def test_multiple_apps_dispatched_in_order(self, calls):
         cmd = _make_command()
@@ -83,19 +152,191 @@ class TestHandleDispatch:
         assert "plugin_init" in names
         assert "node_init" in names
         assert "log_init" in names
+        assert names.index("init_realm_resource") < names.index("migrate_patch_settings_split")
 
-    def test_system_mgmt_creates_admin_with_resolved_password(self, calls, monkeypatch):
+    def test_cmdb_reconciles_node_sync_as_last_init_step(self, calls):
+        cmd = _make_command()
+
+        cmd.handle(apps="cmdb", continue_on_error=False)
+
+        assert [call[0] for call in calls][-1] == "reconcile_node_mgmt_sync"
+
+    def test_fresh_system_mgmt_without_managed_secret_uses_default_password(self, calls, monkeypatch):
         monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD", raising=False)
+        monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD_FILE", raising=False)
+        monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD_MIGRATE_EXISTING", raising=False)
+
+        _make_command().handle(apps="system_mgmt", continue_on_error=False)
+
+        create_user = [call for call in calls if call[0] == "create_user"]
+        assert create_user[0][1] == ("admin", "password")
+        assert create_user[0][2]["update_existing_password"] is False
+
+    def test_fresh_system_mgmt_uses_explicit_managed_secret(self, calls):
+        _make_command().handle(apps="system_mgmt", continue_on_error=False)
+
+        create_user = [call for call in calls if call[0] == "create_user"]
+        assert create_user[0][1] == ("admin", "Managed-Secret-1!")
+        assert create_user[0][2]["update_existing_password"] is False
+        assert "temporary_password" not in create_user[0][2]
+
+    def test_system_mgmt_secret_file_can_migrate_existing_admin(self, calls, monkeypatch, tmp_path):
+        monkeypatch.setattr(bi.Command, "_any_admin_username_exists", lambda _self: True)
+        password_file = tmp_path / "admin-password"
+        password_file.write_text("Generated-Secret-1!\n", encoding="utf-8")
+        monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD", raising=False)
+        monkeypatch.setenv("BK_INIT_ADMIN_PASSWORD_FILE", str(password_file))
+        monkeypatch.setenv("BK_INIT_ADMIN_PASSWORD_MIGRATE_EXISTING", "true")
+
+        _make_command().handle(apps="system_mgmt", continue_on_error=False)
+
+        create_user = [c for c in calls if c[0] == "create_user"]
+        assert create_user[0][1] == ("admin", "Generated-Secret-1!")
+        assert "temporary_password" not in create_user[0][2]
+        assert create_user[0][2]["update_existing_password"] is True
+
+    def test_existing_admin_without_migration_skips_password_bootstrap(self, calls, monkeypatch, tmp_path):
+        monkeypatch.setattr(bi.Command, "_any_admin_username_exists", lambda _self: True)
+        monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD", raising=False)
+        monkeypatch.setenv("BK_INIT_ADMIN_PASSWORD_FILE", str(tmp_path / "missing-secret"))
+        monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD_MIGRATE_EXISTING", raising=False)
+
+        _make_command().handle(apps="system_mgmt", continue_on_error=False)
+
+        assert not [call for call in calls if call[0] == "create_user"]
+
+    def test_any_domain_admin_preserves_legacy_noop_without_secret(self, calls, monkeypatch, tmp_path):
+        monkeypatch.setattr(bi.Command, "_any_admin_username_exists", lambda _self: True)
+        monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD", raising=False)
+        monkeypatch.setenv("BK_INIT_ADMIN_PASSWORD_FILE", str(tmp_path / "missing-secret"))
+
+        _make_command().handle(apps="system_mgmt", continue_on_error=False)
+
+        assert not [call for call in calls if call[0] == "create_user"]
+
+    def test_admin_existence_check_matches_legacy_cross_domain_scope(self, monkeypatch):
+        calls = []
+        queryset = SimpleNamespace(exists=lambda: calls.append("exists") or True)
+        manager = SimpleNamespace(filter=lambda **kwargs: calls.append(("filter", kwargs)) or queryset)
+        manager.select_for_update = lambda: calls.append("select_for_update") or manager
+        model = SimpleNamespace(objects=manager)
+        monkeypatch.setattr(bi.django_apps, "get_model", lambda *args: calls.append(("get_model", args)) or model)
+
+        assert _any_admin_username_exists() is True
+        assert calls == [
+            ("get_model", ("system_mgmt", "User")),
+            "select_for_update",
+            ("filter", {"username": "admin"}),
+            "exists",
+        ]
+
+    def test_system_mgmt_runs_opspilot_legacy_menu_cleanup_before_realm_resource(self, calls):
         cmd = _make_command()
         cmd.handle(apps="system_mgmt", continue_on_error=False)
-        create_user = [c for c in calls if c[0] == "create_user"]
-        assert len(create_user) == 1
-        _, args, kwargs = create_user[0]
-        assert args == ("admin", "password")
-        assert kwargs.get("is_superuser") is True
+        names = [c[0] for c in calls]
+        assert names.index("cleanup_opspilot_legacy_knowledge_menus") < names.index("init_realm_resource")
 
 
 class TestErrorHandlingPolicy:
+    def test_patch_source_init_failure_warns_and_does_not_block_startup(self, monkeypatch):
+        calls = []
+
+        def fake_call_command(name, *args, **kwargs):
+            calls.append(name)
+            if name == "init_patch_sources":
+                raise RuntimeError("patch source seed failed")
+
+        monkeypatch.setattr(bi, "call_command", fake_call_command)
+        monkeypatch.setattr(
+            bi,
+            "preload_language_cache",
+            lambda *args, **kwargs: {"loaded": [], "skipped": [], "failed": []},
+        )
+        cmd = _make_command()
+
+        cmd.handle(apps="patch_mgmt,node_mgmt", continue_on_error=False)
+
+        assert calls == ["migrate_patch_settings_split", "init_patch_sources", "node_init"]
+        assert any("WARN:内置补丁源初始化跳过（RuntimeError）: patch source seed failed" in message for message in cmd.stdout.messages)
+
+    def test_patch_settings_migration_failure_blocks_patch_initialization(self, monkeypatch):
+        calls = []
+
+        def fake_call_command(name, *args, **kwargs):
+            calls.append(name)
+            if name == "migrate_patch_settings_split":
+                raise RuntimeError("patch permission migration failed")
+
+        monkeypatch.setattr(bi, "call_command", fake_call_command)
+        monkeypatch.setattr(
+            bi,
+            "preload_language_cache",
+            lambda *args, **kwargs: {"loaded": [], "skipped": [], "failed": []},
+        )
+        cmd = _make_command()
+
+        with pytest.raises(RuntimeError, match="patch permission migration failed"):
+            cmd.handle(apps="patch_mgmt,node_mgmt", continue_on_error=False)
+
+        assert calls == ["migrate_patch_settings_split"]
+
+    def test_invalid_default_namespace_config_warns_and_continues_operation_analysis_init(self, monkeypatch):
+        calls = []
+
+        def fake_call_command(name, *args, **kwargs):
+            calls.append(name)
+            if name == "init_default_namespace":
+                raise CommandError("NATS_SERVERS 配置非法")
+
+        monkeypatch.setattr(bi, "call_command", fake_call_command)
+        cmd = _make_command()
+
+        cmd._init_operation_analysis()
+
+        assert calls == [
+            "init_default_namespace",
+            "init_default_groups",
+            "init_builtin_canvases",
+        ]
+        assert any("WARN:默认命名空间初始化跳过（CommandError）: NATS_SERVERS 配置非法" in message for message in cmd.stdout.messages)
+
+    def test_builtin_canvas_sync_failure_does_not_block_operation_analysis_init(self, monkeypatch):
+        calls = []
+
+        def fake_call_command(name, *args, **kwargs):
+            calls.append(name)
+            if name == "init_builtin_canvases":
+                raise RuntimeError("invalid builtin config")
+
+        monkeypatch.setattr(bi, "call_command", fake_call_command)
+        cmd = _make_command()
+
+        cmd._init_operation_analysis()
+
+        assert calls == ["init_default_namespace", "init_default_groups", "init_builtin_canvases"]
+        assert any("WARN:内置画布与数据源同步跳过（RuntimeError）: invalid builtin config" in message for message in cmd.stdout.messages)
+
+    def test_cmdb_reconcile_failure_obeys_continue_on_error(self, monkeypatch):
+        calls = []
+
+        def fake_call_command(name, *args, **kwargs):
+            calls.append(name)
+            if name == "reconcile_node_mgmt_sync":
+                raise RuntimeError("reconcile failed")
+
+        monkeypatch.setattr(bi, "call_command", fake_call_command)
+        monkeypatch.setattr(
+            bi,
+            "preload_language_cache",
+            lambda *a, **k: {"loaded": [], "skipped": [], "failed": []},
+        )
+        cmd = _make_command()
+
+        cmd.handle(apps="cmdb,node_mgmt", continue_on_error=True)
+
+        assert calls[-1] == "node_init"
+        assert any("初始化 cmdb 失败: reconcile failed" in message for message in cmd.stdout.messages)
+
     def test_system_mgmt_failure_reraises_and_aborts(self, monkeypatch):
         calls = []
 
@@ -105,9 +346,7 @@ class TestErrorHandlingPolicy:
                 raise RuntimeError("sysmgmt boom")
 
         monkeypatch.setattr(bi, "call_command", fake_call_command)
-        monkeypatch.setattr(
-            bi, "preload_language_cache", lambda *a, **k: {"loaded": [], "skipped": [], "failed": []}
-        )
+        monkeypatch.setattr(bi, "preload_language_cache", lambda *a, **k: {"loaded": [], "skipped": [], "failed": []})
         cmd = _make_command()
         with pytest.raises(RuntimeError, match="sysmgmt boom"):
             cmd.handle(apps="system_mgmt,cmdb", continue_on_error=False)
@@ -122,9 +361,7 @@ class TestErrorHandlingPolicy:
                 raise RuntimeError("monitor boom")
 
         monkeypatch.setattr(bi, "call_command", fake_call_command)
-        monkeypatch.setattr(
-            bi, "preload_language_cache", lambda *a, **k: {"loaded": [], "skipped": [], "failed": []}
-        )
+        monkeypatch.setattr(bi, "preload_language_cache", lambda *a, **k: {"loaded": [], "skipped": [], "failed": []})
         cmd = _make_command()
         with pytest.raises(RuntimeError, match="monitor boom"):
             cmd.handle(apps="monitor,log", continue_on_error=False)
@@ -140,19 +377,14 @@ class TestErrorHandlingPolicy:
                 raise RuntimeError("plugin init failed")
 
         monkeypatch.setattr(bi, "call_command", fake_call_command)
-        monkeypatch.setattr(
-            bi, "preload_language_cache", lambda *a, **k: {"loaded": [], "skipped": [], "failed": []}
-        )
+        monkeypatch.setattr(bi, "preload_language_cache", lambda *a, **k: {"loaded": [], "skipped": [], "failed": []})
         cmd = _make_command()
 
         cmd.handle(apps="monitor,node_mgmt", continue_on_error=True)
 
         assert calls == [("plugin_init", (), {}), ("node_init", (), {})]
         assert any("ERR:" in m and "初始化 monitor 失败: plugin init failed" in m for m in cmd.stdout.messages)
-        assert any(
-            "WARN:" in m and "批量初始化完成，失败模块: monitor: plugin init failed" in m
-            for m in cmd.stdout.messages
-        )
+        assert any("WARN:" in m and "批量初始化完成，失败模块: monitor: plugin init failed" in m for m in cmd.stdout.messages)
 
 
 class TestGetAdminPassword:
@@ -160,13 +392,69 @@ class TestGetAdminPassword:
         monkeypatch.setenv("BK_INIT_ADMIN_PASSWORD", "  s3cret  ")
         assert bi.Command._get_admin_password() == "s3cret"
 
-    def test_blank_env_falls_back_to_default(self, monkeypatch):
+    def test_blank_env_without_file_uses_default_password(self, monkeypatch, caplog):
         monkeypatch.setenv("BK_INIT_ADMIN_PASSWORD", "   ")
-        assert bi.Command._get_admin_password() == "password"
+        monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD_FILE", raising=False)
+        with caplog.at_level("WARNING", logger="app"):
+            assert bi.Command._get_admin_password() == "password"
+        assert "使用内置初始密码" in caplog.text
 
-    def test_missing_env_falls_back_to_default(self, monkeypatch):
+    def test_missing_env_reads_secret_file(self, monkeypatch, tmp_path):
         monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD", raising=False)
-        assert bi.Command._get_admin_password() == "password"
+        password_file = tmp_path / "admin-password"
+        password_file.write_text("Managed-Secret-1!\n", encoding="utf-8")
+        monkeypatch.setenv("BK_INIT_ADMIN_PASSWORD_FILE", str(password_file))
+        assert bi.Command._get_admin_password() == "Managed-Secret-1!"
+
+    def test_empty_secret_file_fails_closed(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD", raising=False)
+        password_file = tmp_path / "admin-password"
+        password_file.write_text("\n", encoding="utf-8")
+        monkeypatch.setenv("BK_INIT_ADMIN_PASSWORD_FILE", str(password_file))
+        with pytest.raises(CommandError, match="不能为空"):
+            bi.Command._get_admin_password()
+
+    def test_oversized_secret_file_fails_closed(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD", raising=False)
+        password_file = tmp_path / "admin-password"
+        password_file.write_text("x" * 4097, encoding="utf-8")
+        monkeypatch.setenv("BK_INIT_ADMIN_PASSWORD_FILE", str(password_file))
+        with pytest.raises(CommandError, match="内容过大"):
+            bi.Command._get_admin_password()
+
+    def test_non_utf8_secret_file_fails_with_sanitized_error(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD", raising=False)
+        password_file = tmp_path / "admin-password"
+        password_file.write_bytes(b"\xff")
+        monkeypatch.setenv("BK_INIT_ADMIN_PASSWORD_FILE", str(password_file))
+        with pytest.raises(CommandError, match="无法读取.*UnicodeDecodeError"):
+            bi.Command._get_admin_password()
+
+    def test_missing_secret_file_fails_closed_when_password_is_needed(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD", raising=False)
+        monkeypatch.setenv("BK_INIT_ADMIN_PASSWORD_FILE", str(tmp_path / "missing-secret"))
+        with pytest.raises(CommandError, match="无法读取"):
+            bi.Command._get_admin_password()
+
+    def test_invalid_migration_switch_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("BK_INIT_ADMIN_PASSWORD_MIGRATE_EXISTING", "maybe")
+        with pytest.raises(CommandError, match="仅支持"):
+            bi.Command._should_migrate_admin_password()
+
+    def test_migration_without_managed_password_fails_closed(self, monkeypatch):
+        monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD", raising=False)
+        monkeypatch.delenv("BK_INIT_ADMIN_PASSWORD_FILE", raising=False)
+        monkeypatch.setenv("BK_INIT_ADMIN_PASSWORD_MIGRATE_EXISTING", "true")
+        with pytest.raises(CommandError, match="必须配置"):
+            bi.Command._should_migrate_admin_password()
+
+    def test_dev_password_remains_scoped_to_explicit_make_target(self):
+        makefile = (Path(__file__).resolve().parents[3] / "Makefile").read_text(encoding="utf-8")
+        setup_dev_user = makefile.split("setup-dev-user:", 1)[1].split("\n\n", 1)[0]
+
+        assert "DJANGO_SUPERUSER_PASSWORD=password" in setup_dev_user
+        assert "manage.py createsuperuser --noinput" in setup_dev_user
+        assert "batch_init" not in setup_dev_user
 
 
 class TestPreloadLanguageCache:

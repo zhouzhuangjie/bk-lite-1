@@ -1,7 +1,8 @@
 'use client';
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Button, Card, Empty, Select, Space, Spin, Table, Tag, Tooltip, message } from 'antd';
+import { Alert, Button, Card, Select, Space, Spin, Table, Tag, Tooltip, message } from 'antd';
+import CompactEmptyState from '@/components/compact-empty-state';
 import type { ColumnsType } from 'antd/es/table';
 import { InfoCircleOutlined, LinkOutlined, PlusOutlined } from '@ant-design/icons';
 
@@ -124,10 +125,27 @@ const RelatedAlertsPanel = ({ alert, onRefresh }: Props) => {
     return getMatchedDimensionsText(item.matched_dimensions || {});
   };
 
+  const toAlarmTableDataItem = (item: RelatedAlertItem): AlarmTableDataItem => ({
+    ...item,
+    level: item.level as AlarmTableDataItem['level'],
+    event_count: 0,
+    duration: '--',
+    operator_user: '',
+    operator: [],
+    created_at: item.first_event_time || '',
+    updated_at: item.last_event_time || '',
+    item: '',
+    resource_id: '',
+    resource_name: '',
+    resource_type: '',
+    operate: null,
+    incident_name: (item.incidents || []).map((incident) => incident.title).join(', '),
+  });
+
   const handleOpenDetail = (item: RelatedAlertItem) => {
     detailRef.current?.showModal({
       title: item.title,
-      form: item as AlarmTableDataItem,
+      form: toAlarmTableDataItem(item),
       type: '',
       defaultTab: 'baseInfo',
     });
@@ -230,7 +248,7 @@ const RelatedAlertsPanel = ({ alert, onRefresh }: Props) => {
           <Spin />
         </div>
       ) : !data?.items?.length ? (
-        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('alarms.noRelatedAlerts')} />
+        <CompactEmptyState description={t('alarms.noRelatedAlerts')} />
       ) : (
         <>
           <div className="space-y-5">

@@ -26,8 +26,9 @@ def generate_attachment_file(
     save, or export any file, document, report, or attachment — regardless of file format.**
 
     Do NOT output file content as plain text in your response. Always use this tool so the
-    user receives a downloadable link. After calling this tool, briefly summarize what was
-    generated and present the returned download URL to the user.
+    user receives a downloadable file. After calling this tool, briefly summarize what was
+    generated. Do NOT paste the download URL, file:// links, /api/proxy paths, or placeholder
+    tokens such as "加密token" into the chat or the file body; the UI renders the download button.
 
     When to call this tool:
     - User says "generate a report / create a file / export data / save as PDF" etc.
@@ -70,5 +71,5 @@ def generate_attachment_file(
         "filename": asset.filename,
         "file_url": build_signed_attachment_download_url(asset),
         "mime_type": asset.mime_type,
-        "file_knowledge_id": asset.file_knowledge_id,
+        "attachment_asset_id": asset.id,
     }

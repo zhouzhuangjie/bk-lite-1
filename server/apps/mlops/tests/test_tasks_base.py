@@ -11,11 +11,7 @@ from unittest.mock import MagicMock
 import pydantic.root_model  # noqa
 import pytest
 
-from apps.mlops.models.anomaly_detection import (
-    AnomalyDetectionDataset,
-    AnomalyDetectionDatasetRelease,
-    AnomalyDetectionTrainData,
-)
+from apps.mlops.models.anomaly_detection import AnomalyDetectionDataset, AnomalyDetectionDatasetRelease, AnomalyDetectionTrainData
 from apps.mlops.tasks import base as base_mod
 from apps.mlops.tasks.base import (
     DatasetPublishConfig,
@@ -29,6 +25,16 @@ from apps.mlops.tasks.base import (
 pytestmark = pytest.mark.unit
 
 
+@pytest.mark.parametrize(
+    ("configured_size", "expected_size"),
+    [("0", 1), ("-1", 1), (str(1024**3), 65536)],
+)
+def test_stream_chunk_size_stays_bounded(monkeypatch, configured_size, expected_size):
+    monkeypatch.setenv("MLOPS_STREAM_CHUNK_SIZE", configured_size)
+
+    assert base_mod._get_stream_chunk_size() == expected_size
+
+
 # ---------------- count_csv_samples ----------------
 
 
@@ -36,6 +42,46 @@ def test_count_csv_samples_subtracts_header(tmp_path):
     f = tmp_path / "a.csv"
     f.write_bytes(b"col1,col2\n1,2\n3,4\n5,6\n")
     assert count_csv_samples(f) == 3
+
+
+def test_count_csv_samples_counts_last_record_without_trailing_newline(tmp_path):
+    f = tmp_path / "no-trailing-newline.csv"
+    f.write_bytes(b"col1,col2\n1,2")
+
+    assert count_csv_samples(f) == 1
+
+
+def test_count_csv_samples_counts_quoted_newline_as_one_record(tmp_path):
+    f = tmp_path / "quoted-newline.csv"
+    f.write_text(
+        'text,label\r\n"first line\r\nsecond line",failure\r\nplain,normal',
+        encoding="utf-8-sig",
+        newline="",
+    )
+
+    assert count_csv_samples(f) == 2
+
+
+def test_count_csv_samples_handles_record_larger_than_stream_chunk(tmp_path):
+    f = tmp_path / "large-record.csv"
+    large_text = b"x" * (base_mod._STREAM_CHUNK_SIZE * 3 + 7)
+    f.write_bytes(b'text,label\n"' + large_text + b'\ncontinued",failure\n')
+
+    assert count_csv_samples(f) == 1
+
+
+def test_count_csv_samples_preserves_non_utf8_bytes(tmp_path):
+    f = tmp_path / "non-utf8.csv"
+    f.write_bytes(b"text,label\n\xff,broken\n")
+
+    assert count_csv_samples(f) == 1
+
+
+def test_count_csv_samples_falls_back_for_malformed_csv(tmp_path):
+    f = tmp_path / "malformed.csv"
+    f.write_bytes(b'a,b\n"unterminated\nvalue\n')
+
+    assert count_csv_samples(f) == 2
 
 
 def test_count_csv_samples_header_only_is_zero(tmp_path):
@@ -65,6 +111,24 @@ def test_count_txt_samples_no_trailing_newline(tmp_path):
     assert count_txt_samples(f) == 3
 
 
+def test_count_txt_samples_ignores_empty_and_whitespace_only_lines(tmp_path):
+    f = tmp_path / "empty-lines.txt"
+    f.write_text(
+        "line1\n\n \t\r\n\N{NO-BREAK SPACE}\n\N{IDEOGRAPHIC SPACE}\nline2\n",
+        encoding="utf-8",
+        newline="",
+    )
+
+    assert count_txt_samples(f) == 2
+
+
+def test_count_txt_samples_handles_line_larger_than_stream_chunk(tmp_path):
+    f = tmp_path / "large-line.txt"
+    f.write_bytes(b"x" * (base_mod._STREAM_CHUNK_SIZE * 3 + 7))
+
+    assert count_txt_samples(f) == 1
+
+
 def test_count_txt_samples_empty(tmp_path):
     f = tmp_path / "c.txt"
     f.write_bytes(b"")
@@ -83,6 +147,7 @@ def test_build_base_metadata_totals_and_source():
     assert md["val_samples"] == 3
     assert md["test_samples"] == 2
     assert md["total_samples"] == 15
+    assert md["sample_count_algorithm"] == "logical_records_v1_legacy_fallback"
     assert md["source"]["type"] == "manual_selection"
     assert md["source"]["train_file_id"] == 1
     assert md["source"]["test_file_name"] == "test.csv"
@@ -102,8 +167,14 @@ def test_build_base_metadata_merges_extra_fields():
 def _make_release(status="pending"):
     dataset = AnomalyDetectionDataset.objects.create(name="ds", description="", team=[1])
     return AnomalyDetectionDatasetRelease.objects.create(
-        name="r", description="", dataset=dataset, version="v1",
-        dataset_file="x.zip", status=status, metadata={}, file_size=1,
+        name="r",
+        description="",
+        dataset=dataset,
+        version="v1",
+        dataset_file="x.zip",
+        status=status,
+        metadata={},
+        file_size=1,
     )
 
 
@@ -151,8 +222,14 @@ def _config():
 def test_publish_base_skips_when_already_published(monkeypatch):
     dataset = AnomalyDetectionDataset.objects.create(name="ds", description="", team=[1])
     rel = AnomalyDetectionDatasetRelease.objects.create(
-        name="r", description="", dataset=dataset, version="v1",
-        dataset_file="x.zip", status="published", metadata={}, file_size=1,
+        name="r",
+        description="",
+        dataset=dataset,
+        version="v1",
+        dataset_file="x.zip",
+        status="published",
+        metadata={},
+        file_size=1,
     )
     result = publish_dataset_release_base(_config(), rel.id, 1, 2, 3)
     assert result["result"] is False
@@ -163,8 +240,14 @@ def test_publish_base_skips_when_already_published(monkeypatch):
 def test_publish_base_skips_when_failed(monkeypatch):
     dataset = AnomalyDetectionDataset.objects.create(name="ds", description="", team=[1])
     rel = AnomalyDetectionDatasetRelease.objects.create(
-        name="r", description="", dataset=dataset, version="v1",
-        dataset_file="x.zip", status="failed", metadata={}, file_size=1,
+        name="r",
+        description="",
+        dataset=dataset,
+        version="v1",
+        dataset_file="x.zip",
+        status="failed",
+        metadata={},
+        file_size=1,
     )
     result = publish_dataset_release_base(_config(), rel.id, 1, 2, 3)
     assert result["result"] is False
@@ -175,8 +258,14 @@ def test_publish_base_skips_when_failed(monkeypatch):
 def test_publish_base_full_success(monkeypatch):
     dataset = AnomalyDetectionDataset.objects.create(name="ds", description="", team=[1])
     rel = AnomalyDetectionDatasetRelease.objects.create(
-        name="r", description="", dataset=dataset, version="v1",
-        dataset_file="", status="pending", metadata={}, file_size=0,
+        name="r",
+        description="",
+        dataset=dataset,
+        version="v1",
+        dataset_file="",
+        status="pending",
+        metadata={},
+        file_size=0,
     )
     train = AnomalyDetectionTrainData.objects.create(name="train.csv", dataset=dataset, is_train_data=True)
     val = AnomalyDetectionTrainData.objects.create(name="val.csv", dataset=dataset, is_val_data=True)
@@ -184,10 +273,19 @@ def test_publish_base_full_success(monkeypatch):
 
     # Provide a fake MinIO storage at the module boundary.
     fake_storage = MagicMock()
-    fake_storage.save.return_value = "anomaly_datasets/1/saved.zip"
+    fake_storage.get_available_name.return_value = "anomaly_datasets/1/saved.zip"
+    fake_storage._save.return_value = "anomaly_datasets/1/saved.zip"
     fake_storage.url.return_value = "http://minio.local/saved.zip"
     monkeypatch.setattr(base_mod, "MinioBackend", lambda **kw: fake_storage)
     monkeypatch.setattr(base_mod, "iso_date_prefix", lambda obj, name: f"2020/{name}")
+    recorded_paths = []
+    real_record_path = base_mod.record_dataset_release_object_path
+
+    def capture_recorded_path(*args, **kwargs):
+        recorded_paths.append(args[3])
+        return real_record_path(*args, **kwargs)
+
+    monkeypatch.setattr(base_mod, "record_dataset_release_object_path", capture_recorded_path)
 
     # publish_base fetches each TrainData via objects.get(); wrap that to attach
     # an openable fake FileField returning CSV bytes (3 rows + header).
@@ -211,5 +309,8 @@ def test_publish_base_full_success(monkeypatch):
     assert rel.status == "published"
     assert rel.metadata["train_samples"] == 2  # 3 lines - header
     assert rel.metadata["total_samples"] == 6
+    assert rel.metadata["sample_count_algorithm"] == "logical_records_v1_legacy_fallback"
     assert rel.dataset_file.name == "anomaly_datasets/1/saved.zip"
-    fake_storage.save.assert_called_once()
+    assert recorded_paths == ["anomaly_datasets/1/saved.zip"]
+    fake_storage._save.assert_called_once()
+    fake_storage.save.assert_not_called()

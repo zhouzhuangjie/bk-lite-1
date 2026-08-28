@@ -1,0 +1,32 @@
+'use client';
+
+import { AppstoreOutlined } from '@ant-design/icons';
+import { Typography } from 'antd';
+import { useTranslation } from '@/utils/i18n';
+
+interface ServiceIdentityProps {
+  namespace: string;
+  name: string;
+  secondary?: string;
+}
+
+const { Text } = Typography;
+
+export default function ServiceIdentity({ namespace, name, secondary }: ServiceIdentityProps) {
+  const { t } = useTranslation();
+  return (
+    <div className="flex min-w-0 items-center gap-3">
+      <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-[var(--color-primary-bg-active)] text-[var(--color-primary)]">
+        <AppstoreOutlined aria-hidden="true" />
+      </span>
+      <div className="min-w-0">
+        <Text strong className="block truncate text-sm text-[var(--color-text-1)]">
+          {name}
+        </Text>
+        <Text type="secondary" className="block truncate text-xs">
+          {namespace || t('apm.common.unsetNamespace', '未设置 namespace')}{secondary ? ` · ${secondary}` : ''}
+        </Text>
+      </div>
+    </div>
+  );
+}

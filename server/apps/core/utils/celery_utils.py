@@ -1,8 +1,10 @@
 import json
+
 from django.core.exceptions import MultipleObjectsReturned
 from django.utils import timezone
 from django_celery_beat.models import CrontabSchedule, IntervalSchedule, PeriodicTask
-from apps.core.logger import opspilot_logger as logger
+
+from apps.core.logger import logger
 
 
 def crontab_format(value_type: str, value: str):
@@ -51,7 +53,14 @@ class CeleryUtils:
         """
         创建或更新周期任务
         """
-        logger.info(f"创建或更新周期任务: name={name}, crontab={crontab}, interval={interval}, task={task}, enabled={enabled}")
+        logger.info(
+            "创建或更新周期任务: name=%s, crontab=%s, interval=%s, task=%s, enabled=%s",
+            name,
+            crontab,
+            interval,
+            task,
+            enabled,
+        )
 
         if crontab:
             minute, hour, day_of_month, month_of_year, day_of_week = crontab.split()
@@ -65,7 +74,9 @@ class CeleryUtils:
             schedule_type = "crontab"
         elif interval:
             schedule_data = dict(every=interval, period="seconds")
-            schedule, created = IntervalSchedule.objects.get_or_create(**schedule_data, defaults=schedule_data)
+            schedule = IntervalSchedule.objects.filter(**schedule_data).order_by("id").first()
+            if schedule is None:
+                schedule = IntervalSchedule.objects.create(**schedule_data)
             schedule_type = "interval"
         else:
             raise ValueError("Either crontab or interval must be provided")
@@ -80,14 +91,18 @@ class CeleryUtils:
         if schedule_type == "crontab":
             defaults["crontab"] = schedule
             defaults["interval"] = None
+            defaults["solar"] = None
+            defaults["clocked"] = None
         else:
             defaults["interval"] = schedule
             defaults["crontab"] = None
+            defaults["solar"] = None
+            defaults["clocked"] = None
 
         task_obj, task_created = PeriodicTask.objects.update_or_create(name=name, defaults=defaults)
 
         action = "创建" if task_created else "更新"
-        logger.info(f"{action}周期任务成功: {name}")
+        logger.info("%s周期任务成功: %s", action, name)
 
         return task_obj
 
@@ -99,9 +114,9 @@ class CeleryUtils:
         try:
             deleted_count, _ = PeriodicTask.objects.filter(name=name).delete()
             if deleted_count > 0:
-                logger.info(f"删除周期任务成功: {name}")
+                logger.info("删除周期任务成功: %s", name)
             else:
-                logger.warning(f"未找到要删除的周期任务: {name}")
+                logger.warning("未找到要删除的周期任务: %s", name)
             return deleted_count
         except Exception as e:
             logger.error(f"删除周期任务失败: {name}, 错误: {str(e)}")
@@ -137,7 +152,7 @@ class CeleryUtils:
             task = PeriodicTask.objects.get(name=name)
             task.enabled = True
             task.save()
-            logger.info(f"启用周期任务成功: {name}")
+            logger.info("启用周期任务成功: %s", name)
             return True
         except PeriodicTask.DoesNotExist:
             logger.warning(f"要启用的周期任务不存在: {name}")
@@ -156,7 +171,7 @@ class CeleryUtils:
             task = PeriodicTask.objects.get(name=name)
             task.enabled = False
             task.save()
-            logger.info(f"禁用周期任务成功: {name}")
+            logger.info("禁用周期任务成功: %s", name)
             return True
         except PeriodicTask.DoesNotExist:
             logger.warning(f"要禁用的周期任务不存在: {name}")

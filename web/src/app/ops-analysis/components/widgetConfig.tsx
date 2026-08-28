@@ -1,15 +1,14 @@
 import React, { useEffect, useState, useMemo, useCallback, useRef } from 'react';
 import { useTranslation } from '@/utils/i18n';
 import useUnsavedConfirm from '@/hooks/useUnsavedConfirm';
+import { markFormPristine } from '@/utils/formPristine';
 import {
   ViewConfigProps,
   ViewConfigItem,
-  TableConfig,
   UnifiedFilterDefinition,
   FilterBindings,
   ValueConfig,
   FilterValue,
-  WidgetConfig,
   DashboardActionConfig,
 } from '@/app/ops-analysis/types/dashBoard';
 import {
@@ -19,7 +18,10 @@ import {
   Input,
   Radio,
   Select,
+  Segmented,
   Tooltip,
+  Checkbox,
+  InputNumber,
   message,
 } from 'antd';
 import { QuestionCircleOutlined, SwapOutlined } from '@ant-design/icons';
@@ -32,32 +34,41 @@ import {
 import DataSourceParamsConfig from '@/app/ops-analysis/components/paramsConfig';
 import { SingleValueSettingsSection } from '@/app/ops-analysis/components/singleValueSettingsSection';
 import { FilterBindingPanel } from '@/app/ops-analysis/components/unifiedFilter';
+import { ParamInputConfigEditor } from '@/app/ops-analysis/components/paramInputConfigEditor';
 import { useDataSourceApi } from '@/app/ops-analysis/api/dataSource';
-import { useInstanceApi, useModelApi } from '@/app/cmdb/api';
-import {
-  filterNetworkTopologyModelOptions,
-  getNetworkTopologyModelIds,
-} from '@/app/ops-analysis/utils/networkTopologyModels';
 import {
   getFilterDefinitionId,
   getBindableFilterParams,
   buildDefaultFilterBindings,
 } from '@/app/ops-analysis/utils/widgetDataTransform';
 import { canEnableCompare } from '@/app/ops-analysis/utils/compareQuery';
+import {
+  clearComponentParamSwitch,
+  findComponentSwitchParams,
+  reconcileComponentParamValue,
+  supportsComponentSwitch,
+} from '@/app/ops-analysis/utils/componentParamSwitch';
 import type {
   DatasourceItem,
+  InputControlConfig,
+  InputOption,
   ParamItem,
   ResponseFieldDefinition,
 } from '@/app/ops-analysis/types/dataSource';
-import type { OpsChartThemeMode } from '@/app/ops-analysis/utils/chartTheme';
 import { initThresholdColors } from '@/app/ops-analysis/utils/thresholdUtils';
+import { ValueFormatConfigSection } from '@/app/ops-analysis/components/ops-analysis-config-sections';
+import { ThresholdColorConfigSection } from '@/app/ops-analysis/components/thresholdColorConfigSection';
+import { ValueMappingsConfigSection } from '@/app/ops-analysis/components/valueMappingsConfigSection';
 import ComponentSelector from './widgetSelector';
-import type { NetworkStatusTopologyConfig } from '@/app/ops-analysis/types/sceneWidget';
 
 import { useTableConfig } from './widgetConfig/hooks/useTableConfig';
 import { TableSettingsSection } from './widgetConfig/sections/tableSettingsSection';
 import { TopNSettingsSection } from './widgetConfig/sections/topNSettingsSection';
 import { GaugeSettingsSection } from './widgetConfig/sections/gaugeSettingsSection';
+import { RadarSettingsSection } from './widgetConfig/sections/radarSettingsSection';
+import { CardListSettingsSection } from './widgetConfig/sections/cardListSettingsSection';
+import { ThresholdColorListField } from './widgetConfig/sections/thresholdColorListField';
+import { resolveCardListSettingsRemountKey } from './widgetConfig/utils/cardListSettingsRemountKey';
 import {
   buildDisplayColumnsFromSchema,
   isDisplayableDefaultField,
@@ -67,32 +78,30 @@ import {
   resolveDatasourceChartTypes,
   shouldShowTableFilterFields,
 } from './widgetConfig/utils/tableSettingsBehavior';
-
-interface FormValues {
-  name: string;
-  description?: string;
-  chartType: string;
-  sceneWidgetType?: 'networkStatusTopology';
-  networkStatusTopology?: NetworkStatusTopologyConfig;
-  chartThemeMode?: OpsChartThemeMode;
-  dataSource?: string | number;
-  compare?: boolean;
-  dataSourceParams?: ParamItem[];
-  params?: Record<string, string | number | boolean | [number, number] | null>;
-  tableConfig?: TableConfig;
-  selectedFields?: string[];
-  topNLabelField?: string;
-  topNValueField?: string;
-  unit?: string;
-  unitId?: string;
-  valueMappings?: ValueConfig['valueMappings'];
-  conversionFactor?: number;
-  decimalPlaces?: number;
-  gaugeMin?: number;
-  gaugeMax?: number;
-  gaugeShape?: 'semicircle' | 'circle';
-  actions?: DashboardActionConfig[];
-}
+import {
+  buildWidgetSubmitConfig,
+  type WidgetConfigFormValues,
+} from './widgetConfig/utils/submitConfig';
+import { useNetworkStatusTopologyConfig } from './widgetConfig/hooks/useNetworkStatusTopologyConfig';
+import { NetworkStatusTopologyDeviceList } from './widgetConfig/sections/networkStatusTopologyDeviceList';
+import {
+  canConfigureScreenWidgetFrame,
+  getDefaultScreenWidgetAppearance,
+  resolveScreenWidgetAppearance,
+} from '@/app/ops-analysis/(pages)/view/screen/utils/layoutUtils';
+import { ensurePrometheusQueryRequired } from '@/app/ops-analysis/utils/dataSourceParamContract';
+import {
+  coerceValueForMultiple,
+  isMultipleSelectInputConfig,
+  migrateParamItemsFromStringList,
+  normalizeDatasourceItemParams,
+} from '@/app/ops-analysis/utils/stringParamMultipleMigrate';
+import {
+  NETWORK_STATUS_TOPOLOGY_MAX_NODE_LIMIT,
+  networkStatusTopologySelectionExceedsLimit,
+} from '@/app/ops-analysis/utils/networkStatusTopologyLayout';
+import { isSceneWidgetType } from '@/app/ops-analysis/types/sceneWidgetCapability';
+import type { SceneWidgetType } from '@/app/ops-analysis/types/sceneWidget';
 
 interface ViewConfigPropsWithManager extends ViewConfigProps {
   dataSourceManager: ReturnType<typeof useDataSourceManager>;
@@ -100,14 +109,8 @@ interface ViewConfigPropsWithManager extends ViewConfigProps {
   unifiedFilterValues?: Record<string, FilterValue>;
 }
 
-const NETWORK_INSTANCE_PAGE_SIZE = 100;
-const SELECT_SCROLL_LOAD_OFFSET = 24;
 const NETWORK_STATUS_TOPOLOGY = 'networkStatusTopology';
-
-interface SelectOption {
-  label: string;
-  value: string;
-}
+const VALUE_FORMAT_CHART_TYPES = new Set(['line', 'bar', 'pie', 'multiValue']);
 
 interface SelectorLike {
   id?: unknown;
@@ -116,23 +119,22 @@ interface SelectorLike {
 }
 
 const isSceneWidgetSelection = (item?: SelectorLike | null): boolean => {
-  if (!item) return false;
-
-  return (
-    item.sceneWidgetType === NETWORK_STATUS_TOPOLOGY ||
-    item.chartType === NETWORK_STATUS_TOPOLOGY ||
-    item.id === `scene:${NETWORK_STATUS_TOPOLOGY}`
-  );
+  return Boolean(getSceneWidgetSelectionType(item));
 };
 
-const mergeSelectOptions = (
-  previous: SelectOption[],
-  next: SelectOption[],
-): SelectOption[] => {
-  const optionMap = new Map(previous.map((item) => [item.value, item]));
-  next.forEach((item) => optionMap.set(item.value, item));
-  return Array.from(optionMap.values());
-};
+function getSceneWidgetSelectionType(
+  item?: SelectorLike | null,
+): SceneWidgetType | undefined {
+  if (!item) return undefined;
+  for (const value of [item.sceneWidgetType, item.chartType]) {
+    if (typeof value === 'string' && isSceneWidgetType(value)) return value;
+  }
+  if (typeof item.id === 'string' && item.id.startsWith('scene:')) {
+    const value = item.id.slice('scene:'.length);
+    if (isSceneWidgetType(value)) return value;
+  }
+  return undefined;
+}
 
 const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
   open,
@@ -144,6 +146,7 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
   unifiedFilterValues = {},
   builtinNamespaceId,
   showChartThemeMode = false,
+  surface = 'dashboard',
 }) => {
   const { t } = useTranslation();
   const guardClose = useUnsavedConfirm();
@@ -153,22 +156,11 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
   const [filterBindings, setFilterBindings] = useState<FilterBindings>({});
   const [actions, setActions] = useState<DashboardActionConfig[]>([]);
   const [dataSourceSelectorVisible, setDataSourceSelectorVisible] = useState(false);
+  const [editingInputConfigParam, setEditingInputConfigParam] = useState<ParamItem | null>(null);
+  const [widgetParamOverrides, setWidgetParamOverrides] = useState<ParamItem[]>([]);
   const { getSourceDataByApiId } = useDataSourceApi();
-  const { getModelList, getModelAssociations } = useModelApi();
-  const { searchInstances } = useInstanceApi();
-  const [networkModelOptions, setNetworkModelOptions] = useState<
-    { label: string; value: string }[]
-  >([]);
-  const [networkInstanceOptions, setNetworkInstanceOptions] = useState<SelectOption[]>([]);
-  const [networkModelsLoading, setNetworkModelsLoading] = useState(false);
-  const [networkInstancesLoading, setNetworkInstancesLoading] = useState(false);
-  const [networkInstancePage, setNetworkInstancePage] = useState(1);
-  const [networkInstanceTotal, setNetworkInstanceTotal] = useState(0);
-  const [networkInstanceKeyword, setNetworkInstanceKeyword] = useState('');
-  const networkInstanceRequestIdRef = useRef(0);
-  const networkInstanceSearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const configRequestIdRef = useRef(0);
-  const sceneModelId = Form.useWatch(['networkStatusTopology', 'modelId'], form);
+  const resolvedParamOptionsRef = useRef(new Map<string, InputOption[]>());
 
   const {
     selectedDataSource,
@@ -185,19 +177,16 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
 
   const getFilteredChartTypes = (
     dataSource: DatasourceItem | undefined,
-  ): ChartTypeItem[] => {
-    if (!dataSource?.chart_type?.length) {
-      return [];
-    }
-    return resolveDatasourceChartTypes({
-      chartTypes: dataSource.chart_type,
+  ): ChartTypeItem[] =>
+    resolveDatasourceChartTypes({
+      chartTypes: dataSource?.chart_type || [],
       chartTypeDefinitions: getChartTypeList(),
+      surface,
     });
-  };
 
   const getDataSourceChartTypes = useMemo(() => {
     return getFilteredChartTypes(selectedDataSource);
-  }, [selectedDataSource]);
+  }, [selectedDataSource, surface]);
 
   const computePreviewDefinitions = (
     existingDefinitions: UnifiedFilterDefinition[],
@@ -224,46 +213,55 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
     return Array.from(existingMap.values());
   };
 
+  const canonicalSelectedDataSource = useMemo(
+    () => (
+      selectedDataSource
+        ? normalizeDatasourceItemParams(selectedDataSource)
+        : undefined
+    ),
+    [selectedDataSource],
+  );
+
   const previewFilterDefinitions = useMemo(
-    () => computePreviewDefinitions(filterDefinitions, selectedDataSource),
-    [filterDefinitions, selectedDataSource],
+    () => computePreviewDefinitions(filterDefinitions, canonicalSelectedDataSource),
+    [canonicalSelectedDataSource, filterDefinitions],
   );
 
   const queryConfigParams = useMemo(
     () =>
-      (Array.isArray(selectedDataSource?.params)
-        ? selectedDataSource.params
+      (Array.isArray(canonicalSelectedDataSource?.params)
+        ? canonicalSelectedDataSource.params
         : []
       ).filter((param: ParamItem) =>
         ['params', 'fixed'].includes(param.filterType || 'fixed'),
       ),
-    [selectedDataSource?.params],
+    [canonicalSelectedDataSource?.params],
   );
 
   const bindableFilterParams = useMemo(
     () =>
-      Array.isArray(selectedDataSource?.params)
-        ? getBindableFilterParams(selectedDataSource.params)
+      Array.isArray(canonicalSelectedDataSource?.params)
+        ? getBindableFilterParams(canonicalSelectedDataSource.params)
         : [],
-    [selectedDataSource?.params],
+    [canonicalSelectedDataSource?.params],
   );
 
   const hasQueryParams = queryConfigParams.length > 0;
   const shouldShowUnifiedFilterSection =
-    previewFilterDefinitions.length > 0 && Boolean(selectedDataSource?.params);
+    previewFilterDefinitions.length > 0 && Boolean(canonicalSelectedDataSource?.params);
   const hasUnifiedFilterBindings = bindableFilterParams.length > 0;
   const effectiveNamespaceId = useMemo(() => {
     if (builtinNamespaceId !== undefined) {
       return builtinNamespaceId;
     }
 
-    return selectedDataSource?.namespaces?.[0];
-  }, [builtinNamespaceId, selectedDataSource?.namespaces]);
+    return canonicalSelectedDataSource?.namespaces?.[0];
+  }, [builtinNamespaceId, canonicalSelectedDataSource?.namespaces]);
 
   const tableConfig = useTableConfig({
     form,
     chartType,
-    selectedDataSource,
+    selectedDataSource: canonicalSelectedDataSource,
     availableFields,
     getSourceDataByApiId,
     processFormParamsForSubmit,
@@ -278,10 +276,22 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
   const isNetworkStatusTopology =
     chartType === 'networkStatusTopology' ||
     form.getFieldValue('sceneWidgetType') === 'networkStatusTopology';
+  const isSceneWidget =
+    isSceneWidgetType(chartType) ||
+    isSceneWidgetType(form.getFieldValue('sceneWidgetType'));
+  const networkTopologyConfig = useNetworkStatusTopologyConfig({
+    open,
+    enabled: isNetworkStatusTopology,
+    form,
+  });
+  const networkTopoNodeLimit = Form.useWatch(
+    ['networkStatusTopology', 'nodeLimit'],
+    form,
+  );
 
   const singleValueConfig = useSingleValueConfig({
     form,
-    selectedDataSource,
+    selectedDataSource: canonicalSelectedDataSource,
     getSourceDataByApiId,
     builtinNamespaceId: effectiveNamespaceId,
     open,
@@ -301,24 +311,32 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
   const handleDataSourceChangeFromSelector = useCallback(
     async (item: DatasourceItem) => {
       const requestId = nextConfigRequestId();
+      resolvedParamOptionsRef.current.clear();
       setDataSourceSelectorVisible(false);
 
       if (isSceneWidgetSelection(item)) {
-        setChartType(NETWORK_STATUS_TOPOLOGY);
+        const sceneWidgetType =
+          getSceneWidgetSelectionType(item) || NETWORK_STATUS_TOPOLOGY;
+        setChartType(sceneWidgetType);
         setSelectedDataSource(undefined);
         setFilterBindings({});
         setActions([]);
+        setWidgetParamOverrides([]);
         tableConfig.resetTableConfig();
         singleValueConfig.resetSingleValueConfig();
 
         form.setFieldsValue({
-          chartType: NETWORK_STATUS_TOPOLOGY,
-          sceneWidgetType: NETWORK_STATUS_TOPOLOGY,
+          chartType: sceneWidgetType,
+          sceneWidgetType,
+          appearance:
+            surface === 'screen'
+              ? getDefaultScreenWidgetAppearance(sceneWidgetType)
+              : undefined,
           dataSource: undefined,
           networkStatusTopology: {
-            modelId: '',
-            instId: '',
-            depth: 2,
+            instUuids: [],
+            nodeLimit: 100,
+            linkTrafficDisplays: ['inbound', 'outbound'],
           },
           params: {},
           dataSourceParams: [],
@@ -333,7 +351,20 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
           gaugeMin: 0,
           gaugeMax: 100,
           gaugeShape: 'semicircle',
+          eventTimeline: {
+            sortOrder: 'desc',
+          },
+          radar: {
+            min: 0,
+            max: 100,
+            indicators: [],
+          },
+          cardList: {
+            leading: { type: 'none' },
+            layout: 'list',
+          },
           compare: false,
+          compareMode: 'percent',
           tableConfig: undefined,
           actions: [],
         });
@@ -344,11 +375,14 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
       setChartType('');
       setFilterBindings({});
       setActions([]);
+      setWidgetParamOverrides([]);
       tableConfig.resetTableConfig();
       singleValueConfig.resetSingleValueConfig();
 
       // 加载完整数据源（brief 模式不含 params）
-      const fullItem = (await ensureDataSource(item.id)) || item;
+      const fullItem = normalizeDatasourceItemParams(
+        ((await ensureDataSource(item.id)) || item) as DatasourceItem,
+      );
       if (!isCurrentConfigRequest(requestId)) {
         return;
       }
@@ -359,6 +393,9 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
       const defaultChartType = newChartTypes[0]?.value || '';
 
       setChartType(defaultChartType);
+      if (defaultChartType === 'multiValue') {
+        singleValueConfig.setThresholdColors(initThresholdColors([]));
+      }
 
       // 重置 form 中的依赖字段
       const params: Record<string, any> = {};
@@ -369,6 +406,10 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
       form.setFieldsValue({
         dataSource: fullItem.id,
         chartType: defaultChartType,
+        appearance:
+          surface === 'screen'
+            ? getDefaultScreenWidgetAppearance(defaultChartType)
+            : undefined,
         sceneWidgetType: undefined,
         networkStatusTopology: undefined,
         params,
@@ -376,12 +417,27 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
         topNLabelField: undefined,
         topNValueField: undefined,
         unit: undefined,
+        unitId: undefined,
+        valueMappings: undefined,
         conversionFactor: undefined,
         decimalPlaces: undefined,
         gaugeMin: 0,
         gaugeMax: 100,
         gaugeShape: 'semicircle',
+        eventTimeline: {
+          sortOrder: 'desc',
+        },
+        radar: {
+          min: 0,
+          max: 100,
+          indicators: [],
+        },
+        cardList: {
+          leading: { type: 'none' },
+          layout: 'list',
+        },
         compare: false,
+        compareMode: 'percent',
       });
 
       // 重建 filter bindings
@@ -424,6 +480,7 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
       singleValueConfig,
       nextConfigRequestId,
       isCurrentConfigRequest,
+      surface,
     ],
   );
 
@@ -513,7 +570,37 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
   const handleChartTypeChange = async (e: any) => {
     const newChartType = e.target.value;
     setChartType(newChartType);
-    form.setFieldsValue({ chartType: newChartType });
+    form.setFieldValue('chartType', newChartType);
+    if (newChartType === 'eventTimeline' && !form.getFieldValue('eventTimeline')) {
+      form.setFieldValue('eventTimeline', { sortOrder: 'desc' });
+    }
+    if (newChartType === 'radar' && !form.getFieldValue('radar')) {
+      form.setFieldValue('radar', { min: 0, max: 100, indicators: [] });
+    }
+    if (newChartType === 'cardList' && !form.getFieldValue('cardList')) {
+      form.setFieldValue('cardList', {
+        leading: { type: 'none' },
+        layout: 'list',
+      });
+    }
+    if (newChartType === 'multiValue') {
+      singleValueConfig.setThresholdColors(initThresholdColors([]));
+    } else if (newChartType === 'single' || newChartType === 'gauge') {
+      singleValueConfig.setThresholdColors((prev) =>
+        prev.length > 0 ? prev : initThresholdColors(undefined),
+      );
+    }
+    if (surface === 'screen') {
+      form.setFieldValue(
+        'appearance',
+        getDefaultScreenWidgetAppearance(newChartType),
+      );
+    }
+    if (!supportsComponentSwitch(newChartType)) {
+      setWidgetParamOverrides((previous) =>
+        previous.map(clearComponentParamSwitch),
+      );
+    }
     await tableConfig.handleChartTypeChange(newChartType);
   };
 
@@ -521,15 +608,19 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
     widgetItem: ViewConfigItem,
     requestId: number,
   ): Promise<void> => {
+    resolvedParamOptionsRef.current.clear();
     if (!isCurrentConfigRequest(requestId)) {
       return;
     }
 
     const { valueConfig } = widgetItem;
-    const isSceneWidget =
-      valueConfig?.sceneWidgetType === 'networkStatusTopology' ||
-      valueConfig?.chartType === 'networkStatusTopology';
-    const formValues: FormValues = {
+    const sceneWidgetType = isSceneWidgetType(valueConfig?.sceneWidgetType)
+      ? valueConfig.sceneWidgetType
+      : isSceneWidgetType(valueConfig?.chartType)
+        ? valueConfig.chartType
+        : undefined;
+    const isSceneWidget = Boolean(sceneWidgetType);
+    const formValues: WidgetConfigFormValues = {
       name: widgetItem?.name || '',
       description: widgetItem.description || '',
       chartType: valueConfig?.chartType || '',
@@ -538,6 +629,13 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
       chartThemeMode: showChartThemeMode
         ? valueConfig?.chartThemeMode || 'default'
         : undefined,
+      appearance:
+        surface === 'screen'
+          ? resolveScreenWidgetAppearance(
+            valueConfig?.chartType,
+            valueConfig?.appearance,
+          )
+          : undefined,
       dataSource: valueConfig?.dataSource || '',
       dataSourceParams: valueConfig?.dataSourceParams || [],
       params: {},
@@ -549,9 +647,8 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
 
     if (isSceneWidget) {
       const networkStatusTopology = valueConfig?.networkStatusTopology || {
-        modelId: '',
-        instId: '',
-        depth: 2,
+        instUuids: [],
+        nodeLimit: 100,
       };
       setSelectedDataSource(undefined);
       setFilterBindings({});
@@ -559,11 +656,18 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
       singleValueConfig.resetSingleValueConfig();
       form.setFieldsValue({
         ...formValues,
-        chartType: 'networkStatusTopology',
-        sceneWidgetType: 'networkStatusTopology',
+        chartType: sceneWidgetType,
+        sceneWidgetType,
         dataSource: undefined,
-        networkStatusTopology,
+        networkStatusTopology: {
+          ...networkStatusTopology,
+          linkTrafficDisplays: Array.isArray(networkStatusTopology.linkTrafficDisplays)
+            ? networkStatusTopology.linkTrafficDisplays
+            : ['inbound', 'outbound'],
+        },
       });
+      // setFieldsValue 在 rc-field-form 2.x 会标记 touched，初始化后清掉以免误报未保存
+      markFormPristine(form);
       return;
     }
 
@@ -578,13 +682,23 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
       tableConfig.setFilterFields([]);
     }
 
-    const targetDataSource = await ensureDataSource(formValues.dataSource);
+    const loadedDataSource = await ensureDataSource(formValues.dataSource);
+    const targetDataSource = loadedDataSource
+      ? normalizeDatasourceItemParams(loadedDataSource)
+      : undefined;
     if (!isCurrentConfigRequest(requestId)) {
       return;
     }
 
     if (targetDataSource) {
       setSelectedDataSource(targetDataSource);
+      // 从 widget 已有的 dataSourceParams 恢复组件级 inputConfig 覆盖。
+      const widgetOverrides = migrateParamItemsFromStringList(
+        valueConfig?.dataSourceParams || [],
+      ).params
+        .filter((p) => p.inputConfig !== undefined)
+        .map((p) => ({ ...p, options: undefined }));
+      setWidgetParamOverrides(widgetOverrides);
       formValues.params = formValues.params || {};
 
       if (!formValues.chartType && targetDataSource.chart_type?.length) {
@@ -707,13 +821,18 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
       singleValueConfig.setSelectedFields([]);
     }
 
+    if ((valueConfig as ValueConfig | undefined)?.descriptionField !== undefined) {
+      formValues.descriptionField = (valueConfig as ValueConfig).descriptionField;
+    } else {
+      formValues.descriptionField = undefined;
+    }
+
     if (valueConfig?.topNLabelField !== undefined) {
       formValues.topNLabelField = valueConfig.topNLabelField;
     }
     if (valueConfig?.topNValueField !== undefined) {
       formValues.topNValueField = valueConfig.topNValueField;
     }
-
     if (valueConfig?.unit !== undefined) {
       formValues.unit = valueConfig.unit;
     }
@@ -738,16 +857,44 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
     if (valueConfig?.gaugeShape !== undefined) {
       formValues.gaugeShape = valueConfig.gaugeShape;
     }
+    if (valueConfig?.eventTimeline !== undefined) {
+      formValues.eventTimeline = valueConfig.eventTimeline;
+    }
+    if (valueConfig?.radar !== undefined) {
+      formValues.radar = valueConfig.radar;
+    }
+    if (valueConfig?.cardList !== undefined) {
+      formValues.cardList = {
+        ...valueConfig.cardList,
+        leading: valueConfig.cardList.leading || { type: 'none' },
+        layout: valueConfig.cardList.layout || 'list',
+      };
+    } else {
+      formValues.cardList = {
+        leading: { type: 'none' },
+        layout: 'list',
+      };
+    }
     if (valueConfig?.compare !== undefined) {
       formValues.compare = valueConfig.compare && canEnableCompare({
         config: { chartType: 'single', dataSourceParams: targetDataSource?.params },
         dataSource: targetDataSource,
       });
     }
+    formValues.compareMode = valueConfig?.compareMode || 'percent';
 
-    singleValueConfig.setThresholdColors(initThresholdColors(valueConfig?.thresholdColors));
+    singleValueConfig.setThresholdColors(
+      formValues.chartType === 'multiValue'
+        ? initThresholdColors(valueConfig?.thresholdColors ?? [])
+        : initThresholdColors(valueConfig?.thresholdColors),
+    );
 
+    // Nested cardList fields are registered individually; reset first so omitted
+    // optional slots from the previous edit target cannot survive setFieldsValue merge.
+    form.resetFields(['cardList']);
     form.setFieldsValue(formValues);
+    // setFieldsValue 在 rc-field-form 2.x 会标记 touched，初始化后清掉以免误报未保存
+    markFormPristine(form);
   };
 
   const resetForm = (): void => {
@@ -757,165 +904,98 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
     setFilterBindings({});
     setActions([]);
     setDataSourceSelectorVisible(false);
-    setNetworkInstanceOptions([]);
+    setEditingInputConfigParam(null);
+    setWidgetParamOverrides([]);
+    networkTopologyConfig.resetInstanceOptions();
     tableConfig.resetTableConfig();
     singleValueConfig.resetSingleValueConfig();
   };
 
-  useEffect(() => {
-    if (!open || !isNetworkStatusTopology || networkModelOptions.length > 0) {
-      return;
-    }
+  const handleEditInputConfig = (param: ParamItem) => {
+    const override = widgetParamOverrides.find((o) => o.name === param.name);
+    setEditingInputConfigParam(override ?? param);
+  };
 
-    let cancelled = false;
-    const fetchModels = async () => {
-      try {
-        setNetworkModelsLoading(true);
-        const [models, associations] = await Promise.all([
-          getModelList(),
-          getModelAssociations('interface'),
-        ]);
-        if (cancelled) return;
-        setNetworkModelOptions(
-          filterNetworkTopologyModelOptions(
-            Array.isArray(models) ? models : [],
-            getNetworkTopologyModelIds(
-              Array.isArray(associations) ? associations : [],
-            ),
-          ),
+  const reconcileParamWithOptions = useCallback(
+    (paramName: string, options: InputOption[]) => {
+      if (options.length === 0) return;
+      resolvedParamOptionsRef.current.set(paramName, options);
+      const currentParams = form.getFieldValue('params') || {};
+      const nextValue = reconcileComponentParamValue(currentParams[paramName], options);
+      if (nextValue !== currentParams[paramName]) {
+        form.setFieldValue(['params', paramName], nextValue);
+      }
+    },
+    [form],
+  );
+
+  const handleInputConfigConfirm = (
+    newConfig: InputControlConfig,
+    resolvedOptions?: InputOption[],
+  ) => {
+    if (!editingInputConfigParam) return;
+    const editingParamName = editingInputConfigParam.name;
+    setWidgetParamOverrides((prev) => {
+      const existing = prev.find((o) => o.name === editingInputConfigParam.name);
+      const baseParam = {
+        ...editingInputConfigParam,
+        options: undefined,
+      };
+      if (existing) {
+        return prev.map((o) =>
+          o.name === editingInputConfigParam.name
+            ? { ...baseParam, inputConfig: newConfig }
+            : o,
         );
-      } catch (error) {
-        console.error('获取模型列表失败:', error);
-        if (!cancelled) setNetworkModelOptions([]);
-      } finally {
-        if (!cancelled) setNetworkModelsLoading(false);
       }
-    };
-
-    void fetchModels();
-    return () => {
-      cancelled = true;
-    };
-    // API hooks return fresh function references; this load is driven by panel/component state.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isNetworkStatusTopology, networkModelOptions.length, open]);
-
-  const fetchNetworkInstances = async ({
-    page,
-    keyword,
-    append,
-  }: {
-    page: number;
-    keyword: string;
-    append: boolean;
-  }) => {
-    if (!sceneModelId) return;
-
-    const requestId = networkInstanceRequestIdRef.current + 1;
-    networkInstanceRequestIdRef.current = requestId;
-    setNetworkInstancesLoading(true);
-
-    try {
-      const trimmedKeyword = keyword.trim();
-      const instanceRes = await searchInstances({
-        model_id: sceneModelId,
-        query_list: trimmedKeyword
-          ? [{ field: 'inst_name', type: 'str*', value: trimmedKeyword }]
-          : [],
-        page,
-        page_size: NETWORK_INSTANCE_PAGE_SIZE,
-        order: '',
-        role: '',
-        case_sensitive: false,
-      });
-
-      if (requestId !== networkInstanceRequestIdRef.current) return;
-
-      const nextOptions = (instanceRes?.insts || []).map((instance: any) => {
-        const instanceId = instance._id || instance.id;
-        return {
-          label: String(instance.inst_name || instance.name || instanceId),
-          value: String(instanceId),
-        };
-      });
-      setNetworkInstanceOptions((previous) =>
-        append ? mergeSelectOptions(previous, nextOptions) : nextOptions,
-      );
-      setNetworkInstancePage(page);
-      setNetworkInstanceTotal(Number(instanceRes?.count) || nextOptions.length);
-    } catch (error) {
-      console.error('获取网络拓扑实例失败:', error);
-      if (requestId === networkInstanceRequestIdRef.current) {
-        setNetworkInstanceOptions((previous) => (append ? previous : []));
-        setNetworkInstanceTotal((previous) => (append ? previous : 0));
-      }
-    } finally {
-      if (requestId === networkInstanceRequestIdRef.current) {
-        setNetworkInstancesLoading(false);
-      }
-    }
-  };
-
-  useEffect(() => {
-    if (!open || !isNetworkStatusTopology || !sceneModelId) {
-      setNetworkInstanceOptions([]);
-      setNetworkInstancePage(1);
-      setNetworkInstanceTotal(0);
-      setNetworkInstanceKeyword('');
-      return;
-    }
-
-    setNetworkInstanceOptions([]);
-    setNetworkInstancePage(1);
-    setNetworkInstanceTotal(0);
-    setNetworkInstanceKeyword('');
-    void fetchNetworkInstances({ page: 1, keyword: '', append: false });
-    // API hooks return fresh function references; this load is driven by model/panel state.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    isNetworkStatusTopology,
-    open,
-    sceneModelId,
-  ]);
-
-  useEffect(() => {
-    return () => {
-      if (networkInstanceSearchTimerRef.current) {
-        clearTimeout(networkInstanceSearchTimerRef.current);
-      }
-    };
-  }, []);
-
-  const handleNetworkInstanceSearch = (keyword: string) => {
-    setNetworkInstanceKeyword(keyword);
-    if (networkInstanceSearchTimerRef.current) {
-      clearTimeout(networkInstanceSearchTimerRef.current);
-    }
-    networkInstanceSearchTimerRef.current = setTimeout(() => {
-      setNetworkInstanceOptions([]);
-      setNetworkInstancePage(1);
-      setNetworkInstanceTotal(0);
-      void fetchNetworkInstances({ page: 1, keyword, append: false });
-    }, 300);
-  };
-
-  const handleNetworkInstancePopupScroll = (event: React.UIEvent<HTMLDivElement>) => {
-    const target = event.currentTarget;
-    const hasMore = networkInstanceOptions.length < networkInstanceTotal;
-    const isNearBottom =
-      target.scrollTop + target.offsetHeight >=
-      target.scrollHeight - SELECT_SCROLL_LOAD_OFFSET;
-
-    if (!hasMore || networkInstancesLoading || !isNearBottom) {
-      return;
-    }
-
-    void fetchNetworkInstances({
-      page: networkInstancePage + 1,
-      keyword: networkInstanceKeyword,
-      append: true,
+      return [...prev, { ...baseParam, inputConfig: newConfig }];
     });
+    const currentParams = form.getFieldValue('params') || {};
+    const coerced = coerceValueForMultiple(
+      currentParams[editingParamName],
+      isMultipleSelectInputConfig(newConfig),
+    );
+    if (coerced !== currentParams[editingParamName]) {
+      form.setFieldValue(['params', editingParamName], coerced);
+    }
+    if (resolvedOptions?.length) {
+      reconcileParamWithOptions(editingParamName, resolvedOptions);
+    } else {
+      resolvedParamOptionsRef.current.delete(editingParamName);
+    }
+    setEditingInputConfigParam(null);
   };
+
+  // 把组件级 inputConfig 覆盖合并到 selectedDataSource，供参数表渲染。
+  const effectiveDataSource = useMemo(() => {
+    if (!selectedDataSource) return undefined;
+    const sourceParams =
+      canonicalSelectedDataSource.source_type === 'prometheus'
+        ? ensurePrometheusQueryRequired(canonicalSelectedDataSource.params)
+        : canonicalSelectedDataSource.params;
+
+    if (widgetParamOverrides.length === 0) {
+      return sourceParams === selectedDataSource.params
+        ? canonicalSelectedDataSource
+        : { ...canonicalSelectedDataSource, params: sourceParams };
+    }
+    return {
+      ...canonicalSelectedDataSource,
+      params: sourceParams.map((p) => {
+        const override = widgetParamOverrides.find((o) => o.name === p.name);
+        return override?.inputConfig !== undefined
+          ? { ...p, inputConfig: override.inputConfig }
+          : p;
+      }),
+    };
+  }, [canonicalSelectedDataSource, widgetParamOverrides]);
+
+  const componentSwitchOwner = useMemo(() => {
+    const owner = findComponentSwitchParams(effectiveDataSource?.params)[0];
+    return owner
+      ? { name: owner.name, label: owner.alias_name || owner.name }
+      : undefined;
+  }, [effectiveDataSource]);
 
   const handleFormValuesChange = (changedValues: Record<string, any>) => {
     if (!isTableLikeChartType) {
@@ -928,6 +1008,9 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
 
   useEffect(() => {
     if (open) {
+      if (!widgetItem) {
+        return;
+      }
       const requestId = nextConfigRequestId();
       void initializeItemForm(widgetItem, requestId);
     } else if (!open) {
@@ -955,164 +1038,112 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
 
   const handleConfirm = async () => {
     try {
-      const values: FormValues = await form.validateFields();
-      if (values.sceneWidgetType === 'networkStatusTopology') {
-        const topologyConfig = values.networkStatusTopology;
-        onConfirm?.({
-          name: values.name,
-          description: values.description,
-          chartType: 'networkStatusTopology',
-          sceneWidgetType: 'networkStatusTopology',
-          networkStatusTopology: {
-            modelId: topologyConfig?.modelId || '',
-            instId: topologyConfig?.instId || '',
-            depth: topologyConfig?.depth || 2,
-          },
-        });
-        return;
-      }
+      const values: WidgetConfigFormValues = await form.validateFields();
 
-      if (selectedDataSource?.params?.length) {
+      if (!isSceneWidgetType(values.sceneWidgetType) && effectiveDataSource?.params?.length) {
         const formParams = values.params || form.getFieldValue('params') || {};
-        values.dataSourceParams = processFormParamsForSubmit(
-          formParams,
-          selectedDataSource.params,
+        const reconciledFormParams = { ...formParams };
+        effectiveDataSource?.params.forEach((param) => {
+          const options = resolvedParamOptionsRef.current.get(param.name);
+          if (!options?.length) return;
+          reconciledFormParams[param.name] = reconcileComponentParamValue(
+            reconciledFormParams[param.name],
+            options,
+          );
+        });
+        if (Object.keys(reconciledFormParams).some(
+          (name) => reconciledFormParams[name] !== formParams[name],
+        )) {
+          form.setFieldValue('params', reconciledFormParams);
+        }
+        const processed = processFormParamsForSubmit(
+          reconciledFormParams,
+          effectiveDataSource.params,
         );
+        // 合并组件级 inputConfig 覆盖
+        values.dataSourceParams = processed.map((param) => {
+          const override = widgetParamOverrides.find((o) => o.name === param.name);
+          return override?.inputConfig !== undefined
+            ? { ...param, inputConfig: override.inputConfig }
+            : param;
+        });
         delete values.params;
       }
 
       if (isTableLikeChartType) {
         tableConfig.setDisplayColumnsError('');
-        const tableConfigData: TableConfig = {};
+      }
 
-        if (showTableFilterFields && tableConfig.filterFields.length > 0) {
-          tableConfigData.filterFields = tableConfig.filterFields
-            .filter((f) => f.key)
-            .map(({ key, label, inputType }) => ({
-              key,
-              label,
-              inputType,
-            }));
-        }
+      if (
+        values.sceneWidgetType === 'networkStatusTopology' ||
+        chartType === 'networkStatusTopology'
+      ) {
+        const existingTopology = widgetItem?.valueConfig?.networkStatusTopology;
+        const formTopology = values.networkStatusTopology;
+        values.networkStatusTopology = {
+          instUuids: formTopology?.instUuids || existingTopology?.instUuids || [],
+          nodeLimit: formTopology?.nodeLimit ?? existingTopology?.nodeLimit ?? 100,
+          linkTrafficDisplays:
+            formTopology?.linkTrafficDisplays ?? existingTopology?.linkTrafficDisplays,
+          inboundTrafficThresholds:
+            formTopology?.inboundTrafficThresholds ??
+            existingTopology?.inboundTrafficThresholds,
+          outboundTrafficThresholds:
+            formTopology?.outboundTrafficThresholds ??
+            existingTopology?.outboundTrafficThresholds,
+          layoutMode: formTopology?.layoutMode ?? existingTopology?.layoutMode,
+          layoutByMode:
+            formTopology?.layoutByMode ?? existingTopology?.layoutByMode,
+          nodePositions:
+            formTopology?.nodePositions ?? existingTopology?.nodePositions,
+          linkVertices:
+            formTopology?.linkVertices ?? existingTopology?.linkVertices,
+        };
+      }
 
-        const validDisplayColumns = tableConfig.displayColumns
-          .map((col) => ({
-            ...col,
-            key: col.key.trim(),
-            title: col.title?.trim() || col.key.trim(),
-          }))
-          .filter((col) => col.key);
+      const submitResult = buildWidgetSubmitConfig({
+        values,
+        chartType,
+        showChartThemeMode,
+        showTableFilterFields,
+        selectedFields: singleValueConfig.selectedFields,
+        thresholdColors: singleValueConfig.thresholdColors,
+        filterBindings,
+        displayColumns: tableConfig.displayColumns,
+        filterFields: tableConfig.filterFields,
+        actions,
+      });
 
-        const duplicateKeySet = new Set<string>();
-        const hasDuplicateKeys = validDisplayColumns.some((col) => {
-          if (duplicateKeySet.has(col.key)) return true;
-          duplicateKeySet.add(col.key);
-          return false;
-        });
-
-        if (hasDuplicateKeys) {
+      if (submitResult.error) {
+        if (submitResult.error === 'duplicateFieldKey') {
           message.error(
             t('dashboard.duplicateFieldKey') || '字段 key 不能重复',
           );
           return;
         }
-
-        const hasVisibleColumn = validDisplayColumns.some(
-          (col) => col.visible !== false,
-        );
-        if (!hasVisibleColumn) {
+        if (submitResult.error === 'atLeastOneVisibleColumn') {
           tableConfig.setDisplayColumnsError(
             t('dashboard.atLeastOneVisibleColumn') || '请至少保留一列可见',
           );
           return;
         }
-
-        if (validDisplayColumns.length > 0) {
-          tableConfigData.columns = validDisplayColumns.map((col, index) => ({
-            key: col.key,
-            title: col.title,
-            visible: col.visible,
-            order: index,
-            columnType: col.columnType,
-          }));
+        if (submitResult.error === 'multipleComponentSwitchParams') {
+          message.error(t('dashboard.multipleComponentSwitchParams'));
+          return;
         }
-
-        if (
-          tableConfigData.filterFields?.length ||
-          tableConfigData.columns?.length
-        ) {
-          values.tableConfig = tableConfigData;
+        if (submitResult.error === 'cardListTitleRequired') {
+          message.error(t('dashboard.cardListTitleRequired'));
+          return;
+        }
+        if (submitResult.error === 'cardListLeadingFieldRequired') {
+          message.error(t('dashboard.cardListLeadingFieldRequired'));
+          return;
         }
       }
 
-      let result: WidgetConfig = { ...values } as WidgetConfig;
-      if (!showChartThemeMode) {
-        delete result.chartThemeMode;
-      } else if (result.chartThemeMode === 'default') {
-        delete result.chartThemeMode;
+      if (submitResult.config) {
+        onConfirm?.(submitResult.config);
       }
-
-      if (chartType === 'table') {
-        const displayColumnKeys = new Set(
-          tableConfig.displayColumns
-            .map((col) => (col.key || '').trim())
-            .filter(Boolean),
-        );
-        const validActions = actions.filter((action) =>
-          displayColumnKeys.has(action.columnKey),
-        );
-        if (validActions.length > 0) {
-          result.actions = validActions;
-        }
-      }
-
-      if (chartType === 'single') {
-        result.selectedFields = singleValueConfig.selectedFields;
-        result.thresholdColors = singleValueConfig.thresholdColors;
-        result.compare = !!values.compare;
-        const unitValue = form.getFieldValue('unit');
-        const conversionFactorValue = form.getFieldValue('conversionFactor');
-        const decimalPlacesValue = form.getFieldValue('decimalPlaces');
-        if (unitValue !== undefined) result.unit = unitValue;
-        result.unitId = form.getFieldValue('unitId') || undefined;
-        result.valueMappings = form.getFieldValue('valueMappings') || undefined;
-        if (conversionFactorValue !== undefined)
-          result.conversionFactor = conversionFactorValue;
-        if (decimalPlacesValue !== undefined)
-          result.decimalPlaces = decimalPlacesValue;
-      }
-
-      if (chartType === 'gauge') {
-        result.selectedFields = singleValueConfig.selectedFields;
-        result.thresholdColors = singleValueConfig.thresholdColors;
-        const unitValue = form.getFieldValue('unit');
-        const conversionFactorValue = form.getFieldValue('conversionFactor');
-        const decimalPlacesValue = form.getFieldValue('decimalPlaces');
-        const gaugeMinValue = form.getFieldValue('gaugeMin');
-        const gaugeMaxValue = form.getFieldValue('gaugeMax');
-        const gaugeShapeValue = form.getFieldValue('gaugeShape');
-        if (unitValue !== undefined) result.unit = unitValue;
-        result.unitId = form.getFieldValue('unitId') || undefined;
-        result.valueMappings = form.getFieldValue('valueMappings') || undefined;
-        if (conversionFactorValue !== undefined)
-          result.conversionFactor = conversionFactorValue;
-        if (decimalPlacesValue !== undefined)
-          result.decimalPlaces = decimalPlacesValue;
-        if (gaugeMinValue !== undefined) result.gaugeMin = gaugeMinValue;
-        if (gaugeMaxValue !== undefined) result.gaugeMax = gaugeMaxValue;
-        if (gaugeShapeValue !== undefined) result.gaugeShape = gaugeShapeValue;
-      }
-
-      if (chartType === 'topN') {
-        result.topNLabelField = values.topNLabelField;
-        result.topNValueField = values.topNValueField;
-      }
-
-      if (filterBindings && Object.keys(filterBindings).length > 0) {
-        result = { ...result, filterBindings };
-      }
-
-      onConfirm?.(result);
     } catch (error) {
       console.error('Form validation failed:', error);
       message.error(t('common.saveFailed'));
@@ -1123,7 +1154,7 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
     <Drawer
       title={t('dashboard.viewConfig')}
       placement="right"
-      width={700}
+      width={isNetworkStatusTopology ? 760 : 700}
       open={open}
       maskClosable={false}
       onClose={handleClose}
@@ -1140,7 +1171,8 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
     >
       <Form
         form={form}
-        labelCol={{ span: 4 }}
+        layout="vertical"
+        initialValues={{ compare: false, compareMode: 'percent' }}
         onValuesChange={handleFormValuesChange}
       >
         <div className="mb-6">
@@ -1160,67 +1192,95 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
           {isNetworkStatusTopology ? (
             <>
               <Form.Item
-                label={t('dashboard.networkTopoModel')}
-                name={['networkStatusTopology', 'modelId']}
-                rules={[{ required: true, message: t('dashboard.selectModel') }]}
-                tooltip={t('dashboard.networkTopoModelHelp')}
+                label={t('dashboard.networkTopoDevices')}
+                name={['networkStatusTopology', 'instUuids']}
+                dependencies={[['networkStatusTopology', 'nodeLimit']]}
+                rules={[
+                  { required: true, message: t('dashboard.networkTopoSelectDevicesRequired') },
+                  {
+                    validator: async (_, value) => {
+                      if (
+                        networkStatusTopologySelectionExceedsLimit(
+                          value,
+                          form.getFieldValue(['networkStatusTopology', 'nodeLimit']),
+                        )
+                      ) {
+                        throw new Error(t('dashboard.networkTopoSelectionExceedsLimit'));
+                      }
+                    },
+                  },
+                ]}
+                tooltip={t('dashboard.networkTopoDevicesHelp')}
               >
-                <Select
-                  showSearch
-                  loading={networkModelsLoading}
-                  placeholder={t('dashboard.selectModel')}
-                  options={networkModelOptions}
-                  optionFilterProp="label"
-                  notFoundContent={
-                    networkModelsLoading
-                      ? undefined
-                      : t('dashboard.networkTopoNoSupportedModel')
-                  }
-                  onChange={() => {
-                    form.setFieldValue(['networkStatusTopology', 'instId'], undefined);
-                    setNetworkInstanceOptions([]);
-                    setNetworkInstancePage(1);
-                    setNetworkInstanceTotal(0);
-                    setNetworkInstanceKeyword('');
-                  }}
+                <NetworkStatusTopologyDeviceList
+                  nodeLimit={networkTopoNodeLimit}
+                  listedOptions={networkTopologyConfig.instanceOptions}
+                  instanceTotal={networkTopologyConfig.instanceTotal}
+                  instancePage={networkTopologyConfig.instancePage}
+                  instancePageSize={networkTopologyConfig.instancePageSize}
+                  instanceKeyword={networkTopologyConfig.instanceKeyword}
+                  instancesLoading={networkTopologyConfig.instancesLoading}
+                  modelsLoading={networkTopologyConfig.modelsLoading}
+                  modelFilter={networkTopologyConfig.modelFilter}
+                  modelOptions={networkTopologyConfig.modelOptions}
+                  onModelFilterChange={networkTopologyConfig.handleModelFilterChange}
+                  onSearch={networkTopologyConfig.handleInstanceSearch}
+                  onPageChange={networkTopologyConfig.handleInstancePageChange}
                 />
               </Form.Item>
               <Form.Item
-                label={t('dashboard.networkTopoInstance')}
-                name={['networkStatusTopology', 'instId']}
-                rules={[{ required: true, message: t('dashboard.selectInstance') }]}
-                tooltip={t('dashboard.networkTopoInstanceHelp')}
+                label={t('dashboard.networkTopoNodeLimit')}
+                name={['networkStatusTopology', 'nodeLimit']}
+                initialValue={100}
+                tooltip={t('dashboard.networkTopoNodeLimitHelp')}
               >
-                <Select
-                  showSearch
-                  loading={networkInstancesLoading}
-                  placeholder={t('dashboard.selectInstance')}
-                  options={networkInstanceOptions}
-                  filterOption={false}
-                  disabled={!sceneModelId}
-                  notFoundContent={
-                    networkInstancesLoading ? t('common.loading') : t('dashboard.noData')
-                  }
-                  onSearch={handleNetworkInstanceSearch}
-                  onPopupScroll={handleNetworkInstancePopupScroll}
+                <InputNumber
+                  min={1}
+                  max={NETWORK_STATUS_TOPOLOGY_MAX_NODE_LIMIT}
+                  precision={0}
+                  className="w-full"
                 />
               </Form.Item>
               <Form.Item
-                label={t('dashboard.expandDepth')}
-                name={['networkStatusTopology', 'depth']}
-                initialValue={2}
+                label={t('dashboard.networkTopoLinkTraffic')}
+                name={['networkStatusTopology', 'linkTrafficDisplays']}
+                initialValue={['inbound', 'outbound']}
               >
-                <Select
+                <Checkbox.Group
                   options={[
-                    { label: '1', value: 1 },
-                    { label: '2', value: 2 },
-                    { label: '3', value: 3 },
-                    { label: '4', value: 4 },
+                    {
+                      label: t('dashboard.networkTopoLinkTrafficInbound'),
+                      value: 'inbound',
+                    },
+                    {
+                      label: t('dashboard.networkTopoLinkTrafficOutbound'),
+                      value: 'outbound',
+                    },
                   ]}
                 />
               </Form.Item>
+              <Form.Item
+                name={['networkStatusTopology', 'inboundTrafficThresholds']}
+                noStyle
+              >
+                <ThresholdColorListField
+                  t={t}
+                  label={t('dashboard.networkTopoLinkTrafficInboundThresholds')}
+                  extra={t('dashboard.networkTopoTrafficThresholdHint')}
+                />
+              </Form.Item>
+              <Form.Item
+                name={['networkStatusTopology', 'outboundTrafficThresholds']}
+                noStyle
+              >
+                <ThresholdColorListField
+                  t={t}
+                  label={t('dashboard.networkTopoLinkTrafficOutboundThresholds')}
+                  extra={t('dashboard.networkTopoTrafficThresholdHint')}
+                />
+              </Form.Item>
             </>
-          ) : (
+          ) : isSceneWidget ? null : (
             <>
               <Form.Item
                 label={t('dashboard.dataSource')}
@@ -1228,7 +1288,11 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
                 rules={[{ required: true, message: t('common.selectTip') }]}
                 getValueProps={() => ({
                   value: selectedDataSource
-                    ? `${selectedDataSource.name}（${selectedDataSource.rest_api}）`
+                    ? `${selectedDataSource.name}${
+                        selectedDataSource.rest_api
+                          ? `（${selectedDataSource.rest_api}）`
+                          : ''
+                      }`
                     : '',
                 })}
               >
@@ -1285,6 +1349,28 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
               />
             </Form.Item>
           )}
+          {surface === 'screen' && canConfigureScreenWidgetFrame(chartType) && (
+            <Form.Item
+              label={t('opsAnalysis.screen.widgetAppearance')}
+              name={['appearance', 'frame']}
+              initialValue="panel"
+            >
+              <Segmented
+                block
+                className="w-60 max-w-full"
+                options={[
+                  {
+                    label: t('opsAnalysis.screen.widgetFramePanel'),
+                    value: 'panel',
+                  },
+                  {
+                    label: t('opsAnalysis.screen.widgetFrameBare'),
+                    value: 'bare',
+                  },
+                ]}
+              />
+            </Form.Item>
+          )}
           <Form.Item label={t('dataSource.describe')} name="description">
             <Input.TextArea
               placeholder={t('common.inputMsg')}
@@ -1299,8 +1385,12 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
               {t('dashboard.queryParams')}
             </div>
             <DataSourceParamsConfig
-              selectedDataSource={selectedDataSource}
+              selectedDataSource={effectiveDataSource}
               includeFilterTypes={['params', 'fixed']}
+              onEditInputConfig={handleEditInputConfig}
+              onParamOptionsResolved={(param, options) =>
+                reconcileParamWithOptions(param.name, options)
+              }
             />
           </div>
         )}
@@ -1331,6 +1421,7 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
             filterFields={tableConfig.filterFields}
             filterFieldOptions={filterFieldOptions}
             showFilterFields={showTableFilterFields}
+            showColumnCellStyle={chartType === 'table'}
             invalidConfiguredFieldKeys={invalidConfiguredFieldKeys}
             isProbingColumns={tableConfig.isProbingColumns}
             paramsChangedAfterProbe={tableConfig.paramsChangedAfterProbe}
@@ -1354,6 +1445,9 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
               }
             }}
             onDisplayColumnChange={tableConfig.handleDisplayColumnChange}
+            onDisplayColumnStyleChange={
+              tableConfig.handleDisplayColumnStyleChange
+            }
             onDisplayColumnKeyBlur={tableConfig.handleDisplayColumnKeyBlur}
             onDisplayColumnDragEnd={tableConfig.handleDisplayColumnDragEnd}
             onReProbeColumns={tableConfig.handleReProbeColumns}
@@ -1395,6 +1489,7 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
             onAddThreshold={singleValueConfig.addThreshold}
             onRemoveThreshold={singleValueConfig.removeThreshold}
             compareAvailable={singleValueConfig.compareAvailable}
+            showDescriptionField
           />
         )}
 
@@ -1420,6 +1515,57 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
           />
         )}
 
+        {VALUE_FORMAT_CHART_TYPES.has(chartType) && (
+          <div className="mb-6">
+            <div className="font-medium mb-4">{t('dashboard.displaySettings')}</div>
+            <ValueFormatConfigSection t={t} />
+            {chartType === 'multiValue' && (
+              <>
+                <ThresholdColorConfigSection
+                  t={t}
+                  thresholdColors={singleValueConfig.thresholdColors}
+                  onThresholdChange={singleValueConfig.handleThresholdChange}
+                  onThresholdBlur={singleValueConfig.handleThresholdBlur}
+                  onAddThreshold={singleValueConfig.addThreshold}
+                  onRemoveThreshold={singleValueConfig.removeThreshold}
+                  allowEmpty
+                />
+                <Form.Item
+                  label={t('topology.nodeConfig.valueMappings')}
+                  name="valueMappings"
+                >
+                  <ValueMappingsConfigSection t={t} />
+                </Form.Item>
+              </>
+            )}
+          </div>
+        )}
+
+        {chartType === 'eventTimeline' && (
+          <div className="mb-6">
+            <div className="font-medium mb-4">{t('dashboard.eventTimelineSettings')}</div>
+            <Form.Item
+              label={t('dashboard.eventTimelineSortOrder')}
+              name={['eventTimeline', 'sortOrder']}
+              initialValue="desc"
+            >
+              <Select
+                options={[
+                  { label: t('dashboard.eventTimelineSortDesc'), value: 'desc' },
+                  { label: t('dashboard.eventTimelineSortAsc'), value: 'asc' },
+                ]}
+              />
+            </Form.Item>
+          </div>
+        )}
+
+        {chartType === 'radar' && (
+          <RadarSettingsSection
+            t={t}
+            availableFields={availableFields}
+          />
+        )}
+
         {chartType === 'topN' && (
           <TopNSettingsSection
             t={t}
@@ -1430,11 +1576,31 @@ const ViewConfig: React.FC<ViewConfigPropsWithManager> = ({
           />
         )}
 
+        {chartType === 'cardList' && (
+          <CardListSettingsSection
+            key={resolveCardListSettingsRemountKey(widgetItem)}
+            t={t}
+            availableFields={availableFields}
+          />
+        )}
+
       </Form>
       <ComponentSelector
         visible={dataSourceSelectorVisible}
         onCancel={() => setDataSourceSelectorVisible(false)}
         onOpenConfig={handleDataSourceChangeFromSelector}
+        surface={surface}
+      />
+      <ParamInputConfigEditor
+        key={editingInputConfigParam?.name ?? 'closed'}
+        open={editingInputConfigParam !== null}
+        value={editingInputConfigParam?.inputConfig}
+        onConfirm={handleInputConfigConfirm}
+        onCancel={() => setEditingInputConfigParam(null)}
+        excludeSourceIds={selectedDataSource ? [selectedDataSource.id] : []}
+        componentSwitchEnabled={supportsComponentSwitch(chartType)}
+        componentSwitchOwner={componentSwitchOwner}
+        editingParamName={editingInputConfigParam?.name}
       />
     </Drawer>
   );

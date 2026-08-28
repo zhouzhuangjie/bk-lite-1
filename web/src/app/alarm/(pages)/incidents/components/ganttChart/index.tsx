@@ -9,8 +9,9 @@ import { AlarmTableDataItem } from '@/app/alarm/types/alarms';
 import { ModalRef } from '@/app/alarm/types/types';
 import { Tooltip, Checkbox, Spin } from 'antd';
 import { useCommon } from '@/app/alarm/context/common';
-import { Empty } from 'antd';
+import CompactEmptyState from '@/components/compact-empty-state';
 import { useTranslation } from '@/utils/i18n';
+import { useLocalizedTime } from '@/hooks/useLocalizedTime';
 dayjs.extend(minMax);
 
 interface GanttChartProps {
@@ -28,6 +29,7 @@ export default function GanttChart({
 }: GanttChartProps) {
   const detailRef = useRef<ModalRef>(null);
   const { levelMap } = useCommon();
+  const { convertToLocalizedTime } = useLocalizedTime();
   const { t } = useTranslation();
 
   const toggleTask = (id: number) => {
@@ -81,10 +83,7 @@ export default function GanttChart({
       <div className={styles.chartWrapper}>
         <Spin spinning={loading}>
           {!sortedData?.length ? (
-            <Empty
-              image={Empty.PRESENTED_IMAGE_SIMPLE}
-              description={t('common.noData')}
-            />
+            <CompactEmptyState description={t('common.noData')} />
           ) : (
             <div className={styles.chartGrid}>
               <div className={styles.emptyHeader} />
@@ -149,11 +148,11 @@ export default function GanttChart({
                               <div>{d.title}</div>
                               <div>
                                 {t('alarms.firstEventTime')}:{' '}
-                                {d.first_event_time || '--'}
+                                {d.first_event_time ? convertToLocalizedTime(d.first_event_time) : '--'}
                               </div>
                               <div>
                                 {t('alarms.lastEventTime')}:{' '}
-                                {d.last_event_time || '--'}
+                                {d.last_event_time ? convertToLocalizedTime(d.last_event_time) : '--'}
                               </div>
                               <div>
                                 {t('alarmCommon.operator')}:{' '}

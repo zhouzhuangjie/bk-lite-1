@@ -2,10 +2,15 @@ import assert from 'node:assert/strict';
 
 import {
   buildSearchQueryParams,
+  generateSearchId,
   getMetricsMapKey,
   resolveInitialPlugin,
   resolveMetricSelection,
 } from '../src/app/monitor/(pages)/search/searchQueryLogic';
+import {
+  buildSearchTimeQueryParams,
+  parseSearchTimeQueryParams,
+} from '../src/app/monitor/utils/searchTimeQuery';
 import type { MetricItem } from '../src/app/monitor/types';
 import type { InstanceItem } from '../src/app/monitor/types/search';
 
@@ -47,6 +52,20 @@ const hostInstance = {
 
 assert.equal(getMetricsMapKey(8, 6), '8_6');
 assert.equal(getMetricsMapKey('8', null), '8');
+
+assert.equal(
+  generateSearchId({ randomUUID: () => 'native-random-uuid' }),
+  'native-random-uuid'
+);
+assert.equal(
+  generateSearchId({
+    getRandomValues: (values) => {
+      values.fill(0);
+      return values;
+    },
+  }),
+  '00000000-0000-4000-8000-000000000000'
+);
 
 assert.equal(resolveInitialPlugin([{ id: 6, name: 'Host' }]), 6);
 assert.equal(
@@ -107,5 +126,58 @@ assert.equal(
   remoteParams.query,
   'host_cpu_usage_percent_gauge{instance_type="os", instance_id=~"MTVmOTFiYTM5ODZk"}'
 );
+
+assert.deepEqual(buildSearchTimeQueryParams({ timeRange: [], originValue: 15 }), {
+  origin: '15',
+});
+assert.deepEqual(buildSearchTimeQueryParams({ timeRange: [], originValue: 60 }), {
+  origin: '60',
+});
+assert.deepEqual(
+  buildSearchTimeQueryParams({
+    timeRange: [1_700_000_000_000, 1_700_000_900_000],
+    originValue: 0,
+  }),
+  { start: '1700000000000', end: '1700000900000' }
+);
+assert.deepEqual(
+  buildSearchTimeQueryParams({ timeRange: [100, 50], originValue: 0 }),
+  {}
+);
+
+const asParams = (query: string) => new URLSearchParams(query);
+assert.deepEqual(parseSearchTimeQueryParams(asParams('origin=60')), {
+  timeValues: { timeRange: [], originValue: 60 },
+  selectValue: 60,
+  rangeStart: null,
+  rangeEnd: null,
+});
+assert.deepEqual(
+  parseSearchTimeQueryParams(asParams('start=1700000000000&end=1700000900000')),
+  {
+    timeValues: { timeRange: [1_700_000_000_000, 1_700_000_900_000], originValue: 0 },
+    selectValue: 0,
+    rangeStart: 1_700_000_000_000,
+    rangeEnd: 1_700_000_900_000,
+  }
+);
+assert.deepEqual(parseSearchTimeQueryParams(asParams('origin=15&start=1&end=2')), {
+  timeValues: { timeRange: [], originValue: 15 },
+  selectValue: 15,
+  rangeStart: null,
+  rangeEnd: null,
+});
+assert.deepEqual(parseSearchTimeQueryParams(asParams('start=abc&end=def')), {
+  timeValues: { timeRange: [], originValue: 15 },
+  selectValue: 15,
+  rangeStart: null,
+  rangeEnd: null,
+});
+assert.deepEqual(parseSearchTimeQueryParams(asParams('')), {
+  timeValues: { timeRange: [], originValue: 15 },
+  selectValue: 15,
+  rangeStart: null,
+  rangeEnd: null,
+});
 
 console.log('monitor-search plugin scope validation passed');

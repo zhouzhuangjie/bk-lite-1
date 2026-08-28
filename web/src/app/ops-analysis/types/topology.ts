@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import { DirItem } from './index';
 import type { ParamItem } from './dataSource';
 import type {
@@ -115,6 +116,7 @@ export interface TopologyNodeData {
   isLoading?: boolean;
   hasError?: boolean;
   errorMessage?: string;
+  fetchError?: boolean;
   rawData?: TopologyRawData;
   isPlaceholder?: boolean;
   isNewNode?: boolean; 
@@ -215,6 +217,7 @@ export interface NodeConfPanelProps {
   visible?: boolean;
   title?: string;
   builtinNamespaceId?: number;
+  filterDefinitions?: UnifiedFilterDefinition[];
   onClose?: () => void;
   onConfirm?: (values: NodeConfigFormValues) => void;
   onCancel?: () => void;
@@ -298,6 +301,9 @@ export interface ToolbarProps {
   isSelectMode: boolean;
   isEditMode?: boolean;
   isFullscreen?: boolean;
+  shareMode?: boolean;
+  shareLoading?: boolean;
+  onOpenShare?: () => void;
   selectedTopology?: DirItem | null;
   onZoomIn: () => void;
   onZoomOut: () => void;
@@ -313,8 +319,10 @@ export interface ToolbarProps {
   canRedo?: boolean;
   onRefresh?: () => void;
   onFrequencyChange?: (frequency: number) => void;
+  frequenceValue?: number;
   onCancel?: () => void;
   onFilterConfig?: () => void;
+  editExtra?: ReactNode;
 }
 
 // ViewConfig 表单值类型
@@ -325,12 +333,14 @@ export interface ViewConfigFormValues {
   chartThemeMode?: OpsChartThemeMode;
   dataSource?: number | string;
   compare?: boolean;
+  compareMode?: 'percent' | 'value';
   dataSourceParams?: ParamItem[];
   filterBindings?: FilterBindings;
   selectedFields?: string[];
   topNLabelField?: string;
   topNValueField?: string;
   unit?: string;
+  unitId?: string;
   conversionFactor?: number;
   decimalPlaces?: number;
   gaugeMin?: number;
@@ -340,6 +350,7 @@ export interface ViewConfigFormValues {
     value: string;
     color: string;
   }>;
+  valueMappings?: import('@/app/ops-analysis/utils/valueMapping').ValueMapping[];
   tableConfig?: TableConfig;
 }
 
@@ -351,10 +362,12 @@ export interface NodeConfigFormValues {
   logoIcon?: string;
   logoUrl?: string;
   compare?: boolean;
+  compareMode?: 'percent' | 'value';
   selectedFields?: string[];
   chartType?: string;
   dataSource?: number | string;
   dataSourceParams?: ParamItem[];
+  filterBindings?: FilterBindings;
   builtinNamespaceId?: number;
   topNLabelField?: string;
   topNValueField?: string;
@@ -386,6 +399,7 @@ export interface NodeConfigFormValues {
 // Topology 组件 Props 和 Ref 类型
 export interface TopologyProps {
   selectedTopology?: DirItem | null;
+  shareMode?: boolean;
 }
 
 export interface TopologyRef {

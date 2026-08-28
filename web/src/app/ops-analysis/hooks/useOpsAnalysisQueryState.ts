@@ -52,7 +52,7 @@ export const useOpsAnalysisQueryState = () => {
     setNamespaceSearchVersion(0);
   }, []);
 
-  const setDefinitions = useCallback(
+  const applyFilterConfigConfirm = useCallback(
     (nextDefinitions: UnifiedFilterDefinition[]) => {
       setDefinitionsState(nextDefinitions);
       setFilterValuesState((current) =>
@@ -64,6 +64,8 @@ export const useOpsAnalysisQueryState = () => {
     },
     [],
   );
+
+  const setDefinitions = applyFilterConfigConfirm;
 
   const setFilterValues = useCallback(
     (values: Record<string, FilterValue>) => {
@@ -98,14 +100,17 @@ export const useOpsAnalysisQueryState = () => {
   const applyQuery = useCallback(
     (values: Record<string, FilterValue>, namespaceId: number | undefined) => {
       const nextValues = syncFilterValuesWithDefinitions(definitions, values);
+      const namespaceChanged = appliedNamespaceId !== namespaceId;
       setFilterValuesState(nextValues);
       setAppliedFilterValuesState(nextValues);
       setNamespaceDraftId(namespaceId);
       setAppliedNamespaceId(namespaceId);
       setFilterSearchVersion((current) => current + 1);
-      setNamespaceSearchVersion((current) => current + 1);
+      if (namespaceChanged) {
+        setNamespaceSearchVersion((current) => current + 1);
+      }
     },
-    [definitions],
+    [appliedNamespaceId, definitions],
   );
 
   return {
@@ -117,6 +122,7 @@ export const useOpsAnalysisQueryState = () => {
     filterSearchVersion,
     namespaceSearchVersion,
     setDefinitions,
+    applyFilterConfigConfirm,
     setFilterValues,
     setAppliedFilterValues,
     setNamespaceDraftId,

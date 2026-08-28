@@ -1,14 +1,20 @@
+import uuid
 from datetime import timedelta
 
 from celery import shared_task
+from celery.exceptions import MaxRetriesExceededError
+from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone as django_timezone
 
 from apps.core.logger import system_mgmt_logger as logger
+from apps.core.utils.database import bulk_create_with_primary_keys
 from apps.core.utils.permission_cache import clear_users_permission_cache
 from apps.rpc.base import RpcClient
 from apps.system_mgmt.models import Channel, ErrorLog, Group, LoginModule, SystemSettings, User
 from apps.system_mgmt.models.channel import ChannelChoices
 from apps.system_mgmt.utils.channel_utils import send_email_to_user
+from apps.system_mgmt.utils.group_utils import GroupUtils
 
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
@@ -41,6 +47,11 @@ def write_error_log_async(self, username, app, module, error_message, domain, st
 
 @shared_task
 def sync_user_and_group_by_login_module(login_module_id):
+    """执行遗留 LoginModule 的 bk_lite 用户/组织同步。
+
+    管理入口已关闭。后续同步必须使用集成中心 Provider 的 ``user_sync``
+    capability；此任务只为存量定时任务兼容保留，不得新增调用方。
+    """
     login_module = LoginModule.objects.filter(id=login_module_id, enabled=True).first()
     if not login_module:
         return {"result": False, "message": "Login module not found or not enabled."}
@@ -50,6 +61,7 @@ def sync_user_and_group_by_login_module(login_module_id):
     result = client.request("sync_data")
     if not result["result"]:
         logger.error(f"Failed to sync data for login module {login_module_id}: {result['message']}")
+        return result
     user_list = result["data"]["user_list"]
     group_list = result["data"]["group_list"]
     sync_user_and_groups(user_list, group_list, login_module)
@@ -57,7 +69,7 @@ def sync_user_and_group_by_login_module(login_module_id):
 
 
 def sync_user_and_groups(user_list, group_list, login_module):
-    """同步用户和组数据到本地数据库"""
+    """遗留 LoginModule 同步实现；迁移目标为集成中心 ``user_sync`` Provider。"""
     try:
         parent_group, _ = Group.objects.get_or_create(
             name=login_module.other_config.get("root_group", login_module.name),
@@ -96,7 +108,18 @@ def _sync_groups(group_list, parent_group, parent_group_id):
     # 处理需要删除的组
     delete_groups = [group.id for group in existing_groups if group.external_id and group.external_id not in current_external_ids]
     if delete_groups:
-        Group.objects.filter(id__in=delete_groups).delete()
+        with transaction.atomic():
+            affected_identities = set()
+            affected_group_ids = GroupUtils.get_group_with_descendants(delete_groups)
+            for offset in range(0, len(affected_group_ids), 100):
+                affected_query = Q()
+                for group_id in affected_group_ids[offset : offset + 100]:
+                    affected_query |= Q(group_list__contains=[group_id])
+                affected_identities.update(User.objects.filter(affected_query).values_list("username", "domain").iterator(chunk_size=1000))
+            affected_users = [{"username": username, "domain": domain} for username, domain in sorted(affected_identities)]
+            Group.objects.filter(id__in=delete_groups).delete()
+            if affected_users:
+                clear_users_permission_cache(affected_users)
         logger.info(f"Deleted {len(delete_groups)} groups under parent {parent_group.name}")
 
     # 处理当前层级的组
@@ -145,7 +168,7 @@ def _sync_groups(group_list, parent_group, parent_group_id):
 
     # 批量创建新组
     if add_groups:
-        created_groups = Group.objects.bulk_create(add_groups, batch_size=100)
+        created_groups = bulk_create_with_primary_keys(Group.objects, add_groups, batch_size=100)
         logger.info(f"Created {len(created_groups)} groups under parent {parent_group.name}")
 
         # 为新创建的组添加映射并递归处理子组
@@ -217,6 +240,7 @@ def _sync_users(user_list, group_id_mapping, domain, default_role):
         else:
             # 创建新用户
             user_defaults = {
+                "user_id": str(uuid.uuid4()),
                 "username": username,
                 "display_name": user_data.get("display_name", username),
                 "email": user_data.get("email", ""),
@@ -230,19 +254,21 @@ def _sync_users(user_list, group_id_mapping, domain, default_role):
             new_user = User(**user_defaults)
             create_users.append(new_user)
 
-    # 批量创建新用户
+    affected_users = create_users + update_users
+    if affected_users:
+        with transaction.atomic():
+            if create_users:
+                User.objects.bulk_create(create_users, batch_size=100)
+            if update_users:
+                update_fields = ["display_name", "group_list"]
+                if any(hasattr(user, "domain") for user in update_users):
+                    update_fields.append("domain")
+                User.objects.bulk_update(update_users, update_fields, batch_size=100)
+            clear_users_permission_cache([{"username": user.username, "domain": user.domain} for user in affected_users])
+
     if create_users:
-        User.objects.bulk_create(create_users, batch_size=100)
         logger.info(f"Created {len(create_users)} new users")
-
-    # 批量更新已存在的用户
     if update_users:
-        update_fields = ["display_name", "group_list"]
-        if any(hasattr(user, "domain") for user in update_users):
-            update_fields.append("domain")
-
-        User.objects.bulk_update(update_users, update_fields, batch_size=100)
-        clear_users_permission_cache([{"username": user.username, "domain": user.domain} for user in update_users])
         logger.info(f"Updated {len(update_users)} existing users")
 
     return list(user_data_map.keys())
@@ -309,3 +335,164 @@ def check_password_expiry_and_notify():
 
     logger.info(f"== 密码过期提醒完成 == 通知={notified}, 失败={skipped}")
     return {"result": True, "notified": notified, "failed": skipped}
+
+
+@shared_task
+def execute_user_sync_source(source_id, trigger_mode="manual"):
+    from apps.system_mgmt.services.user_sync_service import execute_user_sync
+
+    return execute_user_sync(int(source_id), trigger_mode)
+
+
+@shared_task
+def schedule_im_notification_sync(channel_id):
+    from apps.system_mgmt.services.im_notification_service import create_im_notification_sync_run
+
+    result = create_im_notification_sync_run(int(channel_id), trigger_mode="schedule")
+    if not result.get("result"):
+        logger.info(f"Skip scheduled IM notification sync for channel {channel_id}: {result.get('message', '')}")
+        return result
+
+    run_id = result["data"]["run_id"]
+    execute_im_notification_sync_run_task.delay(run_id)
+    return result
+
+
+@shared_task
+def execute_im_notification_sync_run_task(run_id):
+    from apps.system_mgmt.services.im_notification_service import execute_im_notification_sync_run
+
+    return execute_im_notification_sync_run(int(run_id))
+
+
+# ---------------------------------------------------------------------------
+# 用户同步-本地密码初始化: 初始密码邮件发送(Task 3 完整实现)
+# ---------------------------------------------------------------------------
+
+
+@shared_task(
+    bind=True,
+    retry_backoff=True,
+    retry_backoff_max=600,
+    retry_jitter=True,
+    max_retries=3,
+)
+def send_initial_password_email(self, user_id, run_id):
+    """
+    Celery worker 端:
+      1. 取 user + run
+      2. 解密 vault 拿 raw_password
+      3. 调 RuntimeApplicationService 发送邮件
+      4. 成功后原子地 pop vault + 回写 email_status
+      5. 失败重试 3 次，最终失败才原子标记 failed
+    """
+    from apps.system_mgmt.models import User as UserModel
+    from apps.system_mgmt.models import UserSyncRun as UserSyncRunModel
+    from apps.system_mgmt.services.password_init_dispatch import complete_password_email_delivery
+    from apps.system_mgmt.services.password_init_email import send_email_via_runtime
+    from apps.system_mgmt.utils.password_vault import decrypt_from_vault
+
+    user = UserModel.objects.filter(id=user_id).first()
+    run = UserSyncRunModel.objects.filter(id=run_id).first()
+    if not user or not run:
+        logger.error(f"send_initial_password_email user={user_id} run={run_id} 数据缺失")
+        return
+
+    username = user.username
+    encrypted = (run.payload or {}).get("password_vault", {}).get(username)
+    if not encrypted:
+        logger.warning(f"vault 缺 username={username},run={run_id} 已发送或丢失")
+        return
+
+    try:
+        raw_password = decrypt_from_vault(encrypted)
+    except Exception as e:
+        logger.error(f"vault 解密失败 user={username} run={run_id}: {e}")
+        complete_password_email_delivery(run_id, username, ok=False, reason="vault 解密失败")
+        return
+
+    try:
+        result = send_email_via_runtime(user, raw_password)
+    except Exception as exc:
+        logger.warning(f"邮件发送异常 username={username}: {exc};触发重试")
+        _retry_or_complete_failure(self, run_id, username, str(exc), exc)
+        return
+
+    if result.get("result"):
+        complete_password_email_delivery(run_id, username, ok=True)
+    else:
+        msg = result.get("message", "未知错误")
+        _retry_or_complete_failure(self, run_id, username, msg, Exception(msg))
+
+
+def _retry_or_complete_failure(task, run_id, username, reason, exc):
+    """重试未耗尽时让 Retry 冒泡；耗尽后才完成失败状态。"""
+    from apps.system_mgmt.services.password_init_dispatch import complete_password_email_delivery
+
+    try:
+        task.retry(exc=exc)
+    except MaxRetriesExceededError:
+        complete_password_email_delivery(run_id, username, ok=False, reason=reason)
+
+
+@shared_task
+def send_initial_password_email_batch(run_id: int):
+    """领取一批待投递用户，在单条 SMTP 会话中发送个性化初始密码邮件。"""
+    from apps.system_mgmt.models import User as UserModel
+    from apps.system_mgmt.models import UserSyncRun as UserSyncRunModel
+    from apps.system_mgmt.services.password_init_dispatch import claim_password_email_batch, complete_password_email_batch
+    from apps.system_mgmt.services.password_init_email import send_initial_password_emails
+    from apps.system_mgmt.utils.password_vault import decrypt_from_vault
+
+    claimed = claim_password_email_batch(run_id)
+    if not claimed:
+        return
+    run = UserSyncRunModel.objects.filter(id=run_id).select_related("source").first()
+    if not run:
+        return
+    users = {user.id: user for user in UserModel.objects.filter(id__in=[item["user_id"] for item in claimed])}
+    deliveries, outcomes = [], []
+    vault = (run.payload or {}).get("password_vault", {})
+    for item in claimed:
+        username = item["username"]
+        user = users.get(item["user_id"])
+        if not user or not user.email:
+            outcomes.append({"username": username, "ok": False, "reason": "用户邮箱为空或用户不存在"})
+            continue
+        try:
+            raw_password = decrypt_from_vault(vault[username])
+        except Exception:
+            outcomes.append({"username": username, "ok": False, "reason": "vault 解密失败"})
+            continue
+        deliveries.append({"user": user, "username": username, "raw_password": raw_password})
+    if deliveries:
+        results = send_initial_password_emails(run.source, deliveries)
+        outcomes.extend(
+            {
+                "username": item["username"],
+                "ok": bool(results.get(item["username"], {}).get("result")),
+                "reason": results.get(item["username"], {}).get("message", "邮件发送失败"),
+            }
+            for item in deliveries
+        )
+    has_pending = complete_password_email_batch(run_id, outcomes)
+    if has_pending:
+        send_initial_password_email_batch.delay(run_id)
+
+
+@shared_task
+def recover_stuck_initial_password_email_batches():
+    """Beat 兜底回收 Worker 中断时遗留的邮件投递租约。"""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from apps.system_mgmt.models import UserSyncRun as UserSyncRunModel
+    from apps.system_mgmt.services.password_init_dispatch import recover_expired_password_email_batch
+
+    recovered_runs = 0
+    for run_id in UserSyncRunModel.objects.filter(started_at__gte=timezone.now() - timedelta(days=1)).values_list("id", flat=True):
+        if recover_expired_password_email_batch(run_id):
+            send_initial_password_email_batch.delay(run_id)
+            recovered_runs += 1
+    return {"recovered_runs": recovered_runs}

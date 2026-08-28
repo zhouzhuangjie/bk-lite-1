@@ -13,9 +13,9 @@
     sec_name = "{{ sec_name }}"
     sec_level = "{{ sec_level }}"
     auth_protocol = "{{ auth_protocol }}"
-    auth_password = "{{ auth_password }}"
+    auth_password = "${AUTH_PASSWORD__{{ config_id }}}"
     priv_protocol = "{{ priv_protocol }}"
-    priv_password = "{{ priv_password }}"
+    priv_password = "${PRIV_PASSWORD__{{ config_id }}}"
     {% else %}
     {% endif %}
     [inputs.snmp.tags]
@@ -55,6 +55,7 @@
     [[inputs.snmp.table]]
         name = "device_cpu"
         inherit_tags = ["source"]
+        index_as_tag = true
     [[inputs.snmp.table.field]]
         oid = "1.3.6.1.4.1.3320.9.109.1.1.1.1.5.1"
         name = "usage"
@@ -62,9 +63,9 @@
     # 待现网核验：used 列 1.3.6.1.4.1.3320.9.48.1.1.1.5 / free 列 ...1.1.1.6（按 pool index 走表）。
     # 利用率共享盘按 used/(used+free) 计算。
     [[inputs.snmp.table]]
-        oid = "1.3.6.1.4.1.3320.9.48.1.1"
         name = "device_memory"
         inherit_tags = ["source"]
+        index_as_tag = true
     [[inputs.snmp.table.field]]
         oid = "1.3.6.1.4.1.3320.9.48.1.1.1.5"
         name = "used"
@@ -74,9 +75,9 @@
     # ---- BDCOM card temperature (BDCOM-SYS nmscardTemperature, °C, per-card table) ----
     # 待现网核验：列 OID 1.3.6.1.4.1.3320.3.6.10.1.13（专用温度列）。device_temperature_celsius max()。
     [[inputs.snmp.table]]
-        oid = "1.3.6.1.4.1.3320.3.6.10.1"
         name = "device_temperature"
         inherit_tags = ["source"]
+        index_as_tag = true
     [[inputs.snmp.table.field]]
         oid = "1.3.6.1.4.1.3320.3.6.10.1.13"
         name = "celsius"

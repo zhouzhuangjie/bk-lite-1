@@ -2,11 +2,19 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { Modal, Menu, List, Input, Spin, Empty, Tag } from 'antd';
 import { ApartmentOutlined, DatabaseOutlined, LockOutlined } from '@ant-design/icons';
 import { useTranslation } from '@/utils/i18n';
-import { ComponentSelectorProps } from '@/app/ops-analysis/types/dashBoard';
+import {
+  ComponentSelectorProps,
+  type ComponentSelectorConfigItem,
+} from '@/app/ops-analysis/types/dashBoard';
 import { TagItem } from '@/app/ops-analysis/types/namespace';
 import { useDataSourceApi } from '@/app/ops-analysis/api/dataSource';
 import { useNamespaceApi } from '@/app/ops-analysis/api/namespace';
 import { SCENE_WIDGETS } from '@/app/ops-analysis/constants/sceneWidgets';
+import { isSceneWidgetAllowedOnSurface } from '@/app/ops-analysis/types/sceneWidgetCapability';
+import {
+  filterChartTypesForSurface,
+  hasSupportedChartTypeForSurface,
+} from '@/app/ops-analysis/utils/chartTypeSurface';
 import styles from './widgetSelector.module.scss';
 import type {
   DatasourceItem,
@@ -17,6 +25,7 @@ const ComponentSelector: React.FC<ComponentSelectorProps> = ({
   visible,
   onCancel,
   onOpenConfig,
+  surface = 'dashboard',
 }) => {
   const { t } = useTranslation();
   const [search, setSearch] = useState('');
@@ -43,18 +52,25 @@ const ComponentSelector: React.FC<ComponentSelectorProps> = ({
     bar: t('dataSource.barChart'),
     pie: t('dataSource.pieChart'),
     single: t('dataSource.singleValue'),
+    multiValue: t('dataSource.multiValue'),
     gauge: t('dataSource.gauge'),
     table: t('dataSource.table'),
     eventTable: t('dataSource.eventTable'),
+    eventTimeline: t('dashboard.eventTimeline'),
+    cardList: t('dataSource.cardList'),
     message: t('dataSource.eventTable'),
     topN: t('dataSource.topN'),
+    radar: t('dashboard.radar'),
+    topologyMap: t('dataSource.topologyMap'),
+    room3D: t('dataSource.room3D'),
   };
 
   const getChartTags = (chartTypes: ChartType[]) => {
-    if (!chartTypes?.length) return null;
+    const visibleChartTypes = filterChartTypesForSurface(chartTypes, surface) as ChartType[];
+    if (!visibleChartTypes?.length) return null;
     return (
       <div className="flex gap-1.5 flex-wrap pt-0.5">
-        {chartTypes.map((type, index) => (
+        {visibleChartTypes.map((type, index) => (
           <Tag
             key={index}
             bordered={false}
@@ -66,6 +82,12 @@ const ComponentSelector: React.FC<ComponentSelectorProps> = ({
       </div>
     );
   };
+
+  useEffect(() => {
+    if (surface === 'report' && selectorMode !== 'dataSource') {
+      setSelectorMode('dataSource');
+    }
+  }, [selectorMode, surface]);
 
   useEffect(() => {
     const fetchTags = async () => {
@@ -150,7 +172,9 @@ const ComponentSelector: React.FC<ComponentSelectorProps> = ({
     () =>
       Array.from(
         new Map(
-          SCENE_WIDGETS.map((item) => [
+          SCENE_WIDGETS.filter((item) =>
+            isSceneWidgetAllowedOnSurface(item.type, surface),
+          ).map((item) => [
             item.category,
             {
               key: item.category,
@@ -160,13 +184,25 @@ const ComponentSelector: React.FC<ComponentSelectorProps> = ({
           ]),
         ).values(),
       ),
-    [t],
+    [surface, t],
   );
 
   const filteredSceneWidgets = useMemo(
     () =>
-      SCENE_WIDGETS.filter((item) => item.category === selectedSceneCategory),
-    [selectedSceneCategory],
+      SCENE_WIDGETS.filter(
+        (item) =>
+          item.category === selectedSceneCategory &&
+          isSceneWidgetAllowedOnSurface(item.type, surface),
+      ),
+    [selectedSceneCategory, surface],
+  );
+
+  const visibleDataSources = useMemo(
+    () =>
+      currentDataSources.filter((item) =>
+        hasSupportedChartTypeForSurface(item.chart_type || [], surface),
+      ),
+    [currentDataSources, surface],
   );
 
   const menuItems = selectorMode === 'sceneWidget'
@@ -187,24 +223,26 @@ const ComponentSelector: React.FC<ComponentSelectorProps> = ({
       styles={{ body: { height: '56vh', overflow: 'hidden' } }}
     >
       <div className={styles.selector}>
-        <div className={styles.modeBar}>
-          <button
-            type="button"
-            className={`${styles.modeButton} ${selectorMode === 'dataSource' ? styles.activeModeButton : ''}`}
-            onClick={() => handleModeChange('dataSource')}
-          >
-            <DatabaseOutlined />
-            {t('dashboard.dataComponents')}
-          </button>
-          <button
-            type="button"
-            className={`${styles.modeButton} ${selectorMode === 'sceneWidget' ? styles.activeModeButton : ''}`}
-            onClick={() => handleModeChange('sceneWidget')}
-          >
-            <ApartmentOutlined />
-            {t('dashboard.sceneComponents')}
-          </button>
-        </div>
+        {surface !== 'report' && (
+          <div className={styles.modeBar}>
+            <button
+              type="button"
+              className={`${styles.modeButton} ${selectorMode === 'dataSource' ? styles.activeModeButton : ''}`}
+              onClick={() => handleModeChange('dataSource')}
+            >
+              <DatabaseOutlined />
+              {t('dashboard.dataComponents')}
+            </button>
+            <button
+              type="button"
+              className={`${styles.modeButton} ${selectorMode === 'sceneWidget' ? styles.activeModeButton : ''}`}
+              onClick={() => handleModeChange('sceneWidget')}
+            >
+              <ApartmentOutlined />
+              {t('dashboard.sceneComponents')}
+            </button>
+          </div>
+        )}
 
         <div className={styles.content}>
           <div className={styles.categoryPane}>
@@ -272,7 +310,7 @@ const ComponentSelector: React.FC<ComponentSelectorProps> = ({
                         sceneWidgetType: item.type,
                         defaultWidth: item.defaultWidth,
                         defaultHeight: item.defaultHeight,
-                      } as any)
+                      } as unknown as ComponentSelectorConfigItem)
                     }
                   >
                     <div className={styles.cardIcon}>
@@ -293,7 +331,7 @@ const ComponentSelector: React.FC<ComponentSelectorProps> = ({
               <div className={styles.cardList}>
                 <List
                   size="small"
-                  dataSource={currentDataSources}
+                  dataSource={visibleDataSources}
                   locale={{
                     emptyText: (
                       <Empty

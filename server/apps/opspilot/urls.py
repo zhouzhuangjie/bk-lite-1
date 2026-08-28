@@ -7,28 +7,29 @@ from apps.opspilot.viewsets import (
     ChannelViewSet,
     ChatApplicationViewSet,
     EmbedProviderViewSet,
-    FileKnowledgeViewSet,
     HistoryViewSet,
-    KnowledgeBaseViewSet,
-    KnowledgeDocumentViewSet,
-    KnowledgeGraphViewSet,
     LLMModelViewSet,
     LLMViewSet,
-    ManualKnowledgeViewSet,
     MemorySpaceViewSet,
     MemoryViewSet,
     ModelVendorViewSet,
     OCRProviderViewSet,
-    QAPairsViewSet,
     RasaModelViewSet,
-    SkillPackageViewSet,
     RerankProviderViewSet,
+    SkillPackageViewSet,
     SkillRequestLogViewSet,
     SkillToolsViewSet,
-    WebPageKnowledgeViewSet,
+    WikiBuildRecordViewSet,
+    WikiCheckItemViewSet,
+    WikiDirectoryViewSet,
+    WikiKnowledgeBaseViewSet,
+    WikiMaterialViewSet,
+    WikiPageViewSet,
     WorkFlowTaskResultViewSet,
 )
 from apps.opspilot.viewsets.memory_engine_view import MemoryEngineViewSet
+from apps.opspilot.viewsets.skill_channel_view import SkillChannelViewSet
+from apps.opspilot.viewsets.wiki_media_proxy_view import WikiParsedMediaProxyView
 
 router = routers.DefaultRouter()
 # model_provider
@@ -41,6 +42,7 @@ router.register(r"model_provider_mgmt/skill_tools", SkillToolsViewSet)
 router.register(r"model_provider_mgmt/skill_packages", SkillPackageViewSet)
 router.register(r"model_provider_mgmt/skill_log", SkillRequestLogViewSet)
 router.register(r"model_provider_mgmt/model_vendor", ModelVendorViewSet)
+router.register(r"model_provider_mgmt/skill_channel", SkillChannelViewSet, basename="skill_channel")
 
 # bot
 router.register(r"bot_mgmt/bot", BotViewSet)
@@ -52,21 +54,31 @@ router.register(r"bot_mgmt/chat_application", ChatApplicationViewSet)
 # channel
 router.register(r"channel_mgmt/channel", ChannelViewSet)
 
-# knowledge
-router.register(r"knowledge_mgmt/knowledge_base", KnowledgeBaseViewSet)
-router.register(r"knowledge_mgmt/file_knowledge", FileKnowledgeViewSet)
-router.register(r"knowledge_mgmt/knowledge_document", KnowledgeDocumentViewSet)
-router.register(r"knowledge_mgmt/web_page_knowledge", WebPageKnowledgeViewSet)
-router.register(r"knowledge_mgmt/manual_knowledge", ManualKnowledgeViewSet)
-router.register(r"knowledge_mgmt/qa_pairs", QAPairsViewSet)
-router.register(r"knowledge_mgmt/knowledge_graph", KnowledgeGraphViewSet)
-
 # memory
 router.register(r"memory_mgmt/memory_space", MemorySpaceViewSet)
 router.register(r"memory_mgmt/memory", MemoryViewSet)
 router.register(r"memory_mgmt/memory_engines", MemoryEngineViewSet, basename="memory_engines")
 
+# wiki (new knowledge base)
+router.register(r"wiki_mgmt/knowledge_base", WikiKnowledgeBaseViewSet, basename="wiki_knowledge_base")
+router.register(r"wiki_mgmt/directory", WikiDirectoryViewSet, basename="wiki_directory")
+router.register(r"wiki_mgmt/material", WikiMaterialViewSet, basename="wiki_material")
+router.register(r"wiki_mgmt/page", WikiPageViewSet, basename="wiki_page")
+router.register(r"wiki_mgmt/build_record", WikiBuildRecordViewSet, basename="wiki_build_record")
+router.register(r"wiki_mgmt/check_item", WikiCheckItemViewSet, basename="wiki_check_item")
+
 urlpatterns = router.urls
+
+# wiki media 同源代理（HMAC，供 <img> 无 Bearer 加载）
+_wiki_media_proxy = WikiParsedMediaProxyView.as_view()
+_wiki_media_proxy.api_exempt = True
+urlpatterns += [
+    path(
+        r"wiki_mgmt/media/",
+        _wiki_media_proxy,
+        name="wiki_parsed_media_proxy",
+    ),
+]
 
 # bot open api
 urlpatterns += [
@@ -80,11 +92,6 @@ urlpatterns += [
         r"bot_mgmt/v1/chat/completions",
         views.openai_completions,
         name="openai_completions",
-    ),
-    path(
-        r"bot_mgmt/lobe_chat/v1/chat/completions",
-        views.lobe_skill_execute,
-        name="lobe_openai_completions",
     ),
     path(
         r"bot_mgmt/get_active_users_line_data/",
@@ -137,6 +144,11 @@ urlpatterns += [
         name="execute_chat_flow_wechat",
     ),
     path(
+        r"bot_mgmt/execute_chat_flow_enterprise_wechat_aibot/<int:bot_id>/",
+        views.execute_chat_flow_enterprise_wechat_aibot,
+        name="execute_chat_flow_enterprise_wechat_aibot",
+    ),
+    path(
         r"bot_mgmt/execute_chat_flow_wechat_official/<int:bot_id>/",
         views.execute_chat_flow_wechat_official,
         name="execute_chat_flow_wechat_official",
@@ -145,6 +157,57 @@ urlpatterns += [
         r"bot_mgmt/execute_chat_flow_dingtalk/<int:bot_id>/",
         views.execute_chat_flow_dingtalk,
         name="execute_chat_flow_dingtalk",
+    ),
+    # 智能体渠道发布
+    path(
+        r"skill_channel/platform/",
+        views.list_platform_skill_channels,
+        name="list_platform_skill_channels",
+    ),
+    path(
+        r"skill_channel/web_chat/",
+        views.list_web_chat_skill_channels,
+        name="list_web_chat_skill_channels",
+    ),
+    path(
+        r"skill_channel/web_skills/",
+        views.list_published_web_skills,
+        name="list_published_web_skills",
+    ),
+    path(
+        r"skill_channel/skill/<int:skill_id>/chat/",
+        views.execute_published_web_skill_chat,
+        name="execute_published_web_skill_chat",
+    ),
+    path(
+        r"skill_channel/conversations/",
+        views.list_skill_channel_conversations,
+        name="list_skill_channel_conversations",
+    ),
+    path(
+        r"skill_channel/conversations/messages/",
+        views.list_skill_channel_session_messages,
+        name="list_skill_channel_session_messages",
+    ),
+    path(
+        r"skill_channel/conversations/delete/",
+        views.delete_skill_channel_session,
+        name="delete_skill_channel_session",
+    ),
+    path(
+        r"skill_channel/<int:channel_id>/chat/",
+        views.execute_skill_channel_chat,
+        name="execute_skill_channel_chat",
+    ),
+    path(
+        r"skill_channel/embedded/<int:skill_id>/<int:channel_id>/",
+        views.execute_skill_embedded_chat,
+        name="execute_skill_embedded_chat",
+    ),
+    path(
+        r"skill_channel/<int:channel_id>/<str:channel_type>/",
+        views.execute_skill_channel_im,
+        name="execute_skill_channel_im",
     ),
     # path(r"api/bot/automation_skill_execute", AutomationSkillExecuteView.as_view(), name="automation_skill_execute"),
 ]

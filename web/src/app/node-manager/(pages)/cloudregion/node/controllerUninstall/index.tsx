@@ -34,6 +34,18 @@ import CustomTable from '@/components/custom-table';
 import BatchEditModal from './batchEditModal';
 import { cloneDeep, isNumber } from 'lodash';
 import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
+import {
+  applyControllerUninstallCertificateValidation,
+  buildControllerUninstallRequestNode,
+  buildControllerUninstallRow
+} from '@/app/node-manager/utils/nodeOperation';
+import WinrmCertificateValidationField from '@/app/node-manager/components/winrm-certificate-validation-field';
+import WinrmSchemeField from '@/app/node-manager/components/winrm-scheme-field';
+import {
+  applyWinrmScheme,
+  isWinrmSchemePortMismatch,
+  type WinrmScheme
+} from '@/app/node-manager/utils/winrm';
 
 const ControllerUninstall = forwardRef<ModalRef, ModalSuccess>(
   ({ onSuccess, config }, ref) => {
@@ -48,6 +60,15 @@ const ControllerUninstall = forwardRef<ModalRef, ModalSuccess>(
     const [collectorVisible, setCollectorVisible] = useState<boolean>(false);
     const [confirmLoading, setConfirmLoading] = useState<boolean>(false);
     const [tableData, setTableData] = useState<TableDataItem[]>([]);
+    const isWindowsUninstall = tableData[0]?.os === 'windows';
+    const uninstallWinrmScheme: WinrmScheme =
+      isWindowsUninstall && tableData[0]?.winrm_scheme === 'http'
+        ? 'http'
+        : 'https';
+    const winrmCertValidation =
+      isWindowsUninstall &&
+      uninstallWinrmScheme === 'https' &&
+      tableData[0]?.winrm_cert_validation === true;
 
     const tableColumns = useMemo(
       () => [
@@ -75,6 +96,7 @@ const ControllerUninstall = forwardRef<ModalRef, ModalSuccess>(
               <InputNumber
                 className="w-full"
                 min={1}
+                max={65535}
                 precision={0}
                 value={row.port}
                 defaultValue={row.port}
@@ -88,7 +110,7 @@ const ControllerUninstall = forwardRef<ModalRef, ModalSuccess>(
             <>
               {t('node-manager.cloudregion.node.loginAccount')}
               <EditOutlined
-                className="cursor-pointer ml-[10px] text-[var(--color-primary)]"
+                className={`cursor-pointer ml-[10px] text-[var(--color-primary)] ${tableData[0]?.os === 'windows' ? 'hidden' : ''}`}
                 onClick={() => batchEditModal('username')}
               />
             </>
@@ -139,16 +161,25 @@ const ControllerUninstall = forwardRef<ModalRef, ModalSuccess>(
                     setTableData(data);
                   }
                 }}
-                options={[
-                  {
-                    label: t('node-manager.cloudregion.node.password'),
-                    value: 'password'
-                  },
-                  {
-                    label: t('node-manager.cloudregion.node.privateKey'),
-                    value: 'private_key'
-                  }
-                ]}
+                options={
+                  row.os === 'windows'
+                    ? [
+                      {
+                        label: t('node-manager.cloudregion.node.password'),
+                        value: 'password'
+                      }
+                    ]
+                    : [
+                      {
+                        label: t('node-manager.cloudregion.node.password'),
+                        value: 'password'
+                      },
+                      {
+                        label: t('node-manager.cloudregion.node.privateKey'),
+                        value: 'private_key'
+                      }
+                    ]
+                }
               />
             );
           }
@@ -277,17 +308,7 @@ const ControllerUninstall = forwardRef<ModalRef, ModalSuccess>(
       showModal: ({ type, form }) => {
         setCollectorVisible(true);
         setType(type);
-        const list = (form?.list || []).map((item: TableDataItem) => ({
-          id: item.id,
-          os: item.operating_system,
-          ip: item.ip,
-          port: 22,
-          username: null,
-          auth_type: 'password',
-          password: null,
-          private_key: null,
-          key_file_name: undefined
-        }));
+        const list = (form?.list || []).map(buildControllerUninstallRow);
         setTableData(list);
       }
     }));
@@ -357,6 +378,12 @@ const ControllerUninstall = forwardRef<ModalRef, ModalSuccess>(
           return false;
         }
         const authType = item.auth_type || 'password';
+        if (
+          item.os === 'windows' &&
+          isWinrmSchemePortMismatch(item.winrm_scheme || 'https', item.port)
+        ) {
+          return false;
+        }
         if (authType === 'password') {
           return !!item.password?.length;
         } else {
@@ -376,17 +403,7 @@ const ControllerUninstall = forwardRef<ModalRef, ModalSuccess>(
         const params = {
           cloud_region_id: cloudId,
           work_node: config.work_node,
-          nodes: data.map((item) => {
-            const node: any = {
-              os: item.os,
-              ip: item.ip,
-              port: item.port,
-              username: item.username,
-              password: item.private_key ? '' : item.password,
-              private_key: item.private_key || ''
-            };
-            return node;
-          })
+          nodes: data.map(buildControllerUninstallRequestNode)
         };
         uninstall(params);
       });
@@ -412,7 +429,7 @@ const ControllerUninstall = forwardRef<ModalRef, ModalSuccess>(
         title={t(`node-manager.cloudregion.node.${type}`)}
         open={collectorVisible}
         width={650}
-        destroyOnClose
+        destroyOnHidden
         okText={t('common.confirm')}
         cancelText={t('common.cancel')}
         onCancel={handleCancel}
@@ -446,6 +463,26 @@ const ControllerUninstall = forwardRef<ModalRef, ModalSuccess>(
         }
       >
         <Form ref={collectorformRef} layout="vertical" colon={false}>
+          {isWindowsUninstall && (
+            <>
+              <WinrmSchemeField
+                value={uninstallWinrmScheme}
+                onChange={(scheme) =>
+                  setTableData((rows) => applyWinrmScheme(rows, scheme))
+                }
+              />
+              {uninstallWinrmScheme === 'https' && (
+                <WinrmCertificateValidationField
+                  checked={winrmCertValidation}
+                  onChange={(checked) =>
+                    setTableData((rows) =>
+                      applyControllerUninstallCertificateValidation(rows, checked)
+                    )
+                  }
+                />
+              )}
+            </>
+          )}
           <Form.Item<ControllerInstallFields>
             name="nodes"
             label={t('node-manager.cloudregion.node.controllerInfo')}

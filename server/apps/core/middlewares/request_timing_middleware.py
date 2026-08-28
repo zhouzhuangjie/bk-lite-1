@@ -2,13 +2,11 @@
 请求耗时记录中间件
 记录每个请求的处理时间，并可选记录慢请求
 """
-import logging
 import time
 
+from apps.core.logger import logger
 from django.conf import settings
 from django.utils.deprecation import MiddlewareMixin
-
-logger = logging.getLogger("app")
 
 
 class RequestTimingMiddleware(MiddlewareMixin):
@@ -87,12 +85,13 @@ class RequestTimingMiddleware(MiddlewareMixin):
 
         # 根据耗时和状态码选择日志级别
         if elapsed_time_ms > self.SLOW_REQUEST_THRESHOLD_MS:
-            logger.warning(f"Slow {log_message} (threshold: {self.SLOW_REQUEST_THRESHOLD_MS}ms)")
+            logger.warning("Slow %s (threshold: %sms)", log_message, self.SLOW_REQUEST_THRESHOLD_MS)
         elif status_code >= 500:
             logger.error(log_message)
         elif status_code >= 400:
             logger.warning(log_message)
         elif self._is_sidecar_open_api_path(path):
-            logger.debug(log_message)
+            # Sidecar 会高频轮询这些接口，成功请求不逐条记录，避免淹没异常日志。
+            return
         else:
             logger.info(log_message)

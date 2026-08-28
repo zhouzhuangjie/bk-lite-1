@@ -37,8 +37,8 @@ export const getNewAuthSourceFormFields = ({
     label: t('system.security.authSourceType'),
     placeholder: `${t('common.select')}${t('system.security.authSourceType')}`,
     options: [
-      { value: 'bk_lite', label: 'BK-Lite认证源' },
-      { value: 'bk_login', label: '蓝鲸认证源' }
+      { value: 'bk_lite', label: t('system.security.authSourceBkLite') },
+      { value: 'bk_login', label: t('system.security.authSourceBlueking') }
     ],
     rules: [{ required: true, message: `${t('common.select')}${t('system.security.authSourceType')}` }],
     initialValue: 'bk_lite',
@@ -107,7 +107,6 @@ export const getNewAuthSourceFormFields = ({
           value={dynamicForm.getFieldValue('sync_time') ? dayjs(dynamicForm.getFieldValue('sync_time'), 'HH:mm') : undefined}
           onChange={(time) => {
             const timeString = time ? time.format('HH:mm') : '';
-            console.log('Selected sync time:', timeString);
             dynamicForm.setFieldsValue({ sync_time: timeString });
           }}
           className="mx-2 min-w-[100px]"
@@ -148,8 +147,8 @@ export const getBluekingFormFields = ({
     label: t('system.security.authSourceType'),
     placeholder: `${t('common.select')}${t('system.security.authSourceType')}`,
     options: [
-      { value: 'bk_lite', label: 'BK-Lite认证源' },
-      { value: 'bk_login', label: '蓝鲸认证源' }
+      { value: 'bk_lite', label: t('system.security.authSourceBkLite') },
+      { value: 'bk_login', label: t('system.security.authSourceBlueking') }
     ],
     rules: [{ required: true, message: `${t('common.select')}${t('system.security.authSourceType')}` }],
     initialValue: 'bk_login',
@@ -182,9 +181,9 @@ export const getBluekingFormFields = ({
   {
     name: 'bk_url',
     type: 'input',
-    label: '认证URL',
-    placeholder: '请输入认证URL',
-    rules: [{ required: true, message: '请输入认证URL' }],
+    label: t('system.security.authSourceUrl'),
+    placeholder: `${t('common.inputMsg')}${t('system.security.authSourceUrl')}`,
+    rules: [{ required: true, message: `${t('common.inputMsg')}${t('system.security.authSourceUrl')}` }],
     disabled: isBuiltIn
   },
   {

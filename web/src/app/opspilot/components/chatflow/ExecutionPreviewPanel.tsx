@@ -1,7 +1,8 @@
 'use client';
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Button, Empty, Tag } from 'antd';
+import { Button, Tag } from 'antd';
+import CompactEmptyState from '@/components/compact-empty-state';
 import {
   CheckCircleFilled,
   CloseCircleFilled,
@@ -13,9 +14,15 @@ import {
   RightOutlined,
 } from '@ant-design/icons';
 import { useTranslation } from '@/utils/i18n';
+import { formatDurationMs } from '@/app/opspilot/utils/duration';
 import type { WorkflowExecutionDetailItem } from '@/app/opspilot/types/studio';
 import { ApprovalRequest } from '@/app/opspilot/types/global';
 import ApprovalCard from '../custom-chat-sse/ApprovalCard';
+import {
+  sortExecutionPreviewItems,
+  type ExecutionPreviewWorkflowEdge,
+  type ExecutionPreviewWorkflowNode,
+} from './utils/executionPreviewOrder';
 
 interface ExecutionPreviewPanelProps {
   open: boolean;
@@ -25,6 +32,8 @@ interface ExecutionPreviewPanelProps {
   streamingContent: string;
   rawExecutionData?: unknown;
   items: WorkflowExecutionDetailItem[];
+  workflowNodes?: ExecutionPreviewWorkflowNode[];
+  workflowEdges?: ExecutionPreviewWorkflowEdge[];
   activeNodeId?: string | null;
   onClose: () => void;
   approvalRequests?: ApprovalRequest[];
@@ -77,6 +86,8 @@ const ExecutionPreviewPanel: React.FC<ExecutionPreviewPanelProps> = ({
   streamingContent,
   rawExecutionData,
   items,
+  workflowNodes = [],
+  workflowEdges = [],
   activeNodeId,
   onClose,
   approvalRequests,
@@ -88,13 +99,9 @@ const ExecutionPreviewPanel: React.FC<ExecutionPreviewPanelProps> = ({
   const [expandedErrorNodeIds, setExpandedErrorNodeIds] = useState<string[]>([]);
   const failedNodeRef = useRef<HTMLDivElement | null>(null);
 
-  const sortedItems = useMemo(() => {
-    return [...items].sort((left, right) => {
-      const leftIndex = left.node_index ?? Number.MAX_SAFE_INTEGER;
-      const rightIndex = right.node_index ?? Number.MAX_SAFE_INTEGER;
-      return leftIndex - rightIndex;
-    });
-  }, [items]);
+  const sortedItems = useMemo(() => (
+    sortExecutionPreviewItems(items, workflowNodes, workflowEdges)
+  ), [items, workflowEdges, workflowNodes]);
 
   const firstFailedNode = useMemo(
     () => sortedItems.find((item) => item.status === 'failed') ?? null,
@@ -259,12 +266,6 @@ const ExecutionPreviewPanel: React.FC<ExecutionPreviewPanelProps> = ({
     }
   };
 
-  const formatDuration = (duration?: number | null) => {
-    if (!duration && duration !== 0) {
-      return '--';
-    }
-    return `${duration}ms`;
-  };
 
   const renderStatusTag = (status: WorkflowExecutionDetailItem['status']) => {
     if (status === 'failed') return <Tag color="error">{t('chatflow.preview.failed')}</Tag>;
@@ -319,7 +320,7 @@ const ExecutionPreviewPanel: React.FC<ExecutionPreviewPanelProps> = ({
             {t('chatflow.preview.loading')}
           </div>
         ) : sortedItems.length === 0 ? (
-          <Empty description={t('chatflow.preview.empty')} image={Empty.PRESENTED_IMAGE_SIMPLE} />
+          <CompactEmptyState description={t('chatflow.preview.empty')} />
         ) : (
           <div className="space-y-3">
             {sortedItems.map((item) => {
@@ -357,7 +358,7 @@ const ExecutionPreviewPanel: React.FC<ExecutionPreviewPanelProps> = ({
                       <div className="truncate text-sm font-semibold text-(--color-text-1)">{item.node_name}</div>
                     </div>
                     <div className="flex items-center gap-2">
-                      <span className="text-xs text-(--color-text-3)">{formatDuration(item.duration_ms)}</span>
+                      <span className="text-xs text-(--color-text-3)">{formatDurationMs(item.duration_ms)}</span>
                       {isExpanded ? <DownOutlined className="text-xs text-(--color-text-3)" /> : <RightOutlined className="text-xs text-(--color-text-3)" />}
                     </div>
                   </button>
@@ -373,7 +374,7 @@ const ExecutionPreviewPanel: React.FC<ExecutionPreviewPanelProps> = ({
                           <div className="mt-1 text-[11px] text-(--color-text-3)">ID: {item.node_id}</div>
                         </div>
                         <div className="text-right text-[11px] text-(--color-text-3)">
-                          <div>{formatDuration(item.duration_ms)}</div>
+                          <div>{formatDurationMs(item.duration_ms)}</div>
                         </div>
                       </div>
 

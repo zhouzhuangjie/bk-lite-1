@@ -4,7 +4,15 @@
 越界/重叠/同格冲突均标记返回，由前端高亮提示。
 """
 
+import re
+
+from apps.cmdb.constants.constants import INSTANCE_ASSOCIATION
+from apps.cmdb.graph.drivers.graph_client import GraphClient
 from apps.cmdb.services.instance import InstanceManage
+from apps.cmdb.services.instance_identity import optional_inst_uuid
+from apps.core.logger import cmdb_logger as logger
+
+RACK_LOCATION_PATTERN = re.compile(r"^([A-Z]+)(\d+)$")
 
 
 def col_to_letter(col: int) -> str:
@@ -17,10 +25,41 @@ def col_to_letter(col: int) -> str:
     return result
 
 
+def letter_to_index(value: str) -> int:
+    result = 0
+    for char in value:
+        result = result * 26 + (ord(char) - ord("A") + 1)
+    return result
+
+
+def format_rack_location_label(row: int, col: int) -> str:
+    """格式化机柜位置标签：字母为列（A–…）、数字为行（01–…）。"""
+    return f"{col_to_letter(col)}{row:02d}"
+
+
+def parse_rack_location(value) -> tuple[int, int] | None:
+    """解析 rack.location，字母为列、数字为行；支持 A3/A03。
+
+    与机房俯视图约定一致：列 A–L（横轴）、行 1–N（纵轴）。
+    """
+    if not isinstance(value, str):
+        return None
+
+    match = RACK_LOCATION_PATTERN.match(value.strip().upper())
+    if not match:
+        return None
+
+    col = letter_to_index(match.group(1))
+    row = int(match.group(2))
+    if row < 1 or col < 1:
+        return None
+    return row, col
+
+
 def build_room_layout(racks: list) -> dict:
     """把机柜列表组装成俯视平面图数据。
 
-    入参每项：inst_id, inst_name, row, col, u_count, datacenter_type,
+    入参每项：inst_uuid, inst_name, row, col, u_count, datacenter_type,
               datacenter_state, used_u（已占用 U 数）。
     """
     placed, unplaced, cells = [], [], {}
@@ -36,14 +75,17 @@ def build_room_layout(racks: list) -> dict:
                 "usage": round(used_u / u_count * 100) if u_count else 0,
             }
             placed.append(item)
-            cells.setdefault((r["row"], r["col"]), []).append(item["inst_id"])
+            cells.setdefault((r["row"], r["col"]), []).append(item["inst_uuid"])
         else:
-            unplaced.append(r)
+            location = r.get("location")
+            unplaced.append(
+                {
+                    **r,
+                    "unplaced_reason": ("missing_location" if not isinstance(location, str) or not location.strip() else "invalid_location"),
+                }
+            )
 
-    conflicts = [
-        {"row": rc[0], "col": rc[1], "inst_ids": ids}
-        for rc, ids in cells.items() if len(ids) > 1
-    ]
+    conflicts = [{"row": rc[0], "col": rc[1], "inst_uuids": uuids} for rc, uuids in cells.items() if len(uuids) > 1]
     return {
         "racks": placed,
         "unplaced": unplaced,
@@ -58,7 +100,7 @@ def build_room_layout(racks: list) -> dict:
 def build_rack_layout(u_count: int, devices: list) -> dict:
     """把机柜内设备组装成正视 U 图数据。
 
-    入参每项：inst_id, inst_name, model_id, rack_u_start, u_size。
+    入参每项：inst_uuid, inst_name, model_id, rack_u_start, u_size。
     """
     placed, unplaced = [], []
     for d in devices:
@@ -73,16 +115,13 @@ def build_rack_layout(u_count: int, devices: list) -> dict:
     overlaps = []
     ordered = sorted(placed, key=lambda x: x["rack_u_start"])
     for i, a in enumerate(ordered):
-        for b in ordered[i + 1:]:
+        for b in ordered[i + 1 :]:
             if b["rack_u_start"] > a["u_end"]:
                 break
-            overlaps.append([a["inst_id"], b["inst_id"]])
+            overlaps.append([a["inst_uuid"], b["inst_uuid"]])
 
-    free_u, max_free_u = free_u_stats(
-        u_count, [(d["rack_u_start"], d["u_end"]) for d in placed])
-    return {"u_count": u_count, "placed": placed,
-            "unplaced": unplaced, "overlaps": overlaps,
-            "free_u": free_u, "max_free_u": max_free_u}
+    free_u, max_free_u = free_u_stats(u_count, [(d["rack_u_start"], d["u_end"]) for d in placed])
+    return {"u_count": u_count, "placed": placed, "unplaced": unplaced, "overlaps": overlaps, "free_u": free_u, "max_free_u": max_free_u}
 
 
 def free_u_stats(u_count: int, ranges: list) -> tuple:
@@ -125,8 +164,7 @@ def _scalar(value):
 def _rack_device_instances(rack_id, permission_map=None, user=None) -> list:
     """机柜直接 contains 的设备实例（已按权限过滤）。"""
     assocs = InstanceManage.instance_association_instance_list("rack", int(rack_id))
-    ids = [item["_id"] for a in assocs if a["src_model_id"] == "rack"
-           for item in a["inst_list"]]
+    ids = [item["_id"] for a in assocs if a["src_model_id"] == "rack" for item in a["inst_list"]]
     if not ids:
         return []
     inst_map = InstanceManage._query_instance_map_by_ids({int(i) for i in ids})
@@ -135,36 +173,144 @@ def _rack_device_instances(rack_id, permission_map=None, user=None) -> list:
         inst = inst_map.get(int(i))
         if not inst:
             continue
-        if permission_map and not InstanceManage._has_topology_view_permission(
-            inst, permission_map, user=user
-        ):
+        if permission_map and not InstanceManage._has_topology_view_permission(inst, permission_map, user=user):
             continue
         devices.append(inst)
     return devices
+
+
+def _normalize_int_ids(values) -> list[int]:
+    result = []
+    seen = set()
+    for value in values or []:
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+def _rack_device_relations(rack_ids: list[int]) -> tuple[dict[int, list[int]], dict[int, dict]]:
+    relation_map = {rack_id: [] for rack_id in rack_ids}
+    if not rack_ids:
+        return relation_map, {}
+
+    rack_instances = InstanceManage.query_entity_by_ids(rack_ids)
+    rack_uuid_by_id = {
+        int(instance["_id"]): instance["inst_uuid"]
+        for instance in rack_instances
+        if instance.get("_id") in relation_map and instance.get("inst_uuid")
+    }
+    rack_id_by_uuid = {inst_uuid: rack_id for rack_id, inst_uuid in rack_uuid_by_id.items()}
+    rack_uuids = [rack_uuid_by_id[rack_id] for rack_id in rack_ids if rack_id in rack_uuid_by_id]
+    if not rack_uuids:
+        return relation_map, {}
+
+    query_data = [
+        {"field": "src_inst_uuid", "type": "str[]", "value": rack_uuids},
+        {"field": "src_model_id", "type": "str=", "value": "rack"},
+    ]
+    with GraphClient() as ag:
+        edges = ag.query_edge(INSTANCE_ASSOCIATION, query_data)
+
+    device_uuids = sorted({edge.get("dst_inst_uuid") for edge in edges or [] if edge.get("dst_inst_uuid")})
+    device_instances = InstanceManage.query_entity_by_uuids(device_uuids) if device_uuids else []
+    device_map = {int(instance["_id"]): instance for instance in device_instances if instance.get("_id") is not None}
+    device_id_by_uuid = {
+        instance["inst_uuid"]: int(instance["_id"]) for instance in device_instances if instance.get("_id") is not None and instance.get("inst_uuid")
+    }
+    seen_by_rack = {rack_id: set() for rack_id in rack_ids}
+    for edge in edges or []:
+        rack_id = rack_id_by_uuid.get(edge.get("src_inst_uuid"))
+        device_id = device_id_by_uuid.get(edge.get("dst_inst_uuid"))
+        if rack_id is None or device_id is None:
+            continue
+        if device_id in seen_by_rack[rack_id]:
+            continue
+        seen_by_rack[rack_id].add(device_id)
+        relation_map[rack_id].append(device_id)
+    return relation_map, device_map
+
+
+def get_room3d_rack_device_summaries(rack_uuids, permission_map=None, user=None) -> dict:
+    """批量组装 Room3D 机柜设备摘要，避免按机柜重复查询正视图布局。"""
+    normalized_rack_uuids = [value for item in rack_uuids or [] if (value := optional_inst_uuid(item))]
+    if not normalized_rack_uuids:
+        return {}
+
+    rack_instances = InstanceManage.query_entity_by_uuids(normalized_rack_uuids)
+    rack_uuid_by_id = {int(item["_id"]): item["inst_uuid"] for item in rack_instances if item.get("_id") is not None and item.get("inst_uuid")}
+    normalized_rack_ids = list(rack_uuid_by_id)
+
+    relation_map, device_map = _rack_device_relations(normalized_rack_ids)
+    summaries = {rack_uuid: {"devices": [], "device_count": 0, "unplaced_device_count": 0} for rack_uuid in normalized_rack_uuids}
+
+    for rack_id in normalized_rack_ids:
+        rack_uuid = rack_uuid_by_id[rack_id]
+        for device_id in relation_map.get(rack_id, []):
+            inst = device_map.get(int(device_id))
+            if not inst:
+                continue
+            if permission_map and not InstanceManage._has_topology_view_permission(inst, permission_map, user=user):
+                continue
+
+            inst_uuid = optional_inst_uuid(inst.get("inst_uuid"))
+            if not inst_uuid:
+                logger.warning("Room3D 设备缺少合法 inst_uuid，已安全跳过: graph_id=%s", inst.get("_id"))
+                continue
+            summaries[rack_uuid]["device_count"] += 1
+            rack_u_start = _safe_int(inst.get("rack_u_start"))
+            u_size = _safe_int(inst.get("u_size"))
+            if not rack_u_start or not u_size:
+                summaries[rack_uuid]["unplaced_device_count"] += 1
+                continue
+            summaries[rack_uuid]["devices"].append(
+                {
+                    "device_id": inst_uuid,
+                    "device_name": inst.get("inst_name") or "",
+                    "model_id": inst.get("model_id"),
+                    "rack_u_start": rack_u_start,
+                    "u_size": u_size,
+                    "status": _scalar(inst.get("status") or inst.get("datacenter_state")),
+                }
+            )
+
+    return summaries
 
 
 def get_rack_layout(rack_id, permission_map=None, user=None) -> dict:
     rack = InstanceManage.query_entity_by_id(int(rack_id)) or {}
     u_count = _safe_int(rack.get("u_count")) or 0
     devices = [
-        {"inst_id": str(d["_id"]), "inst_name": d.get("inst_name"),
-         "model_id": d.get("model_id"),
-         "rack_u_start": _safe_int(d.get("rack_u_start")),
-         "u_size": _safe_int(d.get("u_size"))}
+        {
+            "inst_uuid": d["inst_uuid"],
+            "inst_name": d.get("inst_name"),
+            "model_id": d.get("model_id"),
+            "rack_u_start": _safe_int(d.get("rack_u_start")),
+            "u_size": _safe_int(d.get("u_size")),
+            "status": _scalar(d.get("status") or d.get("datacenter_state")),
+            "organization": d.get("organization") or [],
+            "_creator": d.get("_creator"),
+        }
         for d in _rack_device_instances(rack_id, permission_map, user)
+        if d.get("inst_uuid")
     ]
     layout = build_rack_layout(u_count, devices)
-    layout["rack"] = {"inst_id": str(rack_id),
-                      "inst_name": rack.get("inst_name"), "u_count": u_count}
+    layout["rack"] = {
+        "inst_uuid": rack.get("inst_uuid"),
+        "inst_name": rack.get("inst_name"),
+        "u_count": u_count,
+    }
     return layout
 
 
 def get_room_layout(server_room_id, permission_map=None, user=None) -> dict:
-    assocs = InstanceManage.instance_association_instance_list(
-        "server_room", int(server_room_id))
-    rack_ids = [item["_id"] for a in assocs
-                if a["src_model_id"] == "server_room" and a["dst_model_id"] == "rack"
-                for item in a["inst_list"]]
+    assocs = InstanceManage.instance_association_instance_list("server_room", int(server_room_id))
+    rack_ids = [item["_id"] for a in assocs if a["src_model_id"] == "server_room" and a["dst_model_id"] == "rack" for item in a["inst_list"]]
     racks = []
     if rack_ids:
         inst_map = InstanceManage._query_instance_map_by_ids({int(i) for i in rack_ids})
@@ -172,9 +318,9 @@ def get_room_layout(server_room_id, permission_map=None, user=None) -> dict:
             r = inst_map.get(int(rid))
             if not r:
                 continue
-            if permission_map and not InstanceManage._has_topology_view_permission(
-                r, permission_map, user=user
-            ):
+            if permission_map and not InstanceManage._has_topology_view_permission(r, permission_map, user=user):
+                continue
+            if not r.get("inst_uuid"):
                 continue
             u_count = _safe_int(r.get("u_count")) or 0
             ranges = []
@@ -187,12 +333,295 @@ def get_room_layout(server_room_id, permission_map=None, user=None) -> dict:
             # 已占用 = 总U - 空闲U（去重计数）：忽略未分配设备、重叠不重复计、永不超 100%，
             # 与机柜抽屉概览口径一致
             used_u = u_count - free_u
-            racks.append({
-                "inst_id": str(rid), "inst_name": r.get("inst_name"),
-                "row": _safe_int(r.get("row")), "col": _safe_int(r.get("col")),
-                "u_count": u_count,
-                "datacenter_type": _scalar(r.get("datacenter_type")),
-                "datacenter_state": _scalar(r.get("datacenter_state")),
-                "used_u": used_u, "free_u": free_u, "max_free_u": max_free_u,
-            })
+            row_col = parse_rack_location(r.get("location"))
+            row, col = row_col if row_col else (None, None)
+            racks.append(
+                {
+                    "inst_uuid": r.get("inst_uuid"),
+                    "inst_name": r.get("inst_name"),
+                    "model_id": r.get("model_id") or "rack",
+                    "row": row,
+                    "col": col,
+                    "location": r.get("location"),
+                    "u_count": u_count,
+                    "datacenter_type": _scalar(r.get("datacenter_type")),
+                    "datacenter_state": _scalar(r.get("datacenter_state")),
+                    "used_u": used_u,
+                    "free_u": free_u,
+                    "max_free_u": max_free_u,
+                    "organization": r.get("organization") or [],
+                    "_creator": r.get("_creator"),
+                }
+            )
     return build_room_layout(racks)
+
+
+# 业务上限：单次拉取最多返回 N 条机房记录。机房数业务上不会超过该值，
+# 不分页（避免前端分页复杂度）；如未来业务量超限再调整。
+_ROOM_LIST_PAGE_SIZE = 1000
+# 机柜选择器按机房分页；搜索命中窗口与机房列表上限对齐，避免无界拉取。
+_PICKER_ROOM_PAGE_MAX = 100
+_PICKER_SEARCH_MATCH_CAP = 1000
+
+
+def _inst_name_query(keyword: str) -> list:
+    return [{"field": "inst_name", "type": "str*", "value": keyword}]
+
+
+def _picker_uuid(item: dict | None) -> str | None:
+    if not item:
+        return None
+    return optional_inst_uuid(item.get("inst_uuid"))
+
+
+def _rack_picker_item(item: dict) -> dict | None:
+    inst_uuid = _picker_uuid(item)
+    if not inst_uuid:
+        return None
+    return {
+        "inst_uuid": inst_uuid,
+        "inst_name": item.get("inst_name") or inst_uuid,
+        "model_id": item.get("model_id") or "rack",
+    }
+
+
+def _visible_racks_by_room(
+    room_uuids: list[str],
+    rack_permission_map: dict | None,
+    user=None,
+) -> dict[str, list[dict]]:
+    grouped = {room_uuid: [] for room_uuid in room_uuids}
+    if not room_uuids:
+        return grouped
+
+    relation = InstanceManage.instance_association_map_by_uuids(
+        "server_room",
+        room_uuids,
+        related_model="rack",
+    )
+    rack_uuids: list[str] = []
+    seen: set[str] = set()
+    for room_uuid in room_uuids:
+        for rack_uuid in relation.get(room_uuid) or []:
+            normalized = optional_inst_uuid(rack_uuid)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            rack_uuids.append(normalized)
+
+    entities = InstanceManage.query_entity_by_uuids(rack_uuids) if rack_uuids else []
+    by_uuid = {}
+    for item in entities:
+        inst_uuid = _picker_uuid(item)
+        if not inst_uuid:
+            continue
+        if not InstanceManage._has_topology_view_permission(item, rack_permission_map, user=user):
+            continue
+        packed = _rack_picker_item(item)
+        if packed:
+            by_uuid[inst_uuid] = packed
+
+    for room_uuid in room_uuids:
+        racks = []
+        for rack_uuid in relation.get(room_uuid) or []:
+            normalized = optional_inst_uuid(rack_uuid)
+            item = by_uuid.get(normalized) if normalized else None
+            if item:
+                racks.append(item)
+        racks.sort(key=lambda rack: (rack["inst_name"], rack["inst_uuid"]))
+        grouped[room_uuid] = racks
+    return grouped
+
+
+def _room_picker_group(room: dict, racks: list[dict]) -> dict | None:
+    room_uuid = _picker_uuid(room)
+    if not room_uuid:
+        return None
+    return {
+        "room_uuid": room_uuid,
+        "room_name": room.get("inst_name") or room_uuid,
+        "racks": racks,
+    }
+
+
+def _unassociated_picker_group(racks: list[dict]) -> dict:
+    return {"room_uuid": None, "room_name": "", "racks": racks}
+
+
+def _list_visible_instances(
+    model_id: str,
+    *,
+    keyword: str = "",
+    page: int = 1,
+    page_size: int = _PICKER_SEARCH_MATCH_CAP,
+    permission_map: dict | None = None,
+    creator: str | None = None,
+) -> tuple[list, int]:
+    params = list(_inst_name_query(keyword)) if keyword else []
+    inst_list, count = InstanceManage.instance_list(
+        model_id=model_id,
+        params=params,
+        page=page,
+        page_size=page_size,
+        order="inst_name",
+        permission_map=permission_map or {},
+        creator=creator,
+        case_sensitive=False,
+    )
+    return inst_list or [], int(count or 0)
+
+
+def _matching_rooms_for_rack_search(
+    *,
+    keyword: str,
+    room_permission_map: dict | None,
+    rack_permission_map: dict | None,
+    user=None,
+    creator: str | None = None,
+) -> tuple[list[dict], list[dict]]:
+    rooms_by_name, _ = _list_visible_instances(
+        "server_room",
+        keyword=keyword,
+        permission_map=room_permission_map,
+        creator=creator,
+    )
+    racks_by_name, _ = _list_visible_instances(
+        "rack",
+        keyword=keyword,
+        permission_map=rack_permission_map,
+        creator=creator,
+    )
+
+    rack_uuids = [uid for item in racks_by_name if (uid := _picker_uuid(item))]
+    parent_map = InstanceManage.instance_association_map_by_uuids("rack", rack_uuids, related_model="server_room") if rack_uuids else {}
+
+    rooms_by_uuid: dict[str, dict] = {}
+    for room in rooms_by_name:
+        room_uuid = _picker_uuid(room)
+        if room_uuid:
+            rooms_by_uuid[room_uuid] = room
+
+    parent_room_uuids: list[str] = []
+    unassociated: list[dict] = []
+    seen_parents: set[str] = set()
+    for rack in racks_by_name:
+        packed = _rack_picker_item(rack)
+        if not packed:
+            continue
+        parents = [optional_inst_uuid(value) for value in parent_map.get(packed["inst_uuid"]) or []]
+        parents = [value for value in parents if value]
+        if not parents:
+            unassociated.append(packed)
+            continue
+        for parent_uuid in parents:
+            if parent_uuid in seen_parents:
+                continue
+            seen_parents.add(parent_uuid)
+            parent_room_uuids.append(parent_uuid)
+
+    missing = [uid for uid in parent_room_uuids if uid not in rooms_by_uuid]
+    if missing:
+        for room in InstanceManage.query_entity_by_uuids(missing):
+            room_uuid = _picker_uuid(room)
+            if not room_uuid:
+                continue
+            if not InstanceManage._has_topology_view_permission(room, room_permission_map, user=user):
+                continue
+            rooms_by_uuid[room_uuid] = room
+
+    ordered: list[dict] = []
+    seen: set[str] = set()
+    for room in rooms_by_name:
+        room_uuid = _picker_uuid(room)
+        if not room_uuid or room_uuid in seen or room_uuid not in rooms_by_uuid:
+            continue
+        ordered.append(rooms_by_uuid[room_uuid])
+        seen.add(room_uuid)
+    rest = [rooms_by_uuid[uid] for uid in rooms_by_uuid if uid not in seen]
+    rest.sort(key=lambda item: (item.get("inst_name") or "", _picker_uuid(item) or ""))
+    ordered.extend(rest)
+    unassociated.sort(key=lambda item: (item["inst_name"], item["inst_uuid"]))
+    return ordered, unassociated
+
+
+def list_racks_grouped_by_room(
+    *,
+    room_permission_map: dict | None = None,
+    rack_permission_map: dict | None = None,
+    user=None,
+    creator: str | None = None,
+    search: str = "",
+    page: int = 1,
+    page_size: int = 20,
+) -> dict:
+    """机柜选择器选项：按机房分组，搜索同时匹配机房名与机柜名。
+
+    分页单位是机房（每个分组带出该机房下可见机柜），不是机柜行。
+    """
+    try:
+        page = int(page)
+        page_size = int(page_size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("page 与 page_size 必须是整数") from exc
+    if page < 1:
+        raise ValueError("page 必须大于等于 1")
+    if page_size < 1 or page_size > _PICKER_ROOM_PAGE_MAX:
+        raise ValueError("page_size 必须在 1 到 100 之间")
+
+    keyword = (search or "").strip()
+    unassociated: list[dict] = []
+    if keyword:
+        rooms, unassociated = _matching_rooms_for_rack_search(
+            keyword=keyword,
+            room_permission_map=room_permission_map,
+            rack_permission_map=rack_permission_map,
+            user=user,
+            creator=creator,
+        )
+        count = len(rooms) + (1 if unassociated else 0)
+        start = (page - 1) * page_size
+        page_items: list = list(rooms)
+        if unassociated:
+            page_items.append({"_unassociated": True})
+        page_items = page_items[start : start + page_size]
+    else:
+        rooms, count = _list_visible_instances(
+            "server_room",
+            page=page,
+            page_size=page_size,
+            permission_map=room_permission_map,
+            creator=creator,
+        )
+        page_items = list(rooms)
+
+    room_uuids = [uid for item in page_items if not item.get("_unassociated") and (uid := _picker_uuid(item))]
+    racks_by_room = _visible_racks_by_room(room_uuids, rack_permission_map, user=user)
+
+    groups = []
+    for item in page_items:
+        if item.get("_unassociated"):
+            groups.append(_unassociated_picker_group(unassociated))
+            continue
+        group = _room_picker_group(item, racks_by_room.get(_picker_uuid(item) or "", []))
+        if group:
+            groups.append(group)
+    return {"groups": groups, "count": count}
+
+
+def list_server_rooms(permission_map: dict | None = None, user_info=None) -> list:
+    """列出当前用户可见的 server_room，返回 CMDB 原始字段。
+
+    作为运维分析参数动态选项源。返回字段保持 CMDB 原样
+    （_id, inst_name, model_id, organization, ...），不做 _id→id 等重命名。
+
+    复用 ``InstanceManage.instance_list`` 的现成权限过滤逻辑。
+    """
+    inst_list, _count = InstanceManage.instance_list(
+        model_id="server_room",
+        params=[],
+        page=1,
+        page_size=_ROOM_LIST_PAGE_SIZE,
+        order="inst_name",
+        permission_map=permission_map or {},
+    )
+    return inst_list or []

@@ -1,11 +1,14 @@
 import os
 
-from apps.rpc.base import RpcClient, AppClient
+from apps.core.logger import logger
+from apps.rpc.base import AppClient, RpcClient
+from apps.rpc.exceptions import RpcLocalClientRequiredError
 
 
 class NodeMgmt(object):
     def __init__(self, is_local_client=False):
         is_local_client = os.getenv("IS_LOCAL_RPC", "0") == "1" or is_local_client
+        self.is_local_client = is_local_client
 
         self.permission_client = AppClient("apps.node_mgmt.nats.node.permission") if is_local_client else RpcClient()
         self.client = AppClient("apps.node_mgmt.nats.node") if is_local_client else RpcClient()
@@ -55,6 +58,15 @@ class NodeMgmt(object):
         """
         return_data = self.client.run("node_list", query_data)
         return return_data
+
+    def get_nodes_with_child_config(self, node_ids, collector, collect_type):
+        """查询关联了指定采集器子配置的节点 ID。"""
+        return self.client.run(
+            "get_nodes_with_child_config",
+            node_ids,
+            collector,
+            collect_type,
+        )
 
     def get_node_names_by_ids(self, node_ids):
         """
@@ -116,6 +128,14 @@ class NodeMgmt(object):
         return_data = self.client.run("get_child_configs_by_ids", ids)
         return return_data
 
+    def get_child_config_nodes_by_ids(self, ids, organization_ids):
+        """按子配置 ID 批量获取当前组织范围内的采集节点。"""
+        return self.client.run(
+            "get_child_config_nodes_by_ids",
+            ids,
+            organization_ids,
+        )
+
     def get_configs_by_ids(self, ids):
         """
         :param ids: 配置ID列表
@@ -141,6 +161,16 @@ class NodeMgmt(object):
             {"id": id, "content": content, "env_config": env_config},
         )
         return return_data
+
+    def compare_and_swap_child_config_content_local(self, id, expected_content, content):
+        """同进程运维专用：仅当子配置内容仍等于读取快照时更新。"""
+        if not self.is_local_client:
+            logger.warning("RPC local client required: operation=compare_and_swap_child_config_content")
+            raise RpcLocalClientRequiredError("compare_and_swap_child_config_content")
+        return self.client.run(
+            "compare_and_swap_child_config_content",
+            {"id": id, "expected_content": expected_content, "content": content},
+        )
 
     def update_config_content(self, id, content, env_config=None):
         """
@@ -192,6 +222,10 @@ class NodeMgmt(object):
         return_data = self.client.run("get_cloud_region_envconfig", cloud_region_id)
         return return_data
 
+    def get_cloud_region_public_config(self, cloud_region_id):
+        """获取允许跨业务模块读取的非敏感云区域配置。"""
+        return self.client.run("get_cloud_region_public_config", cloud_region_id)
+
     def install_collector(self, collector_package: int, nodes: list[str]):
         """通过 NATS 触发采集器安装"""
         return self.client.run(
@@ -205,3 +239,10 @@ class NodeMgmt(object):
             "install_managed_component",
             {"collector_package": collector_package, "nodes": nodes},
         )
+
+    def ingest_from_source(self, **kwargs):
+        """跨模块推送写入节点（只关联，不创建）。
+
+        NATS handler 签名为 node_ingest_from_source(params)，须整包为 params。
+        """
+        return self.client.run("node_ingest_from_source", params=kwargs)

@@ -1,25 +1,41 @@
 import re
 import os
 import uuid
+from urllib.parse import urlsplit
 
 import requests
 from django.core.cache import cache
+from django.db import transaction
+from django.utils import timezone
 
 from apps.core.exceptions.base_app_exception import BaseAppException
 from apps.core.logger import node_logger as logger
 from apps.core.utils.crypto.aes_crypto import AESCryptor
 from apps.core.utils.webhook_tls import get_webhook_tls_verify
 from apps.node_mgmt.models import SidecarEnv
-from apps.node_mgmt.models.cloud_region import CloudRegion
+from apps.node_mgmt.models.cloud_region import CloudRegion, CloudRegionService
 from apps.node_mgmt.constants.cloudregion_service import CloudRegionServiceConstants
 from apps.node_mgmt.constants.database import CloudRegionConstants, EnvVariableConstants
 from apps.node_mgmt.constants.node import NodeConstants
 from apps.node_mgmt.constants.controller import ControllerConstants
 from apps.node_mgmt.services.sidecar_cache import build_sidecar_env_cache_key, invalidate_sidecar_env_cache
+from apps.node_mgmt.utils.proxy_address import normalize_proxy_address
 from apps.node_mgmt.utils.token_auth import generate_node_token
 
 
 class RegionService:
+    @staticmethod
+    def _get_cloud_region_or_raise(cloud_region_id: int) -> CloudRegion:
+        cloud_region = CloudRegion.objects.filter(id=cloud_region_id).first()
+        if not cloud_region:
+            raise BaseAppException("Cloud region not found")
+        return cloud_region
+
+    @staticmethod
+    def ensure_user_managed_region(cloud_region: CloudRegion) -> None:
+        if cloud_region.is_default:
+            raise BaseAppException("默认云区域由平台统一维护，不支持此操作")
+
     @staticmethod
     def get_region_service_instance_id(cloud_region_name: str, service_name: str) -> str:
         """返回云区域级服务的实例 ID。
@@ -78,6 +94,32 @@ class RegionService:
         return RegionService._decode_env_rows(RegionService._get_cloud_region_env_rows(cloud_region_id), keys=keys)
 
     @staticmethod
+    def get_cloud_regions_envconfig(cloud_region_ids):
+        region_ids = set(cloud_region_ids)
+        env_rows_by_region = {}
+        missing_region_ids = []
+        for region_id in region_ids:
+            cached_env_rows = cache.get(build_sidecar_env_cache_key(region_id))
+            if cached_env_rows is None:
+                missing_region_ids.append(region_id)
+            else:
+                env_rows_by_region[region_id] = cached_env_rows
+
+        if missing_region_ids:
+            for region_id in missing_region_ids:
+                env_rows_by_region[region_id] = []
+            for env_row in SidecarEnv.objects.filter(cloud_region_id__in=missing_region_ids).values("cloud_region_id", "key", "value", "type"):
+                env_rows_by_region[env_row["cloud_region_id"]].append({key: env_row[key] for key in ("key", "value", "type")})
+            for region_id in missing_region_ids:
+                cache.set(
+                    build_sidecar_env_cache_key(region_id),
+                    env_rows_by_region[region_id],
+                    ControllerConstants.E_CACHE_TIMEOUT,
+                )
+
+        return {region_id: RegionService._decode_env_rows(env_rows_by_region[region_id]) for region_id in region_ids}
+
+    @staticmethod
     def get_deploy_script(data: dict):
         """获取云区域代理服务部署脚本，调用 webhookd /infra/proxy 接口"""
         try:
@@ -85,20 +127,39 @@ class RegionService:
         except (TypeError, ValueError):
             raise BaseAppException("Invalid cloud_region_id: must be an integer")
 
-        cloud_region = CloudRegion.objects.filter(id=cloud_region_id).first()
-        if not cloud_region:
-            logger.warning(f"Cloud region not found: {cloud_region_id}")
-            raise BaseAppException("Cloud region not found")
+        cloud_region = RegionService._get_cloud_region_or_raise(cloud_region_id)
+        RegionService.ensure_user_managed_region(cloud_region)
 
         env_vars = RegionService._get_env_vars_dict(cloud_region_id)
+        proxy_ip = cloud_region.pending_proxy_address or cloud_region.proxy_address
+        if cloud_region.pending_proxy_address:
+            env_vars = RegionService._build_pending_proxy_env_vars(
+                env_vars,
+                current_proxy_address=cloud_region.proxy_address,
+                pending_proxy_address=cloud_region.pending_proxy_address,
+            )
 
-        webhook_url = env_vars.get("WEBHOOK_SERVER_URL") or os.getenv("WEBHOOK_SERVER_URL")
+        # webhookd is a platform-side dependency. Prefer the server runtime
+        # address because cloud-region variables may contain a Docker-internal
+        # hostname that is only valid for agents in that region.
+        webhook_url = os.getenv("WEBHOOK_SERVER_URL") or env_vars.get(
+            "WEBHOOK_SERVER_URL"
+        )
         if not webhook_url:
             logger.error(f"Missing WEBHOOK_SERVER_URL for cloud region {cloud_region_id}")
             raise BaseAppException("Webhook configuration missing")
 
-        server_url = env_vars.get("NODE_SERVER_URL")
-        nats_url = env_vars.get("NATS_SERVERS")
+        # 自定义区域会把 NODE_SERVER_URL / NATS_SERVERS 改成代理地址，供区域内节点访问。
+        # Traefik 与 NATS leaf 的上游必须仍指向平台中心，否则代理会反代/连回自己。
+        hub_env_vars = RegionService._get_env_vars_dict(
+            CloudRegionConstants.DEFAULT_CLOUD_REGION_ID
+        )
+        server_url = hub_env_vars.get("NODE_SERVER_URL") or os.getenv(
+            "DEFAULT_ZONE_VAR_NODE_SERVER_URL"
+        )
+        nats_url = hub_env_vars.get("NATS_SERVERS") or os.getenv(
+            "DEFAULT_ZONE_VAR_NATS_SERVERS"
+        )
         nats_username = env_vars.get("NATS_USERNAME")
         nats_password = env_vars.get(NodeConstants.NATS_PASSWORD_KEY)
         nats_monitor_username = os.getenv("NATS_ADMIN_USERNAME") or os.getenv("DEFAULT_ZONE_VAR_NATS_ADMIN_USERNAME")
@@ -125,7 +186,6 @@ class RegionService:
             )
             raise BaseAppException("Cloud region environment configuration is incomplete")
 
-        proxy_ip = cloud_region.proxy_address
         if not proxy_ip:
             logger.error(f"Missing proxy_address for cloud region {cloud_region_id}")
             raise BaseAppException("Cloud region proxy_address not configured")
@@ -133,6 +193,8 @@ class RegionService:
         node_id = uuid.uuid4().hex
         api_token = generate_node_token(node_id, proxy_ip, "system")
         redis_password = uuid.uuid4().hex[:12]
+        apm_nats_username = f"apm_region_{cloud_region_id}"
+        apm_nats_password = uuid.uuid4().hex
 
         region_executor_instance_id = RegionService.get_region_service_instance_id(
             cloud_region.name,
@@ -152,6 +214,8 @@ class RegionService:
             "proxy_ip": proxy_ip,
             "nats_monitor_username": nats_monitor_username,
             "nats_monitor_password": nats_monitor_password,
+            "apm_nats_username": apm_nats_username,
+            "apm_nats_password": apm_nats_password,
             "traefik_web_port": env_vars.get("TRAEFIK_WEB_PORT", "443"),
         }
 
@@ -214,6 +278,173 @@ class RegionService:
         return env_vars
 
     @staticmethod
+    def _build_pending_proxy_env_vars(
+        env_vars: dict,
+        current_proxy_address: str,
+        pending_proxy_address: str,
+    ) -> dict:
+        """为待生效地址构造脚本变量，不修改数据库中的当前配置。"""
+        resolved_current_address = current_proxy_address or RegionService._get_default_proxy_address()
+        resolved_env_vars = dict(env_vars)
+        if not resolved_current_address:
+            return resolved_env_vars
+
+        for key in NodeConstants.PROXY_ADDRESS_REPLACE_KEYS:
+            value = resolved_env_vars.get(key)
+            if value:
+                if not RegionService._env_value_uses_address(
+                    value,
+                    resolved_current_address,
+                ):
+                    raise BaseAppException(
+                        f"代理相关环境变量与当前地址不一致: {key}"
+                    )
+                resolved_env_vars[key] = RegionService._replace_address(
+                    value,
+                    resolved_current_address,
+                    pending_proxy_address,
+                )
+                if not RegionService._env_value_uses_address(
+                    resolved_env_vars[key],
+                    pending_proxy_address,
+                ):
+                    raise BaseAppException(
+                        f"代理相关环境变量无法切换到待生效地址: {key}"
+                    )
+        resolved_env_vars[EnvVariableConstants.PROXY_ADDRESS_KEY] = pending_proxy_address
+        return resolved_env_vars
+
+    @staticmethod
+    def stage_proxy_address(cloud_region_id: int, proxy_address: str) -> CloudRegion:
+        try:
+            normalized_proxy_address = normalize_proxy_address(proxy_address)
+        except ValueError as exc:
+            raise BaseAppException(str(exc))
+
+        cloud_region = RegionService._get_cloud_region_or_raise(cloud_region_id)
+        RegionService.ensure_user_managed_region(cloud_region)
+        try:
+            current_proxy_address = normalize_proxy_address(
+                cloud_region.proxy_address,
+                allow_blank=True,
+            )
+        except ValueError:
+            current_proxy_address = cloud_region.proxy_address
+        if normalized_proxy_address == current_proxy_address:
+            raise BaseAppException("新代理地址不能与当前生效地址相同")
+
+        cloud_region.pending_proxy_address = normalized_proxy_address
+        cloud_region.pending_proxy_address_created_at = timezone.now()
+        cloud_region.save(
+            update_fields=[
+                "pending_proxy_address",
+                "pending_proxy_address_created_at",
+                "updated_at",
+            ]
+        )
+        return cloud_region
+
+    @staticmethod
+    def cancel_pending_proxy_address(cloud_region_id: int) -> CloudRegion:
+        cloud_region = RegionService._get_cloud_region_or_raise(cloud_region_id)
+        RegionService.ensure_user_managed_region(cloud_region)
+        cloud_region.pending_proxy_address = None
+        cloud_region.pending_proxy_address_created_at = None
+        cloud_region.save(
+            update_fields=[
+                "pending_proxy_address",
+                "pending_proxy_address_created_at",
+                "updated_at",
+            ]
+        )
+        return cloud_region
+
+    @staticmethod
+    @transaction.atomic
+    def activate_pending_proxy_address(
+        cloud_region_id: int,
+        *,
+        confirmed: bool,
+    ) -> CloudRegion:
+        if not confirmed:
+            raise BaseAppException("请确认已在新代理主机执行部署脚本")
+
+        cloud_region = CloudRegion.objects.select_for_update().filter(id=cloud_region_id).first()
+        if not cloud_region:
+            raise BaseAppException("Cloud region not found")
+        RegionService.ensure_user_managed_region(cloud_region)
+        if not cloud_region.pending_proxy_address:
+            raise BaseAppException("没有待生效的代理地址")
+
+        services = list(cloud_region.cloudregionservice_set.all())
+        expected_services = set(CloudRegionServiceConstants.SERVICES)
+        services_by_name = {
+            service.name: service
+            for service in services
+            if service.name in expected_services
+        }
+        if not expected_services.issubset(services_by_name):
+            raise BaseAppException("新环境尚未通过全部组件健康检查")
+
+        # 激活属于高风险切换，不能只信任定时任务留下的历史状态。
+        from apps.node_mgmt.tasks.services.cloud_service_check_health import (
+            SERVICES_FUNC,
+        )
+
+        for service_name in CloudRegionServiceConstants.SERVICES:
+            health_check = SERVICES_FUNC.get(service_name)
+            if not health_check:
+                raise BaseAppException(
+                    f"缺少 {service_name} 的实时健康检查能力"
+                )
+            live_status, live_message = health_check(cloud_region)
+            if live_status != CloudRegionServiceConstants.NORMAL:
+                logger.warning(
+                    "Cloud region %s live health check failed for %s: %s",
+                    cloud_region.id,
+                    service_name,
+                    live_message,
+                )
+                raise BaseAppException("新环境尚未通过全部组件健康检查")
+            service = services_by_name[service_name]
+            service.deployed_status = CloudRegionServiceConstants.DEPLOYED
+            service.status = live_status
+            service.message = live_message
+
+        CloudRegionService.objects.bulk_update(
+            services_by_name.values(),
+            ["deployed_status", "status", "message"],
+        )
+
+        old_proxy_address = cloud_region.proxy_address
+        new_proxy_address = cloud_region.pending_proxy_address
+        RegionService._ensure_proxy_env_uses_address(
+            cloud_region.id,
+            old_proxy_address,
+        )
+        RegionService.sync_proxy_related_env_vars(
+            cloud_region_id=cloud_region.id,
+            old_proxy_address=old_proxy_address,
+            new_proxy_address=new_proxy_address,
+        )
+        RegionService._ensure_proxy_env_uses_address(
+            cloud_region.id,
+            new_proxy_address,
+        )
+        cloud_region.proxy_address = new_proxy_address
+        cloud_region.pending_proxy_address = None
+        cloud_region.pending_proxy_address_created_at = None
+        cloud_region.save(
+            update_fields=[
+                "proxy_address",
+                "pending_proxy_address",
+                "pending_proxy_address_created_at",
+                "updated_at",
+            ]
+        )
+        return cloud_region
+
+    @staticmethod
     def _extract_default_address(value):
         """从默认云区域的环境变量中提取 IP 地址或域名
 
@@ -255,7 +486,57 @@ class RegionService:
         """
         if not old_address or not new_address:
             return value
-        return value.replace(old_address, new_address)
+        old_core = old_address.strip("[]")
+        new_core = new_address.strip("[]")
+        new_token = f"[{new_core}]" if ":" in new_core else new_core
+        old_bracketed = f"[{old_core}]"
+        if old_bracketed in value:
+            return value.replace(old_bracketed, new_token)
+        return value.replace(old_address, new_token)
+
+    @staticmethod
+    def _env_value_uses_address(value: str, proxy_address: str) -> bool:
+        expected_host = proxy_address.strip("[]").lower()
+        for endpoint in re.split(r"[,;]", value):
+            endpoint = endpoint.strip()
+            if not endpoint:
+                continue
+            parsed = urlsplit(
+                endpoint if "://" in endpoint else f"//{endpoint}"
+            )
+            try:
+                hostname = parsed.hostname
+            except ValueError:
+                hostname = None
+            if hostname and hostname.strip("[]").lower() == expected_host:
+                return True
+        return False
+
+    @staticmethod
+    def _ensure_proxy_env_uses_address(
+        cloud_region_id: int,
+        proxy_address: str,
+    ) -> None:
+        values_by_key = dict(
+            SidecarEnv.objects.filter(
+                cloud_region_id=cloud_region_id,
+                key__in=NodeConstants.PROXY_ADDRESS_REPLACE_KEYS,
+            ).values_list("key", "value")
+        )
+        invalid_keys = [
+            key
+            for key in NodeConstants.PROXY_ADDRESS_REPLACE_KEYS
+            if not values_by_key.get(key)
+            or not RegionService._env_value_uses_address(
+                values_by_key[key],
+                proxy_address,
+            )
+        ]
+        if invalid_keys:
+            raise BaseAppException(
+                "代理相关环境变量与当前地址不一致: "
+                + ", ".join(invalid_keys)
+            )
 
     @staticmethod
     def _sync_proxy_address_env_var(cloud_region_id: int, proxy_address: str) -> int:
@@ -373,6 +654,12 @@ class RegionService:
             new_proxy_address=new_proxy_address,
             default_proxy_address=default_proxy_address,
         )
+        if updated_count:
+            transaction.on_commit(
+                lambda region_id=cloud_region_id: invalidate_sidecar_env_cache(
+                    [region_id]
+                )
+            )
         logger.info(f"Synchronized {updated_count} proxy-related env vars for cloud region {cloud_region_id}")
         return updated_count
 
@@ -446,8 +733,6 @@ class RegionService:
 
             # 使用 bulk_create 批量创建，ignore_conflicts=True 避免重复创建
             created_count = len(SidecarEnv.objects.bulk_create(new_env_vars, ignore_conflicts=True))
-            if created_count:
-                invalidate_sidecar_env_cache([cloud_region_id])
             created_count += RegionService.sync_proxy_related_env_vars(
                 cloud_region_id=cloud_region_id,
                 old_proxy_address=proxy_address,

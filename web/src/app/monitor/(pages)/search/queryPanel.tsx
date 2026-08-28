@@ -6,7 +6,7 @@ import React, {
   useImperativeHandle,
   forwardRef
 } from 'react';
-import { Select, Button, Tooltip, Input, Card, message } from 'antd';
+import { Select, Button, Tooltip, AutoComplete, Input, Card, message } from 'antd';
 import {
   PlusOutlined,
   DeleteOutlined,
@@ -26,15 +26,21 @@ import {
 import { useTranslation } from '@/utils/i18n';
 import { useConditionList } from '@/app/monitor/hooks';
 import useMonitorApi from '@/app/monitor/api';
+import useViewApi from '@/app/monitor/api/view';
 import useApiClient from '@/utils/request';
+import { runWithConcurrency } from '@/app/monitor/dashboards/shared/utils/concurrency';
 import { useSearchParams } from 'next/navigation';
 import {
   ListItem,
   MetricItem,
   IndexViewItem,
-  ObjectItem,
-  GroupInfo
+  ObjectItem
 } from '@/app/monitor/types';
+import {
+  buildGroupedMetricSelectOptions,
+  METRIC_SELECT_POPUP_CLASSNAME,
+} from '@/app/monitor/components/metricSelectOptions';
+import { loadMonitorPluginsByObjectCached } from '@/app/monitor/utils/monitorPluginCache';
 import {
   InstanceItem,
   PluginItem,
@@ -48,17 +54,20 @@ import {
 import { cloneDeep } from 'lodash';
 import SavedQueryDrawer from './savedQueryDrawer';
 import SaveQueryModal from './saveQueryModal';
+import { loadSavedQueryResources } from './savedQueryLoading';
 import {
+  generateSearchId,
   getMetricsMapKey,
+  extractDimensionLabelValues,
+  normalizeMonitorEntityId,
   resolveInitialPlugin,
+  resolveMetricDimensionLabels,
   resolveMetricSelection
 } from './searchQueryLogic';
 
 const { Option } = Select;
 
 export type { QueryGroup, SearchPayload, QueryPanelRef, QueryPanelProps };
-
-const generateId = () => crypto.randomUUID();
 
 const generateGroupName = (index: number) => `查询条件 ${index + 1}`;
 
@@ -74,15 +83,18 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
       getMetricsGroup,
       getInstanceList
     } = useMonitorApi();
+    const { getMetricsInstanceQuery } = useViewApi();
     const CONDITION_LIST = useConditionList();
     const [panelCollapsed, setPanelCollapsed] = useState(false);
     const initialObjectId = searchParams.get('monitor_object');
     const initialPluginId = searchParams.get('plugin_id');
     const initialInstanceId = searchParams.get('instance_id');
     const initialMetricId = searchParams.get('metric_id');
+    const normalizedInitialObjectId = normalizeMonitorEntityId(initialObjectId);
+    const normalizedInitialPluginId = normalizeMonitorEntityId(initialPluginId);
     const [queryGroups, setQueryGroups] = useState<QueryGroup[]>([
       {
-        id: generateId(),
+        id: generateSearchId(),
         name: '查询条件 1',
         object: '',
         plugin: null,
@@ -113,10 +125,25 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
     const [metricsGroupMap, setMetricsGroupMap] = useState<
       Record<string, IndexViewItem[]>
     >({});
+    const [metricSearchResultMap, setMetricSearchResultMap] = useState<
+      Record<string, IndexViewItem[]>
+    >({});
+    const [selectedMetricMap, setSelectedMetricMap] = useState<
+      Record<string, MetricItem>
+    >({});
+    const [metricSearchMap, setMetricSearchMap] = useState<
+      Record<string, string>
+    >({});
     const [instancesMap, setInstancesMap] = useState<
       Record<string, InstanceItem[]>
     >({});
-    const [labelsMap, setLabelsMap] = useState<Record<string, string[]>>({});
+    // 条件值下拉：key = object_plugin_metric_instances_label
+    const [conditionValueOptionsMap, setConditionValueOptionsMap] = useState<
+      Record<string, string[]>
+    >({});
+    const [conditionValueLoadingMap, setConditionValueLoadingMap] = useState<
+      Record<string, boolean>
+    >({});
     const [metricsLoading, setMetricsLoading] = useState<
       Record<string, boolean>
     >({});
@@ -130,6 +157,9 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
       {}
     );
     const metricsAbortControllerRef = useRef<Record<string, AbortController>>(
+      {}
+    );
+    const metricSearchTimerRef = useRef<Record<string, ReturnType<typeof setTimeout>>>(
       {}
     );
     const instanceAbortControllerRef = useRef<Record<string, AbortController>>(
@@ -151,10 +181,22 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
       objects.forEach((obj) => {
         objectsMap[String(obj.id)] = obj;
       });
+      const payloadMetricsMap = { ...metricsMap };
+      queryGroups.forEach((group) => {
+        const selectedMetric = selectedMetricMap[group.id];
+        if (!selectedMetric) return;
+        const key = getMetricsMapKey(group.object, group.plugin);
+        const current = payloadMetricsMap[key] || [];
+        payloadMetricsMap[key] = current.some(
+          (metric) => metric.id === selectedMetric.id
+        )
+          ? current
+          : [...current, selectedMetric];
+      });
       return {
         queryGroups,
         activeGroup,
-        metricsMap,
+        metricsMap: payloadMetricsMap,
         instancesMap,
         pluginsMap,
         objectsMap
@@ -178,6 +220,9 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
         Object.values(instanceAbortControllerRef.current).forEach((c) =>
           c?.abort()
         );
+        Object.values(metricSearchTimerRef.current).forEach((timer) =>
+          clearTimeout(timer)
+        );
       };
     }, []);
 
@@ -187,7 +232,7 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
       // 应用 URL 参数到初始查询组
       if (
         !urlParamsApplied &&
-        (initialObjectId || initialInstanceId || initialMetricId)
+        (normalizedInitialObjectId || initialInstanceId || initialMetricId)
       ) {
         setQueryGroups((prev) => {
           const first = prev[0];
@@ -195,8 +240,8 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
           return [
             {
               ...first,
-              object: initialObjectId ? +initialObjectId : first.object,
-              plugin: initialPluginId || first.plugin,
+              object: normalizedInitialObjectId ?? first.object,
+              plugin: normalizedInitialPluginId ?? first.plugin,
               instanceIds: initialInstanceId
                 ? [initialInstanceId]
                 : first.instanceIds,
@@ -213,14 +258,17 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
           ];
         });
         setUrlParamsApplied(true);
-        if (initialObjectId) {
+        if (normalizedInitialObjectId) {
           getPlugins(
-            +initialObjectId,
+            normalizedInitialObjectId,
             queryGroups[0].id,
-            initialPluginId,
+            normalizedInitialPluginId,
             Boolean(initialMetricId && !/^\d+$/.test(initialMetricId)),
             initialMetricId && !/^\d+$/.test(initialMetricId)
               ? initialMetricId
+              : null,
+            initialMetricId && /^\d+$/.test(initialMetricId)
+              ? Number(initialMetricId)
               : null
           );
         }
@@ -283,7 +331,8 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
       groupId?: string,
       preferredPluginId?: React.Key | null,
       allowFirstPluginFallback = false,
-      legacyMetricName?: string | null
+      legacyMetricName?: string | null,
+      preferredMetricId?: React.Key | null
     ): Promise<PluginItem[]> => {
       const key = String(objectId);
       pluginAbortControllerRef.current[key]?.abort();
@@ -291,19 +340,27 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
       pluginAbortControllerRef.current[key] = abortController;
       try {
         setPluginLoading((prev) => ({ ...prev, [key]: true }));
-        const data = await getMonitorPlugin(
-          { monitor_object_id: objectId },
-          { signal: abortController.signal }
-        );
-        const plugins = (data || []) as PluginItem[];
+        const plugins = (await loadMonitorPluginsByObjectCached(
+          objectId,
+          () => getMonitorPlugin({ monitor_object_id: objectId })
+        )) as PluginItem[];
+        if (abortController.signal.aborted) {
+          return [];
+        }
         setPluginsMap((prev) => ({ ...prev, [key]: plugins }));
         const selectedPlugin =
-          preferredPluginId ||
-          resolveInitialPlugin(plugins) ||
+          normalizeMonitorEntityId(preferredPluginId) ??
+          resolveInitialPlugin(plugins) ??
           (allowFirstPluginFallback ? plugins[0]?.id : null);
         if (groupId && selectedPlugin) {
           updateQueryGroup(groupId, { plugin: selectedPlugin });
-          getMetrics(objectId, selectedPlugin, groupId, legacyMetricName);
+          getMetrics(
+            objectId,
+            selectedPlugin,
+            groupId,
+            legacyMetricName,
+            preferredMetricId
+          );
           getInstList(objectId, selectedPlugin);
         }
         return plugins;
@@ -318,48 +375,97 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
       objectId: React.Key,
       pluginId?: React.Key | null,
       groupId?: string,
-      legacyMetricName?: string | null
+      legacyMetricName?: string | null,
+      selectedMetricId?: React.Key | null,
+      keyword = ''
     ): Promise<MetricItem[]> => {
       const key = getMetricsMapKey(objectId, pluginId);
-      metricsAbortControllerRef.current[key]?.abort();
+      const requestKey = keyword.trim() && groupId ? `${key}|${groupId}` : key;
+      metricsAbortControllerRef.current[requestKey]?.abort();
       const abortController = new AbortController();
-      metricsAbortControllerRef.current[key] = abortController;
+      metricsAbortControllerRef.current[requestKey] = abortController;
       try {
         setMetricsLoading((prev) => ({ ...prev, [key]: true }));
         const config = { signal: abortController.signal };
         const params = {
-          monitor_object_id: objectId,
-          ...(pluginId ? { monitor_plugin_id: String(pluginId) } : {})
+          monitor_object_id: String(objectId),
+          ...(pluginId ? { monitor_plugin_id: String(pluginId) } : {}),
+          ...(keyword.trim() ? { keyword: keyword.trim() } : {})
         };
-        const [groupList, metricsList] = await Promise.all([
+        const [groupList, firstMetricsPage] = await Promise.all([
           getMetricsGroup(params, config),
           getMonitorMetrics(params, config)
         ]);
-        const metricData = cloneDeep(metricsList || []);
-        setMetricsMap((prev) => ({ ...prev, [key]: metricsList || [] }));
-        const groupData = groupList.map((item: GroupInfo) => ({
+        if (abortController.signal.aborted) return [];
+        let metricsList = firstMetricsPage;
+        const selectedMetricExists = metricsList.items.some(
+          (metric) => String(metric.id) === String(selectedMetricId)
+        );
+        const legacyMetricExists = legacyMetricName
+          ? metricsList.items.some((metric) => metric.name === legacyMetricName)
+          : true;
+        if (!keyword.trim() && ((!selectedMetricExists && selectedMetricId) || !legacyMetricExists)) {
+          const selectedPage = await getMonitorMetrics(
+            {
+              monitor_object_id: String(objectId),
+              ...(pluginId ? { monitor_plugin_id: String(pluginId) } : {}),
+              ...(!selectedMetricExists && selectedMetricId
+                ? { id: selectedMetricId }
+                : { name: legacyMetricName || '' })
+            },
+            config
+          );
+          if (abortController.signal.aborted) return [];
+          metricsList = {
+            ...metricsList,
+            items: [...metricsList.items, ...selectedPage.items],
+            metric_groups: [
+              ...(metricsList.metric_groups || []),
+              ...(selectedPage.metric_groups || [])
+            ]
+          };
+        }
+        const metricData = cloneDeep(metricsList.items);
+        if (!keyword.trim()) {
+          setMetricsMap((prev) => ({ ...prev, [key]: metricsList.items }));
+        }
+        const groupData: IndexViewItem[] = (
+          metricsList.metric_groups || groupList.items
+        ).map((item) => ({
           ...item,
+          id: Number(item.id),
           child: []
         }));
         metricData.forEach((metric: MetricItem) => {
           const target = groupData.find(
-            (item: GroupInfo) => item.id === metric.metric_group
+            (item) => item.id === metric.metric_group
           );
           if (target) {
             target.child.push(metric);
           }
         });
-        const filteredGroupData = groupData.filter(
-          (item: IndexViewItem) => !!item.child?.length
-        );
-        setMetricsGroupMap((prev) => ({ ...prev, [key]: filteredGroupData }));
+        const filteredGroupData = groupData.filter((item) => !!item.child?.length);
+        if (keyword.trim() && groupId) {
+          setMetricSearchResultMap((prev) => ({
+            ...prev,
+            [groupId]: filteredGroupData
+          }));
+        } else {
+          setMetricsGroupMap((prev) => ({ ...prev, [key]: filteredGroupData }));
+          if (groupId) {
+            setMetricSearchResultMap((prev) => ({
+              ...prev,
+              [groupId]: filteredGroupData
+            }));
+          }
+        }
         const group = groupId
           ? queryGroups.find((item) => item.id === groupId)
           : null;
         const legacyName = legacyMetricName || group?.legacyMetricName;
         if (legacyName && !group?.metric) {
           const legacyMetric = resolveMetricSelection(
-            metricsList || [],
+            metricsList.items,
             legacyName
           );
           if (legacyMetric && (group?.id || groupId)) {
@@ -369,11 +475,13 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
             });
           }
         }
-        return metricsList || [];
+        return metricsList.items;
       } catch {
         return [];
       } finally {
-        setMetricsLoading((prev) => ({ ...prev, [key]: false }));
+        if (metricsAbortControllerRef.current[requestKey] === abortController) {
+          setMetricsLoading((prev) => ({ ...prev, [key]: false }));
+        }
       }
     };
 
@@ -416,7 +524,7 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
 
     const addQueryGroup = () => {
       const newGroup: QueryGroup = {
-        id: generateId(),
+        id: generateSearchId(),
         name: generateGroupName(queryGroups.length),
         object: '',
         plugin: null,
@@ -442,6 +550,11 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
           queryGroups[0].id === groupId ? queryGroups[1]?.id : queryGroups[0].id
         );
       }
+      setSelectedMetricMap((prev) => {
+        const next = { ...prev };
+        delete next[groupId];
+        return next;
+      });
     };
 
     const duplicateQueryGroup = (groupId: string) => {
@@ -449,10 +562,16 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
       if (!group) return;
       const newGroup: QueryGroup = {
         ...cloneDeep(group),
-        id: generateId(),
+        id: generateSearchId(),
         name: generateGroupName(queryGroups.length)
       };
       setQueryGroups((prev) => [...prev, newGroup]);
+      if (selectedMetricMap[groupId]) {
+        setSelectedMetricMap((prev) => ({
+          ...prev,
+          [newGroup.id]: selectedMetricMap[groupId]
+        }));
+      }
     };
 
     const toggleGroupCollapse = (groupId: string) => {
@@ -468,55 +587,152 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
       );
     };
 
-    const handleObjectChange = (groupId: string, objectId: React.Key) => {
+    const handleObjectChange = (groupId: string, objectId: unknown) => {
+      const normalizedObjectId = normalizeMonitorEntityId(objectId);
+      if (normalizedObjectId === null) return;
+      setSelectedMetricMap((prev) => {
+        const next = { ...prev };
+        delete next[groupId];
+        return next;
+      });
       updateQueryGroup(groupId, {
-        object: objectId,
+        object: normalizedObjectId,
         plugin: null,
         instanceIds: [],
         metric: null,
         legacyMetricName: null,
         conditions: []
       });
-      if (objectId) {
-        getPlugins(objectId, groupId);
+      if (normalizedObjectId) {
+        getPlugins(normalizedObjectId, groupId);
       }
     };
 
     const handlePluginChange = (
       groupId: string,
-      pluginId: React.Key | null
+      pluginId: unknown
     ) => {
       const group = queryGroups.find((g) => g.id === groupId);
       if (!group) return;
+      const normalizedPluginId = normalizeMonitorEntityId(pluginId);
+      setSelectedMetricMap((prev) => {
+        const next = { ...prev };
+        delete next[groupId];
+        return next;
+      });
       updateQueryGroup(groupId, {
-        plugin: pluginId,
+        plugin: normalizedPluginId,
         instanceIds: [],
         metric: null,
         legacyMetricName: null,
         conditions: []
       });
-      if (group.object && pluginId) {
-        getMetrics(group.object, pluginId, groupId);
-        getInstList(group.object, pluginId);
+      if (group.object && normalizedPluginId) {
+        getMetrics(group.object, normalizedPluginId, groupId);
+        getInstList(group.object, normalizedPluginId);
       }
     };
 
-    const handleMetricChange = (groupId: string, metricId: React.Key) => {
+    const handleMetricChange = (groupId: string, metricId: unknown) => {
       const group = queryGroups.find((g) => g.id === groupId);
       if (!group) return;
-      const metrics =
-        metricsMap[getMetricsMapKey(group.object, group.plugin)] || [];
-      const target = resolveMetricSelection(metrics, metricId);
-      const labels = (target?.dimensions || []).map((item) => item.name);
-      setLabelsMap((prev) => ({
-        ...prev,
-        [`${group.object}_${group.plugin}_${metricId}`]: labels
-      }));
+      const dataKey = getMetricsMapKey(group.object, group.plugin);
+      const searchMetrics = (metricSearchResultMap[groupId] || []).flatMap(
+        (item) => item.child || []
+      );
+      const metrics = [...searchMetrics, ...(metricsMap[dataKey] || [])];
+      const normalizedMetricId = normalizeMonitorEntityId(metricId);
+      const target = resolveMetricSelection(metrics, normalizedMetricId);
+      if (target) {
+        setSelectedMetricMap((prev) => ({ ...prev, [groupId]: target }));
+      }
       updateQueryGroup(groupId, {
-        metric: target?.id || metricId,
+        metric: target?.id ?? normalizedMetricId,
         legacyMetricName: null,
         conditions: []
       });
+    };
+
+    const handleMetricSearch = (group: QueryGroup, value: string) => {
+      setMetricSearchMap((prev) => ({ ...prev, [group.id]: value }));
+      const previousTimer = metricSearchTimerRef.current[group.id];
+      if (previousTimer) {
+        clearTimeout(previousTimer);
+      }
+      metricSearchTimerRef.current[group.id] = setTimeout(() => {
+        getMetrics(
+          group.object,
+          group.plugin,
+          group.id,
+          null,
+          selectedMetricMap[group.id]?.id || group.metric,
+          value
+        );
+      }, 300);
+    };
+
+    const getConditionValueOptionsKey = (
+      group: QueryGroup,
+      label: string | null | undefined
+    ) =>
+      [
+        group.object,
+        group.plugin,
+        group.metric,
+        (group.instanceIds || []).slice().sort().join(','),
+        label || ''
+      ].join('_');
+
+    const loadConditionValueOptions = async (
+      group: QueryGroup,
+      label: string | null | undefined
+    ) => {
+      const dim = String(label || '').trim();
+      if (
+        !dim ||
+        !group.object ||
+        !group.metric ||
+        !(group.instanceIds || []).length
+      ) {
+        return;
+      }
+      const cacheKey = getConditionValueOptionsKey(group, dim);
+      if (conditionValueOptionsMap[cacheKey]) return;
+
+      setConditionValueLoadingMap((prev) => ({ ...prev, [cacheKey]: true }));
+      try {
+        const responses = await runWithConcurrency(
+          group.instanceIds,
+          4,
+          (instanceId) =>
+            getMetricsInstanceQuery({
+              monitor_object_id: group.object,
+              instance_id: instanceId,
+              metric_id: group.metric as React.Key,
+              auto_convert: false,
+              limit: 200,
+              mode: 'limited'
+            })
+        );
+        const series = responses.flatMap(
+          (resp) => resp?.data?.result || []
+        );
+        const values = extractDimensionLabelValues(series, dim);
+        setConditionValueOptionsMap((prev) => ({
+          ...prev,
+          [cacheKey]: values
+        }));
+      } catch {
+        setConditionValueOptionsMap((prev) => ({
+          ...prev,
+          [cacheKey]: []
+        }));
+      } finally {
+        setConditionValueLoadingMap((prev) => ({
+          ...prev,
+          [cacheKey]: false
+        }));
+      }
     };
 
     const handleLabelChange = (groupId: string, val: string, index: number) => {
@@ -524,7 +740,9 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
       if (!group) return;
       const conditions = cloneDeep(group.conditions);
       conditions[index].label = val;
+      conditions[index].value = '';
       updateQueryGroup(groupId, { conditions });
+      void loadConditionValueOptions(group, val);
     };
 
     const handleConditionChange = (
@@ -541,13 +759,13 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
 
     const handleValueChange = (
       groupId: string,
-      e: React.ChangeEvent<HTMLInputElement>,
+      val: string,
       index: number
     ) => {
       const group = queryGroups.find((g) => g.id === groupId);
       if (!group) return;
       const conditions = cloneDeep(group.conditions);
-      conditions[index].value = e.target.value;
+      conditions[index].value = val;
       updateQueryGroup(groupId, { conditions });
     };
 
@@ -573,7 +791,7 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
     const clearAll = () => {
       setQueryGroups([
         {
-          id: generateId(),
+          id: generateSearchId(),
           name: '查询条件 1',
           object: '',
           plugin: null,
@@ -607,63 +825,25 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
     };
 
     const handleLoadSavedQuery = async (savedQueryGroups: QueryGroup[]) => {
-      const objectIds = [
-        ...new Set(savedQueryGroups.map((g) => g.object).filter(Boolean))
-      ];
-      const loadedPluginsMap: Record<string, PluginItem[]> = { ...pluginsMap };
-      const loadedMetricsMap: Record<string, MetricItem[]> = { ...metricsMap };
-      const loadedInstancesMap: Record<string, InstanceItem[]> = {
-        ...instancesMap
-      };
-      await Promise.all(
-        objectIds.map(async (objectId) => {
-          const key = String(objectId);
-          const plugins = pluginsMap[key] || (await getPlugins(objectId));
-          loadedPluginsMap[key] = plugins;
-          const groupsForObject = savedQueryGroups.filter(
-            (group) => group.object === objectId
-          );
-          await Promise.all(
-            groupsForObject.map(async (group) => {
-              const pluginId =
-                group.plugin ||
-                resolveInitialPlugin(plugins) ||
-                (group.legacyMetricName ? plugins[0]?.id : null);
-              if (pluginId && !group.plugin) {
-                group.plugin = pluginId;
-              }
-              const mapKey = getMetricsMapKey(objectId, pluginId);
-              const metricsPromise = loadedMetricsMap[mapKey]
-                ? Promise.resolve(loadedMetricsMap[mapKey])
-                : getMetrics(
-                  objectId,
-                  pluginId,
-                  group.id,
-                  group.legacyMetricName
-                );
-              const instancesPromise = loadedInstancesMap[mapKey]
-                ? Promise.resolve(loadedInstancesMap[mapKey])
-                : getInstList(objectId, pluginId);
-              const [metrics, instances] = await Promise.all([
-                metricsPromise,
-                instancesPromise
-              ]);
-              if (group.legacyMetricName && !group.metric) {
-                const legacyMetric = resolveMetricSelection(
-                  metrics,
-                  group.legacyMetricName
-                );
-                if (legacyMetric) {
-                  group.metric = legacyMetric.id;
-                  group.legacyMetricName = null;
-                }
-              }
-              loadedMetricsMap[mapKey] = metrics;
-              loadedInstancesMap[mapKey] = instances;
-            })
-          );
-        })
-      );
+      const loadedResources = await loadSavedQueryResources({
+        queryGroups: savedQueryGroups,
+        pluginsMap,
+        metricsMap,
+        instancesMap,
+        loadPlugins: getPlugins,
+        loadMetrics: (objectId, pluginId, selectedMetricId) =>
+          getMetrics(objectId, pluginId, undefined, null, selectedMetricId),
+        loadInstances: getInstList,
+        getResourceKey: getMetricsMapKey,
+        resolvePlugin: (plugins, group) =>
+          group.plugin ||
+          resolveInitialPlugin(plugins) ||
+          (group.legacyMetricName ? plugins[0]?.id : null),
+        resolveLegacyMetric: resolveMetricSelection
+      });
+      const loadedPluginsMap = loadedResources.pluginsMap;
+      const loadedMetricsMap = loadedResources.metricsMap;
+      const loadedInstancesMap = loadedResources.instancesMap;
       setPluginsMap(loadedPluginsMap);
       setQueryGroups(savedQueryGroups);
       const canSearchNow = savedQueryGroups.some(
@@ -689,10 +869,17 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
     const renderQueryGroup = (group: QueryGroup) => {
       const pluginOptions = pluginsMap[String(group.object)] || [];
       const dataKey = getMetricsMapKey(group.object, group.plugin);
-      const groupMetrics = metricsGroupMap[dataKey] || [];
+      const groupMetrics =
+        metricSearchResultMap[group.id] || metricsGroupMap[dataKey] || [];
       const groupInstances = instancesMap[dataKey] || [];
-      const groupLabels =
-        labelsMap[`${group.object}_${group.plugin}_${group.metric}`] || [];
+      // 直接从当前指标定义取维度，避免 URL 深链只填 metric、未走 handleMetricChange 时标签为空。
+      const selectedMetric = resolveMetricSelection(
+        [selectedMetricMap[group.id], ...(metricsMap[dataKey] || [])].filter(
+          (metric): metric is MetricItem => Boolean(metric)
+        ),
+        group.metric
+      );
+      const groupLabels = resolveMetricDimensionLabels(selectedMetric);
       const isPluginLoading = pluginLoading[String(group.object)] || false;
       const isMetricsLoading = metricsLoading[dataKey] || false;
       const isInstanceLoading = instanceLoading[dataKey] || false;
@@ -913,19 +1100,19 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
                 loading={isMetricsLoading}
                 disabled={!group.object || !group.plugin}
                 showSearch
-                filterOption={(input, option) =>
-                  String(option?.label || '')
-                    .toLowerCase()
-                    .includes(input.toLowerCase())
-                }
-                options={groupMetrics.map((item) => ({
-                  label: item.display_name,
-                  title: item.name,
-                  options: (item.child || []).map((tex) => ({
-                    label: tex.display_name,
-                    value: tex.id
-                  }))
-                }))}
+                filterOption={false}
+                optionLabelProp="displayLabel"
+                popupClassName={METRIC_SELECT_POPUP_CLASSNAME}
+                options={buildGroupedMetricSelectOptions(
+                  groupMetrics,
+                  metricSearchMap[group.id] || '',
+                )}
+                onSearch={(value) => handleMetricSearch(group, value)}
+                onDropdownVisibleChange={(open) => {
+                  if (!open) {
+                    handleMetricSearch(group, '');
+                  }
+                }}
                 onChange={(val) => handleMetricChange(group.id, val)}
               />
             </div>
@@ -955,58 +1142,121 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
               </label>
               {group.conditions.length > 0 && (
                 <div className="space-y-2 mb-3">
-                  {group.conditions.map((conditionItem, index) => (
+                  {group.conditions.map((conditionItem, index) => {
+                    const valueOptionsKey = getConditionValueOptionsKey(
+                      group,
+                      conditionItem.label
+                    );
+                    const valueOptions =
+                      conditionValueOptionsMap[valueOptionsKey] || [];
+                    const valueLoading = Boolean(
+                      conditionValueLoadingMap[valueOptionsKey]
+                    );
+                    return (
                     <div
                       key={index}
                       className="flex items-center gap-1.5 bg-[var(--color-fill-1)] rounded-md p-1.5"
                     >
                       <Select
-                        className="w-20"
+                        className="min-w-[96px] flex-[1.1]"
                         size="small"
                         placeholder={t('monitor.label')}
                         value={conditionItem.label}
                         showSearch
+                        popupMatchSelectWidth={false}
+                        dropdownStyle={{ minWidth: 180 }}
+                        styles={{
+                          popup: {
+                            root: { minWidth: 180 }
+                          }
+                        }}
                         onChange={(val) =>
                           handleLabelChange(group.id, val, index)
                         }
-                      >
-                        {groupLabels.map((item) => (
-                          <Option key={item} value={item}>
-                            {item}
-                          </Option>
-                        ))}
-                      </Select>
+                        onDropdownVisibleChange={(open) => {
+                          if (open && conditionItem.label) {
+                            void loadConditionValueOptions(
+                              group,
+                              conditionItem.label
+                            );
+                          }
+                        }}
+                        options={groupLabels.map((item) => ({
+                          label: item,
+                          value: item
+                        }))}
+                      />
                       <Select
-                        className="w-20"
+                        className="min-w-[80px] w-[80px] shrink-0"
                         size="small"
                         placeholder={t('monitor.term')}
                         value={conditionItem.condition}
                         onChange={(val) =>
                           handleConditionChange(group.id, val, index)
                         }
-                      >
-                        {CONDITION_LIST.map((item: ListItem) => (
-                          <Option key={item.id} value={item.id}>
-                            {item.name}
-                          </Option>
-                        ))}
-                      </Select>
-                      <Input
-                        className="flex-1"
+                        options={CONDITION_LIST.map((item: ListItem) => ({
+                          label: item.name,
+                          value: item.id
+                        }))}
+                      />
+                      <AutoComplete
+                        className="min-w-[120px] flex-[1.6]"
                         size="small"
+                        allowClear
                         placeholder={t('monitor.value')}
                         value={conditionItem.value}
-                        onChange={(e) => handleValueChange(group.id, e, index)}
+                        options={valueOptions.map((item) => ({
+                          value: item,
+                          label: item
+                        }))}
+                        disabled={!conditionItem.label}
+                        popupMatchSelectWidth={false}
+                        dropdownStyle={{ minWidth: 220 }}
+                        styles={{
+                          popup: {
+                            root: { minWidth: 220 }
+                          }
+                        }}
+                        onFocus={() => {
+                          if (conditionItem.label) {
+                            void loadConditionValueOptions(
+                              group,
+                              conditionItem.label
+                            );
+                          }
+                        }}
+                        onDropdownVisibleChange={(open) => {
+                          if (open && conditionItem.label) {
+                            void loadConditionValueOptions(
+                              group,
+                              conditionItem.label
+                            );
+                          }
+                        }}
+                        filterOption={(input, option) =>
+                          String(option?.value || '')
+                            .toLowerCase()
+                            .includes(input.toLowerCase())
+                        }
+                        onChange={(val) =>
+                          handleValueChange(group.id, val || '', index)
+                        }
+                        notFoundContent={
+                          valueLoading
+                            ? t('common.loading')
+                            : t('common.noData')
+                        }
                       />
                       <Button
                         type="text"
                         size="small"
                         icon={<MinusCircleOutlined />}
-                        className="text-[var(--color-text-3)] hover:text-[var(--color-fail)]"
+                        className="shrink-0 text-[var(--color-text-3)] hover:text-[var(--color-fail)]"
                         onClick={() => deleteConditionItem(group.id, index)}
                       />
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
               <Button
@@ -1029,7 +1279,7 @@ const QueryPanel = forwardRef<QueryPanelRef, QueryPanelProps>(
         {/* 左侧面板 */}
         <div
           className={`flex flex-col border-r transition-all duration-300 h-full ${
-            panelCollapsed ? 'w-0 overflow-hidden' : 'w-[340px]'
+            panelCollapsed ? 'w-0 overflow-hidden' : 'w-[400px]'
           }`}
           style={{
             backgroundColor: 'var(--color-bg-1)',

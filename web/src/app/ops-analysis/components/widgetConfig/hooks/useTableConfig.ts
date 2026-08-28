@@ -13,6 +13,7 @@ import {
   formatTimeRange,
   processDataSourceParams,
 } from '@/app/ops-analysis/utils/widgetDataTransform';
+import { getDateRangeTimezone } from '@/app/ops-analysis/utils/dateRange';
 import {
   DisplayColumnRow,
   buildDisplayColumnsFromSchema,
@@ -180,7 +181,11 @@ export function useTableConfig({
   );
 
   const handleDisplayColumnChange = useCallback(
-    (id: string, fieldName: keyof TableColumnConfigItem, value: string | boolean) => {
+    (
+      id: string,
+      fieldName: keyof TableColumnConfigItem,
+      value: TableColumnConfigItem[keyof TableColumnConfigItem],
+    ) => {
       setDisplayColumns((prev) =>
         prev.map((col) => {
           if (col.id !== id) return col;
@@ -189,20 +194,64 @@ export function useTableConfig({
             const currentTitle = (col.title || '').trim();
             const currentKey = (col.key || '').trim();
             const shouldSyncTitle = !currentTitle || currentTitle === currentKey;
-
-            return {
+            const keyChanged = nextKey.trim() !== currentKey;
+            const next: DisplayColumnRow = {
               ...col,
               key: nextKey,
               title: shouldSyncTitle
                 ? getDisplayColumnTitle(nextKey)
                 : col.title,
             };
+
+            if (keyChanged) {
+              delete next.cellType;
+              delete next.valueMappings;
+              delete next.cellThresholdColors;
+            }
+
+            return next;
+          }
+          if (value === undefined) {
+            const next = { ...col };
+            delete next[fieldName];
+            return next;
           }
           return { ...col, [fieldName]: value };
         }),
       );
     },
     [getDisplayColumnTitle],
+  );
+
+  const handleDisplayColumnStyleChange = useCallback(
+    (
+      id: string,
+      style: Pick<
+        TableColumnConfigItem,
+        'cellType' | 'valueMappings' | 'cellThresholdColors'
+      >,
+    ) => {
+      setDisplayColumns((prev) =>
+        prev.map((col) => {
+          if (col.id !== id) return col;
+          const next: DisplayColumnRow = { ...col };
+          delete next.cellType;
+          delete next.valueMappings;
+          delete next.cellThresholdColors;
+          if (style.cellType) {
+            next.cellType = style.cellType;
+          }
+          if (style.valueMappings?.length) {
+            next.valueMappings = style.valueMappings;
+          }
+          if (style.cellThresholdColors?.length) {
+            next.cellThresholdColors = style.cellThresholdColors;
+          }
+          return next;
+        }),
+      );
+    },
+    [],
   );
 
   const handleDisplayColumnKeyBlur = useCallback((id: string) => {
@@ -250,6 +299,10 @@ export function useTableConfig({
           filterBindings,
           filterDefinitions,
           timeRangeFormatter: formatTimeRange,
+          resolutionContext: {
+            referenceNow: Date.now(),
+            timezone: getDateRangeTimezone(),
+          },
         }),
       );
 
@@ -285,7 +338,7 @@ export function useTableConfig({
     ): Promise<DisplayColumnRow[]> => {
       try {
         const payload = buildProbeParams(targetDataSource, formParams);
-        const sourceData = await getSourceDataByApiId(targetDataSource.id, payload);
+        const { data: sourceData } = await getSourceDataByApiId(targetDataSource.id, payload);
         const firstRecord = extractFirstRecordFromSourceData(sourceData);
         if (!firstRecord) return [];
 
@@ -317,6 +370,14 @@ export function useTableConfig({
 
       if (probedColumns.length > 0) {
         setDetectedDisplayColumns(probedColumns);
+        // 关键:把探测结果写入 displayColumns(实际渲染数组)
+        // 同时保留用户自定义列(isDefault !== true 的列),与 tooltip 文案一致
+        setDisplayColumns((prev) => {
+          const customCols = prev.filter((c) => !c.isDefault);
+          const customKeys = new Set(customCols.map((c) => c.key).filter(Boolean));
+          const newDefaults = probedColumns.filter((c) => !customKeys.has(c.key));
+          return [...customCols, ...newDefaults];
+        });
         setParamsChangedAfterProbe(false);
         message.success(t('dashboard.reProbeSuccess'));
         return;
@@ -388,6 +449,7 @@ export function useTableConfig({
     handleAddDisplayColumn,
     handleDeleteDisplayColumn,
     handleDisplayColumnChange,
+    handleDisplayColumnStyleChange,
     handleDisplayColumnKeyBlur,
     handleDisplayColumnDragEnd,
     handleReProbeColumns,

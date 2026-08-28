@@ -37,6 +37,9 @@ from .enrichment import EnrichmentRule  # noqa: F401
 
 # 动作规则与执行记录
 from .action import ActionRule, ActionExecution  # noqa: F401
+from .active_fingerprint import ActiveAlertFingerprint  # noqa: F401
+from .outbox import AlertOutbox  # noqa: F401
+from .install_token import K8sInstallToken  # noqa: F401
 
 __all__ = [
     # 告警源
@@ -68,4 +71,7 @@ __all__ = [
     # 动作规则与执行记录
     "ActionRule",
     "ActionExecution",
+    "ActiveAlertFingerprint",
+    "AlertOutbox",
+    "K8sInstallToken",
 ]

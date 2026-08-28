@@ -1,25 +1,32 @@
 """Job Management NATS API - 用于数据权限规则"""
 
-from asgiref.sync import async_to_sync
-from celery import current_app
-from django.utils import timezone
+import os
 
 import nats_client
 from apps.core.logger import job_logger as logger
+from apps.core.openapi.decorators import openapi_expose
 from apps.core.utils.ssrf_validator import SSRFError, SSRFValidator
+from apps.core.utils.viewset_utils import build_json_membership_query
 from apps.job_mgmt.constants import CallbackType, ExecutionStatus, JobType, TriggerSource
-from apps.job_mgmt.models import DangerousPath, DangerousRule, DistributionFile, JobExecution, Playbook, ScheduledTask, Script, Target
-from apps.job_mgmt.services.callback_service import send_callback
+from apps.job_mgmt.models import DistributionFile, JobExecution, Playbook, Script, Target
+from apps.job_mgmt.openapi_serializers import FileDistributeRequestSerializer
+from apps.job_mgmt.services.ansible_callback_service import handle_ansible_task_callback
+from apps.job_mgmt.services.celery_dispatch import dispatch_celery_task
 from apps.job_mgmt.services.dangerous_checker import DangerousChecker
-from apps.job_mgmt.services.execution_stream_service import publish_done_sentinel
+from apps.job_mgmt.services.execution_cancellation_service import (
+    ExecutionCancellationAuthorizationError,
+    ExecutionCancellationError,
+    request_execution_cancel,
+)
+from apps.job_mgmt.services.nats_module_service import get_module_data, get_module_list
+from apps.job_mgmt.services.param_crypto import ParamCrypto
+from apps.job_mgmt.services.script_normalize import normalize_script_line_endings
 from apps.job_mgmt.services.script_params_service import ScriptParamsService
-from apps.job_mgmt.tasks import distribute_files_task, execute_script_task, finalize_cancelling_execution
+from apps.job_mgmt.tasks import distribute_files_task, execute_script_task
 from apps.job_mgmt.utils.team_authz import is_team_authorized, normalize_team
-from apps.node_mgmt.utils.s3 import delete_s3_file
-from apps.rpc.sensitive import sanitize_sensitive_data, summarize_ansible_callback
-
-
-CANCEL_CONVERGE_BUFFER_SECONDS = 60
+from apps.node_mgmt.models import Node
+from apps.system_mgmt.nats.common import _verify_token
+from apps.system_mgmt.utils.group_utils import GroupUtils
 
 
 def _validate_callback_config(callback_type: str, callback_url: str, callback_subject: str, tag: str):
@@ -48,59 +55,13 @@ def _validate_callback_config(callback_type: str, callback_url: str, callback_su
 @nats_client.register
 def get_job_mgmt_module_list():
     """获取作业管理模块列表"""
-    return [
-        {"name": "script", "display_name": "脚本库"},
-        {"name": "playbook", "display_name": "Playbook库"},
-        {"name": "target", "display_name": "目标"},
-        {"name": "job_execution", "display_name": "作业执行"},
-        {"name": "scheduled_task", "display_name": "定时任务"},
-        {
-            "name": "system",
-            "display_name": "系统管理",
-            "children": [
-                {"name": "dangerous_rule", "display_name": "高危命令"},
-                {"name": "dangerous_path", "display_name": "高危路径"},
-            ],
-        },
-    ]
+    return get_module_list()
 
 
 @nats_client.register
-def get_job_mgmt_module_data(module, child_module, page, page_size, group_id):
+def get_job_mgmt_module_data(module, child_module, page, page_size, group_id, *, team=None):
     """获取作业管理模块数据"""
-    model_map = {
-        "script": Script,
-        "playbook": Playbook,
-        "target": Target,
-        "job_execution": JobExecution,
-        "scheduled_task": ScheduledTask,
-    }
-    system_model_map = {
-        "dangerous_rule": DangerousRule,
-        "dangerous_path": DangerousPath,
-    }
-
-    if module != "system":
-        model = model_map[module]
-    else:
-        model = system_model_map[child_module]
-
-    queryset = model.objects.filter(team__contains=int(group_id))
-
-    # 计算总数
-    total_count = queryset.count()
-
-    # 计算分页
-    start = (page - 1) * page_size
-    end = page * page_size
-
-    # 获取当前页的数据
-    data_list = queryset.values("id", "name")[start:end]
-
-    return {
-        "count": total_count,
-        "items": list(data_list),
-    }
+    return get_module_data(module, child_module, page, page_size, group_id, team=team)
 
 
 @nats_client.register
@@ -114,8 +75,11 @@ def job_script_detail(data: dict):
         {"result": True, "data": {id, name, script_type, content, params, timeout}} 或 {"result": False, "message": "..."}
     """
     script_id = data.get("id")
+    authorized_team_ids = normalize_team(data.get("team"))
+    if not authorized_team_ids:
+        return {"result": False, "message": "team 不能为空"}
     script = Script.objects.filter(id=script_id).first()
-    if not script:
+    if not script or not (normalize_team(script.team) & authorized_team_ids):
         return {"result": False, "message": f"脚本不存在: id={script_id}"}
     return {
         "result": True,
@@ -130,202 +94,103 @@ def job_script_detail(data: dict):
     }
 
 
+_MAX_JOB_LIST_PAGE_SIZE = 100
+
+
+def _masked_params(params):
+    if not isinstance(params, list):
+        return []
+    return ParamCrypto.mask_encrypted_defaults(params)
+
+
+def _parse_job_list_page(data: dict):
+    try:
+        page = int(data.get("page") or 1)
+        page_size = int(data.get("page_size") or 20)
+    except (TypeError, ValueError):
+        return None, "page/page_size 参数非法"
+    if page < 1:
+        return None, "page 必须大于 0"
+    if page_size < 1 or page_size > _MAX_JOB_LIST_PAGE_SIZE:
+        return None, f"page_size 范围为 1-{_MAX_JOB_LIST_PAGE_SIZE}"
+    return (page, page_size), None
+
+
+def _team_owned_queryset(model, authorized_team_ids):
+    queryset = model.objects.all()
+    return queryset.filter(build_json_membership_query(queryset, "team", list(authorized_team_ids)))
+
+
+def _paginate_queryset(queryset, page, page_size):
+    total = queryset.count()
+    start = (page - 1) * page_size
+    return total, list(queryset.order_by("-updated_at", "-id")[start : start + page_size])
+
+
+def _serialize_script_job(script):
+    return {
+        "id": script.id,
+        "job_type": "script",
+        "name": script.name,
+        "description": script.description,
+        "script_type": script.script_type,
+        "params": _masked_params(script.params),
+        "timeout": script.timeout,
+        "is_built_in": script.is_built_in,
+    }
+
+
+def _serialize_playbook_job(playbook):
+    return {
+        "id": playbook.id,
+        "job_type": "playbook",
+        "name": playbook.name,
+        "description": playbook.description,
+        "version": playbook.version,
+        "params": _masked_params(playbook.params),
+    }
+
+
+@nats_client.register
+def job_list(data: dict):
+    """返回当前团队可执行的作业模板列表（脚本库 + Playbook），含参数定义、不含脚本/包内容。
+
+    供第三方 App 在执行前获取作业背景信息。
+    Args:
+        data: {"team": [...], "name": 可选模糊搜索, "page": 默认1, "page_size": 默认20，最大100}
+    Returns:
+        {"result": True, "data": {"scripts": {"count", "items"}, "playbooks": {"count", "items"}}}
+    """
+    authorized_team_ids = normalize_team((data or {}).get("team"))
+    if not authorized_team_ids:
+        return {"result": False, "message": "team 不能为空"}
+
+    page_info, error = _parse_job_list_page(data or {})
+    if error:
+        return {"result": False, "message": error}
+    page, page_size = page_info
+
+    name = (data or {}).get("name") or ""
+    scripts = _team_owned_queryset(Script, authorized_team_ids)
+    playbooks = _team_owned_queryset(Playbook, authorized_team_ids)
+    if name:
+        scripts = scripts.filter(name__icontains=name)
+        playbooks = playbooks.filter(name__icontains=name)
+
+    script_count, script_rows = _paginate_queryset(scripts, page, page_size)
+    playbook_count, playbook_rows = _paginate_queryset(playbooks, page, page_size)
+    return {
+        "result": True,
+        "data": {
+            "scripts": {"count": script_count, "items": [_serialize_script_job(item) for item in script_rows]},
+            "playbooks": {"count": playbook_count, "items": [_serialize_playbook_job(item) for item in playbook_rows]},
+        },
+    }
+
+
 @nats_client.register
 def ansible_task_callback(data: dict):
-    """
-    Ansible 任务执行回调
-
-    由新版本 Ansible Executor 执行完成后调用，更新 JobExecution 状态和结果。
-
-    仅支持结构化的 per-host 结果数组，不再兼容旧版字符串输出。
-
-    所有异常分支都必须收敛到终态（FAILED），避免作业永久 RUNNING。
-
-    Args:
-        data: 回调数据，包含以下字段：
-            - task_id: 任务ID（对应 JobExecution.id）
-            - task_type: 任务类型（adhoc/playbook）
-            - status: 执行状态（success/failed）
-            - success: 任务级是否成功
-            - result: per-host 结果数组，每项至少包含 host/status/stdout/stderr/exit_code/error_message
-            - error: 错误信息
-            - started_at: 开始时间（ISO格式）
-            - finished_at: 结束时间（ISO格式）
-
-    Returns:
-        {"success": True/False, "message": "..."}
-    """
-    logger.info("[ansible_task_callback] %s", summarize_ansible_callback(data))
-
-    task_id = data.get("task_id")
-    if not task_id:
-        logger.warning("[ansible_task_callback] 缺少 task_id")
-        return {"success": False, "message": "缺少 task_id"}
-
-    try:
-        execution = JobExecution.objects.get(id=task_id)
-    except JobExecution.DoesNotExist:
-        logger.warning(f"[ansible_task_callback] 执行记录不存在: task_id={task_id}")
-        return {"success": False, "message": f"执行记录不存在: {task_id}"}
-
-    # 检查是否已经是终态（避免重复处理）
-    if execution.status in ExecutionStatus.TERMINAL_STATES:
-        logger.info(f"[ansible_task_callback] 任务已处于终态: task_id={task_id}, status={execution.status}")
-        return {"success": True, "message": "任务已处理"}
-
-    # CANCELLING 是非终态：真实结果仍正常落库，但最终状态收敛为 CANCELLED（修复取消后结果被丢弃）
-    was_cancelling = execution.status == ExecutionStatus.CANCELLING
-
-    # 辅助函数：将执行记录收敛到 FAILED 终态
-    def _fail_execution(error_message: str):
-        """将执行记录收敛到 FAILED 终态"""
-        safe_error_message = str(sanitize_sensitive_data(error_message))
-        target_list_for_fail = execution.target_list or []
-        execution.status = ExecutionStatus.FAILED
-        execution.finished_at = timezone.now()
-        execution.execution_results = [
-            {
-                "target_key": str(t.get("target_id", "")),
-                "name": t.get("name", ""),
-                "ip": t.get("ip", ""),
-                "status": ExecutionStatus.FAILED,
-                "stdout": "",
-                "stderr": safe_error_message,
-                "exit_code": 1,
-                "error_message": safe_error_message,
-                "started_at": execution.started_at.isoformat() if execution.started_at else "",
-                "finished_at": timezone.now().isoformat(),
-            }
-            for t in target_list_for_fail
-        ]
-        execution.success_count = 0
-        execution.failed_count = len(target_list_for_fail)
-        execution.save(
-            update_fields=[
-                "status",
-                "execution_results",
-                "finished_at",
-                "success_count",
-                "failed_count",
-                "updated_at",
-            ]
-        )
-        logger.warning("[ansible_task_callback] 任务异常收敛到 FAILED: task_id=%s, reason=%s", task_id, safe_error_message)
-        # 为各目标补发 done 哨兵，关闭前端实时流面板（避免空等到 idle 超时）
-        for t in target_list_for_fail:
-            publish_done_sentinel(execution.id, str(t.get("target_id", "")), ExecutionStatus.FAILED)
-        send_callback(execution)
-
-    # 解析新版本结构化回调数据
-    raw_result = data.get("result", [])
-    error_output = str(sanitize_sensitive_data(data.get("error", "")))
-    finished_at_str = data.get("finished_at")
-    target_list = execution.target_list or []
-    execution_results = []
-
-    if not (isinstance(raw_result, list) and raw_result and all(isinstance(item, dict) for item in raw_result)):
-        _fail_execution(f"回调结果格式非法: {sanitize_sensitive_data(raw_result)}")
-        return {"success": False, "message": "非法的新版本结果格式，已收敛到 FAILED"}
-
-    target_map = {}
-    for target_info in target_list:
-        target_map[str(target_info.get("ip", ""))] = target_info
-        target_map[str(target_info.get("target_id", ""))] = target_info
-
-    seen_target_keys = set()
-    for host_result in raw_result:
-        host_key = str(host_result.get("host", ""))
-        target_info = target_map.get(host_key)
-        if not target_info:
-            _fail_execution(f"结果中的主机未匹配到目标: {host_key}")
-            return {"success": False, "message": f"结果中的主机未匹配到目标: {host_key}，已收敛到 FAILED"}
-
-        target_key = str(target_info.get("target_id", ""))
-        if target_key in seen_target_keys:
-            _fail_execution(f"结果中的主机重复: {host_key}")
-            return {"success": False, "message": f"结果中的主机重复: {host_key}，已收敛到 FAILED"}
-        seen_target_keys.add(target_key)
-
-        host_status = host_result.get("status")
-        final_status = ExecutionStatus.SUCCESS if host_status == "success" else ExecutionStatus.FAILED
-        execution_results.append(
-            {
-                "target_key": target_key,
-                "name": target_info.get("name", host_key),
-                "ip": target_info.get("ip", host_key),
-                "status": final_status,
-                "stdout": str(sanitize_sensitive_data(str(host_result.get("stdout", "")))),
-                "stderr": str(sanitize_sensitive_data(str(host_result.get("stderr", "")))),
-                "exit_code": host_result.get("exit_code", 0),
-                "error_message": str(sanitize_sensitive_data(str(host_result.get("error_message", "")))),
-                "started_at": execution.started_at.isoformat() if execution.started_at else "",
-                "finished_at": finished_at_str or timezone.now().isoformat(),
-            }
-        )
-
-    if len(execution_results) < len(target_list):
-        existing_keys = {item["target_key"] for item in execution_results}
-        for target_info in target_list:
-            target_key = str(target_info.get("target_id", ""))
-            if target_key in existing_keys:
-                continue
-            execution_results.append(
-                {
-                    "target_key": target_key,
-                    "name": target_info.get("name", ""),
-                    "ip": target_info.get("ip", ""),
-                    "status": ExecutionStatus.FAILED,
-                    "stdout": "",
-                    "stderr": str(error_output or "未收到该目标执行结果"),
-                    "exit_code": 1,
-                    "error_message": str(error_output or "未收到该目标执行结果"),
-                    "started_at": execution.started_at.isoformat() if execution.started_at else "",
-                    "finished_at": finished_at_str or timezone.now().isoformat(),
-                }
-            )
-
-    # 更新执行记录：取消中(CANCELLING)的任务收敛为 CANCELLED 终态，其余按真实结果写 SUCCESS/FAILED
-    if was_cancelling:
-        execution.status = ExecutionStatus.CANCELLED
-    else:
-        execution.status = (
-            ExecutionStatus.FAILED if any(item.get("status") == ExecutionStatus.FAILED for item in execution_results) else ExecutionStatus.SUCCESS
-        )
-    execution.execution_results = execution_results
-    execution.finished_at = timezone.now()
-    execution.success_count = sum(1 for item in execution_results if item.get("status") == ExecutionStatus.SUCCESS)
-    execution.failed_count = sum(1 for item in execution_results if item.get("status") == ExecutionStatus.FAILED)
-    execution.save(
-        update_fields=[
-            "status",
-            "execution_results",
-            "finished_at",
-            "success_count",
-            "failed_count",
-            "updated_at",
-        ]
-    )
-
-    # 为各目标补发 done 哨兵，关闭前端实时流面板（ansible 异步回调收尾）
-    for item in execution_results:
-        publish_done_sentinel(execution.id, item.get("target_key", ""), item.get("status", ExecutionStatus.SUCCESS))
-
-    logger.info(f"[ansible_task_callback] 任务完成: task_id={task_id}, status={execution.status}")
-
-    # 清理 Playbook 执行中转到 NATS OS 的临时文件
-    if execution.playbook_id:
-        nats_file_key = f"job-playbooks/{task_id}/{execution.playbook.file_name}" if execution.playbook else None
-        if nats_file_key:
-            try:
-                async_to_sync(delete_s3_file)(nats_file_key)
-                logger.info(f"[ansible_task_callback] 已清理 NATS OS 中转文件: {nats_file_key}")
-            except Exception as e:
-                logger.warning(f"[ansible_task_callback] 清理 NATS OS 中转文件失败: {nats_file_key}, error={e}")
-
-    # 回调通知（如有 callback_url）
-    send_callback(execution)
-
-    return {"success": True, "message": "回调处理成功"}
+    return handle_ansible_task_callback(data)
 
 
 # ============================================================
@@ -334,9 +199,14 @@ def ansible_task_callback(data: dict):
 
 
 @nats_client.register
-def job_script_execute(data: dict):
+def job_script_execute(data: dict, **_ignored):
+    """脚本执行（NATS 开放接口）。忽略调用方 kwargs，身份固定为 api。"""
+    return _run_script_execute(data)
+
+
+def _run_script_execute(data: dict, *, trusted_actor=None):
     """
-    脚本执行（NATS 开放接口）
+    脚本执行实现。
 
     Args:
         data: 请求数据，包含：
@@ -351,6 +221,7 @@ def job_script_execute(data: dict):
             - callback_type: 回调通道 web|nats|both（可选，默认 web）
             - callback_url: web 通道回调地址（callback_type 含 web 时使用）
             - callback_subject: nats 通道回调主题，如 bklite.alert_job_result（callback_type 含 nats 时必填）
+        trusted_actor: 仅网关封装传入的可信身份；NATS 入口不得传入。
 
     Returns:
         {"result": True, "data": {"task_id": <int>}} 或 {"result": False, "message": "..."}
@@ -368,6 +239,9 @@ def job_script_execute(data: dict):
     callback_type = data.get("callback_type", CallbackType.WEB)
     callback_url = data.get("callback_url")
     callback_subject = data.get("callback_subject")
+    actor = trusted_actor if isinstance(trusted_actor, dict) else {}
+    actor_name = actor.get("user") or "api"
+    actor_domain = actor.get("domain") or "domain.com"
 
     if not name:
         return {"result": False, "message": "name 不能为空"}
@@ -396,6 +270,10 @@ def job_script_execute(data: dict):
     # 构建 params 字符串
     params_str = ScriptParamsService.params_to_string(params) if params else ""
 
+    # 入库前规范化换行符（CRLF/CR → LF；bat/powershell 保留原样）。
+    # NATS 入口绕过 REST serializer, 必须独立处理; worker 兜底仍保留。
+    script_content = normalize_script_line_endings(script_content, script_type)
+
     # 创建执行记录
 
     execution = JobExecution.objects.create(
@@ -414,20 +292,37 @@ def job_script_execute(data: dict):
         callback_type=callback_type,
         callback_url=callback_url,
         callback_subject=callback_subject,
-        created_by="api",
-        updated_by="api",
+        executor_user=actor_name,
+        created_by=actor_name[:32],
+        updated_by=actor_name[:32],
+        domain=actor_domain,
+        updated_by_domain=actor_domain,
     )
 
     # 触发异步执行（Celery Worker）
-    result = execute_script_task.delay(execution.id)
-    execution.celery_task_id = result.id
-    execution.save(update_fields=["celery_task_id", "updated_at"])
+    if not dispatch_celery_task(execute_script_task, execution):
+        return {"result": False, "message": "任务调度服务暂不可用，请稍后重试"}
 
     return {"result": True, "data": {"task_id": execution.id}}
 
 
 @nats_client.register
 def job_file_distribute(data: dict):
+    """旧版 NATS 文件分发入口；默认兼容，支持显式退役与即时回滚。"""
+    if os.getenv("JOB_FILE_DISTRIBUTE_NATS_ENABLED", "1").strip().lower() not in {"1", "true", "yes", "on"}:
+        logger.warning("[job_file_distribute] legacy NATS entry disabled")
+        return {"result": False, "message": "旧版 NATS 文件分发入口已停用，请迁移至 OpenAPI 网关"}
+
+    logger.info(
+        "[job_file_distribute] legacy NATS call: team=%s, file_count=%s, target_count=%s",
+        data.get("team"),
+        len(data.get("file_keys") or []),
+        len(data.get("target_list") or []),
+    )
+    return _run_file_distribute(data)
+
+
+def _run_file_distribute(data: dict, *, trusted_actor=None):
     """
     文件分发（NATS 开放接口）
 
@@ -457,9 +352,13 @@ def job_file_distribute(data: dict):
     overwrite_strategy = data.get("overwrite_strategy", "overwrite")
     timeout = data.get("timeout", 600)
     team = data.get("team", [])
+    authorized_team_ids = normalize_team(team)
     callback_type = data.get("callback_type", CallbackType.WEB)
     callback_url = data.get("callback_url")
     callback_subject = data.get("callback_subject")
+    actor = trusted_actor if isinstance(trusted_actor, dict) else {}
+    actor_name = actor.get("user") or "api"
+    actor_domain = actor.get("domain") or "domain.com"
 
     if not name:
         return {"result": False, "message": "name 不能为空"}
@@ -471,8 +370,8 @@ def job_file_distribute(data: dict):
         return {"result": False, "message": "目标列表不能为空"}
     if not target_path:
         return {"result": False, "message": "target_path 不能为空"}
-    if not team:
-        return {"result": False, "message": "team 不能为空"}
+    if not authorized_team_ids:
+        return {"result": False, "message": "team 不能为空或格式非法"}
 
     # 回调配置校验（web 通道 SSRF 校验、nats 通道 subject 必填）
     cb_err = _validate_callback_config(callback_type, callback_url, callback_subject, "job_file_distribute")
@@ -485,12 +384,13 @@ def job_file_distribute(data: dict):
         forbidden_rules = [r["rule_name"] for r in check_result.forbidden]
         return {"result": False, "message": f"目标路径为高危路径，禁止分发: {', '.join(forbidden_rules)}"}
 
-    # 验证文件存在
-    distribution_files = DistributionFile.objects.filter(file_key__in=file_keys)
-    found_keys = set(distribution_files.values_list("file_key", flat=True))
+    # 文件必须属于本次作业声明的团队。将团队范围直接落到 ORM 查询，
+    # 对跨团队文件与历史无归属文件统一 fail-closed，避免泄露其存在性。
+    distribution_files = list(DistributionFile.objects.filter(file_key__in=file_keys, team__in=authorized_team_ids))
+    found_keys = {df.file_key for df in distribution_files}
     missing_keys = [k for k in file_keys if k not in found_keys]
     if missing_keys:
-        return {"result": False, "message": f"部分文件不存在或已过期: {', '.join(missing_keys)}"}
+        return {"result": False, "message": f"部分文件不存在、已过期或无权访问: {', '.join(missing_keys)}"}
 
     # 构建文件信息
     files_info = [{"name": df.original_name, "file_key": df.file_key} for df in distribution_files]
@@ -512,16 +412,109 @@ def job_file_distribute(data: dict):
         callback_type=callback_type,
         callback_url=callback_url,
         callback_subject=callback_subject,
-        created_by="api",
-        updated_by="api",
+        executor_user=actor_name,
+        # 通用 MaintainerInfo 字段历史上限为 32；完整可信身份保存在
+        # executor_user + domain，维护人列仅作兼容投影，避免合法长账号落库失败。
+        created_by=actor_name[:32],
+        updated_by=actor_name[:32],
+        domain=actor_domain,
+        updated_by_domain=actor_domain,
     )
 
     # 触发异步执行（Celery Worker）
-    result = distribute_files_task.delay(execution.id)
-    execution.celery_task_id = result.id
-    execution.save(update_fields=["celery_task_id", "updated_at"])
+    if not dispatch_celery_task(distribute_files_task, execution):
+        return {"result": False, "message": "任务调度服务暂不可用，请稍后重试"}
 
     return {"result": True, "data": {"task_id": execution.id}}
+
+
+def _validate_openapi_target_scope(target_source, target_list, authorized_team_ids):
+    """校验网关目标均属于可信身份绑定组织。"""
+    id_field = "target_id" if target_source == "manual" else "node_id"
+    target_ids = [item.get(id_field) for item in target_list]
+    if any(not target_id for target_id in target_ids) or len(set(target_ids)) != len(target_ids):
+        return f"目标列表必须包含唯一的 {id_field}"
+
+    if target_source == "manual":
+        targets = list(Target.objects.filter(id__in=target_ids))
+        authorized = len(targets) == len(target_ids) and all(is_team_authorized(item.team, authorized_team_ids) for item in targets)
+    else:
+        authorized = Node.objects.filter(
+            id__in=target_ids,
+            nodeorganization__organization__in=authorized_team_ids,
+        ).distinct().count() == len(target_ids)
+    if not authorized:
+        return "部分目标不存在或无权访问该组织的目标"
+    return None
+
+
+def _validate_openapi_distribute_scope(file_keys, target_source, target_list, authorized_team_ids):
+    """校验网关文件与目标均属于可信身份绑定组织。"""
+    files = list(DistributionFile.objects.filter(file_key__in=file_keys))
+    if len({item.file_key for item in files}) != len(set(file_keys)) or any(not is_team_authorized(item.team, authorized_team_ids) for item in files):
+        return "部分文件不存在、已过期或无权访问该组织的文件"
+    return _validate_openapi_target_scope(target_source, target_list, authorized_team_ids)
+
+
+@openapi_expose(
+    path="job-mgmt/file-distribute",
+    method="POST",
+    schema=FileDistributeRequestSerializer,
+    inject="team_list_with_user",
+    summary="提交文件分发作业（组织口径：API 令牌绑定组织精确匹配，不级联子组织）",
+)
+def openapi_file_distribute(
+    name,
+    file_keys,
+    target_source,
+    target_list,
+    target_path,
+    overwrite_strategy,
+    timeout,
+    *,
+    team=None,
+    user_info=None,
+):
+    """经统一网关绑定可信组织后复用旧 NATS 文件分发实现。"""
+    authorized_team_ids = normalize_team(team)
+    authorized_team_id = next(iter(authorized_team_ids), None)
+    if len(authorized_team_ids) != 1 or not GroupUtils.active_queryset(id=authorized_team_id).exists():
+        return {"result": False, "message": "用户未关联活动团队"}
+
+    scope_error = _validate_openapi_distribute_scope(file_keys, target_source, target_list, authorized_team_ids)
+    if scope_error:
+        id_field = "target_id" if target_source == "manual" else "node_id"
+        logger.warning(
+            "[openapi_file_distribute] scope rejected: user=%s domain=%s team=%s file_keys=%s " "target_source=%s target_ids=%s reason=%s",
+            (user_info or {}).get("user", ""),
+            (user_info or {}).get("domain", ""),
+            authorized_team_id,
+            file_keys,
+            target_source,
+            [item.get(id_field) for item in target_list],
+            scope_error,
+        )
+        return {"result": False, "message": scope_error}
+
+    result = _run_file_distribute(
+        {
+            "name": name,
+            "file_keys": file_keys,
+            "target_source": target_source,
+            "target_list": target_list,
+            "target_path": target_path,
+            "overwrite_strategy": overwrite_strategy,
+            "timeout": timeout,
+            "team": [authorized_team_id],
+            # 新入口暂不接受调用方控制的出站回调；调用方通过查询接口获取结果。
+            "callback_type": CallbackType.WEB,
+            "callback_url": "",
+        },
+        trusted_actor=user_info,
+    )
+    if not result.get("result"):
+        return result
+    return result.get("data") or {}
 
 
 @nats_client.register
@@ -625,62 +618,46 @@ def job_detail_query(data: dict):
 def job_task_terminate(data=None, task_id=None, **kwargs):
     if isinstance(data, dict):
         task_id = data.get("task_id", task_id)
+        caller_token = data.get("caller_token", kwargs.get("caller_token", ""))
+    else:
+        caller_token = kwargs.get("caller_token", "")
     if task_id is None:
         task_id = kwargs.get("task_id")
-    if not task_id:
-        return {"result": False, "message": "task_id 不能为空"}
+    if isinstance(task_id, str):
+        normalized_task_id = task_id.strip()
+        if normalized_task_id.isdecimal():
+            try:
+                task_id = int(normalized_task_id)
+            except ValueError:
+                task_id = None
+    if isinstance(task_id, bool) or not isinstance(task_id, int) or not 1 <= task_id <= 2**63 - 1:
+        return {"result": False, "message": "task_id 必须为正整数或其字符串形式"}
+    if not caller_token:
+        return {"result": False, "message": "caller_token 不能为空"}
 
     try:
-        execution = JobExecution.objects.get(id=task_id)
+        caller = _verify_token(caller_token)
+    except Exception:
+        return {"result": False, "message": "Unauthorized: invalid caller_token"}
+
+    caller_team = normalize_team(getattr(caller, "group_list", []))
+    if not caller_team:
+        logger.warning("[job_task_terminate] 服务端团队归属校验失败: task_id=%s", task_id)
+        return {"result": False, "message": "无权取消该任务"}
+
+    try:
+        execution, message = request_execution_cancel(task_id, authorized_team_ids=caller_team)
     except JobExecution.DoesNotExist:
         return {"result": False, "message": "任务不存在"}
-
-    status_now = execution.status
-    if status_now in ExecutionStatus.TERMINAL_STATES:
-        return {"result": False, "message": f"任务已处于终态({execution.get_status_display()})，无法取消"}
-    if status_now == ExecutionStatus.CANCELLING:
-        return {"result": False, "message": "任务正在取消中，请勿重复操作"}
-
-    if execution.celery_task_id:
-        try:
-            current_app.control.revoke(execution.celery_task_id)
-            logger.info("[job_task_terminate] 已 revoke Celery 任务: execution_id=%s, task_id=%s", execution.id, execution.celery_task_id)
-        except Exception as error:
-            logger.warning("[job_task_terminate] revoke Celery 任务失败: execution_id=%s, error=%s", execution.id, error)
-
-    now = timezone.now()
-    if status_now == ExecutionStatus.PENDING:
-        updated = JobExecution.objects.filter(id=task_id, status=ExecutionStatus.PENDING).update(
-            status=ExecutionStatus.CANCELLED,
-            finished_at=now,
-            updated_at=now,
-        )
-        if updated:
-            execution.refresh_from_db()
-            send_callback(execution)
-            return {
-                "result": True,
-                "data": {"task_id": execution.id, "status": ExecutionStatus.CANCELLED, "message": "已取消执行"},
-            }
-
-    if status_now == ExecutionStatus.RUNNING:
-        updated = JobExecution.objects.filter(id=task_id, status=ExecutionStatus.RUNNING).update(
-            status=ExecutionStatus.CANCELLING,
-            updated_at=now,
-        )
-        if updated:
-            finalize_cancelling_execution.apply_async(
-                args=[execution.id],
-                countdown=execution.timeout + CANCEL_CONVERGE_BUFFER_SECONDS,
-            )
-            execution.refresh_from_db()
-            send_callback(execution)
-            return {
-                "result": True,
-                "data": {"task_id": execution.id, "status": ExecutionStatus.CANCELLING, "message": "正在取消执行"},
-            }
-
-    return {"result": False, "message": "状态已变更，请刷新后重试"}
+    except ExecutionCancellationAuthorizationError as error:
+        logger.warning("[job_task_terminate] 锁内团队归属校验失败: task_id=%s", task_id)
+        return {"result": False, "message": str(error)}
+    except ExecutionCancellationError as error:
+        return {"result": False, "message": str(error)}
+    return {
+        "result": True,
+        "data": {"task_id": execution.id, "status": execution.status, "message": message},
+    }
 
 
 @nats_client.register

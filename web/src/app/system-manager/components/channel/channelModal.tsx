@@ -1,11 +1,12 @@
 'use client';
 import React, { useState, useEffect, useRef } from 'react';
 import { useSearchParams } from 'next/navigation';
-import { Alert, Button, Form, message, Spin } from 'antd';
+import { Button, Form, message, Spin } from 'antd';
 import { useTranslation } from '@/utils/i18n';
 import DynamicForm from '@/components/dynamic-form';
 import OperateModal from '@/components/operate-modal'
 import { useChannelApi } from '@/app/system-manager/api/channel';
+import { useNatsChannelExtension } from '@/app/system-manager/hooks/useNatsChannelExtension';
 import { ChannelType } from '@/app/system-manager/types/channel';
 
 interface ChannelModalProps {
@@ -19,6 +20,19 @@ interface ChannelModalProps {
 const WEBHOOK_SUB_TYPES: ChannelType[] = ['enterprise_wechat_bot', 'feishu_bot', 'dingtalk_bot', 'custom_webhook'];
 
 const isWebhookSubType = (ct: string): boolean => WEBHOOK_SUB_TYPES.includes(ct as ChannelType);
+
+/** 邮件通道 config 的稳定字段集；避免关闭认证保存后缺 smtp_user 导致编辑再开启时无法渲染。 */
+const ensureEmailConfig = (config: Record<string, unknown> = {}): Record<string, unknown> => ({
+  smtp_server: '',
+  port: '',
+  smtp_auth_enabled: true,
+  smtp_user: '',
+  smtp_pwd: '',
+  smtp_usessl: false,
+  smtp_usetls: false,
+  mail_sender: '',
+  ...config,
+});
 
 const getDefaultConfig = (st: ChannelType): Record<string, unknown> => {
   switch (st) {
@@ -35,6 +49,12 @@ const getDefaultConfig = (st: ChannelType): Record<string, unknown> => {
 
 const getMergedConfig = (st: ChannelType, serverConfig: Record<string, unknown>): Record<string, unknown> => {
   const defaults = getDefaultConfig(st);
+  if (st === 'nats') {
+    return {
+      ...serverConfig,
+      supports_notify_person: serverConfig.supports_notify_person === true,
+    };
+  }
   return { ...defaults, ...serverConfig };
 };
 
@@ -50,10 +70,10 @@ const ChannelModal: React.FC<ChannelModalProps> = ({
   const searchParams = useSearchParams();
   const channelType = (searchParams?.get('id') || 'email') as ChannelType;
   const { addChannel, updateChannel, getChannelDetail, testChannel } = useChannelApi();
+  const natsExtension = useNatsChannelExtension();
   const [loading, setLoading] = useState<boolean>(false);
   const [confirmLoading, setConfirmLoading] = useState<boolean>(false);
   const [testLoading, setTestLoading] = useState<boolean>(false);
-  const [testError, setTestError] = useState<string>('');
   const [channelData, setChannelData] = useState<any>({ config: {} });
   const [originalSmtpPwd, setOriginalSmtpPwd] = useState<string | undefined>(undefined);
   const [originalWebhookUrl, setOriginalWebhookUrl] = useState<string | undefined>(undefined);
@@ -65,6 +85,8 @@ const ChannelModal: React.FC<ChannelModalProps> = ({
   const isWebhookChannel = channelType === 'enterprise_wechat_bot';
 
   const watchedSubType = Form.useWatch('sub_type', form);
+  const watchedNatsMode = Form.useWatch('nats_mode', form);
+  const watchedSmtpAuthEnabled = Form.useWatch('smtp_auth_enabled', form);
   useEffect(() => {
     if (!isWebhookChannel || !watchedSubType || isFillingForm.current) return;
     if (watchedSubType as ChannelType !== subType) {
@@ -84,7 +106,6 @@ const ChannelModal: React.FC<ChannelModalProps> = ({
   const fetchChannelDetail = async (id: string) => {
     setLoading(true);
     try {
-      setTestError('');
       const data = await getChannelDetail(id);
       setOriginalSmtpPwd(data.config?.smtp_pwd);
       setOriginalWebhookUrl(data.config?.webhook_url);
@@ -98,7 +119,11 @@ const ChannelModal: React.FC<ChannelModalProps> = ({
       }
       const mergedConfig = isWebhookChannel
         ? getMergedConfig(resolvedSubType, data.config || {})
-        : data.config;
+        : actualType === 'nats'
+          ? natsExtension?.mergeConfig(data.config || {}) || getMergedConfig(actualType, data.config || {})
+          : (actualType === 'email' || channelType === 'email')
+            ? ensureEmailConfig(data.config || {})
+            : data.config;
       const enrichedData = { ...data, config: mergedConfig };
       setChannelData(enrichedData);
       const formValues: Record<string, unknown> = {
@@ -134,7 +159,6 @@ const ChannelModal: React.FC<ChannelModalProps> = ({
   useEffect(() => {
     if (!visible) return;
     form.resetFields();
-    setTestError('');
     setPendingFormFill(null);
     isFillingForm.current = false;
     setOriginalSmtpPwd(undefined);
@@ -151,18 +175,14 @@ const ChannelModal: React.FC<ChannelModalProps> = ({
         name: '',
         channel_type: isWebhookChannel ? defaultSubType : channelType,
         description: '',
-        config: channelType === 'email' ? {
-          smtp_server: '',
-          port: '',
-          smtp_user: '',
-          smtp_pwd: '',
-          smtp_usessl: false,
-          smtp_usetls: false,
-          mail_sender: '',
-        } : channelType === 'nats' ? {
-          namespace: '',
-          method_name: '',
-          timeout: 60,
+        config: channelType === 'email' ? ensureEmailConfig() : channelType === 'nats' ? {
+          ...(natsExtension?.buildInitialConfig() || {
+            nats_mode: 'request_reply',
+            namespace: '',
+            method_name: '',
+            timeout: 60,
+            supports_notify_person: true,
+          }),
         } : getDefaultConfig(defaultSubType),
       });
     }
@@ -171,7 +191,6 @@ const ChannelModal: React.FC<ChannelModalProps> = ({
   const handleOk = async () => {
     try {
       setConfirmLoading(true);
-      setTestError('');
       const values = await form.validateFields();
       const payload = buildChannelPayload(values);
 
@@ -204,8 +223,9 @@ const ChannelModal: React.FC<ChannelModalProps> = ({
     } = values;
 
     delete config.sub_type;
-
-    const finalConfig: Record<string, unknown> = { ...config };
+    const finalConfig: Record<string, unknown> = channelType === 'nats' && natsExtension
+      ? natsExtension.normalizeConfig(config)
+      : { ...config };
 
     const preserveEncryptedFields = options?.preserveEncryptedFields ?? false;
 
@@ -240,22 +260,19 @@ const ChannelModal: React.FC<ChannelModalProps> = ({
   const handleTest = async () => {
     try {
       setTestLoading(true);
-      setTestError('');
       const values = await form.validateFields();
       const payload = buildChannelPayload(values, { preserveEncryptedFields: true });
-      await testChannel(payload);
-      message.success(t('system.channel.settings.testSuccess'));
-    } catch (error: any) {
-      if (error?.errorFields?.length) {
-        const firstFieldErrorMessage = error.errorFields[0].errors[0];
-        setTestError(firstFieldErrorMessage || t('common.valFailed'));
+      if (
+        channelType === 'nats'
+        && natsExtension?.usesEnterpriseTestEndpoint(payload.config as Record<string, unknown>)
+      ) {
+        await natsExtension.testChannel(payload);
       } else {
-        const rawMessage = error?.response?.data?.message || error?.message || t('system.channel.settings.testFailed');
-        const normalizedMessage = typeof rawMessage === 'string'
-          ? rawMessage.replace(/^result:?false[,;]?message:?/i, '').trim()
-          : t('system.channel.settings.testFailed');
-        setTestError(normalizedMessage || t('system.channel.settings.testFailed'));
+        await testChannel(payload);
       }
+      message.success(t('system.channel.settings.testSuccess'));
+    } catch {
+      // Form validation renders next to fields; request failures are shown by the global interceptor.
     } finally {
       setTestLoading(false);
     }
@@ -266,7 +283,7 @@ const ChannelModal: React.FC<ChannelModalProps> = ({
   };
 
   const getFieldType = (key: string): string => {
-    if (['smtp_usessl', 'smtp_usetls'].includes(key)) {
+    if (['smtp_usessl', 'smtp_usetls', 'smtp_auth_enabled', 'supports_notify_person'].includes(key)) {
       return 'switch';
     }
     if (['smtp_pwd', 'webhook_url', 'sign_secret'].includes(key)) {
@@ -328,38 +345,58 @@ const ChannelModal: React.FC<ChannelModalProps> = ({
       });
     }
 
-    const configFields = Object.keys(channelData.config).map((key) => {
-      const nonRequiredKeys = ['smtp_usessl', 'smtp_usetls', 'sign_secret', 'headers'];
-      const fieldDef: Record<string, unknown> = {
-        name: key,
-        type: getFieldType(key),
-        label: t(`system.channel.settings.${key}`),
-        placeholder: `${t('common.inputMsg')}${t(`system.channel.settings.${key}`)}`,
-        initialValue: ['smtp_usessl', 'smtp_usetls'].includes(key) ? false : undefined,
-        rules: [{ required: !nonRequiredKeys.includes(key), message: `${t('common.inputMsg')}${t(`system.channel.settings.${key}`)}` }],
-      };
+    const smtpAuthEnabled = watchedSmtpAuthEnabled !== false;
+    const configSource = channelType === 'email'
+      ? ensureEmailConfig(channelData.config)
+      : channelData.config;
+    const configFields = Object.keys(configSource)
+      .filter((key) => {
+        if (channelType === 'nats') {
+          const visibleKeys = natsExtension?.getVisibleConfigKeys(watchedNatsMode);
+          return visibleKeys ? visibleKeys.includes(key) : !['nats_mode', 'subject_key'].includes(key);
+        }
+        return smtpAuthEnabled || !['smtp_user', 'smtp_pwd'].includes(key);
+      })
+      .map((key) => {
+        const nonRequiredKeys = ['smtp_usessl', 'smtp_usetls', 'smtp_auth_enabled', 'sign_secret', 'headers', 'supports_notify_person'];
+        const fieldDef: Record<string, unknown> = {
+          name: key,
+          type: getFieldType(key),
+          label: t(`system.channel.settings.${key}`),
+          placeholder: `${t('common.inputMsg')}${t(`system.channel.settings.${key}`)}`,
+          initialValue: ['smtp_usessl', 'smtp_usetls'].includes(key)
+            ? false
+            : key === 'smtp_auth_enabled'
+              ? true
+              : undefined,
+          rules: [{ required: !nonRequiredKeys.includes(key), message: `${t('common.inputMsg')}${t(`system.channel.settings.${key}`)}` }],
+        };
 
-      if (key === 'request_method') {
-        fieldDef.options = [
-          { value: 'POST', label: 'POST' },
-          { value: 'GET', label: 'GET' },
-        ];
-      }
+        if (key === 'request_method') {
+          fieldDef.options = [
+            { value: 'POST', label: 'POST' },
+            { value: 'GET', label: 'GET' },
+          ];
+        }
 
-      if (key === 'body_template') {
-        fieldDef.rows = 4;
-        fieldDef.placeholder = t('system.channel.settings.bodyTemplateHint');
-      }
+        if (channelType === 'nats') {
+          Object.assign(fieldDef, natsExtension?.getFieldDefinition(key));
+        }
 
-      if (key === 'headers') {
-        fieldDef.rows = 4;
-      }
+        if (key === 'body_template') {
+          fieldDef.rows = 4;
+          fieldDef.placeholder = t('system.channel.settings.bodyTemplateHint');
+        }
 
-      return fieldDef;
-    });
+        if (key === 'headers') {
+          fieldDef.rows = 4;
+        }
+
+        return fieldDef;
+      });
 
     return [...basicFields, ...configFields];
-  }, [channelData.config, t, isWebhookChannel]);
+  }, [channelData.config, t, isWebhookChannel, watchedSmtpAuthEnabled, channelType, watchedNatsMode, natsExtension]);
 
   return (
     <OperateModal
@@ -379,9 +416,6 @@ const ChannelModal: React.FC<ChannelModalProps> = ({
       ]}
     >
       <Spin spinning={loading}>
-        {testError ? (
-          <Alert className="mb-4" type="error" showIcon message={testError} />
-        ) : null}
         <DynamicForm
           form={form}
           fields={formFields}

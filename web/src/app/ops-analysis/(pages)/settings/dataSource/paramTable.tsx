@@ -1,0 +1,536 @@
+"use client";
+
+import React, { useImperativeHandle } from "react";
+import dayjs, { Dayjs } from "dayjs";
+import { Button, DatePicker, Input, Select, Switch } from "antd";
+import { MinusCircleOutlined, PlusCircleOutlined } from "@ant-design/icons";
+import CustomTable from "@/components/custom-table";
+import CompactEmptyState from "@/components/compact-empty-state";
+import TimeSelector from "@/components/time-selector";
+import DateRangeSelector from "@/app/ops-analysis/components/dateRangeSelector";
+import { useTranslation } from "@/utils/i18n";
+import { formatOpsRequestTime } from "@/app/ops-analysis/utils/dateTime";
+import {
+  isBindableDataSourceParamType,
+} from "@/app/ops-analysis/utils/dataSourceParamContract";
+import type {
+  DataSourceParamFilterType,
+  ParamItem,
+} from "@/app/ops-analysis/types/dataSource";
+import {
+  DEFAULT_DATE_RANGE_VALUE,
+  type DateRangeValue,
+} from "@/app/ops-analysis/types/dateRange";
+import { createDefaultParam, validateParams } from "./operateModalUtils";
+
+export interface ParamTableRef {
+  validate: () => boolean;
+  clearValidation: () => void;
+}
+
+interface ParamTableProps {
+  params: ParamItem[];
+  onChange: (params: ParamItem[]) => void;
+  readOnly?: boolean;
+}
+
+const FormTimeSelector: React.FC<{
+  value?: any;
+  onChange?: (value: any) => void;
+  disabled?: boolean;
+}> = ({ value, onChange, disabled = false }) => {
+  const [selectValue, setSelectValue] = React.useState(10080);
+  const [rangeValue, setRangeValue] = React.useState<any>(null);
+
+  React.useEffect(() => {
+    if (value !== undefined) {
+      if (Array.isArray(value)) {
+        setSelectValue(0);
+        setRangeValue(value);
+      } else {
+        setSelectValue(value);
+        setRangeValue(null);
+      }
+    } else {
+      onChange?.(10080);
+    }
+  }, [value, onChange]);
+
+  const handleChange = (range: number[], originValue: number | null) => {
+    if (originValue === 0) {
+      setSelectValue(0);
+      setRangeValue(range);
+      onChange?.(range);
+    } else if (originValue !== null) {
+      setSelectValue(originValue);
+      setRangeValue(null);
+      onChange?.(originValue);
+    }
+  };
+
+  const formatRangeValue = (value: any): [dayjs.Dayjs, dayjs.Dayjs] | null => {
+    if (Array.isArray(value) && value.length === 2) {
+      return [dayjs(value[0]), dayjs(value[1])];
+    }
+    return null;
+  };
+
+  return (
+    <div className="w-full">
+      {disabled ? (
+        <Input
+          size="small"
+          disabled
+          value={Array.isArray(value) ? value.join(" - ") : String(value ?? "")}
+        />
+      ) : (
+        <TimeSelector
+          onlyTimeSelect
+          className="w-full"
+          defaultValue={{
+            selectValue: selectValue,
+            rangePickerVaule: formatRangeValue(rangeValue),
+          }}
+          onChange={handleChange}
+        />
+      )}
+    </div>
+  );
+};
+
+const ParamTable = React.forwardRef<ParamTableRef, ParamTableProps>(
+  ({ params, onChange, readOnly = false }, ref) => {
+    const { t } = useTranslation();
+    const [duplicateNames, setDuplicateNames] = React.useState<string[]>([]);
+    const [emptyNames, setEmptyNames] = React.useState<string[]>([]);
+    const [emptyAliases, setEmptyAliases] = React.useState<string[]>([]);
+    const [invalidDateRangeIds, setInvalidDateRangeIds] = React.useState<
+      string[]
+    >([]);
+    const [invalidFilterBindingIds, setInvalidFilterBindingIds] = React.useState<
+      string[]
+    >([]);
+
+    const clearValidation = () => {
+      setDuplicateNames([]);
+      setEmptyNames([]);
+      setEmptyAliases([]);
+      setInvalidDateRangeIds([]);
+      setInvalidFilterBindingIds([]);
+    };
+
+    const paramTypeOptions = [
+      { label: t("dataSource.paramTypes.string"), value: "string" },
+      { label: t("dataSource.paramTypes.number"), value: "number" },
+      { label: t("dataSource.paramTypes.boolean"), value: "boolean" },
+      { label: t("dataSource.paramTypes.date"), value: "date" },
+      { label: t("dataSource.paramTypes.timeRange"), value: "timeRange" },
+      { label: t("dataSource.paramTypes.dateRange"), value: "dateRange" },
+    ];
+
+    const filterTypeOptions: Array<{
+      label: string;
+      value: DataSourceParamFilterType;
+    }> = [
+      { label: t("dataSource.filterTypes.filter"), value: "filter" },
+      { label: t("dataSource.filterTypes.fixed"), value: "fixed" },
+      { label: t("dataSource.filterTypes.params"), value: "params" },
+    ];
+
+    const applyValidation = (nextParams: ParamItem[]) => {
+      const result = validateParams(nextParams);
+      setDuplicateNames(result.duplicateNames);
+      setEmptyNames(result.emptyNames);
+      setEmptyAliases(result.emptyAliases);
+      setInvalidDateRangeIds(result.invalidDateRangeIds);
+      setInvalidFilterBindingIds(result.invalidFilterBindingIds);
+      return result.isValid;
+    };
+
+    useImperativeHandle(ref, () => ({
+      validate: () => applyValidation(params),
+      clearValidation,
+    }));
+
+    const handleAliasChange = (val: string, id: string) => {
+      onChange(
+        params.map((item) =>
+          item.id === id ? { ...item, alias_name: val } : item,
+        ),
+      );
+    };
+
+    const handleAliasBlur = (val: string, id: string) => {
+      const newParams = params.map((item) => {
+        if (item.id === id) {
+          return { ...item, alias_name: val.trim() };
+        }
+        return item;
+      });
+      onChange(newParams);
+      applyValidation(newParams);
+    };
+
+    const handleDefaultChange = (val: any, id: string, type: string) => {
+      onChange(
+        params.map((item) => {
+          if (item.id !== id) return item;
+          let newValue = val;
+          if (type === "boolean") {
+            newValue = val;
+          } else if (type === "number") {
+            newValue = val === "" ? null : Number(val);
+          } else if (type === "date") {
+            if (!val) {
+              newValue = "";
+            } else if (val.format) {
+              newValue = formatOpsRequestTime(val);
+            } else {
+              newValue = val;
+            }
+          } else if (type === "timeRange") {
+            newValue = val;
+          }
+          return { ...item, value: newValue };
+        }),
+      );
+    };
+
+    const handleTypeChange = (val: string, id: string) => {
+      onChange(
+        params.map((item) => {
+          if (item.id !== id) return item;
+          let newValue: any = "";
+          const newFilterType =
+            item.filterType === "filter" &&
+            !isBindableDataSourceParamType(val)
+              ? "params"
+              : item.filterType;
+
+          if (val === "boolean") {
+            newValue = false;
+          } else if (val === "number") {
+            newValue = null;
+          } else if (val === "date") {
+            newValue = "";
+          } else if (val === "timeRange") {
+            newValue = 10080;
+          } else if (val === "dateRange") {
+            newValue = { ...DEFAULT_DATE_RANGE_VALUE };
+          } else {
+            newValue = "";
+          }
+
+          return {
+            ...item,
+            type: val,
+            value: newValue,
+            filterType: newFilterType,
+          };
+        }),
+      );
+    };
+
+    const handleFilterTypeChange = (
+      val: DataSourceParamFilterType,
+      id: string,
+    ) => {
+      onChange(
+        params.map((item) =>
+          item.id === id ? { ...item, filterType: val } : item,
+        ),
+      );
+    };
+
+    const handleAddParamAfter = (index: number) => {
+      const newParam = createDefaultParam();
+      const newParams = [...params];
+      newParams.splice(index + 1, 0, newParam);
+      onChange(newParams);
+    };
+
+    const handleDeleteParam = (id: string) => {
+      const newParams = params.filter((item) => item.id !== id);
+      onChange(newParams);
+      applyValidation(newParams);
+    };
+
+    const handleParamNameChange = (val: string, id: string) => {
+      onChange(
+        params.map((item) =>
+          item.id === id
+            ? {
+              ...item,
+              name: val,
+            }
+            : item,
+        ),
+      );
+    };
+
+    const handleParamNameBlur = (val: string, id: string) => {
+      const newParams = params.map((item) => {
+        if (item.id === id) {
+          return { ...item, name: val.trim() };
+        }
+        return item;
+      });
+      onChange(newParams);
+      applyValidation(newParams);
+    };
+
+    const columns = [
+      {
+        title: t("dataSource.name"),
+        dataIndex: "name",
+        key: "name",
+        width: 120,
+        render: (_: any, record: ParamItem) => (
+          <Input
+            size="small"
+            disabled={readOnly}
+            value={record.name}
+            placeholder={t("dataSource.name")}
+            onChange={(e) => handleParamNameChange(e.target.value, record.id!)}
+            onBlur={(e) => handleParamNameBlur(e.target.value, record.id!)}
+            status={
+              duplicateNames.includes(record.name) ||
+              emptyNames.includes(record.id!)
+                ? "error"
+                : undefined
+            }
+          />
+        ),
+      },
+      {
+        title: t("dataSource.aliasName"),
+        dataIndex: "alias_name",
+        key: "alias_name",
+        width: 120,
+        render: (_: any, record: ParamItem) => (
+          <Input
+            size="small"
+            disabled={readOnly}
+            value={record.alias_name || ""}
+            placeholder={t("dataSource.aliasName")}
+            onChange={(e) => handleAliasChange(e.target.value, record.id!)}
+            onBlur={(e) => handleAliasBlur(e.target.value, record.id!)}
+            status={emptyAliases.includes(record.id!) ? "error" : undefined}
+          />
+        ),
+      },
+      {
+        title: t("dataSource.paramType"),
+        dataIndex: "type",
+        key: "type",
+        width: 110,
+        render: (_: any, record: ParamItem) => (
+          <Select
+            size="small"
+            disabled={readOnly}
+            value={record.type || "string"}
+            options={paramTypeOptions}
+            className="w-full"
+            onChange={(val) => handleTypeChange(val, record.id!)}
+          />
+        ),
+      },
+      {
+        title: t("dataSource.filterType"),
+        dataIndex: "filterType",
+        key: "filterType",
+        width: 100,
+        render: (_: any, record: ParamItem) => {
+          const availableFilterTypeOptions = isBindableDataSourceParamType(
+            record.type,
+          )
+            ? filterTypeOptions
+            : filterTypeOptions.filter(
+              (option) => option.value !== "filter",
+            );
+          return (
+            <Select
+              size="small"
+              disabled={readOnly}
+              value={record.filterType || "fixed"}
+              options={availableFilterTypeOptions}
+              status={
+                invalidFilterBindingIds.includes(record.id!)
+                  ? "error"
+                  : undefined
+              }
+              className="w-full"
+              onChange={(val) => handleFilterTypeChange(val, record.id!)}
+            />
+          );
+        },
+      },
+      {
+        title: t("dataSource.defaultValue"),
+        dataIndex: "value",
+        key: "value",
+        width: 200,
+        render: (text: any, record: ParamItem) => {
+          const type = record.type || "string";
+          const isFixed = record.name && record.filterType === "fixed";
+          const showRequiredBorder =
+            isFixed && !text && text !== 0 && text !== false;
+          const commonProps = {
+            className: "w-full",
+            ...(showRequiredBorder
+              ? { style: { borderColor: "var(--color-fail)" } }
+              : {}),
+          };
+
+          if (type === "date") {
+            return (
+              <DatePicker
+                size="small"
+                disabled={readOnly}
+                showTime
+                value={text ? dayjs(text) : undefined}
+                onChange={(date: Dayjs | null) =>
+                  handleDefaultChange(date, record.id!, "date")
+                }
+                className="w-full"
+                format="YYYY-MM-DD HH:mm:ss"
+              />
+            );
+          }
+          if (type === "timeRange") {
+            return (
+              <FormTimeSelector
+                disabled={readOnly}
+                value={text}
+                onChange={(val: any) =>
+                  handleDefaultChange(val, record.id!, "timeRange")
+                }
+              />
+            );
+          }
+          if (type === "dateRange") {
+            return (
+              <DateRangeSelector
+                disabled={readOnly}
+                value={text as DateRangeValue | null}
+                className="w-full"
+                onChange={(val) =>
+                  handleDefaultChange(val, record.id!, "dateRange")
+                }
+                status={
+                  invalidDateRangeIds.includes(record.id!) ? "error" : undefined
+                }
+              />
+            );
+          }
+          if (type === "boolean") {
+            return (
+              <Switch
+                disabled={readOnly}
+                checked={!!text}
+                onChange={(val: boolean) =>
+                  handleDefaultChange(val, record.id!, "boolean")
+                }
+              />
+            );
+          }
+          if (type === "number") {
+            return (
+              <Input
+                size="small"
+                disabled={readOnly}
+                type="number"
+                value={text ?? ""}
+                placeholder={
+                  isFixed
+                    ? t("dataSource.required")
+                    : t("dataSource.defaultValue")
+                }
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                  handleDefaultChange(e.target.value, record.id!, "number")
+                }
+                {...commonProps}
+              />
+            );
+          }
+          return (
+            <Input
+              size="small"
+              disabled={readOnly}
+              value={text}
+              placeholder={
+                isFixed
+                  ? t("dataSource.required")
+                  : t("dataSource.defaultValue")
+              }
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                handleDefaultChange(e.target.value, record.id!, "string")
+              }
+              {...commonProps}
+            />
+          );
+        },
+      },
+      ...(readOnly
+        ? []
+        : [
+          {
+            title: t("dataSource.operation"),
+            key: "action",
+            width: 80,
+            render: (_: any, record: ParamItem, index: number) => (
+                <div className="flex justify-center gap-1">
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<PlusCircleOutlined />}
+                    onClick={() => handleAddParamAfter(index)}
+                    className="border-0 p-1"
+                  />
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<MinusCircleOutlined />}
+                    onClick={() => handleDeleteParam(record.id!)}
+                    className="border-0 p-1"
+                  />
+                </div>
+            ),
+          },
+        ]),
+    ];
+
+    return (
+      <div className="m-0">
+        <CustomTable
+          rowKey="id"
+          size="small"
+          columns={columns}
+          dataSource={params}
+          pagination={false}
+          bordered
+          locale={{
+            emptyText: (
+              <CompactEmptyState description={t("common.noData")} />
+            ),
+          }}
+        />
+        {duplicateNames.length > 0 && (
+          <div className="mt-0.5 px-2 py-0.5 text-xs text-[var(--color-fail)]">
+            {t("dataSource.duplicateParamNames")}
+            {duplicateNames.join("、")}
+          </div>
+        )}
+        {invalidFilterBindingIds.length > 0 && (
+          <div className="mt-0.5 px-2 py-0.5 text-xs text-[var(--color-fail)]">
+            {t("dataSource.invalidFilterParamType")}
+          </div>
+        )}
+      </div>
+    );
+  },
+);
+
+ParamTable.displayName = "ParamTable";
+
+export default ParamTable;

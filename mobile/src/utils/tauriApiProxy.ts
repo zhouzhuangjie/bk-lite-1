@@ -3,11 +3,15 @@
  * 使用 Tauri 命令来处理 HTTP 请求，避免 CORS 问题
  */
 
+import { getUserInfoSync } from './secureStorage';
+import { getCurrentTeamCookie, getIncludeChildrenCookie, resolveDefaultCurrentTeamId } from './teamCookie';
+
 export interface ApiRequest {
   url: string;
   method: string;
   headers?: Record<string, string>;
   body?: string;
+  requestId?: string;
 }
 
 export interface ApiResponse {
@@ -21,25 +25,35 @@ export interface ApiError {
   status?: number;
 }
 
-export interface StreamChunk {
-  stream_id: string;
-  data: string;
+export interface CurrentTeamResolution {
+  value: string | null;
+  source: 'cookie' | 'stored-login-info' | 'missing';
 }
 
-export interface StreamEnd {
-  stream_id: string;
+let requestSequence = 0;
+
+function createNativeRequestId(): string {
+  requestSequence = (requestSequence + 1) % Number.MAX_SAFE_INTEGER;
+  return `request-${Date.now()}-${requestSequence}`;
 }
 
-export interface StreamError {
-  stream_id: string;
-  error: string;
+type NativeStreamEvent =
+  | { event: 'chunk'; data: string }
+  | { event: 'end' }
+  | { event: 'error'; error: string; status?: number };
+
+export class TauriStreamError extends Error {
+  constructor(message: string, public readonly status?: number) {
+    super(message);
+    this.name = 'TauriStreamError';
+  }
 }
 
 /**
  * 安全地调用 Tauri invoke
  * Tauri 2.x 使用 __TAURI_INTERNALS__ 作为主要标识
  */
-async function safeInvoke<T>(cmd: string, args?: any): Promise<T> {
+async function getTauriCore() {
   // 检查 Tauri 运行时是否可用
   if (typeof window === 'undefined') {
     throw new Error('Tauri is not available: window is undefined');
@@ -50,18 +64,70 @@ async function safeInvoke<T>(cmd: string, args?: any): Promise<T> {
     throw new Error('Tauri is not available: __TAURI_INTERNALS__ not found');
   }
 
+  // 动态导入 Tauri API
+  const { Channel, invoke } = await import('@tauri-apps/api/core');
+
+  if (typeof invoke !== 'function') {
+    throw new Error('Tauri invoke is not a function');
+  }
+
+  return { Channel, invoke };
+}
+
+async function safeInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const { invoke } = await getTauriCore();
+  return normalizeInvokeError(invoke<T>(cmd, args));
+}
+
+async function normalizeInvokeError<T>(operation: Promise<T>): Promise<T> {
   try {
-    // 动态导入 Tauri API
-    const { invoke } = await import('@tauri-apps/api/core');
-
-    if (typeof invoke !== 'function') {
-      throw new Error('Tauri invoke is not a function');
-    }
-
-    return await invoke<T>(cmd, args);
+    return await operation;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     throw new Error(`Tauri invoke failed: ${errorMessage}`);
+  }
+}
+
+async function invokeCancellableApiProxy(
+  request: ApiRequest,
+  signal: AbortSignal,
+  requestId: string
+): Promise<ApiResponse> {
+  const { Channel, invoke } = await getTauriCore();
+  if (signal.aborted) {
+    throw new DOMException('The operation was aborted', 'AbortError');
+  }
+
+  let markRegistered: (() => void) | undefined;
+  const registered = new Promise<void>((resolve) => {
+    markRegistered = resolve;
+  });
+  const onRegistered = new Channel<boolean>();
+  onRegistered.onmessage = () => markRegistered?.();
+  const nativeRequest = normalizeInvokeError(
+    invoke<ApiResponse>('api_proxy_cancellable', { request, onRegistered })
+  );
+  let abort: (() => void) | undefined;
+  try {
+    return await Promise.race([
+      nativeRequest,
+      new Promise<never>((_, reject) => {
+        abort = () => {
+          void registered
+            .then(() => invoke('cancel_request', { requestId }))
+            .catch(() => undefined);
+          reject(new DOMException('The operation was aborted', 'AbortError'));
+        };
+        signal.addEventListener('abort', abort, { once: true });
+        if (signal.aborted) {
+          abort();
+        }
+      }),
+    ]);
+  } finally {
+    if (abort) {
+      signal.removeEventListener('abort', abort);
+    }
   }
 }
 
@@ -100,6 +166,40 @@ export function getTauriProxyInfo(response: Response): {
   };
 }
 
+export function resolveCurrentTeamForNativeProxy(): CurrentTeamResolution {
+  const cookieTeam = getCurrentTeamCookie();
+  const storageTeam = cookieTeam ? null : resolveDefaultCurrentTeamId(getUserInfoSync());
+  const currentTeam = cookieTeam ?? storageTeam;
+
+  return {
+    value: currentTeam,
+    source: currentTeam ? (cookieTeam ? 'cookie' : 'stored-login-info') : 'missing',
+  };
+}
+
+function upsertCookie(headers: Record<string, string>, name: string, value: string) {
+  const cookieHeaderKey = Object.keys(headers).find((key) => key.toLowerCase() === 'cookie');
+  const nextPair = `${name}=${encodeURIComponent(value)}`;
+
+  if (cookieHeaderKey) {
+    const existingCookie = headers[cookieHeaderKey];
+    if (!existingCookie.includes(`${name}=`)) {
+      headers[cookieHeaderKey] = `${existingCookie}; ${nextPair}`;
+    }
+    return;
+  }
+
+  headers.Cookie = headers.Cookie ? `${headers.Cookie}; ${nextPair}` : nextPair;
+}
+
+function appendCurrentTeamCookie(headers: Record<string, string>) {
+  const currentTeam = resolveCurrentTeamForNativeProxy();
+  if (currentTeam.value) {
+    upsertCookie(headers, 'current_team', currentTeam.value);
+  }
+  upsertCookie(headers, 'include_children', getIncludeChildrenCookie() ? '1' : '0');
+}
+
 /**
  * 兼容 fetch API 的 Tauri 代理包装器
  */
@@ -107,6 +207,10 @@ export async function tauriApiFetch(
   url: string,
   options: RequestInit = {}
 ): Promise<Response> {
+  if (options.signal?.aborted) {
+    throw new DOMException('The operation was aborted', 'AbortError');
+  }
+
   const method = options.method || 'GET';
   const headers: Record<string, string> = {};
 
@@ -121,6 +225,8 @@ export async function tauriApiFetch(
     }
   }
 
+  appendCurrentTeamCookie(headers);
+
   // 处理请求体
   let body: string | undefined;
   if (options.body) {
@@ -131,12 +237,21 @@ export async function tauriApiFetch(
     }
   }
 
-  const response = await tauriApiProxy({
+  const requestId = options.signal ? createNativeRequestId() : undefined;
+  const request = {
     url,
     method,
     headers,
     body,
-  });
+    ...(requestId ? { requestId } : {}),
+  };
+  const response = options.signal && requestId
+    ? await invokeCancellableApiProxy(request, options.signal, requestId)
+    : await tauriApiProxy(request);
+
+  if (options.signal?.aborted) {
+    throw new DOMException('The operation was aborted', 'AbortError');
+  }
 
   // 创建兼容的 Response 对象
   return new Response(response.body, {
@@ -168,6 +283,8 @@ export async function* tauriApiStream(
     }
   }
 
+  appendCurrentTeamCookie(headers);
+
   // 处理请求体
   let body: string | undefined;
   if (options.body) {
@@ -178,69 +295,64 @@ export async function* tauriApiStream(
     }
   }
 
-  // 动态导入 Tauri API
-  const { invoke } = await import('@tauri-apps/api/core');
-  const { listen } = await import('@tauri-apps/api/event');
-
-  // 调用 Rust 流式命令，获取 stream_id
-  const streamId = await invoke<string>('api_stream_proxy', {
-    request: {
-      url,
-      method,
-      headers,
-      body,
-    },
-  });
-
-  // 创建 Promise 队列来缓存接收到的数据块
+  const { Channel, invoke } = await import('@tauri-apps/api/core');
   const queue: string[] = [];
   let isStreamEnded = false;
-  let streamError: Error | null = null;
-  let resolveNext: ((value: IteratorResult<string>) => void) | null = null;
+  let streamError: TauriStreamError | null = null;
+  let resolveNext: (() => void) | null = null;
+  let streamId: string | null = null;
+  const signal = options.signal;
+  const wakeConsumer = () => {
+    resolveNext?.();
+    resolveNext = null;
+  };
+  const handleAbort = () => {
+    queue.length = 0;
+    streamError = null;
+    isStreamEnded = true;
+    wakeConsumer();
+  };
 
-  // 监听流数据块事件
-  const unlistenChunk = await listen<StreamChunk>('stream-chunk', (event) => {
-    if (event.payload.stream_id === streamId) {
-      const data = event.payload.data;
+  if (signal?.aborted) {
+    return;
+  }
+  signal?.addEventListener('abort', handleAbort, { once: true });
 
-      if (resolveNext) {
-        // 如果有等待的 Promise，直接解决它
-        resolveNext({ value: data, done: false });
-        resolveNext = null;
-      } else {
-        // 否则加入队列
-        queue.push(data);
+  const onEvent = new Channel<NativeStreamEvent>();
+  onEvent.onmessage = (event) => {
+    if (signal?.aborted || isStreamEnded) {
+      return;
+    }
+    switch (event.event) {
+      case 'chunk':
+        queue.push(event.data);
+        break;
+      case 'end':
+        isStreamEnded = true;
+        break;
+      case 'error':
+        streamError = new TauriStreamError(event.error, event.status);
+        isStreamEnded = true;
+        break;
+      default: {
+        const exhaustiveCheck: never = event;
+        throw new Error(`Unsupported native stream event: ${String(exhaustiveCheck)}`);
       }
     }
-  });
-
-  // 监听流结束事件
-  const unlistenEnd = await listen<StreamEnd>('stream-end', (event) => {
-    if (event.payload.stream_id === streamId) {
-      isStreamEnded = true;
-
-      if (resolveNext) {
-        resolveNext({ value: undefined as any, done: true });
-        resolveNext = null;
-      }
-    }
-  });
-
-  // 监听流错误事件
-  const unlistenError = await listen<StreamError>('stream-error', (event) => {
-    console.error('[TauriStream] Stream error:', event.payload.error);
-    if (event.payload.stream_id === streamId) {
-      streamError = new Error(event.payload.error);
-      isStreamEnded = true;
-
-      if (resolveNext) {
-        resolveNext({ value: undefined as any, done: true });
-        resolveNext = null;
-      }
-    }
-  });
+    wakeConsumer();
+  };
 
   try {
+    streamId = await invoke<string>('api_stream_proxy', {
+      request: {
+        url,
+        method,
+        headers,
+        body,
+      },
+      onEvent,
+    });
+
     // 异步生成器主循环
     while (true) {
       // 优先处理队列中的数据
@@ -258,29 +370,20 @@ export async function* tauriApiStream(
         break;
       }
 
-      const result = await new Promise<IteratorResult<string>>((resolve) => {
+      await new Promise<void>((resolve) => {
         resolveNext = resolve;
       });
-
-      // 如果有值，yield 它
-      if (!result.done && result.value) {
-        yield result.value;
-      }
-
-      // 如果 done 为 true，回到循环顶部检查队列和状态
     }
 
   } finally {
-    // 清理事件监听器
-    unlistenChunk();
-    unlistenEnd();
-    unlistenError();
-
-    // 通知 Rust 侧取消流（若流已自然结束则 Rust 侧会静默忽略）
-    try {
-      await invoke('cancel_stream', { streamId });
-    } catch {
-      // 忽略取消命令本身的错误（如 Rust 侧已结束）
+    signal?.removeEventListener('abort', handleAbort);
+    if (streamId) {
+      // 通知 Rust 侧取消流（若流已自然结束则 Rust 侧会静默忽略）
+      try {
+        await invoke('cancel_stream', { streamId });
+      } catch {
+        // 忽略取消命令本身的错误（如 Rust 侧已结束）
+      }
     }
   }
 }

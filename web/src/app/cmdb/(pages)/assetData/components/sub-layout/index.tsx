@@ -79,6 +79,7 @@ const SideMenuLayout: React.FC<WithSideMenuLayoutProps> = ({
   useEffect(() => {
     setMenuItems(updateMenuItems?.filter(menu => (
       !menu.isNotMenuItem
+      && (menu.name !== 'asset_k8s_resources' || modelId === 'k8s_cluster')
       && (menu.name !== 'asset_config_files' || isConfigFileSupportedModel(modelId))
       && (menu.name !== 'asset_ip_view' || isIpamModel(modelId))
     )));
@@ -121,13 +122,13 @@ const SideMenuLayout: React.FC<WithSideMenuLayoutProps> = ({
                 {intro}
               </SideMenu>
             )}
-            <section className="flex-1 flex flex-col overflow-hidden">
+            <section className="flex-1 flex flex-col overflow-hidden min-w-0">
               {(intro && topSection) && (
                 <div className={`mb-4 w-full rounded-md ${sideMenuStyle.sectionContainer}`}>
                   {topSection}
                 </div>
               )}
-              <div className={`p-4 flex-1 rounded-md overflow-auto ${sideMenuStyle.sectionContainer} ${sideMenuStyle.sectionContext}`}>
+              <div className={`p-4 flex-1 min-h-0 min-w-0 rounded-md overflow-auto ${sideMenuStyle.sectionContainer} ${sideMenuStyle.sectionContext}`}>
                 {children}
               </div>
             </section>

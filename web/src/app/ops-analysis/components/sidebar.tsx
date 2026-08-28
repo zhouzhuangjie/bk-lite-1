@@ -11,20 +11,20 @@ import Icon from '@/components/icon';
 import GroupTreeSelect from '@/components/group-tree-select';
 import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
 import PermissionWrapper from '@/components/permission';
+import MoreActionsDropdown from '@/components/more-actions-dropdown';
+import type { MoreActionsDropdownItem } from '@/components/more-actions-dropdown';
 import useBtnPermissions from '@/hooks/usePermissions';
 import type { DataNode } from 'antd/lib/tree';
 import {
   Button,
-  Dropdown,
-  Empty,
   Form,
   Input,
-  Menu,
+  message,
   Modal,
-  Radio,
   Spin,
   Tree,
 } from 'antd';
+import CompactEmptyState from '@/components/compact-empty-state';
 import { useTranslation } from '@/utils/i18n';
 import { useSearchParams } from 'next/navigation';
 import { useDirectoryApi } from '@/app/ops-analysis/api/index';
@@ -32,6 +32,9 @@ import { useUserInfoContext } from '@/context/userInfo';
 import { ExportModal, ImportModal } from './importExport';
 import { ObjectType } from '@/app/ops-analysis/api/importExport';
 import { buildDefaultScreenViewSets } from '@/app/ops-analysis/(pages)/view/screen/utils/viewport';
+import {
+  useNetworkTopologyApi,
+} from '@/app/ops-analysis/api/networkTopology';
 import {
   CANVAS_TYPES,
   getCanvasTypeMeta,
@@ -49,13 +52,15 @@ import {
 } from '@/app/ops-analysis/types';
 import {
   PlusOutlined,
-  MoreOutlined,
   BarChartOutlined,
   FolderOutlined,
   ApartmentOutlined,
   DesktopOutlined,
   FileTextOutlined,
+  CheckOutlined,
+  BranchesOutlined,
 } from '@ant-design/icons';
+import { resolveSidebarTreeSelection } from '@/app/ops-analysis/utils/sidebarSelection';
 
 const Sidebar = forwardRef<SidebarRef, SidebarProps>(
   ({ onSelect, onDataUpdate }, ref) => {
@@ -67,9 +72,11 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
     const searchParams = useSearchParams();
     const { selectedGroup } = useUserInfoContext();
     const { hasPermission } = useBtnPermissions();
+    const networkTopologyApi = useNetworkTopologyApi();
     const [dirs, setDirs] = useState<DirItem[]>([]);
     const [loading, setLoading] = useState(false);
     const [submitLoading, setSubmitLoading] = useState(false);
+    const [connectionTesting, setConnectionTesting] = useState(false);
     const [searchTerm, setSearchTerm] = useState('');
     const [modalVisible, setModalVisible] = useState(false);
     const [modalTitle, setModalTitle] = useState('');
@@ -87,6 +94,9 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
     const activeCanvasType =
       selectedCanvasType || (isCanvasType(newItemType) ? newItemType : undefined);
     const isCreatingCanvas = modalAction !== 'edit' && isCanvasType(newItemType);
+    const showNetworkTopologyConnectionTest =
+      (isCreatingCanvas || modalAction === 'edit') &&
+      activeCanvasType === 'networkTopology';
 
     useImperativeHandle(
       ref,
@@ -135,6 +145,9 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
         desc: action === 'edit' && dir ? dir.desc : '',
         groups: initialGroups,
         canvasType: isCanvasType(itemType) ? itemType : undefined,
+        // 编辑网络拓扑时用占位符 `******` 兜底展示;若用户输入新 token 才覆盖。
+        baseUrl: '',
+        token: '',
       };
 
       form.setFieldsValue(formData);
@@ -147,6 +160,24 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
       setCurrentDir(dir);
       setNewItemType(itemType);
       setModalVisible(true);
+
+      // 编辑网络拓扑时拉详情填充 baseUrl/token_set(token 永远不返回明文)。
+      if (
+        action === 'edit' &&
+        itemType === 'networkTopology' &&
+        dir?.data_id
+      ) {
+        networkTopologyApi
+          .getNetworkTopologyDetail(dir.data_id)
+          .then((detail) => {
+            form.setFieldsValue({
+              baseUrl: detail.base_url ?? '',
+              // 已配置 token 时显示占位符;空字符串表示未配置。
+              token: detail.token_set ? '******' : '',
+            });
+          })
+          .catch(() => undefined);
+      }
     };
 
     const handleSubmit = async (values: FormValues) => {
@@ -161,11 +192,19 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
 
         if (modalAction === 'edit') {
           if (!currentDir) return;
-          const updateData = {
+          const updateData: Record<string, unknown> = {
             name: values.name,
             desc: values.desc,
             groups: values.groups,
           };
+          // 网络拓扑编辑:支持改 base_url + 重置 token。
+          // 占位符 `******` 或空串都表示不修改 token,后端会保留旧值。
+          if (targetItemType === 'networkTopology') {
+            if (values.baseUrl) updateData.base_url = values.baseUrl;
+            if (values.token && values.token !== '******') {
+              updateData.token = values.token;
+            }
+          }
           await updateItem(newItemType, currentDir.data_id, updateData);
           if (onDataUpdate) {
             const updatedItem = {
@@ -183,6 +222,10 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
           };
           if (targetItemType === 'screen') {
             itemData.view_sets = buildDefaultScreenViewSets();
+          }
+          if (targetItemType === 'networkTopology') {
+            itemData.base_url = values.baseUrl;
+            itemData.token = values.token;
           }
           if (modalAction === 'addChild' && currentDir?.data_id) {
             if (isCanvasType(targetItemType)) {
@@ -212,9 +255,44 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
         return;
       }
       try {
-        handleSubmit(values);
+        await handleSubmit(values);
       } catch (error) {
         console.error('Modal action failed:', error);
+      }
+    };
+
+    const handleTestNetworkConnection = async () => {
+      const isEditNetworkTopology =
+        modalAction === 'edit' &&
+        newItemType === 'networkTopology' &&
+        Boolean(currentDir?.data_id);
+
+      try {
+        const values = await form.validateFields(['baseUrl', 'token']);
+        const baseUrl = typeof values.baseUrl === 'string' ? values.baseUrl.trim() : '';
+        const token = typeof values.token === 'string' ? values.token.trim() : '';
+
+        setConnectionTesting(true);
+        if (isEditNetworkTopology && currentDir?.data_id) {
+          const payload: { base_url?: string; token?: string } = {};
+          if (baseUrl) payload.base_url = baseUrl;
+          if (token && token !== '******') payload.token = token;
+          await networkTopologyApi.testSavedConnection(currentDir.data_id, payload);
+        } else {
+          await networkTopologyApi.testConnection({
+            base_url: baseUrl,
+            token,
+          });
+        }
+        message.success(t('opsAnalysisSidebar.connectionTestSuccess'));
+      } catch (error) {
+        const maybeValidationError = error as { errorFields?: unknown[] };
+        if (!maybeValidationError?.errorFields) {
+          console.error('Network topology connection test failed:', error);
+          message.error(t('opsAnalysisSidebar.connectionTestFailed'));
+        }
+      } finally {
+        setConnectionTesting(false);
       }
     };
 
@@ -222,6 +300,7 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
       setModalVisible(false);
       form.resetFields();
       setCurrentDir(null);
+      setConnectionTesting(false);
     };
 
     const handleSearch = (value: string) => setSearchTerm(value);
@@ -272,6 +351,7 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
         architecture: <ApartmentOutlined className={`${className} text-green-600`} />,
         screen: <DesktopOutlined className={`${className} text-cyan-600`} />,
         report: <FileTextOutlined className={`${className} text-orange-600`} />,
+        networkTopology: <BranchesOutlined className={`${className} text-blue-600`} />,
       };
       return iconMap[meta.icon];
     };
@@ -284,6 +364,7 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
         architecture: <ApartmentOutlined className={`${className} text-green-600`} />,
         screen: <DesktopOutlined className={`${className} text-cyan-600`} />,
         report: <FileTextOutlined className={`${className} text-orange-600`} />,
+        networkTopology: <BranchesOutlined className={`${className} text-blue-600`} />,
       };
       return iconMap[type];
     };
@@ -300,152 +381,117 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
       );
     };
 
-    const menuFor = (item: DirItem, parentId: string | null = null) => {
+    const menuItemsFor = (
+      item: DirItem,
+      parentId: string | null = null,
+    ): MoreActionsDropdownItem[] => {
       const isRoot = parentId === null;
       const isGroup = item.type === 'directory';
       const canDelete = item.type !== 'directory' || !hasChildren(item);
       const isBuiltIn = !!item.is_build_in;
-
-      const stopEventPropagation = (event?: React.MouseEvent<HTMLElement> | React.KeyboardEvent<HTMLElement> | Event) => {
-        event?.stopPropagation?.();
-      };
-
-      // 根据 item.type 确定需要的权限
       const isCatalogue = item.type === 'directory';
       const editPermission = isCatalogue ? 'EditCatalogue' : 'EditChart';
       const deletePermission = isCatalogue ? 'DeleteCatalogue' : 'DeleteChart';
 
       // 内置对象：只显示导出按钮（非目录），其余禁用
       if (isBuiltIn) {
-        return (
-          <Menu selectable={false}>
-            {!isGroup && (
-              <Menu.Item
-                key="export"
-                onClick={(e) => {
-                  stopEventPropagation(e.domEvent);
-                  handleExport(item);
-                }}
-              >
-                {t('opsAnalysisSidebar.exportYaml')}
-              </Menu.Item>
-            )}
-            <Menu.Item key="edit" disabled>
-              {t('common.edit')}
-            </Menu.Item>
-            <Menu.Item key="delete" disabled>
-              {t('common.delete')}
-            </Menu.Item>
-          </Menu>
-        );
+        return [
+          ...(!isGroup
+            ? [{
+              key: 'export',
+              label: t('opsAnalysisSidebar.exportYaml'),
+              onClick: () => handleExport(item),
+            }]
+            : []),
+          { key: 'edit', label: t('common.edit'), disabled: true },
+          { key: 'delete', label: t('common.delete'), disabled: true },
+        ];
       }
 
-      return (
-        <Menu selectable={false}>
-          {isGroup && (
-            <>
-              <Menu.Item
-                key="add-canvas"
-                onClick={(e) => {
-                  stopEventPropagation(e.domEvent);
-                  if (!hasPermission(['AddChart'])) return;
-                  showModal(
-                    'addChild',
-                    t('opsAnalysisSidebar.addCanvas'),
-                    '',
-                    item,
-                    'dashboard',
-                  );
-                }}
-              >
-                <PermissionWrapper requiredPermissions={['AddChart']}>
-                  {t('opsAnalysisSidebar.addCanvas')}
-                </PermissionWrapper>
-              </Menu.Item>
-              <Menu.Item
-                key="import"
-                onClick={(e) => {
-                  stopEventPropagation(e.domEvent);
-                  if (!hasPermission(['AddChart'])) return;
-                  handleImport(item);
-                }}
-              >
-                <PermissionWrapper requiredPermissions={['AddChart']}>
-                  {t('opsAnalysisSidebar.importYaml')}
-                </PermissionWrapper>
-              </Menu.Item>
-            </>
-          )}
-          {isRoot && (
-            <Menu.Item
-              key="addGroup"
-              onClick={(e) => {
-                stopEventPropagation(e.domEvent);
-                if (!hasPermission(['AddCatalogue'])) return;
-                setNewItemType('directory');
-                showModal(
-                  'addChild',
-                  t('opsAnalysisSidebar.addGroup'),
-                  '',
-                  item,
-                  'directory',
-                );
-              }}
-            >
-              <PermissionWrapper requiredPermissions={['AddCatalogue']}>
-                {t('opsAnalysisSidebar.addGroup')}
-              </PermissionWrapper>
-            </Menu.Item>
-          )}
-
-          <Menu.Item
-            key="edit"
-            onClick={(e) => {
-              stopEventPropagation(e.domEvent);
-              if (!hasPermission([editPermission])) return;
+      const items: MoreActionsDropdownItem[] = [];
+      if (isGroup) {
+        items.push(
+          {
+            key: 'add-canvas',
+            label: t('opsAnalysisSidebar.addCanvas'),
+            permission: 'AddChart',
+            onClick: () => {
+              if (!hasPermission(['AddChart'])) return;
               showModal(
-                'edit',
-                item.type === 'directory'
-                  ? t('opsAnalysisSidebar.editGroup')
-                  : t(getCanvasTypeMeta(item.type)?.editLabelKey || 'common.edit'),
-                item.name,
+                'addChild',
+                t('opsAnalysisSidebar.addCanvas'),
+                '',
                 item,
-                item.type,
+                'dashboard',
               );
-            }}
-          >
-            <PermissionWrapper requiredPermissions={[editPermission]}>
-              {t('common.edit')}
-            </PermissionWrapper>
-          </Menu.Item>
-
-          <Menu.Item
-            key="delete"
-            disabled={!canDelete}
-            onClick={(e) => {
-              stopEventPropagation(e.domEvent);
-              if (!hasPermission([deletePermission])) return;
-              handleDelete(item);
-            }}
-          >
-            <PermissionWrapper requiredPermissions={[deletePermission]}>
-              {t('common.delete')}
-            </PermissionWrapper>
-          </Menu.Item>
-
-          {!isGroup && (
-            <Menu.Item
-              key="export"
-              onClick={(e) => {
-                stopEventPropagation(e.domEvent);
-                handleExport(item);
-              }}
-            >
-              {t('opsAnalysisSidebar.exportYaml')}
-            </Menu.Item>
-          )}
-        </Menu>
+            },
+          },
+          {
+            key: 'import',
+            label: t('opsAnalysisSidebar.importYaml'),
+            permission: 'AddChart',
+            onClick: () => {
+              if (!hasPermission(['AddChart'])) return;
+              handleImport(item);
+            },
+          },
+        );
+      }
+      if (isRoot) {
+        items.push({
+          key: 'addGroup',
+          label: t('opsAnalysisSidebar.addGroup'),
+          permission: 'AddCatalogue',
+          onClick: () => {
+            if (!hasPermission(['AddCatalogue'])) return;
+            setNewItemType('directory');
+            showModal(
+              'addChild',
+              t('opsAnalysisSidebar.addGroup'),
+              '',
+              item,
+              'directory',
+            );
+          },
+        });
+      }
+      items.push(
+        {
+          key: 'edit',
+          label: t('common.edit'),
+          permission: editPermission,
+          onClick: () => {
+            if (!hasPermission([editPermission])) return;
+            showModal(
+              'edit',
+              item.type === 'directory'
+                ? t('opsAnalysisSidebar.editGroup')
+                : t(getCanvasTypeMeta(item.type)?.editLabelKey || 'common.edit'),
+              item.name,
+              item,
+              item.type,
+            );
+          },
+        },
+        {
+          key: 'delete',
+          label: t('common.delete'),
+          permission: deletePermission,
+          disabled: !canDelete,
+          onClick: () => {
+            if (!hasPermission([deletePermission])) return;
+            handleDelete(item);
+          },
+        },
       );
+      if (!isGroup) {
+        items.push({
+          key: 'export',
+          label: t('opsAnalysisSidebar.exportYaml'),
+          onClick: () => handleExport(item),
+        });
+      }
+      return items;
     };
 
     const buildTreeData = (
@@ -473,22 +519,12 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
             {(item.is_build_in && item.type === 'directory') ? (
               <span />
             ) : (
-              <Dropdown
-                overlay={menuFor(item, parentId)}
-                trigger={['click']}
+              <MoreActionsDropdown
+                items={menuItemsFor(item, parentId)}
                 placement="bottomLeft"
-                getPopupContainer={() => document.body}
-              >
-                <Button
-                  type="text"
-                  aria-label={t('common.more')}
-                  icon={<MoreOutlined aria-hidden="true" />}
-                  onClick={(e) => e.stopPropagation()}
-                  onMouseDown={(e) => e.stopPropagation()}
-                  className="flex-shrink-0"
-                  size="small"
-                />
-              </Dropdown>
+                stopPropagation
+                buttonClassName="flex-shrink-0"
+              />
             )}
           </span>
         ),
@@ -641,10 +677,17 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
                 selectedKeys={selectedKeys}
                 onExpand={(keys) => setExpandedKeys(keys)}
                 onSelect={(selectedKeys, info) => {
-                  const key = (selectedKeys as string[])[0];
-                  setSelectedKeys(selectedKeys);
-                  if (onSelect && key && info.selectedNodes.length > 0) {
-                    const item = findItemById(filteredDirs, key);
+                  const selection = resolveSidebarTreeSelection({
+                    selectedKeys,
+                    nodeKey: info.node.key,
+                    selected: info.selected,
+                  });
+                  setSelectedKeys(selection.selectedKeys);
+                  if (onSelect && selection.navigationKey) {
+                    const item = findItemById(
+                      filteredDirs,
+                      selection.navigationKey,
+                    );
                     if (item && item.type !== 'directory') {
                       onSelect(item.type, item);
                     }
@@ -654,7 +697,7 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
                 style={{ overflow: 'hidden' }}
               />
             ) : (
-              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} />
+              <CompactEmptyState description={t('common.noData')} />
             )}
           </Spin>
         </div>
@@ -664,58 +707,120 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
           open={modalVisible}
           centered
           width={isCreatingCanvas ? 760 : 520}
-          okText={t('common.confirm')}
-          cancelText={t('common.cancel')}
-          onOk={handleModalOk}
           onCancel={handleModalCancel}
-          confirmLoading={submitLoading}
+          footer={[
+            showNetworkTopologyConnectionTest ? (
+              <Button
+                key="testConnection"
+                onClick={handleTestNetworkConnection}
+                loading={connectionTesting}
+              >
+                {t('opsAnalysisSidebar.testConnection')}
+              </Button>
+            ) : null,
+            <Button key="cancel" onClick={handleModalCancel}>
+              {t('common.cancel')}
+            </Button>,
+            <Button
+              key="submit"
+              type="primary"
+              onClick={handleModalOk}
+              loading={submitLoading}
+            >
+              {t('common.confirm')}
+            </Button>,
+          ]}
+          styles={{
+            body: {
+              maxHeight: 'calc(100vh - 200px)',
+              overflowY: 'auto',
+            },
+          }}
         >
-          <Form form={form} className="mt-5" labelCol={{ span: 4 }}>
+          <Form
+            form={form}
+            className="mt-5"
+            layout="vertical"
+          >
             {isCreatingCanvas && (
               <Form.Item
-                name="canvasType"
                 label={t('opsAnalysisSidebar.canvasType')}
-                rules={[{ required: true, message: t('common.selectMsg') }]}
+                required
               >
-                <Radio.Group
+                <Form.Item
+                  name="canvasType"
+                  noStyle
+                  rules={[{ required: true, message: t('common.selectMsg') }]}
+                >
+                  <Input type="hidden" />
+                </Form.Item>
+                <div
+                  role="radiogroup"
+                  aria-label={t('opsAnalysisSidebar.canvasType')}
                   className="grid grid-cols-1 gap-2 sm:grid-cols-2 md:grid-cols-3"
-                  onChange={(event) => setNewItemType(event.target.value)}
                 >
                   {CANVAS_TYPES.map((canvasType) => {
                     const meta = getCanvasTypeMeta(canvasType)!;
                     const selected = activeCanvasType === canvasType;
 
                     return (
-                      <Radio
+                      <button
                         key={canvasType}
-                        value={canvasType}
-                        className={`!m-0 flex min-h-[104px] w-full rounded-md border px-3 py-2.5 transition-all ${
+                        type="button"
+                        role="radio"
+                        aria-checked={selected}
+                        onClick={() => {
+                          form.setFieldValue('canvasType', canvasType);
+                          form.validateFields(['canvasType']).catch(() => undefined);
+                          setNewItemType(canvasType);
+                        }}
+                        className={`group relative flex min-h-[104px] w-full cursor-pointer overflow-hidden rounded-md border px-3 py-3 text-left transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 ${
                           selected
-                            ? 'border-blue-500 bg-blue-50 shadow-sm'
-                            : 'border-gray-200 bg-white hover:border-blue-300 hover:bg-gray-50'
+                            ? 'border-blue-500 bg-gradient-to-br from-blue-50 to-white shadow-[0_2px_8px_rgba(37,99,235,0.08)]'
+                            : 'border-gray-200 bg-white hover:border-blue-300 hover:bg-slate-50 hover:shadow-[0_2px_6px_rgba(15,23,42,0.05)]'
                         }`}
                       >
-                        <span className="block min-w-0">
-                          <span className="flex items-center gap-2">
+                        <span
+                          aria-hidden="true"
+                          className={`absolute right-3 top-3 flex h-5 w-5 items-center justify-center rounded-full text-[10px] transition-all ${
+                            selected
+                              ? 'scale-100 bg-blue-600 text-white opacity-100 shadow-sm'
+                              : 'scale-90 bg-gray-100 text-transparent opacity-0'
+                          }`}
+                        >
+                          <CheckOutlined />
+                        </span>
+                        <span className="block min-w-0 pr-6">
+                          <span className="flex items-center gap-2.5">
                             <span
-                              className={`flex h-7 w-7 flex-none items-center justify-center rounded-md ${
-                                selected ? 'bg-white' : 'bg-gray-50'
+                              className={`flex h-8 w-8 flex-none items-center justify-center rounded-md border transition-colors ${
+                                selected
+                                  ? 'border-blue-100 bg-white shadow-sm'
+                                  : 'border-gray-100 bg-gray-50 group-hover:border-blue-100 group-hover:bg-white'
                               }`}
                             >
                               {renderCanvasTypeIcon(canvasType)}
                             </span>
-                            <span className="block text-sm font-medium text-gray-900">
+                            <span
+                              className={`block text-sm font-semibold ${
+                                selected ? 'text-blue-700' : 'text-gray-900'
+                              }`}
+                            >
                               {t(meta.nameKey)}
                             </span>
                           </span>
-                          <span className="mt-1.5 block text-xs leading-5 text-gray-500">
+                          <span
+                            className={`mt-2 block text-xs leading-5 ${
+                              selected ? 'text-slate-600' : 'text-gray-500'
+                            }`}
+                          >
                             {t(meta.descriptionKey)}
                           </span>
                         </span>
-                      </Radio>
+                      </button>
                     );
                   })}
-                </Radio.Group>
+                </div>
               </Form.Item>
             )}
             <Form.Item
@@ -725,6 +830,54 @@ const Sidebar = forwardRef<SidebarRef, SidebarProps>(
             >
               <Input placeholder={t('opsAnalysisSidebar.inputPlaceholder')} />
             </Form.Item>
+            {showNetworkTopologyConnectionTest && (
+              <>
+                <Form.Item
+                  name="baseUrl"
+                  label={t('opsAnalysisSidebar.baseUrlLabel')}
+                  rules={[
+                    // 编辑模式下 baseUrl 可留空(表示不改);创建模式必填。
+                    { required: isCreatingCanvas, message: t('common.inputMsg') },
+                    { type: 'url', message: t('opsAnalysisSidebar.baseUrlFormat') },
+                  ]}
+                >
+                  <Input
+                    placeholder={t('opsAnalysisSidebar.baseUrlPlaceholder')}
+                    allowClear
+                  />
+                </Form.Item>
+                <Form.Item
+                  name="token"
+                  label={t('opsAnalysisSidebar.tokenLabel')}
+                  style={{ marginBottom: 8 }}
+                  // 占位符 `******` 在编辑模式代表「保持原 token」,空字符串
+                  // 代表「未配置」;两者都不再强制 >=4 字符。
+                  rules={[
+                    {
+                      required: isCreatingCanvas,
+                      message: t('common.inputMsg'),
+                    },
+                    {
+                      validator: (_rule, value) => {
+                        if (!value) return Promise.resolve();
+                        if (value === '******') return Promise.resolve();
+                        if (value.length < 4) {
+                          return Promise.reject(
+                            new Error(t('opsAnalysisSidebar.tokenMinLength')),
+                          );
+                        }
+                        return Promise.resolve();
+                      },
+                    },
+                  ]}
+                >
+                  <Input.Password
+                    placeholder={t('opsAnalysisSidebar.tokenPlaceholder')}
+                    autoComplete="new-password"
+                  />
+                </Form.Item>
+              </>
+            )}
             <Form.Item
               name="groups"
               label={t('common.group')}

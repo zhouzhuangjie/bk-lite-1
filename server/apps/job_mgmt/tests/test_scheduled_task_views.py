@@ -7,12 +7,13 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from django.db import DatabaseError
 
 from apps.job_mgmt.constants import JobType
 from apps.job_mgmt.models import ScheduledTask
 from apps.job_mgmt.services.dangerous_checker import DangerousCheckResult
 
-pytestmark = [pytest.mark.unit, pytest.mark.django_db]
+pytestmark = [pytest.mark.integration, pytest.mark.django_db]
 
 URL = "/api/v1/job_mgmt/api/scheduled_task/"
 SVC = "apps.job_mgmt.serializers.scheduled_task.ScheduledTaskService"
@@ -51,6 +52,75 @@ def _make_task(**over):
     return ScheduledTask.objects.create(**defaults)
 
 
+class TestScheduledTaskNormalizeLineEndings:
+    """入库前规范化 script_content 换行符;脚本类型走 _resolve 防 PATCH 误规范化。"""
+
+    def test_create_normalizes_crlf(self, su_client):
+        with patch(SVC + ".create_periodic_task", return_value=MagicMock(id=99)):
+            resp = su_client.post(
+                URL,
+                _create_payload(script_content="echo a\r\necho b\r\n"),
+                format="json",
+            )
+        assert resp.status_code == 201
+        t = ScheduledTask.objects.get(name="task1")
+        assert "\r" not in t.script_content
+        assert t.script_content.startswith("echo a\necho b")
+
+    def test_create_powershell_keeps_crlf(self, su_client):
+        crlf = "Write-Host hi\r\n$x = 1\r\n"
+        with patch(SVC + ".create_periodic_task", return_value=MagicMock(id=99)):
+            resp = su_client.post(
+                URL,
+                _create_payload(script_type="powershell", script_content=crlf),
+                format="json",
+            )
+        assert resp.status_code == 201
+        t = ScheduledTask.objects.get(name="task1")
+        # powershell 保留 CRLF
+        assert "\r" in t.script_content
+
+    def test_update_normalizes_crlf(self, su_client):
+        t = _make_task(script_content="echo", script_type="shell")
+        with patch(SVC + ".update_periodic_task", return_value=MagicMock(id=99)):
+            resp = su_client.put(
+                f"{URL}{t.id}/",
+                _create_payload(name="t2", script_content="echo 1\r\necho 2\r\n"),
+                format="json",
+            )
+        assert resp.status_code == 200
+        t.refresh_from_db()
+        assert "\r" not in t.script_content
+        assert t.script_content.startswith("echo 1\necho 2")
+
+    def test_update_powershell_preserves_crlf(self, su_client):
+        """PATCH 只改 content(不传 script_type),instance 是 powershell → 走 _resolve 不误规范"""
+        crlf = "Write-Host hi\r\n$x = 1\r\n"
+        t = _make_task(script_type="powershell", script_content=crlf)
+        with patch(SVC + ".update_periodic_task", return_value=MagicMock(id=99)):
+            resp = su_client.put(
+                f"{URL}{t.id}/",
+                _create_payload(name="t2", script_content=crlf, script_type="powershell"),
+                format="json",
+            )
+        assert resp.status_code == 200
+        t.refresh_from_db()
+        assert "\r" in t.script_content
+
+    def test_update_partial_no_content_keeps_existing(self, su_client):
+        """PATCH 不传 script_content 时 instance 原值保留,不被规范化。"""
+        t = _make_task(script_content="echo", script_type="shell")
+        with patch(SVC + ".update_periodic_task", return_value=MagicMock(id=99)):
+            resp = su_client.patch(
+                f"{URL}{t.id}/",
+                {"description": "no-content-change"},
+                format="json",
+            )
+        assert resp.status_code == 200
+        t.refresh_from_db()
+        assert t.script_content == "echo"
+
+
 class TestScheduledTaskCrud:
     def test_create(self, su_client):
         with patch(SVC + ".create_periodic_task", return_value=MagicMock(id=99)):
@@ -70,6 +140,37 @@ class TestScheduledTaskCrud:
         assert resp.status_code == 200
         task.refresh_from_db()
         assert task.name == "task1-edit"
+
+    def test_update_rejects_task_team_change_after_initial_read(self, api_client, authenticated_user):
+        """首次权限读取后团队发生变化时，锁内新快照必须拒绝旧团队用户。"""
+        from apps.job_mgmt.views.scheduled_task import ScheduledTaskViewSet
+
+        task = _make_task(team=[1])
+        authenticated_user.is_superuser = False
+        authenticated_user.group_list = [{"id": 1}]
+        authenticated_user.permission = {"job": {"cron_task-Edit"}}
+        api_client.cookies["current_team"] = "1"
+        original_get_object = ScheduledTaskViewSet.get_object
+
+        def get_object_then_change_team(view):
+            stale_task = original_get_object(view)
+            ScheduledTask.objects.filter(pk=stale_task.pk).update(team=[2])
+            return stale_task
+
+        with patch.object(ScheduledTaskViewSet, "get_object", new=get_object_then_change_team), patch(
+            SVC + ".update_periodic_task"
+        ) as update_periodic_task:
+            resp = api_client.patch(
+                f"{URL}{task.id}/",
+                {"name": "must-not-overwrite", "team": [1]},
+                format="json",
+            )
+
+        assert resp.status_code == 403
+        task.refresh_from_db()
+        assert task.team == [2]
+        assert task.name == "t"
+        update_periodic_task.assert_not_called()
 
     def test_list_and_retrieve(self, su_client):
         task = _make_task()
@@ -93,12 +194,102 @@ class TestScheduledTaskCrud:
 
 
 class TestScheduledTaskActions:
+    @pytest.mark.parametrize("action,payload", [("toggle", {"is_enabled": False}), ("run_now", {})])
+    def test_cross_team_user_cannot_operate_task(self, api_client, authenticated_user, action, payload):
+        task = _make_task(team=[2], is_enabled=True)
+        authenticated_user.is_superuser = False
+        authenticated_user.group_list = [{"id": 1}]
+        authenticated_user.permission = {"job": {"cron_task-Edit"}}
+        api_client.cookies["current_team"] = "1"
+
+        with patch(VIEW_SVC + ".toggle_periodic_task_or_raise") as toggle, patch(
+            "apps.job_mgmt.views.scheduled_task.dispatch_celery_task"
+        ) as dispatch:
+            resp = api_client.post(f"{URL}{task.id}/{action}/", payload, format="json")
+
+        assert resp.status_code == 403
+        task.refresh_from_db()
+        assert task.is_enabled is True
+        toggle.assert_not_called()
+        dispatch.assert_not_called()
+
+    @pytest.mark.parametrize("action,payload", [("toggle", {"is_enabled": False}), ("run_now", {})])
+    def test_task_team_change_after_initial_read_is_rejected(self, api_client, authenticated_user, action, payload):
+        """首次权限读取后团队发生变化时，锁内新快照必须再次拒绝旧团队用户。"""
+        from apps.job_mgmt.views.scheduled_task import ScheduledTaskViewSet
+
+        task = _make_task(team=[1], is_enabled=True)
+        authenticated_user.is_superuser = False
+        authenticated_user.group_list = [{"id": 1}]
+        authenticated_user.permission = {"job": {"cron_task-Edit"}}
+        api_client.cookies["current_team"] = "1"
+        original_get_object = ScheduledTaskViewSet.get_object
+
+        def get_object_then_change_team(view):
+            stale_task = original_get_object(view)
+            ScheduledTask.objects.filter(pk=stale_task.pk).update(team=[2])
+            return stale_task
+
+        with patch.object(ScheduledTaskViewSet, "get_object", new=get_object_then_change_team), patch(
+            VIEW_SVC + ".toggle_periodic_task_or_raise"
+        ) as toggle, patch("apps.job_mgmt.views.scheduled_task.dispatch_celery_task") as dispatch:
+            resp = api_client.post(f"{URL}{task.id}/{action}/", payload, format="json")
+
+        assert resp.status_code == 403
+        task.refresh_from_db()
+        assert task.team == [2]
+        assert task.is_enabled is True
+        toggle.assert_not_called()
+        dispatch.assert_not_called()
+
     def test_toggle(self, su_client):
         task = _make_task(is_enabled=True)
-        with patch(VIEW_SVC + ".toggle_periodic_task"):
+        with patch(VIEW_SVC + ".toggle_periodic_task_or_raise"):
             resp = su_client.post(f"{URL}{task.id}/toggle/", {"is_enabled": False}, format="json")
         assert resp.status_code == 200
         assert resp.data["is_enabled"] is False
+
+    def test_toggle_disable_keeps_business_task_disabled_when_beat_db_fails(self, su_client):
+        task = _make_task(is_enabled=True)
+        with patch(VIEW_SVC + ".toggle_periodic_task_or_raise", side_effect=DatabaseError("beat unavailable")):
+            resp = su_client.post(f"{URL}{task.id}/toggle/", {"is_enabled": False}, format="json")
+
+        assert resp.status_code == 200
+        task.refresh_from_db()
+        assert task.is_enabled is False
+        assert "重试" in resp.data["message"]
+
+    def test_toggle_enable_rolls_back_when_beat_db_fails(self, su_client):
+        task = _make_task(is_enabled=False)
+        with patch(VIEW_SVC + ".toggle_periodic_task_or_raise", side_effect=DatabaseError("beat unavailable")):
+            resp = su_client.post(f"{URL}{task.id}/toggle/", {"is_enabled": True}, format="json")
+
+        assert resp.status_code == 400
+        task.refresh_from_db()
+        assert task.is_enabled is False
+
+    def test_patch_disable_keeps_business_task_disabled_when_beat_db_fails(self, su_client):
+        task = _make_task(is_enabled=True)
+        with patch(VIEW_SVC + ".toggle_periodic_task_or_raise", side_effect=DatabaseError("beat unavailable")):
+            resp = su_client.patch(f"{URL}{task.id}/", {"is_enabled": False}, format="json")
+
+        assert resp.status_code == 200
+        task.refresh_from_db()
+        assert task.is_enabled is False
+
+    def test_patch_disable_accepts_authorized_legacy_multi_team_task(self, api_client, authenticated_user):
+        task = _make_task(team=[1, 2], is_enabled=True)
+        authenticated_user.is_superuser = False
+        authenticated_user.group_list = [{"id": 1}]
+        authenticated_user.permission = {"job": {"cron_task-Edit"}}
+        api_client.cookies["current_team"] = "1"
+
+        with patch(VIEW_SVC + ".toggle_periodic_task_or_raise", return_value=True):
+            resp = api_client.patch(f"{URL}{task.id}/", {"is_enabled": False}, format="json")
+
+        assert resp.status_code == 200
+        task.refresh_from_db()
+        assert task.is_enabled is False
 
     def test_run_now_triggers_execution(self, su_client):
         task = _make_task()
@@ -136,22 +327,16 @@ class TestScheduledTaskActions:
         assert "高危" in resp.data.get("error", "")
         assert JobExecution.objects.count() == before_count, "高危命中时不应创建执行记录"
 
-    def test_run_now_dangerous_path_returns_400_without_creating_execution(self, su_client):
-        """run_now 在高危路径命中时应直接返回 400，不创建 JobExecution。"""
+    def test_run_now_temporary_file_distribution_returns_400_without_creating_execution(self, su_client):
+        """周期文件分发没有永久团队制品时应直接返回 400，不创建 JobExecution。"""
         from apps.job_mgmt.models import JobExecution
 
         task = _make_task(job_type=JobType.FILE_DISTRIBUTION, target_path="/etc/passwd")
-        bad_result = DangerousCheckResult()
-        bad_result.add_match(
-            SimpleNamespace(id=2, name="禁止系统路径", pattern="/etc/", level="forbidden"),
-            "/etc/passwd",
-        )
         before_count = JobExecution.objects.count()
-        with patch("apps.job_mgmt.views.scheduled_task.DangerousChecker.check_path", return_value=bad_result):
-            resp = su_client.post(f"{URL}{task.id}/run_now/", {}, format="json")
+        resp = su_client.post(f"{URL}{task.id}/run_now/", {}, format="json")
         assert resp.status_code == 400
-        assert "高危" in resp.data.get("error", "")
-        assert JobExecution.objects.count() == before_count, "高危路径命中时不应创建执行记录"
+        assert "永久" in str(resp.data)
+        assert JobExecution.objects.count() == before_count, "不支持的周期文件分发不应创建执行记录"
 
     def test_run_now_safe_script_proceeds_normally(self, su_client):
         """run_now 在安全脚本时应正常创建执行记录并触发任务。"""

@@ -5,7 +5,7 @@ from apps.log.constants.victoriametrics import VictoriaLogsConstants
 
 class LogFieldValuesSerializer(serializers.Serializer):
     filed = serializers.RegexField(
-        regex=r"^[A-Za-z_][A-Za-z0-9_.]*$",
+        regex=r"^[A-Za-z_@][A-Za-z0-9_.@/-]*$",
         max_length=200,
         error_messages={"invalid": "filed 参数格式非法"},
     )
@@ -40,7 +40,7 @@ class LogHitsSerializer(serializers.Serializer):
     start_time = serializers.CharField(required=False, allow_blank=True, default="")
     end_time = serializers.CharField(required=False, allow_blank=True, default="")
     field = serializers.RegexField(
-        regex=r"^[A-Za-z_][A-Za-z0-9_.]*$",
+        regex=r"^[A-Za-z_@][A-Za-z0-9_.@/-]*$",
         max_length=200,
         error_messages={"invalid": "field 参数格式非法"},
     )
@@ -59,11 +59,13 @@ class LogHitsSerializer(serializers.Serializer):
 
 
 class LogTopStatsSerializer(serializers.Serializer):
+    NON_AGGREGATABLE_META_FIELDS = {"_stream", "_stream_id", "_time"}
+
     query = serializers.CharField(required=False, allow_blank=True, default="*")
     start_time = serializers.CharField(required=False, allow_blank=True, default="")
     end_time = serializers.CharField(required=False, allow_blank=True, default="")
     attr = serializers.RegexField(
-        regex=r"^[A-Za-z_][A-Za-z0-9_.]*$",
+        regex=r"^[A-Za-z_@][A-Za-z0-9_.@/-]*$",
         max_length=200,
         error_messages={"invalid": "attr 参数格式非法"},
     )
@@ -74,3 +76,8 @@ class LogTopStatsSerializer(serializers.Serializer):
         allow_empty=False,
         error_messages={"required": "缺少日志分组", "empty": "缺少日志分组"},
     )
+
+    def validate(self, attrs):
+        if attrs["attr"] in self.NON_AGGREGATABLE_META_FIELDS:
+            raise serializers.ValidationError({"attr": "该字段不支持 TopN 统计"})
+        return attrs

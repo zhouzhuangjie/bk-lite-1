@@ -1,0 +1,426 @@
+# flake8: noqa
+from apps.core.exceptions.base_app_exception import BaseAppException
+from apps.core.utils.current_team_scope import _normalize_organization_ids
+from apps.core.utils.permission_cache import clear_all_permission_cache
+from apps.system_mgmt.services.archived_group_query import ArchivedGroupQuery
+from apps.system_mgmt.services.group_archive_types import ARCHIVED_LIST_MAX_PAGE_SIZE
+
+from .common import *  # noqa: F401,F403
+from .common import _collect_ancestor_group_ids
+
+
+CURRENT_TEAM_ARCHIVED_MESSAGE = "current_team 对应组织已归档或不存在"
+
+
+def _is_persisted_superuser(user_obj):
+    """仅从持久化用户角色解析超管身份。"""
+    explicit_flag = getattr(user_obj, "is_superuser", None)
+    if explicit_flag is not None:
+        return bool(explicit_flag)
+
+    role_ids = get_user_all_roles(user_obj)
+    return Role.objects.filter(id__in=role_ids, name="admin").filter(Q(app="") | Q(app="system-manager")).exists()
+
+
+# SECURITY COMPATIBILITY: 仅为已知仓外消费者限时恢复；不得新增消费者。
+# 风险接受与 NATS 身份/ACL 迁移跟踪见 #4533，截止 2026-09-04。
+@nats_client.register
+def get_group_users(group=None, include_children=False):
+    """
+    获取组织下的用户列表
+    :param group: 组织ID，如果为None则返回所有用户
+    :param include_children: 是否包含子组织的用户
+    :return: 用户列表
+    """
+    if not group:
+        # 如果没有指定组织，返回所有用户
+        users = User.objects.all().values("id", "user_id", "username", "display_name")
+    else:
+        try:
+            group = int(group)
+        except (TypeError, ValueError):
+            return {"result": True, "data": []}
+        if not GroupUtils.active_queryset(id=group).exists():
+            return {"result": True, "data": []}
+        if include_children:
+            group_ids = GroupUtils.get_group_with_descendants(group)
+            users = User.objects.filter(group_list__overlap=group_ids).values("id", "user_id", "username", "display_name")
+        else:
+            users = User.objects.filter(group_list__contains=int(group)).values("id", "user_id", "username", "display_name")
+    return {"result": True, "data": list(users)}
+
+
+def _get_actor_user_scope(actor_context, include_children=False):
+    """
+    根据调用方上下文解析允许访问的组织范围。
+
+    :param actor_context: 调用方上下文，包含 username、domain、current_team、is_superuser 等字段
+    :param include_children: 是否包含当前组织下的已授权子组织
+    :return: (user_obj, authorized_groups, error_message)
+        - user_obj: 当前调用用户对象，不存在时返回 None
+        - authorized_groups: 当前调用方允许访问的组织 ID 列表
+        - error_message: 归档/缺失 current_team 时的明确错误；否则 None
+    """
+    username = (actor_context or {}).get("username")
+    domain = (actor_context or {}).get("domain", "domain.com")
+    current_team = (actor_context or {}).get("current_team")
+    if not username or current_team in (None, ""):
+        return None, [], None
+
+    user_obj = User.objects.filter(username=username, domain=domain).first()
+    if not user_obj:
+        return None, [], None
+
+    # 超管身份只能来自持久化用户，RPC 调用方声明不得提升权限。
+    is_superuser = _is_persisted_superuser(user_obj)
+
+    try:
+        current_team = next(iter(_normalize_organization_ids([current_team])))
+    except BaseAppException:
+        return user_obj, [], None
+
+    if Group.objects.filter(id=current_team, is_delete=True).exists():
+        return user_obj, [], CURRENT_TEAM_ARCHIVED_MESSAGE
+
+    if is_superuser:
+        if not GroupUtils.active_queryset(id=current_team).exists():
+            return user_obj, [], CURRENT_TEAM_ARCHIVED_MESSAGE
+        if include_children:
+            return user_obj, GroupUtils.get_group_with_descendants(current_team), None
+        return user_obj, [current_team], None
+
+    authorized_groups = GroupUtils.get_user_authorized_child_groups(
+        user_obj.group_list,
+        current_team,
+        include_children=include_children,
+    )
+    return user_obj, authorized_groups, None
+
+
+def _actor_scope_response(actor_context, include_children=False):
+    user_obj, authorized_groups, error = _get_actor_user_scope(actor_context, include_children=include_children)
+    if error:
+        return user_obj, None, {"result": False, "message": error}
+    return user_obj, authorized_groups, None
+
+
+# SECURITY COMPATIBILITY: actor_context 仍来自消息体，不构成可信调用身份；见 #4533。
+@nats_client.register
+def get_group_users_scoped(actor_context, group=None, include_children=False):
+    """
+    在调用方授权范围内查询组织用户列表。
+
+    :param actor_context: 调用方上下文，包含 username、domain、current_team、is_superuser 等字段
+    :param group: 可选，指定查询的组织 ID；若不传则使用调用方当前授权范围
+    :param include_children: 是否包含目标组织下的已授权子组织用户
+    :return: 标准 NATS 返回结构，data 为用户列表
+    """
+    user_obj, authorized_groups, error_response = _actor_scope_response(actor_context, include_children=include_children)
+    if error_response is not None:
+        return error_response
+    if not user_obj or not authorized_groups:
+        return {"result": True, "data": []}
+
+    if group is not None:
+        try:
+            group = int(group)
+        except (TypeError, ValueError):
+            return {"result": True, "data": []}
+        if group not in authorized_groups:
+            return {"result": True, "data": []}
+        query_groups = GroupUtils.get_user_authorized_child_groups(
+            user_obj.group_list,
+            group,
+            include_children=include_children,
+        )
+    else:
+        query_groups = authorized_groups
+
+    if not query_groups:
+        return {"result": True, "data": []}
+
+    user_filter = Q()
+    for group_id in query_groups:
+        user_filter |= Q(group_list__contains=int(group_id))
+    users = User.objects.filter(user_filter).values("id", "user_id", "username", "display_name")
+    return {"result": True, "data": list(users)}
+
+
+@nats_client.register
+def get_authorized_groups_scoped(actor_context, include_children=False):
+    """返回调用方在当前组织上下文下可访问的组织范围。"""
+    user_obj, authorized_groups, error_response = _actor_scope_response(actor_context, include_children=include_children)
+    if error_response is not None:
+        return error_response
+    return {
+        "result": True,
+        "data": authorized_groups or [],
+        "is_superuser": bool(user_obj and _is_persisted_superuser(user_obj)),
+    }
+
+
+@nats_client.register
+def get_assignable_groups(actor_context):
+    """返回调用方可作为组织分配目标的真实组织范围。"""
+    username = (actor_context or {}).get("username")
+    domain = (actor_context or {}).get("domain", "domain.com")
+    if not username:
+        return {"result": True, "data": []}
+
+    user_obj = User.objects.filter(username=username, domain=domain).first()
+    if not user_obj:
+        return {"result": True, "data": []}
+
+    if _is_persisted_superuser(user_obj):
+        return {"result": True, "data": list(GroupUtils.active_queryset().values_list("id", flat=True))}
+
+    user_group_list = list(user_obj.group_list or [])
+    if not user_group_list:
+        return {"result": True, "data": []}
+
+    groups = GroupUtils.get_group_with_descendants(user_group_list)
+    return {"result": True, "data": groups}
+
+
+# SECURITY COMPATIBILITY: 限时风险接受的 legacy subject；见 #4533。
+@nats_client.register
+def get_all_users():
+    data = User.objects.all().values(*User.display_fields())
+    return {"result": True, "data": list(data)}
+
+
+@nats_client.register
+def search_groups(query_params):
+    groups = GroupUtils.active_queryset(name__contains=query_params["search"]).values()
+    return {"result": True, "data": list(groups)}
+
+
+# SECURITY COMPATIBILITY: 限时风险接受的 legacy subject；见 #4533。
+@nats_client.register
+def search_users(query_params):
+    page = int(query_params.get("page", 1))
+    page_size = int(query_params.get("page_size", 10))
+    search = query_params.get("search", "")
+    queryset = User.objects.filter(Q(username__icontains=search) | Q(display_name__icontains=search) | Q(email__icontains=search))
+    start = (page - 1) * page_size
+    end = page * page_size
+    total = queryset.count()
+    display_fields = User.display_fields() + ["group_list"]
+    data = queryset.values(*display_fields)[start:end]
+    return {"result": True, "data": {"count": total, "users": list(data)}}
+
+
+@nats_client.register
+def init_user_default_attributes(user_id, group_name, default_group_id):
+    try:
+        role_ids = list(
+            Role.objects.filter(name="guest", app__in=["opspilot", "cmdb", "monitor", "alarm", "log", "node", "mlops", "job", "patch"]).values_list(
+                "id", flat=True
+            )
+        )
+        normal_role = Role.objects.get(name="normal", app="opspilot")
+        user = User.objects.get(id=user_id)
+        top_group, _ = Group.objects.get_or_create(
+            name=os.getenv("DEFAULT_GROUP_NAME", "Guest"),
+            parent_id=0,
+            defaults={"description": ""},
+        )
+        if Group.objects.filter(parent_id=top_group.id, name=group_name).exists():
+            return {"result": False, "message": "Group already exists"}
+
+        guest_group, _ = Group.objects.get_or_create(name="OpsPilotGuest", parent_id=0)
+        with transaction.atomic():
+            group_obj = Group.objects.create(name=group_name, parent_id=top_group.id)
+            user.locale = "zh-Hans"
+            user.timezone = "Asia/Shanghai"
+            user.role_list.extend(role_ids)
+            user.role_list = list(set(user.role_list))  # 去重
+            if normal_role.id in user.role_list:
+                user.role_list.remove(normal_role.id)
+            user.group_list.remove(int(default_group_id))
+            user.group_list.append(guest_group.id)
+            user.group_list.append(group_obj.id)
+            user.save()
+            set_opspilot_guest_group_default_rule(guest_group, user)
+        cache.delete(f"group_{user.username}")
+        return {"result": True, "data": {"group_id": group_obj.id}}
+    except Exception as e:
+        logger.exception(e)
+        return {"result": False, "message": str(e)}
+
+
+@nats_client.register
+def create_guest_role():
+    app_map = {
+        "opspilot": OPSPILOT_GUEST_MENUS[:],
+        "cmdb": CMDB_MENUS[:],
+        "monitor": MONITOR_MENUS[:],
+    }
+    with transaction.atomic():
+        guest_group, _ = Group.objects.get_or_create(name="Guest", parent_id=0, defaults={"description": "Guest group"})
+        app_guest_group, _ = Group.objects.get_or_create(name="OpsPilotGuest", parent_id=0)
+        permissions_changed = False
+        for app, app_menus in app_map.items():
+            menus = dict(Menu.objects.filter(app=app).values_list("id", "name"))
+            menu_list = [k for k, v in menus.items() if v in app_menus]
+            role = Role.objects.filter(name="guest", app=app).first()
+            if role is None:
+                Role.objects.create(name="guest", app=app, menu_list=menu_list)
+                permissions_changed = True
+            elif role.menu_list != menu_list:
+                role.menu_list = menu_list
+                role.save(update_fields=["menu_list"])
+                permissions_changed = True
+        if permissions_changed:
+            clear_all_permission_cache()
+    return {"result": True, "data": {"group_id": app_guest_group.id}}
+
+
+# This initializer is intentionally local-only: console_mgmt calls it through
+# AppClient, while exposing it on NATS would let unauthenticated publishers
+# create the built-in OpsPilot data rule when it is missing.
+def create_default_rule(llm_model, ocr_model, embed_model, rerank_model):
+    guest_group = Group.objects.get(name="OpsPilotGuest", parent_id=0)
+    GroupDataRule.objects.get_or_create(
+        name="OpsPilot内置规则",
+        app="opspilot",
+        defaults=dict(
+            group_id=guest_group.id,
+            description="Guest组数据权限规则",
+            group_name=guest_group.name,
+            rules={
+                "skill": [{"id": 0, "name": "All", "permission": ["View"]}],
+                "tools": [{"id": 0, "name": "All", "permission": ["View"]}],
+                "provider": {
+                    "llm_model": [
+                        {
+                            "id": llm_model["id"],
+                            "name": llm_model["name"],
+                            "permission": ["View"],
+                        }
+                    ],
+                    "ocr_model": [{"id": i["id"], "name": i["name"], "permission": ["View"]} for i in ocr_model],
+                    "embed_model": [{"id": i["id"], "name": i["name"], "permission": ["View"]} for i in embed_model],
+                    "rerank_model": [
+                        {
+                            "id": rerank_model["id"],
+                            "name": rerank_model["name"],
+                            "permission": ["View"],
+                        }
+                    ],
+                },
+                "knowledge": [{"id": 0, "name": "All", "permission": ["View"]}],
+            },
+        ),
+    )
+    return {"result": True}
+
+
+@nats_client.register
+def get_all_groups():
+    groups = GroupUtils.active_queryset().prefetch_related("roles")
+    return_data = GroupUtils.build_group_tree(groups, True)
+    return {"result": True, "data": return_data}
+
+
+@nats_client.register
+def get_archived_groups(page=1, page_size=100):
+    """供其他模块分页查询已归档组织，自行处理其资产/数据。不替代管理端归档 Drawer。"""
+    try:
+        page = int(page)
+        page_size = int(page_size)
+    except (TypeError, ValueError):
+        return {"result": False, "message": "invalid pagination"}
+    if page < 1 or page_size < 1 or page_size > ARCHIVED_LIST_MAX_PAGE_SIZE:
+        return {"result": False, "message": "invalid pagination"}
+    listed = ArchivedGroupQuery.list_all_archived_groups(page=page, page_size=page_size)
+    return {
+        "result": True,
+        "data": {
+            "items": listed.items,
+            "count": listed.count,
+            "page": listed.page,
+            "page_size": listed.page_size,
+        },
+    }
+
+
+@nats_client.register
+def get_group_id(group_name):
+    group = GroupUtils.active_queryset(name=group_name, parent_id=0).first()
+    if not group:
+        return {"result": False, "message": f"group named '{group_name}' not exists."}
+    return {"result": True, "data": group.id}
+
+
+def set_opspilot_guest_group_default_rule(default_group, user):
+    default_rule = GroupDataRule.objects.get(name="OpsPilot内置规则", app="opspilot", group_id=default_group.id)
+    monitor_rule = GroupDataRule.objects.get(name="OpsPilotGuest数据权限", app="monitor", group_id=default_group.id)
+    cmdb_rule = GroupDataRule.objects.get(name="游客数据权限", app="cmdb", group_id=default_group.id)
+    log_rule = GroupDataRule.objects.get(name="log内置规则", app="log", group_id=default_group.id)
+    node_rule = GroupDataRule.objects.get(name="节点管理内置数据权限", app="node", group_id=default_group.id)
+    identity = {"username": user.username, "domain": user.domain}
+    UserRule.objects.get_or_create(**identity, group_rule_id=cmdb_rule.id)
+    UserRule.objects.get_or_create(**identity, group_rule_id=default_rule.id)
+    UserRule.objects.get_or_create(**identity, group_rule_id=monitor_rule.id)
+    UserRule.objects.get_or_create(**identity, group_rule_id=log_rule.id)
+    UserRule.objects.get_or_create(**identity, group_rule_id=node_rule.id)
+
+
+@nats_client.register
+def get_user_group_tree(username, sync_source_id=None):
+    """按 (username, sync_source_id) 唯一定位用户，返回其组织树（参照 login_info.group_tree 形态）。
+
+    :param username: 用户名
+    :param sync_source_id: UserSyncSource 主键；None 或空串表示本地用户（User.sync_source IS NULL）；
+                         其它尝试 int() 强转
+    :return: 标准 NATS 三段式，data 包含 user_id/username/domain/group_list/group_tree
+    """
+    if not username:
+        return {"result": False, "message": "username is required"}
+
+    # 归一化 sync_source_id：None 或空串走本地用户；其余尝试 int() 强转
+    if sync_source_id in (None, ""):
+        sync_source_id = None
+    else:
+        try:
+            sync_source_id = int(sync_source_id)
+        except (TypeError, ValueError):
+            return {"result": False, "message": "invalid sync_source_id"}
+
+    try:
+        qs = User.objects.filter(username=username)
+        if sync_source_id is None:
+            qs = qs.filter(sync_source__isnull=True)
+        else:
+            qs = qs.filter(sync_source_id=sync_source_id)
+        count = qs.count()
+        if count == 0:
+            return {"result": False, "message": "user not found"}
+        if count > 1:
+            return {"result": False, "message": f"expected 1 user, got {count}"}
+        user = qs.first()
+
+        user_group_ids = [int(g) for g in (user.group_list or [])]
+        active_ids = set(GroupUtils.active_queryset(id__in=user_group_ids).values_list("id", flat=True))
+        user_group_ids = [group_id for group_id in user_group_ids if group_id in active_ids]
+        visible_ids = _collect_ancestor_group_ids(user_group_ids)
+        queryset = list(
+            GroupUtils.active_queryset(id__in=visible_ids)
+            .prefetch_related("roles")
+            .order_by("id")
+        )
+        group_tree = GroupUtils.build_group_tree(queryset, is_superuser=False, user_groups=user_group_ids)
+        return {
+            "result": True,
+            "data": {
+                "user_id": user.id,
+                "username": user.username,
+                "domain": user.domain,
+                "group_list": user_group_ids,
+                "group_tree": group_tree,
+            },
+        }
+    except Exception as e:
+        logger.exception(e)
+        return {"result": False, "message": f"internal error: {e}"}

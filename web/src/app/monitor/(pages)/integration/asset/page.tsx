@@ -5,15 +5,18 @@ import {
   Button,
   message,
   Dropdown,
-  Tag,
   Popconfirm,
   Space,
-  Tooltip
+  Tooltip,
+  Modal
 } from 'antd';
 import useApiClient from '@/utils/request';
 import { useSearchParams, useRouter } from 'next/navigation';
 import useMonitorApi from '@/app/monitor/api';
 import useIntegrationApi from '@/app/monitor/api/integration';
+import { findByMonitorId, sameMonitorId, toMonitorIdString } from '@/app/monitor/utils/monitorIds';
+import { useMonitorObjectQuery } from '@/app/monitor/hooks/useMonitorObjectQuery';
+import { resolveMonitorObjectQueryId } from '@/app/monitor/utils/monitorObjectQuery';
 import assetStyle from './index.module.scss';
 import { useTranslation } from '@/utils/i18n';
 import {
@@ -49,8 +52,9 @@ import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
 import type { TableProps, MenuProps } from 'antd';
 import { cloneDeep } from 'lodash';
 import ResizableSidebar from '@/app/monitor/components/resizableSidebar';
-import { getProfessionalDashboardUrl } from '@/app/monitor/dashboards/registry';
+import { resolveDashboardUrl } from '@/app/monitor/dashboards/registry';
 import { buildAssetViewUrl } from './viewRoute';
+import PluginTooltipContent, { PluginTooltipTrigger } from './pluginTooltip';
 
 type TableRowSelection<T extends object = object> =
   TableProps<T>['rowSelection'];
@@ -65,7 +69,11 @@ const Asset = () => {
   const { convertToLocalizedTime } = useLocalizedTime();
   const searchparams = useSearchParams();
   const router = useRouter();
-  const urlObjId = searchparams.get('objId');
+  const { syncObjectId } = useMonitorObjectQuery();
+  const urlObjId = resolveMonitorObjectQueryId({
+    searchParams: searchparams,
+    fallback: ''
+  });
   const authList = useRef(commonContext?.authOrganizations || []);
   const organizationList: Organization[] = authList.current;
   const timerRef = useRef<NodeJS.Timeout | null>(null);
@@ -87,14 +95,19 @@ const Asset = () => {
   const [searchText, setSearchText] = useState<string>('');
   const [objects, setObjects] = useState<ObjectItem[]>([]);
   const [defaultSelectObj, setDefaultSelectObj] = useState<React.Key>(
-    urlObjId ? Number(urlObjId) : ''
+    urlObjId ? toMonitorIdString(urlObjId) : ''
   );
   const [objectId, setObjectId] = useState<React.Key>('');
   const [frequence, setFrequence] = useState<number>(0);
   const [confirmLoading, setConfirmLoading] = useState(false);
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([]);
+  const [modal, modalContextHolder] = Modal.useModal();
 
   const handleAssetMenuClick: MenuProps['onClick'] = (e) => {
+    if (e.key === 'batchDelete') {
+      showBatchDeleteConfirm();
+      return;
+    }
     openInstanceModal(
       {
         keys: selectedRowKeys
@@ -116,7 +129,7 @@ const Asset = () => {
       instanceName: record.instance_name,
       instanceId: record.instance_id,
       selectedConfigId: options?.selectedConfigId,
-      objName: objects.find((item) => item.id === objectId)?.name || '',
+      objName: findByMonitorId(objects, objectId)?.name || '',
       monitorObjId: objectId,
       plugins: record.plugins || [],
       showTemplateList: options?.showTemplateList ?? true
@@ -140,7 +153,7 @@ const Asset = () => {
 
           return (
             <div className="flex flex-wrap gap-1">
-              {plugins.map((plugin: any, index: number) => {
+              {plugins.map((plugin: any) => {
                 const isAuto = plugin.collect_mode === 'auto';
                 const statusInfo = {
                   color: ['normal', 'online'].includes(plugin.status)
@@ -158,37 +171,45 @@ const Asset = () => {
                 const timeText = plugin.time
                   ? convertToLocalizedTime(plugin.time)
                   : '--';
-                const tooltipTitle = `${statusText} - ${t(
-                  'monitor.integrations.lastReportTime'
-                )}：${timeText}`;
+                const tooltipTitle = (
+                  <PluginTooltipContent
+                    statusText={statusText}
+                    lastReportTimeLabel={t(
+                      'monitor.integrations.lastReportTime'
+                    )}
+                    timeText={timeText}
+                    collectionNodeLabel={t(
+                      'monitor.integrations.collectionNode'
+                    )}
+                    notAssociatedText={t(
+                      'monitor.integrations.notAssociated'
+                    )}
+                    collectMode={plugin.collect_mode}
+                    collectorNodes={plugin.collector_nodes}
+                  />
+                );
 
                 return (
-                  <>
+                  <React.Fragment key={plugin.name}>
                     <style>{`
                       .asset-tooltip.ant-tooltip {
                         max-width: none;
                       }
                     `}</style>
-                    <Tooltip
-                      key={`${plugin.name}-${index}`}
+                    <PluginTooltipTrigger
+                      ariaLabel={`${plugin.display_name || '--'}，${statusText}`}
+                      color={statusInfo.color}
+                      onActivate={() =>
+                        openTemplateDrawer(record, {
+                          selectedConfigId: isAuto ? plugin.name : undefined,
+                          showTemplateList: false
+                        })
+                      }
                       title={tooltipTitle}
-                      color="#000"
-                      overlayClassName="asset-tooltip"
                     >
-                      <Tag
-                        color={statusInfo.color}
-                        className="cursor-pointer"
-                        onClick={() =>
-                          openTemplateDrawer(record, {
-                            selectedConfigId: isAuto ? plugin.name : undefined,
-                            showTemplateList: false
-                          })
-                        }
-                      >
-                        {plugin.display_name || '--'}
-                      </Tag>
-                    </Tooltip>
-                  </>
+                      {plugin.display_name || '--'}
+                    </PluginTooltipTrigger>
+                  </React.Fragment>
                 );
               })}
             </div>
@@ -210,6 +231,54 @@ const Asset = () => {
             text={showGroupName(organization, organizationList)}
           />
         )
+      },
+      {
+        title: t('monitor.views.externalId'),
+        dataIndex: 'external_id',
+        key: 'external_id',
+        width: 80,
+        ellipsis: true,
+        onHeaderCell: () => ({
+          style: { width: 80, minWidth: 80, maxWidth: 80 },
+        }),
+        onCell: () => ({
+          style: {
+            width: 80,
+            minWidth: 80,
+            maxWidth: 80,
+            overflow: 'hidden',
+          },
+        }),
+        render: (_, record: TableDataItem) => {
+          const cmdbId = record.cmdb_id ? String(record.cmdb_id) : '--';
+          const nodeId = record.node_id ? String(record.node_id) : '--';
+          return (
+            <Tooltip
+              title={
+                <div className="text-xs leading-5">
+                  <div>
+                    {t('monitor.views.cmdbId')}: {cmdbId}
+                  </div>
+                  <div>
+                    {t('monitor.views.nodeId')}: {nodeId}
+                  </div>
+                </div>
+              }
+            >
+              <div
+                className="block overflow-hidden cursor-default"
+                style={{ width: 64, maxWidth: 64 }}
+              >
+                <div className="overflow-hidden text-ellipsis whitespace-nowrap font-mono text-[12px] leading-[18px]">
+                  {cmdbId}
+                </div>
+                <div className="overflow-hidden text-ellipsis whitespace-nowrap font-mono text-[12px] leading-[18px] text-[var(--color-text-3)]">
+                  {nodeId}
+                </div>
+              </div>
+            </Tooltip>
+          );
+        },
       },
       {
         title: t('common.action'),
@@ -272,7 +341,7 @@ const Asset = () => {
         )
       }
     ];
-    const row = objects.find((item) => item.id === objectId) || {};
+    const row = findByMonitorId(objects, objectId) || {};
     return [
       ...getBaseInstanceColumn({
         objects,
@@ -353,7 +422,9 @@ const Asset = () => {
   const handleObjectChange = (id: string) => {
     cancelAllRequests();
     setTableData([]);
+    setSelectedRowKeys([]);
     setObjectId(id);
+    syncObjectId(id);
   };
 
   const openInstanceModal = (row = {}, type: string) => {
@@ -366,15 +437,21 @@ const Asset = () => {
 
   const checkDetail = (row: ObjectInstItem) => {
     const monitorItem = objects.find(
-      (item: ObjectItem) => item.id === objectId
+      (item: ObjectItem) => sameMonitorId(item.id, objectId)
     );
     const url = buildAssetViewUrl({
       objectId: objectId || '',
       monitorItem,
       row,
-      resolveProfessionalDashboardUrl: getProfessionalDashboardUrl
+      resolveProfessionalDashboardUrl: (objectName, objectDisplayName, queryString) =>
+        resolveDashboardUrl({
+          monitorObjectName: objectName,
+          monitorObjectDisplayName: objectDisplayName,
+          instancePlugins: Array.isArray(row.plugins) ? row.plugins : undefined,
+          queryString,
+        }),
     });
-    window.open(url, '_blank', 'noopener,noreferrer');
+    router.push(url);
   };
 
   const handleTableChange = (pagination: any) => {
@@ -392,7 +469,7 @@ const Asset = () => {
         page: pagination.current,
         page_size: pagination.pageSize,
         name: type === 'clear' ? '' : searchText,
-        id: objectId
+        id: String(objectId)
       };
       const data = await getInstanceListByPrimaryObject(params, {
         signal: abortController.signal
@@ -421,9 +498,13 @@ const Asset = () => {
       setObjects(data);
       const _treeData = getTreeData(cloneDeep(data));
       setTreeData(_treeData);
-      const defaultKey = defaultSelectObj || data[0]?.id || '';
+      const defaultKey = resolveMonitorObjectQueryId({
+        searchParams: searchparams,
+        objects: data,
+        fallback: defaultSelectObj || data[0]?.id
+      });
       if (defaultKey) {
-        setDefaultSelectObj(defaultKey);
+        setDefaultSelectObj(toMonitorIdString(defaultKey));
       }
     } finally {
       setTreeLoading(false);
@@ -444,7 +525,7 @@ const Asset = () => {
           acc[item.type].children.push({
             title: item.display_name || '--',
             label: item.name || '--',
-            key: item.id,
+            key: toMonitorIdString(item.id),
             icon: item.icon,
             count: item.instance_count ?? 0,
             children: []
@@ -466,11 +547,70 @@ const Asset = () => {
       };
       await deleteMonitorInstance(data);
       message.success(t('common.successfullyDeleted'));
-      getObjects();
-      getAssetInsts(objectId);
+      setSelectedRowKeys((keys) =>
+        keys.filter((key) => key !== row.instance_id)
+      );
+      await refreshAfterDeletionSafely(1);
     } finally {
       setConfirmLoading(false);
     }
+  };
+
+  const refreshAfterDeletion = async (deletedCount: number) => {
+    const remainingTotal = Math.max(0, pagination.total - deletedCount);
+    const lastPage = Math.max(1, Math.ceil(remainingTotal / pagination.pageSize));
+    const targetPage = Math.min(pagination.current, lastPage);
+
+    setPagination((prev) => ({
+      ...prev,
+      current: targetPage,
+      total: remainingTotal
+    }));
+
+    if (targetPage === pagination.current) {
+      await Promise.all([getObjects(), getAssetInsts(objectId)]);
+      return;
+    }
+    await getObjects();
+  };
+
+  const refreshAfterDeletionSafely = async (deletedCount: number) => {
+    try {
+      await refreshAfterDeletion(deletedCount);
+    } catch {
+      message.warning(
+        `${t('common.successfullyDeleted')} ${t('common.fetchFailed')}`
+      );
+    }
+  };
+
+  const batchDeleteInstConfirm = async () => {
+    const instanceIds = [...selectedRowKeys];
+    const data = {
+      instance_ids: instanceIds,
+      clean_child_config: true
+    };
+    await deleteMonitorInstance(data);
+    setSelectedRowKeys([]);
+    message.success(t('common.successfullyDeleted'));
+    await refreshAfterDeletionSafely(instanceIds.length);
+  };
+
+  const showBatchDeleteConfirm = () => {
+    const selectedCount = selectedRowKeys.length;
+    if (!selectedCount) return;
+
+    modal.confirm({
+      title: t('common.batchDelete'),
+      content: `${t('common.selected')} ${selectedCount} ${t(
+        'common.items'
+      )} · ${t('common.deleteContent')}`,
+      centered: true,
+      okText: t('common.confirm'),
+      cancelText: t('common.cancel'),
+      okButtonProps: { danger: true },
+      onOk: batchDeleteInstConfirm
+    });
   };
 
   const clearText = () => {
@@ -480,7 +620,7 @@ const Asset = () => {
 
   // 跳转到集成列表页面进行接入
   const goToIntegration = () => {
-    const targetUrl = `/monitor/integration/list?objId=${objectId}`;
+    const targetUrl = `/monitor/integration/list?objId=${String(objectId)}`;
     router.push(targetUrl);
   };
 
@@ -503,6 +643,7 @@ const Asset = () => {
 
   return (
     <div className={assetStyle.asset}>
+      {modalContextHolder}
       <ResizableSidebar collapseStorageKey="monitor.integration.asset.sidebarCollapsed">
         <div className={assetStyle.tree}>
           <TreeSelector

@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
-import { Empty, Modal, Switch, Tag, Tooltip, message } from 'antd';
+import { Modal, Switch, Tag, Tooltip, message } from 'antd';
+import CompactEmptyState from '@/components/compact-empty-state';
 import Image from 'next/image';
 import { DeleteOutlined, EditOutlined } from '@ant-design/icons';
 import { useTranslation } from '@/utils/i18n';
@@ -7,7 +8,7 @@ import { VENDOR_ICON_MAP, VENDOR_LABEL_MAP } from '@/app/opspilot/constants/prov
 import type { ModelVendor } from '@/app/opspilot/types/provider';
 import { useProviderApi } from '@/app/opspilot/api/provider';
 import { ProviderGridSkeleton } from '@/app/opspilot/components/provider/skeleton';
-import { useTheme } from '@/context/theme';
+import { useThemeMode } from '@/theme';
 
 interface VendorCardGridProps {
   vendors: ModelVendor[];
@@ -27,10 +28,10 @@ const VendorCardGrid: React.FC<VendorCardGridProps> = ({
   onChange,
 }) => {
   const { t } = useTranslation();
-  const { themeName } = useTheme();
+  const { mode } = useThemeMode();
   const { patchVendor } = useProviderApi();
   const [switchLoadingId, setSwitchLoadingId] = useState<number | null>(null);
-  const isDark = themeName === 'dark';
+  const isDark = mode === 'dark';
 
   const getModelCount = (vendor: ModelVendor) => {
     if (typeof vendor.model_count === 'number') {
@@ -79,7 +80,7 @@ const VendorCardGrid: React.FC<VendorCardGridProps> = ({
   }
 
   if (!loading && vendors.length === 0) {
-    return <Empty description={t('provider.vendor.empty')} />;
+    return <CompactEmptyState description={t('provider.vendor.empty')} />;
   }
 
   return (

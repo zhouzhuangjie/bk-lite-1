@@ -131,7 +131,7 @@ const PortLinkModal: React.FC<PortLinkModalProps> = ({
       window.clearTimeout(loadingFallback);
     };
     // getAssociationInstanceList/getNetworkTopo/getModelAttrList 行为稳定但每次渲染新引用，故不入依赖
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, [open, sourceId, sourceModel, targetId, targetModel]);
 
   // 仅渲染必填 + 常用选填（按 attr_id 命中），其余隐藏，避免迷你表单过长
@@ -150,7 +150,7 @@ const PortLinkModal: React.FC<PortLinkModalProps> = ({
         model_id: INTERFACE_MODEL,
         instance_info: values,
       });
-      const portId = String(created._id);
+      const portId = String(created.inst_uuid);
       // 同时建端口 -> 设备 belong 归属
       await createInstanceAssociation(
         buildBelongPayload(portId, ep.id, ep.model_id)
@@ -278,7 +278,7 @@ const PortLinkModal: React.FC<PortLinkModalProps> = ({
         onCancel={onCancel}
         onOk={handleOk}
         confirmLoading={submitting}
-        destroyOnClose
+        destroyOnHidden
       >
         <Spin spinning={loading}>
           <div className={topoStyle.portLinkBody}>
@@ -299,7 +299,7 @@ const PortLinkModal: React.FC<PortLinkModalProps> = ({
         onCancel={closeCreateModal}
         onOk={handleCreateOk}
         confirmLoading={submitting}
-        destroyOnClose
+        destroyOnHidden
       >
         <Form form={form} layout="vertical" className={topoStyle.portCreateForm}>
           {miniFields.map((a) => (

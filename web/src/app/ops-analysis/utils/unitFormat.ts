@@ -1,8 +1,6 @@
 /**
  * 结构化单位库 —— 对齐 Grafana 的「单位分类 + 自动量纲缩放」。
  *
- * 设计见 docs/superpowers/specs/2026-06-16-ops-analysis-unit-library-design.md
- *
  * 用 formatUnit(value, unitId, opts) 取代旧的纯文本后缀拼接：
  *   - bytesIEC / bytesSI：数据量，自动 KiB/MiB/GiB（1024）或 KB/MB/GB（1000）
  *   - bps：数据速率（bps/Kbps/Mbps/Gbps）
@@ -126,6 +124,15 @@ const scaleByFamily = (
     value: formatNumber(value / step.factor, decimals),
     suffix: step.suffix,
   };
+};
+
+/**
+ * 会随刻度自动换档的单位家族（字节 / bps / 毫秒 / short）。
+ * 这些单位不能只写在 Y 轴名称上，因为同一轴上可能同时出现 `512 B` 和 `1.5 KiB`。
+ */
+export const isAutoScalingUnitId = (unitId?: string): boolean => {
+  const id = unitId?.trim();
+  return Boolean(id && FAMILIES[id]);
 };
 
 /**

@@ -20,6 +20,7 @@ import { useCommonColumns } from '@/app/log/hooks/integration/common/commonColum
 import { cloneDeep } from 'lodash';
 import BatchEditModal from './batchEditModal';
 import ExcelImportModal from './excelImportModal';
+import { normalizePasswordWhitespace } from '@/components/password/normalizePasswordWhitespace';
 const { confirm } = Modal;
 
 const AutomaticConfiguration: React.FC<IntegrationAccessProps> = () => {
@@ -111,6 +112,7 @@ const AutomaticConfiguration: React.FC<IntegrationAccessProps> = () => {
         cloud_region_id: 0,
         page: 1,
         page_size: -1,
+        os: configsInfo.nodeOperatingSystem,
         is_active: true
       });
       setNodeList(data.nodes || []);
@@ -302,6 +304,19 @@ const AutomaticConfiguration: React.FC<IntegrationAccessProps> = () => {
   };
 
   const handleSave = () => {
+    if (type === 'redis') {
+      const password = form.getFieldValue(['slowlog', 'password']);
+      if (typeof password === 'string') {
+        const normalizedPassword = normalizePasswordWhitespace(password);
+        if (normalizedPassword.changed) {
+          form.setFieldValue(
+            ['slowlog', 'password'],
+            normalizedPassword.value
+          );
+          message.warning(t('common.passwordWhitespaceTrimmed'));
+        }
+      }
+    }
     // Validate table data first
     if (!validateTableData()) {
       return;

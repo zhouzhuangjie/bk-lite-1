@@ -5,6 +5,7 @@ import {
   EditOutlined,
   FullscreenOutlined,
   FullscreenExitOutlined,
+  ShareAltOutlined,
 } from '@ant-design/icons';
 import { ArchitectureProps } from '@/app/ops-analysis/types/architecture';
 import PermissionWrapper from '@/components/permission';
@@ -14,20 +15,30 @@ interface ArchitectureToolbarProps {
   selectedArchitecture: ArchitectureProps['selectedArchitecture'];
   isEditMode: boolean;
   isFullscreen: boolean;
+  shareMode?: boolean;
+  shareLoading?: boolean;
+  onOpenShare?: () => void;
   loading: boolean;
   onEdit: () => void;
+  onCancel?: () => void;
   onSave: () => void;
   onFullscreenToggle: () => void;
+  editExtra?: React.ReactNode;
 }
 
 const ArchitectureToolbar: React.FC<ArchitectureToolbarProps> = ({
   selectedArchitecture,
   isEditMode,
   isFullscreen,
+  shareMode = false,
+  shareLoading = false,
+  onOpenShare,
   loading,
   onEdit,
+  onCancel,
   onSave,
   onFullscreenToggle,
+  editExtra,
 }) => {
   const { t } = useTranslation();
   return (
@@ -52,45 +63,70 @@ const ArchitectureToolbar: React.FC<ArchitectureToolbarProps> = ({
       </div>
 
       {/* 右侧：工具栏 */}
-      <div className="flex items-center space-x-2">
-        <Tooltip
-          title={
-            isFullscreen ? t('common.exitFullscreen') : t('common.fullscreen')
-          }
-        >
-          <Button
-            type="text"
-            icon={
-              isFullscreen ? (
-                <FullscreenExitOutlined style={{ fontSize: 16 }} />
-              ) : (
-                <FullscreenOutlined style={{ fontSize: 16 }} />
-              )
+      <div className="flex items-center gap-2">
+        <div className="flex items-center gap-0.5">
+          <Tooltip
+            title={
+              isFullscreen ? t('common.exitFullscreen') : t('common.fullscreen')
             }
-            onClick={onFullscreenToggle}
-          />
-        </Tooltip>
-        <PermissionWrapper requiredPermissions={['EditChart']}>
-          {isEditMode ? (
+          >
             <Button
-              icon={<SaveOutlined />}
-              loading={loading}
-              onClick={onSave}
-              type="primary"
-            >
-              {t('common.save')}
-            </Button>
-          ) : (
-            <Tooltip title={t('common.edit')}>
+              type="text"
+              icon={
+                isFullscreen ? (
+                  <FullscreenExitOutlined style={{ fontSize: 16 }} />
+                ) : (
+                  <FullscreenOutlined style={{ fontSize: 16 }} />
+                )
+              }
+              onClick={onFullscreenToggle}
+            />
+          </Tooltip>
+          {!shareMode && !isEditMode && onOpenShare && (
+            <Tooltip title={t('dashboard.share')}>
               <Button
                 type="text"
-                icon={<EditOutlined style={{ fontSize: 16 }} />}
-                onClick={onEdit}
-                disabled={selectedArchitecture?.is_build_in}
+                icon={<ShareAltOutlined style={{ fontSize: 16 }} />}
+                loading={shareLoading}
+                disabled={shareLoading}
+                aria-label={t('dashboard.share')}
+                onClick={onOpenShare}
               />
             </Tooltip>
           )}
-        </PermissionWrapper>
+          {!shareMode && !isEditMode && (
+            <PermissionWrapper requiredPermissions={['EditChart']}>
+              <Tooltip title={t('common.edit')}>
+                <Button
+                  type="text"
+                  icon={<EditOutlined style={{ fontSize: 16 }} />}
+                  onClick={onEdit}
+                  disabled={selectedArchitecture?.is_build_in}
+                />
+              </Tooltip>
+            </PermissionWrapper>
+          )}
+        </div>
+        {!shareMode && isEditMode && (
+          <PermissionWrapper requiredPermissions={['EditChart']}>
+            <div className="flex items-center gap-2">
+              {editExtra}
+              {onCancel && (
+                <Button type="default" onClick={onCancel}>
+                  {t('common.cancel')}
+                </Button>
+              )}
+              <Button
+                icon={<SaveOutlined />}
+                loading={loading}
+                onClick={onSave}
+                type="primary"
+              >
+                {t('common.save')}
+              </Button>
+            </div>
+          </PermissionWrapper>
+        )}
       </div>
     </div>
   );

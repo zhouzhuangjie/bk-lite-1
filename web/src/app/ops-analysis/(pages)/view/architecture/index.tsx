@@ -1,6 +1,6 @@
 'use client';
 
-import React, {
+import {
   useState,
   useEffect,
   forwardRef,
@@ -13,24 +13,31 @@ import { useTranslation } from '@/utils/i18n';
 import { iconList } from '@/app/cmdb/utils/common';
 import { message, Spin } from 'antd';
 import { useArchitectureApi } from '@/app/ops-analysis/api/architecture';
+import { useCanvasShareAction } from '@/app/ops-analysis/hooks/useCanvasShareAction';
 import { flattenCollections } from '@isoflow/isopacks/dist/utils';
 import {
   DiagramData,
   ArchitectureProps,
 } from '@/app/ops-analysis/types/architecture';
 import dynamic from 'next/dynamic';
-import awsIsopack from '@isoflow/isopacks/dist/aws';
-import gcpIsopack from '@isoflow/isopacks/dist/gcp';
-import azureIsopack from '@isoflow/isopacks/dist/azure';
 import isoflowIsopack from '@isoflow/isopacks/dist/isoflow';
-import kubernetesIsopack from '@isoflow/isopacks/dist/kubernetes';
 import ArchitectureToolbar from './components/toolbar';
 import { DEFAULT_COLORS } from '@/app/ops-analysis/constants/common';
 import { svgToBase64 } from '@/app/ops-analysis/utils/common';
 import {
+  selectCmdbIsometricIcons,
+  selectIsometricIsopackIcons,
+} from '@/app/ops-analysis/utils/architectureIcons';
+import {
   AppViewFullscreenExit,
   useAppViewFullscreen,
 } from '@/app/ops-analysis/components/appFullscreen';
+import { useCanvasDraft } from '@/app/ops-analysis/hooks/useCanvasDraft';
+import {
+  toCanvasDraftResourceId,
+  type CanvasDraftPayload,
+} from '@/app/ops-analysis/api/canvasDraft';
+import { bindCanvasDraftControls } from '@/app/ops-analysis/components/canvasDraftControls';
 
 const Isoflow = dynamic(
   () => import('x-isoflow-react-19').then((mod) => ({ default: mod.Isoflow })),
@@ -44,20 +51,20 @@ const Isoflow = dynamic(
   }
 );
 
-const createCmdbIsopack = async () => {
-  const icons = await Promise.all(
-    iconList.map(async (icon) => ({
-      id: `cmdb-${icon.key}`,
-      name: icon.describe || icon.key,
-      url: await svgToBase64(icon.url),
-      isIsometric: true,
+const createArchitectureIcons = async () => {
+  const cmdbIcons = await Promise.all(
+    selectCmdbIsometricIcons(iconList).map(async (icon) => ({
+      id: icon.id,
+      name: icon.name,
+      url: await svgToBase64(icon.src),
+      isIsometric: true as const,
     }))
   );
-  return {
-    id: 'cmdb',
-    name: 'CMDB',
-    icons,
-  };
+
+  return [
+    ...cmdbIcons,
+    ...selectIsometricIsopackIcons(flattenCollections([isoflowIsopack])),
+  ];
 };
 
 export interface ArchitectureRef {
@@ -65,9 +72,10 @@ export interface ArchitectureRef {
 }
 
 const Architecture = forwardRef<ArchitectureRef, ArchitectureProps>(
-  ({ selectedArchitecture }, ref) => {
+  ({ selectedArchitecture, shareMode = false }, ref) => {
     const { t } = useTranslation();
     const { getArchitectureDetail, saveArchitecture } = useArchitectureApi();
+    const { shareLoading, openShare } = useCanvasShareAction('architecture');
     const [diagramName, setDiagramName] = useState('');
     const [fossflowKey, setFossflowKey] = useState(0);
     const [currentModel, setCurrentModel] = useState<DiagramData | null>(null);
@@ -82,6 +90,7 @@ const Architecture = forwardRef<ArchitectureRef, ArchitectureProps>(
     const { isFullscreen, enterFullscreen, exitFullscreen } =
       useAppViewFullscreen();
 
+    const officialSnapshotRef = useRef('');
     const debounceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
     const lastModelUpdateRef = useRef<string>('');
     const isUpdatingRef = useRef<boolean>(false);
@@ -98,21 +107,9 @@ const Architecture = forwardRef<ArchitectureRef, ArchitectureProps>(
 
     useEffect(() => {
       let isMounted = true;
-      createCmdbIsopack().then((cmdbIsopack) => {
-        const allIcons = flattenCollections([
-          cmdbIsopack,
-          isoflowIsopack,
-          awsIsopack,
-          azureIsopack,
-          gcpIsopack,
-          kubernetesIsopack,
-        ]);
-        const unique = allIcons.filter(
-          (icon, index, self) =>
-            index === self.findIndex((i) => i.id === icon.id)
-        );
+      createArchitectureIcons().then((icons) => {
         if (isMounted) {
-          setUniqueIcons(unique);
+          setUniqueIcons(icons);
         }
       });
       return () => {
@@ -198,12 +195,99 @@ const Architecture = forwardRef<ArchitectureRef, ArchitectureProps>(
       }
     }, [uniqueIcons, selectedArchitecture?.data_id, loadedArchitectureId]);
 
+    const architectureDraftResourceId = toCanvasDraftResourceId(
+      selectedArchitecture?.data_id,
+    );
+    const getArchitectureDraftPayload = useCallback(
+      (): CanvasDraftPayload => ({
+        name: diagramName,
+        view_sets: {
+          items: currentModel?.items || [],
+          views: currentModel?.views || [],
+        },
+      }),
+      [currentModel?.items, currentModel?.views, diagramName],
+    );
+    const applyArchitectureDraftPayload = useCallback(
+      (payload: CanvasDraftPayload) => {
+        const viewSets = (payload.view_sets || {}) as {
+          items?: DiagramData['items'];
+          views?: DiagramData['views'];
+        };
+        isUpdatingRef.current = true;
+        const merged: DiagramData = {
+          items: viewSets.items || [],
+          views: viewSets.views || [],
+          title: diagramName || 'Untitled Diagram',
+          icons: uniqueIcons,
+          colors: DEFAULT_COLORS,
+          fitToScreen: true,
+        };
+        setDiagramData({ ...merged });
+        setCurrentModel({ ...merged });
+        setFossflowKey((prev) => prev + 1);
+        setHasUnsaved(true);
+        lastModelUpdateRef.current = JSON.stringify({
+          items: merged.items,
+          views: merged.views,
+        });
+        window.setTimeout(() => {
+          isUpdatingRef.current = false;
+        }, 0);
+      },
+      [diagramName, uniqueIcons],
+    );
+    const architectureDraft = useCanvasDraft({
+      resourceType: 'architecture',
+      resourceId: architectureDraftResourceId,
+      enabled: Boolean(
+        isEditMode &&
+          !shareMode &&
+          architectureDraftResourceId &&
+          !selectedArchitecture?.is_build_in,
+      ),
+      getPayload: getArchitectureDraftPayload,
+      applyPayload: applyArchitectureDraftPayload,
+    });
+
     const toggleEditMode = () => {
       const newEditMode = !isEditMode;
       setIsEditMode(newEditMode);
       if (newEditMode) {
+        officialSnapshotRef.current = lastModelUpdateRef.current;
         setHasUnsaved(false);
       }
+    };
+
+    const handleCancelEdit = () => {
+      if (officialSnapshotRef.current) {
+        try {
+          const parsed = JSON.parse(officialSnapshotRef.current) as {
+            items?: DiagramData['items'];
+            views?: DiagramData['views'];
+          };
+          isUpdatingRef.current = true;
+          setCurrentModel((prev) =>
+            prev
+              ? { ...prev, items: parsed.items || [], views: parsed.views || [] }
+              : prev,
+          );
+          setDiagramData((prev) => ({
+            ...prev,
+            items: parsed.items || [],
+            views: parsed.views || [],
+          }));
+          setFossflowKey((prev) => prev + 1);
+          lastModelUpdateRef.current = officialSnapshotRef.current;
+          window.setTimeout(() => {
+            isUpdatingRef.current = false;
+          }, 0);
+        } catch {
+          // 进入编辑时的快照无法解析时，保持当前画面并退出编辑。
+        }
+      }
+      setHasUnsaved(false);
+      setIsEditMode(false);
     };
 
     useEffect(() => {
@@ -348,9 +432,20 @@ const Architecture = forwardRef<ArchitectureRef, ArchitectureProps>(
             selectedArchitecture={selectedArchitecture}
             isEditMode={isEditMode}
             isFullscreen={isFullscreen}
+            shareMode={shareMode}
+            shareLoading={shareLoading}
+            onOpenShare={
+              !shareMode && selectedArchitecture?.data_id
+                ? () => {
+                  void openShare(selectedArchitecture.data_id);
+                }
+                : undefined
+            }
             loading={loading}
             onEdit={toggleEditMode}
+            onCancel={handleCancelEdit}
             onSave={saveDiagram}
+            editExtra={bindCanvasDraftControls(architectureDraft)}
             onFullscreenToggle={handleFullscreenToggle}
           />
         )}
@@ -374,7 +469,7 @@ const Architecture = forwardRef<ArchitectureRef, ArchitectureProps>(
             key={`${fossflowKey}-edit`}
             initialData={diagramData}
             onModelUpdated={handleModelUpdated}
-            editorMode={isEditMode ? 'EDITABLE' : 'EXPLORABLE_READONLY'}
+            editorMode={shareMode || !isEditMode ? 'EXPLORABLE_READONLY' : 'EDITABLE'}
           />
         </div>
       </div>

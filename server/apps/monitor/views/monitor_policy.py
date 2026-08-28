@@ -3,32 +3,56 @@ import json
 from datetime import datetime, timezone
 
 from django.db import transaction
-from django_celery_beat.models import PeriodicTask, CrontabSchedule
-from rest_framework import viewsets
+from django.http import HttpResponse
+from django_celery_beat.models import CrontabSchedule, PeriodicTask
+from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.response import Response
 
-from apps.core.exceptions.base_app_exception import BaseAppException
-from apps.core.utils.permission_utils import get_permission_rules, permission_filter
+from apps.core.exceptions.base_app_exception import BaseAppException, UnauthorizedException
+from apps.core.utils.current_team_scope import resolve_current_team_data_scope, scope_permission_queryset, validate_assignable_organizations
+from apps.core.utils.permission_utils import get_permission_rules
+from apps.core.utils.team_utils import get_current_team
+from apps.core.utils.user_group import normalize_user_group_ids
 from apps.core.utils.web_utils import WebUtils
 from apps.monitor.constants.alert_policy import AlertConstants
 from apps.monitor.constants.database import DatabaseConstants
 from apps.monitor.constants.permission import PermissionConstants
 from apps.monitor.filters.monitor_policy import MonitorPolicyFilter
-from apps.monitor.models import PolicyOrganization, MonitorAlert
+from apps.monitor.models import MonitorAlert, MonitorObject, PolicyOrganization, PolicyTemplate
 from apps.monitor.models.monitor_policy import MonitorPolicy
 from apps.monitor.serializers.monitor_policy import MonitorPolicySerializer
-from apps.monitor.services.alert_lifecycle_notify import (
-    AlertLifecycleNotifier,
-    NOTIFY_SCOPE_ALERT_CENTER_ONLY,
-    NOTIFY_SCOPE_ALL_CONFIGURED,
-)
+from apps.monitor.services.alert_lifecycle_notify import NOTIFY_SCOPE_ALERT_CENTER_ONLY, NOTIFY_SCOPE_ALL_CONFIGURED, AlertLifecycleNotifier
+from apps.monitor.services.node_mgmt import InstanceConfigService
 from apps.monitor.services.policy import PolicyService
-from apps.monitor.services.policy_bulk import build_bulk_policy_payloads
 from apps.monitor.services.policy_baseline import PolicyBaselineService
+from apps.monitor.services.policy_bulk import build_bulk_policy_payloads
 from apps.monitor.services.policy_preview import PolicyPreviewService
 from apps.monitor.utils.pagination import parse_page_params
 from config.drf.pagination import CustomPageNumberPagination
-from apps.core.utils.team_utils import get_current_team
+
+
+def _build_actor_context(request):
+    scope = resolve_current_team_data_scope(request)
+
+    return {
+        "username": scope.username,
+        "domain": scope.domain,
+        "current_team": scope.current_team,
+        "include_children": scope.include_children,
+        "is_superuser": scope.is_superuser,
+        "group_list": normalize_user_group_ids(getattr(request.user, "group_list", [])),
+        "data_scope": scope,
+        "request": request,
+    }
+
+
+def _operate_only_permission(permission):
+    return {
+        **permission,
+        "team": permission.get("team", []),
+        "instance": [item for item in permission.get("instance", []) if isinstance(item, dict) and "Operate" in item.get("permission", [])],
+    }
 
 
 class MonitorPolicyViewSet(viewsets.ModelViewSet):
@@ -37,25 +61,92 @@ class MonitorPolicyViewSet(viewsets.ModelViewSet):
     filterset_class = MonitorPolicyFilter
     pagination_class = CustomPageNumberPagination
 
-    def list(self, request, *args, **kwargs):
-        monitor_object_id = request.query_params.get("monitor_object_id", None)
+    def _get_monitor_object_id(self):
+        request = getattr(self, "request", None)
+        if request is not None:
+            monitor_object_id = (
+                request.query_params.get("monitor_object_id") or request.data.get("monitor_object") or request.data.get("monitor_object_id")
+            )
+            if monitor_object_id not in (None, ""):
+                return monitor_object_id
 
-        include_children = request.COOKIES.get("include_children", "0") == "1"
-        permission = get_permission_rules(
+        policy_id = getattr(self, "kwargs", {}).get("pk")
+        if policy_id in (None, ""):
+            return None
+        return MonitorPolicy.objects.filter(id=policy_id).values_list("monitor_object_id", flat=True).first()
+
+    def _get_permission(self, monitor_object_id=None):
+        request = self.request
+        monitor_object_id = monitor_object_id if monitor_object_id not in (None, "") else self._get_monitor_object_id()
+        permission_key = (
+            f"{PermissionConstants.POLICY_MODULE}.{monitor_object_id}" if monitor_object_id not in (None, "") else PermissionConstants.POLICY_MODULE
+        )
+        return get_permission_rules(
             request.user,
             get_current_team(request),
             "monitor",
-            f"{PermissionConstants.POLICY_MODULE}.{monitor_object_id}",
-            include_children=include_children,
+            permission_key,
+            include_children=request.COOKIES.get("include_children", "0") == "1",
         )
-        qs = permission_filter(
+
+    def _get_data_scope(self):
+        if not hasattr(self, "_current_team_data_scope"):
+            self._current_team_data_scope = resolve_current_team_data_scope(self.request)
+        return self._current_team_data_scope
+
+    def _get_effective_permission(self, monitor_object_id=None):
+        scope = self._get_data_scope()
+        if self.request.user.is_superuser:
+            return {"team": list(scope.data_team_ids), "instance": []}
+        return self._get_permission(monitor_object_id)
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["data_team_ids"] = self._get_data_scope().data_team_ids
+        # 仅列表投影裁剪组织；retrieve/update 需完整 organizations 供编辑回填
+        context["filter_organizations"] = getattr(self, "action", None) == "list"
+        return context
+
+    def _scope_queryset(self, queryset, permission, scope):
+        permitted_qs = scope_permission_queryset(
             MonitorPolicy,
             permission,
+            scope,
             team_key="policyorganization__organization__in",
             id_key="id__in",
         )
+        return queryset.filter(id__in=permitted_qs.values("id")).distinct()
 
-        queryset = self.filter_queryset(qs)
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        request = getattr(self, "request", None)
+        if request is None:
+            return queryset
+
+        monitor_object_id = self._get_monitor_object_id()
+        if monitor_object_id not in (None, ""):
+            queryset = queryset.filter(monitor_object_id=monitor_object_id)
+
+        scope = self._get_data_scope()
+        permission = self._get_effective_permission(monitor_object_id)
+        if not request.user.is_superuser and getattr(self, "action", "") in {"update", "partial_update", "destroy"}:
+            permission = _operate_only_permission(permission)
+        return self._scope_queryset(queryset, permission, scope)
+
+    def _ensure_target_organizations(self, organizations, actor_context=None):
+        validate_assignable_organizations(self.request, organizations)
+
+    def _ensure_template_operate_permission(self, monitor_object_id):
+        if self.request.user.is_superuser:
+            return
+        permission = self._get_effective_permission(monitor_object_id)
+        current_team = str(self._get_data_scope().current_team)
+        if current_team not in {str(item) for item in permission.get("team", [])}:
+            raise BaseAppException("当前项目无策略模板操作权限")
+
+    def list(self, request, *args, **kwargs):
+        permission = self._get_effective_permission(request.query_params.get("monitor_object_id", None))
+        queryset = self.filter_queryset(self.get_queryset())
 
         queryset = queryset.distinct()
 
@@ -85,24 +176,30 @@ class MonitorPolicyViewSet(viewsets.ModelViewSet):
         return WebUtils.response_success(dict(count=queryset.count(), items=results))
 
     def create(self, request, *args, **kwargs):
+        self._ensure_target_organizations(request.data.get("organizations", []))
         request.data["created_by"] = request.user.username
-        response = super().create(request, *args, **kwargs)
-        policy_id = response.data["id"]
-        policy = MonitorPolicy.objects.filter(id=policy_id).first()
-        schedule = request.data.get("schedule")
-        organizations = request.data.get("organizations", [])
-        self.update_or_create_task(policy_id, schedule)
-        self.update_policy_organizations(policy_id, organizations)
-        if self.is_no_data_alert_enabled(policy):
-            self.update_policy_baselines(policy_id, policy.enable_alerts)
+        with transaction.atomic():
+            response = super().create(request, *args, **kwargs)
+            policy_id = response.data["id"]
+            policy = MonitorPolicy.objects.filter(id=policy_id).first()
+            schedule = request.data.get("schedule")
+            organizations = request.data.get("organizations", [])
+            self.update_or_create_task(policy_id, schedule)
+            self.update_policy_organizations(policy_id, organizations)
+            if self.is_no_data_alert_enabled(policy):
+                self.update_policy_baselines(policy_id, policy.enable_alerts)
         return response
 
     def update(self, request, *args, **kwargs):
+        if kwargs.get("partial", False):
+            return super().update(request, *args, **kwargs)
+
+        policy = self.get_object()
+        self._ensure_target_organizations(request.data.get("organizations", []))
         request.data["updated_by"] = request.user.username
-        policy_id = kwargs["pk"]
+        policy_id = policy.id
 
         # 获取策略变更前的 enable 状态和无数据基准语义
-        policy = MonitorPolicy.objects.filter(id=policy_id).first()
         old_enable = policy.enable if policy else None
         old_baseline_state = self.get_baseline_state(policy)
 
@@ -113,9 +210,8 @@ class MonitorPolicyViewSet(viewsets.ModelViewSet):
             schedule = request.data.get("schedule")
             if schedule:
                 self.update_or_create_task(policy_id, schedule)
-            organizations = request.data.get("organizations", [])
-            if organizations:
-                self.update_policy_organizations(policy_id, organizations)
+            organizations = request.data.get("organizations")
+            self.update_policy_organizations(policy_id, organizations)
             if self.should_update_policy_baselines(policy, old_baseline_state, updated_policy):
                 self.update_policy_baselines(
                     policy_id,
@@ -139,11 +235,13 @@ class MonitorPolicyViewSet(viewsets.ModelViewSet):
         return response
 
     def partial_update(self, request, *args, **kwargs):
+        policy = self.get_object()
+        if "organizations" in request.data:
+            self._ensure_target_organizations(request.data.get("organizations", []))
         request.data["updated_by"] = request.user.username
-        policy_id = kwargs["pk"]
+        policy_id = policy.id
 
         # 获取策略变更前的 enable 状态和无数据基准语义
-        policy = MonitorPolicy.objects.filter(id=policy_id).first()
         old_enable = policy.enable if policy else None
         old_baseline_state = self.get_baseline_state(policy)
 
@@ -154,8 +252,8 @@ class MonitorPolicyViewSet(viewsets.ModelViewSet):
             schedule = request.data.get("schedule")
             if schedule:
                 self.update_or_create_task(policy_id, schedule)
-            organizations = request.data.get("organizations", [])
-            if organizations:
+            organizations = request.data.get("organizations")
+            if "organizations" in request.data:
                 self.update_policy_organizations(policy_id, organizations)
             if self.should_update_policy_baselines(policy, old_baseline_state, updated_policy):
                 self.update_policy_baselines(
@@ -180,15 +278,60 @@ class MonitorPolicyViewSet(viewsets.ModelViewSet):
         return response
 
     def destroy(self, request, *args, **kwargs):
-        policy_id = kwargs["pk"]
-        policy = MonitorPolicy.objects.filter(id=policy_id).first()
-        if policy:
+        policy = self.get_object()
+        policy_id = policy.id
+        # Issue #4040: 5 步串行无事务包裹,任一失败留下半截数据(基线已清但 policy
+        # 还在 / 告警已 close 但 policy 还在 / PeriodicTask 已删但 policy 还在)。
+        # 用 transaction.atomic 包裹所有 DB 写,close_alerts 拆成纯 DB 写版本避免
+        # 在事务内同步触发 NATS(NATS 推送放到事务 commit 之后)。
+        with transaction.atomic():
             PolicyBaselineService(policy).clear()
             alerts_to_close = list(MonitorAlert.objects.filter(policy_id=policy_id, status="new"))
-            self.close_alerts(policy, alerts_to_close, request.user.username, "policy_deleted")
-        PeriodicTask.objects.filter(name=f"scan_policy_task_{policy_id}").delete()
-        PolicyOrganization.objects.filter(policy_id=policy_id).delete()
-        return super().destroy(request, *args, **kwargs)
+            # 纯 DB 写版本(原 close_alerts 会同步触发 NATS,这里事务内只做 DB 写)
+            self._close_alerts_in_tx(policy, alerts_to_close, request.user.username, "policy_deleted")
+            if alerts_to_close:
+                notifier = AlertLifecycleNotifier(policy)
+                notifier.enqueue_alert_center_deliveries(
+                    alerts_to_close,
+                    "closed",
+                    operator=request.user.username,
+                    reason="policy_deleted",
+                )
+                transaction.on_commit(
+                    lambda alerts=tuple(alerts_to_close): notifier.notify_alerts(
+                        alerts,
+                        action="closed",
+                        operator=request.user.username,
+                        reason="policy_deleted",
+                        notify_scope=NOTIFY_SCOPE_ALL_CONFIGURED,
+                    )
+                )
+            PeriodicTask.objects.filter(name=f"scan_policy_task_{policy_id}").delete()
+            PolicyOrganization.objects.filter(policy_id=policy_id).delete()
+            policy.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    def _close_alerts_in_tx(self, policy, alerts_to_close, operator, reason):
+        """事务内只做 DB 写,不再触发 NATS(NATS 由 destroy 的 on_commit 负责)。"""
+        if not alerts_to_close:
+            return
+        now = datetime.now(timezone.utc)
+        operation_log = {
+            "action": "closed",
+            "reason": reason,
+            "operator": operator,
+            "time": now.isoformat(),
+        }
+        for alert in alerts_to_close:
+            alert.status = "closed"
+            alert.end_event_time = now
+            alert.operator = operator
+            alert.operation_logs = (alert.operation_logs or []) + [operation_log]
+            alert.alert_center_notified = False
+        MonitorAlert.objects.bulk_update(
+            alerts_to_close,
+            fields=["status", "end_event_time", "operator", "operation_logs", "alert_center_notified"],
+        )
 
     def is_no_data_alert_enabled(self, policy):
         return bool(policy and AlertConstants.NO_DATA in (policy.enable_alerts or []))
@@ -312,12 +455,21 @@ class MonitorPolicyViewSet(viewsets.ModelViewSet):
             fields=["status", "end_event_time", "operator", "operation_logs", "alert_center_notified"],
         )
         if policy and notify_scope:
-            AlertLifecycleNotifier(policy).notify_alerts(
+            notifier = AlertLifecycleNotifier(policy)
+            notifier.enqueue_alert_center_deliveries(
                 alerts_to_close,
-                action="closed",
+                "closed",
                 operator=operator,
                 reason=reason,
-                notify_scope=notify_scope,
+            )
+            transaction.on_commit(
+                lambda alerts=tuple(alerts_to_close): notifier.notify_alerts(
+                    alerts,
+                    action="closed",
+                    operator=operator,
+                    reason=reason,
+                    notify_scope=notify_scope,
+                )
             )
 
     def close_active_no_data_alerts(self, policy, operator, reason):
@@ -401,7 +553,7 @@ class MonitorPolicyViewSet(viewsets.ModelViewSet):
     def update_policy_organizations(self, policy_id, organizations):
         """更新策略的组织"""
         old_organizations = PolicyOrganization.objects.filter(policy_id=policy_id)
-        old_set = set([org.organization for org in old_organizations])
+        old_set = {org.organization for org in old_organizations}
         new_set = set(organizations)
         # 删除不存在的组织
         delete_set = old_set - new_set
@@ -413,26 +565,111 @@ class MonitorPolicyViewSet(viewsets.ModelViewSet):
 
     @action(methods=["post"], detail=False, url_path="template")
     def template(self, request):
-        data = PolicyService.get_policy_templates(request.data["monitor_object_name"])
+        data = PolicyService.get_policy_templates(
+            request.data["monitor_object_name"],
+            organization=self._get_data_scope().current_team,
+            plugin_id=request.data.get("plugin_id"),
+        )
         return WebUtils.response_success(data)
 
     @action(methods=["get"], detail=False, url_path="template/monitor_object")
     def template_monitor_object(self, request):
-        data = PolicyService.get_policy_templates_monitor_object()
+        data = PolicyService.get_policy_templates_monitor_object(organization=self._get_data_scope().current_team)
         return WebUtils.response_success(data)
+
+    @action(methods=["post"], detail=False, url_path="template/save")
+    def save_template(self, request):
+        monitor_object_id = request.data.get("monitor_object")
+        plugin_id = request.data.get("plugin")
+        name = str(request.data.get("name") or "").strip()
+        config = request.data.get("config")
+        if not monitor_object_id or not plugin_id or not name or not isinstance(config, dict):
+            raise BaseAppException("monitor_object、plugin、name 和 config 不能为空")
+        organization = self._get_data_scope().current_team
+        self._ensure_target_organizations([organization])
+        self._ensure_template_operate_permission(monitor_object_id)
+        template = PolicyService.create_custom_template(
+            organization=organization,
+            monitor_object_id=monitor_object_id,
+            plugin_id=plugin_id,
+            name=name,
+            description=request.data.get("description") or "",
+            config=config,
+            user=request.user,
+        )
+        return WebUtils.response_success(PolicyService.serialize_template(template))
+
+    @action(methods=["post"], detail=False, url_path="template/import")
+    def import_templates(self, request):
+        upload = request.FILES.get("file")
+        if upload is None:
+            raise BaseAppException("请选择 ZIP 文件")
+        if not str(upload.name).lower().endswith(".zip"):
+            raise BaseAppException("只支持 ZIP 文件")
+        organization = self._get_data_scope().current_team
+        self._ensure_target_organizations([organization])
+        result = PolicyService.import_archive(
+            upload,
+            organization=organization,
+            user=request.user,
+            overwrite=str(request.data.get("overwrite", "false")).lower() == "true",
+            authorize_monitor_object=self._ensure_template_operate_permission,
+        )
+        return WebUtils.response_success(result)
+
+    @action(methods=["post"], detail=False, url_path="template/export")
+    def export_templates(self, request):
+        keys = request.data.get("keys") or []
+        if not keys:
+            raise BaseAppException("请选择要导出的模板")
+        archive = PolicyService.export_archive(keys, self._get_data_scope().current_team)
+        response = HttpResponse(archive.getvalue(), content_type="application/zip")
+        response["Content-Disposition"] = 'attachment; filename="monitor-policy-templates.zip"'
+        return response
+
+    @action(methods=["post"], detail=False, url_path="template/bulk_delete")
+    def bulk_delete_templates(self, request):
+        keys = request.data.get("keys") or []
+        if not keys:
+            raise BaseAppException("请选择要删除的模板")
+        organization = self._get_data_scope().current_team
+        self._ensure_target_organizations([organization])
+        templates = PolicyService.get_selected_templates(keys, organization)
+        if any(item.template_type == PolicyTemplate.TYPE_BUILTIN for item in templates):
+            raise BaseAppException("内置模版不可删除")
+        for monitor_object_id in {item.monitor_object_id for item in templates}:
+            self._ensure_template_operate_permission(monitor_object_id)
+        deleted_count, _ = PolicyTemplate.objects.filter(
+            id__in=[item.id for item in templates],
+            template_type=PolicyTemplate.TYPE_CUSTOM,
+            organization=organization,
+        ).delete()
+        return WebUtils.response_success({"deleted_count": deleted_count})
 
     @action(methods=["post"], detail=False, url_path="bulk_create_from_templates")
     def bulk_create_from_templates(self, request):
         monitor_object_id = request.data.get("monitor_object")
+        template_keys = request.data.get("template_keys") or []
         templates = request.data.get("templates") or []
         asset_ids = request.data.get("asset_ids") or []
         config = request.data.get("config") or {}
         if not monitor_object_id:
             raise BaseAppException("monitor_object 不能为空")
-        if not templates:
-            raise BaseAppException("templates 不能为空")
+        if not template_keys and not templates:
+            raise BaseAppException("template_keys 不能为空")
         if not asset_ids:
             raise BaseAppException("asset_ids 不能为空")
+
+        if template_keys:
+            organization = self._get_data_scope().current_team
+            selected = PolicyService.get_selected_templates(template_keys, organization)
+            if any(item.monitor_object_id != int(monitor_object_id) for item in selected):
+                raise BaseAppException("模板与监控对象不匹配")
+            templates = [PolicyService.serialize_template(item) for item in selected]
+
+        permission_error = self.get_bulk_policy_asset_permission_error(monitor_object_id, asset_ids)
+        if permission_error:
+            return WebUtils.response_401(permission_error)
 
         assets = self.get_bulk_policy_assets(monitor_object_id, asset_ids)
         enriched_templates = self.enrich_bulk_policy_templates(monitor_object_id, templates)
@@ -449,6 +686,7 @@ class MonitorPolicyViewSet(viewsets.ModelViewSet):
                 payload["updated_by"] = request.user.username
                 payload["domain"] = getattr(request.user, "domain", "domain.com")
                 payload["updated_by_domain"] = getattr(request.user, "domain", "domain.com")
+                self._ensure_target_organizations(payload.get("organizations", []))
                 serializer = self.get_serializer(data=payload)
                 serializer.is_valid(raise_exception=True)
                 policy = serializer.save()
@@ -464,6 +702,41 @@ class MonitorPolicyViewSet(viewsets.ModelViewSet):
                 "policy_ids": [policy.id for policy in created],
             }
         )
+
+    def get_bulk_policy_asset_permission_error(self, monitor_object_id, asset_ids):
+        from apps.monitor.models.monitor_object import MonitorInstance
+
+        normalized_ids = [str(asset_id) for asset_id in asset_ids if asset_id not in (None, "")]
+        request = getattr(self, "request", None)
+        if request is None or not normalized_ids:
+            return ""
+
+        actor_context = _build_actor_context(request)
+        authorized_ids = {
+            str(instance_id)
+            for instance_id in InstanceConfigService._get_authorized_monitor_instances(
+                actor_context,
+                monitor_object_id,
+                require_operate=False,
+            )
+            .filter(
+                id__in=normalized_ids,
+                monitor_object_id=monitor_object_id,
+                is_deleted=False,
+            )
+            .values_list("id", flat=True)
+        }
+        existing_ids = set(
+            MonitorInstance.objects.filter(
+                id__in=normalized_ids,
+                monitor_object_id=monitor_object_id,
+                is_deleted=False,
+            ).values_list("id", flat=True)
+        )
+        unauthorized_ids = sorted(existing_ids - authorized_ids)
+        if unauthorized_ids:
+            return f"无权限访问指定监控资产: {', '.join(unauthorized_ids)}"
+        return ""
 
     @action(methods=["post"], detail=False, url_path="preview")
     def preview(self, request):
@@ -488,10 +761,27 @@ class MonitorPolicyViewSet(viewsets.ModelViewSet):
         if missing_ids:
             raise BaseAppException(f"监控资产不存在: {', '.join(missing_ids)}")
 
+        request = getattr(self, "request", None)
+        if request is not None:
+            actor_context = _build_actor_context(request)
+            authorized_ids = {
+                str(instance_id)
+                for instance_id in InstanceConfigService._get_authorized_monitor_instances(
+                    actor_context,
+                    monitor_object_id,
+                    require_operate=False,
+                )
+                .filter(id__in=normalized_ids)
+                .values_list("id", flat=True)
+            }
+            unauthorized_ids = sorted(set(normalized_ids) - authorized_ids)
+            if unauthorized_ids:
+                raise UnauthorizedException(f"无权限访问指定监控资产: {', '.join(unauthorized_ids)}")
+
         org_map = {}
-        for instance_id, organization in MonitorInstanceOrganization.objects.filter(
-            monitor_instance_id__in=normalized_ids
-        ).values_list("monitor_instance_id", "organization"):
+        for instance_id, organization in MonitorInstanceOrganization.objects.filter(monitor_instance_id__in=normalized_ids).values_list(
+            "monitor_instance_id", "organization"
+        ):
             org_map.setdefault(instance_id, []).append(organization)
 
         return [
@@ -507,6 +797,18 @@ class MonitorPolicyViewSet(viewsets.ModelViewSet):
 
         enriched = []
         for template in templates:
+            if template.get("query_condition"):
+                enriched.append(
+                    {
+                        **template,
+                        "query_condition": PolicyService._runtime_query_condition(
+                            template["query_condition"],
+                            MonitorObject.objects.get(id=monitor_object_id),
+                        ),
+                        "collect_type": template.get("collect_type") or template.get("plugin_id"),
+                    }
+                )
+                continue
             metric_name = template.get("metric_name")
             if not metric_name:
                 raise BaseAppException("模板 metric_name 不能为空")

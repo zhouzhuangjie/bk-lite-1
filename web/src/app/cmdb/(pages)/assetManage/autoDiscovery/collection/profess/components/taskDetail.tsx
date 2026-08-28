@@ -80,7 +80,7 @@ const StatisticCard: React.FC<StatisticCardConfig> = ({
   return (
     <Card size="small" className={`${bgColor} ${borderColor}`}>
       <div className="text-gray-600 text-xs mb-0.5">{title}</div>
-      <div className={`text-2xl font-bold ${valueColor} mb-1`}>{value}</div>
+      <div className={`text-sm font-bold tabular-nums ${valueColor} mb-1`}>{value}</div>
       {showFailed && failedCount !== undefined && (
         <div className="text-xs font-medium text-red-600">
           {t('Collection.taskDetail.writeFailed')} {failedCount}{' '}
@@ -275,9 +275,12 @@ const TaskDetail: React.FC<TaskDetailProps> = ({ task, modelId }) => {
   const topologyDisplayConfig = useMemo(
     () =>
       isTopologyCapableTask
-        ? getTaskTopologyDisplayConfig(task.params)
+        ? getTaskTopologyDisplayConfig(
+          task.params,
+          Number(task.cycle_value)
+        )
         : undefined,
-    [isTopologyCapableTask, task.params]
+    [isTopologyCapableTask, task.cycle_value, task.params]
   );
 
   const hasTopologySummary = Boolean(topologyDisplayConfig?.hasNetworkTopo);
@@ -464,6 +467,8 @@ const TaskDetail: React.FC<TaskDetailProps> = ({ task, modelId }) => {
     }
 
     const configuredProtocols = topologyDisplayConfig?.topologyProtocols || [];
+    const topologyInterval = topologyDisplayConfig?.topologyIntervalMinutes;
+    const topologyIntervalMode = topologyDisplayConfig?.topologyIntervalMode;
     const fallbackStrategy = topologyDisplayConfig?.topologyFallbackStrategy;
     const minConfidence = topologyDisplayConfig?.minConfidence;
 
@@ -511,6 +516,26 @@ const TaskDetail: React.FC<TaskDetailProps> = ({ task, modelId }) => {
         styles={{ body: { display: topologyCollapsed ? 'none' : undefined } }}
       >
         <div className="grid grid-cols-1 md:grid-cols-2 border-t border-l border-[var(--color-border-1)] rounded overflow-hidden">
+          <OverviewCell
+            label={t('Collection.SNMPTask.topologyInterval')}
+            tooltip={
+              topologyInterval
+                ? `${topologyInterval} ${t('Collection.SNMPTask.minuteUnit')}`
+                : '--'
+            }
+          >
+            {topologyInterval ? (
+              <>
+                {topologyInterval} {t('Collection.SNMPTask.minuteUnit')} (
+                {t(
+                  `Collection.SNMPTask.topologyIntervalMode.${topologyIntervalMode}`
+                )}
+                )
+              </>
+            ) : (
+              '--'
+            )}
+          </OverviewCell>
           <OverviewCell
             label={t('Collection.taskDetail.topologyProtocols')}
             tooltip={protocolsText}

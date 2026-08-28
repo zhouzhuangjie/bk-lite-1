@@ -1,14 +1,11 @@
-import logging
-
-from django.conf import settings
-from django.contrib import auth
-from django.utils.deprecation import MiddlewareMixin
-
+import jwt
+from apps.core.logger import logger
 from apps.core.utils.custom_error import DoesNotExist
 from apps.core.utils.loader import LanguageLoader
 from apps.core.utils.web_utils import WebUtils
-
-logger = logging.getLogger(__name__)
+from django.conf import settings
+from django.contrib import auth
+from django.utils.deprecation import MiddlewareMixin
 
 
 class AuthMiddleware(MiddlewareMixin):
@@ -73,6 +70,27 @@ class AuthMiddleware(MiddlewareMixin):
             loader = self._get_loader(request)
             return WebUtils.response_401(loader.get("error.please_provide_token", "Please provide Token"))
 
+        # Render JWT：scope 白名单 + 实时创建者身份；不得走普通 verify_token / Session。
+        if self._is_render_token_candidate(token):
+            from apps.operation_analysis.services.render_scope_service import (
+                DashboardReportRenderScopeService,
+            )
+
+            render_claims = DashboardReportRenderScopeService.authorize_request(
+                request, token
+            )
+            user = DashboardReportRenderScopeService.resolve_request_user(
+                request, render_claims
+            )
+            if not user:
+                loader = self._get_loader(request)
+                return WebUtils.response_401(
+                    loader.get("error.please_provide_token", "Please provide Token")
+                )
+            request.user = user
+            request.dashboard_report_render_scope = render_claims
+            return None
+
         # 认证用户
         try:
             user = auth.authenticate(request=request, token=token)
@@ -81,7 +99,6 @@ class AuthMiddleware(MiddlewareMixin):
                 loader = self._get_loader(request)
                 return WebUtils.response_401(loader.get("error.please_provide_token", "Please provide Token"))
 
-            # 登录用户并确保session有效
             auth.login(request, user)
             if not request.session.session_key:
                 request.session.cycle_key()
@@ -112,3 +129,18 @@ class AuthMiddleware(MiddlewareMixin):
             return token_header[7:].strip()
 
         return token_header.strip()
+
+    @staticmethod
+    def _is_render_token_candidate(token: str) -> bool:
+        """只用于选择认证器；真实性仍由 Render Scope Service 完整校验。"""
+        try:
+            claims = jwt.decode(
+                token,
+                options={"verify_signature": False, "verify_exp": False},
+            )
+        except Exception:
+            return False
+        return (
+            claims.get("token_type") == "dashboard_report_render"
+            or "render_execution_id" in claims
+        )

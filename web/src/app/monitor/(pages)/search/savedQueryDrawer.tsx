@@ -6,13 +6,13 @@ import React, {
   useImperativeHandle,
   useEffect
 } from 'react';
-import { Button, Popconfirm, message, Input } from 'antd';
-import { SearchOutlined } from '@ant-design/icons';
+import { Button, Popconfirm, message } from 'antd';
 import { useTranslation } from '@/utils/i18n';
 import useApiClient from '@/utils/request';
 import { useLocalizedTime } from '@/hooks/useLocalizedTime';
 import useSearchApi from '@/app/monitor/api/search';
-import CustomDrawer from '@/app/monitor/components/operate-drawer';
+import CustomDrawer from '@/components/operate-drawer';
+import SearchActionBar from '@/components/search-action-bar';
 import {
   QueryGroup,
   QueryGroupData,
@@ -21,17 +21,18 @@ import {
   SavedQueryDrawerProps
 } from '@/app/monitor/types/search';
 import CustomTable from '@/components/custom-table';
+import { generateSearchId, normalizeMonitorEntityId } from './searchQueryLogic';
 
-const transformToFrontendFormat = (groups: QueryGroupData[]): QueryGroup[] => {
+export const transformToFrontendFormat = (groups: QueryGroupData[]): QueryGroup[] => {
   return groups.map((group) => ({
-    id: crypto.randomUUID(),
+    id: generateSearchId(),
     name: group.name,
-    object: group.object,
-    plugin: group.plugin ?? null,
+    object: normalizeMonitorEntityId(group.object) ?? '',
+    plugin: normalizeMonitorEntityId(group.plugin),
     instanceIds: group.instance_ids,
     metric:
       group.metric && /^\d+$/.test(String(group.metric))
-        ? Number(group.metric)
+        ? normalizeMonitorEntityId(group.metric)
         : null,
     legacyMetricName:
       group.legacy_metric_name ||
@@ -194,7 +195,7 @@ const SavedQueryDrawer = forwardRef<SavedQueryDrawerRef, SavedQueryDrawerProps>(
         title={t('monitor.search.loadSavedQuery')}
         open={visible}
         width={600}
-        destroyOnClose
+        destroyOnHidden
         footer={
           <div>
             <Button onClick={handleClose}>{t('common.cancel')}</Button>
@@ -202,14 +203,15 @@ const SavedQueryDrawer = forwardRef<SavedQueryDrawerRef, SavedQueryDrawerProps>(
         }
         onClose={handleClose}
       >
-        <Input.Search
-          className="mb-4 w-[300px]"
-          allowClear
-          enterButton={<SearchOutlined />}
-          placeholder={t('monitor.search.searchByName')}
-          value={searchText}
-          onChange={(e) => setSearchText(e.target.value)}
-          onSearch={handleSearch}
+        <SearchActionBar
+          searchClassName="!w-[300px]"
+          searchProps={{
+            allowClear: true,
+            placeholder: t('monitor.search.searchByName'),
+            value: searchText,
+            onChange: (e) => setSearchText(e.target.value),
+            onSearch: handleSearch,
+          }}
         />
         <CustomTable
           columns={columns}

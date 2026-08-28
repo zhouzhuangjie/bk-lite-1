@@ -173,7 +173,11 @@ class TestRequestTimingMiddleware:
 
         warn = mocker.patch.object(mod.logger, "warning")
         self.mw._log_request(_Req(path="/api/slow"), _Resp(200), elapsed_time_ms=99999)
-        warn.assert_called_once()
+        warn.assert_called_once_with(
+            "Slow %s (threshold: %sms)",
+            "Request: GET /api/slow - 200 - 99999.00ms",
+            self.mw.SLOW_REQUEST_THRESHOLD_MS,
+        )
 
     def test_log_request_500_error(self, mocker):
         from apps.core.middlewares import request_timing_middleware as mod
@@ -189,12 +193,12 @@ class TestRequestTimingMiddleware:
         self.mw._log_request(_Req(path="/api/bad"), _Resp(404), elapsed_time_ms=10)
         warn.assert_called_once()
 
-    def test_log_request_sidecar_debug(self, mocker):
+    def test_log_request_sidecar_success_is_suppressed(self, mocker):
         from apps.core.middlewares import request_timing_middleware as mod
 
-        debug = mocker.patch.object(mod.logger, "debug")
+        log = mocker.patch.object(mod.logger, "info")
         self.mw._log_request(_Req(path="/node_mgmt/open_api/node/x"), _Resp(200), elapsed_time_ms=10)
-        debug.assert_called_once()
+        log.assert_not_called()
 
     def test_log_request_normal_info(self, mocker):
         from apps.core.middlewares import request_timing_middleware as mod

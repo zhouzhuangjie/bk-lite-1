@@ -5,7 +5,7 @@ import CustomTable from '@/components/custom-table';
 import AlarmAction from './alarmAction';
 import AlertDetail from './alarmDetail';
 import LevelIcon from '@/app/alarm/components/levelIcon';
-import UserAvatar from '@/components/user-avatar';
+import OperatorWithOrgCell from '@/app/alarm/components/operator-with-org-cell';
 import type { ColumnsType } from 'antd/es/table';
 import { Tag, Button } from 'antd';
 import { AlarmTableProps } from '@/app/alarm/types/alarms';
@@ -14,8 +14,9 @@ import { AlarmTableDataItem } from '@/app/alarm/types/alarms';
 import { useTranslation } from '@/utils/i18n';
 import { useLocalizedTime } from '@/hooks/useLocalizedTime';
 import { ModalRef } from '@/app/alarm/types/types';
-import { useStateMap, useNotifiedStateMap } from '@/app/alarm/constants/alarm';
+import { useStateMap } from '@/app/alarm/constants/alarm';
 import { useCommon } from '@/app/alarm/context/common';
+import NotificationStatusTooltip from './notificationStatusTooltip';
 
 const AlarmTable: React.FC<AlarmTableProps> = ({
   dataSource,
@@ -33,7 +34,6 @@ const AlarmTable: React.FC<AlarmTableProps> = ({
   const { convertToLocalizedTime } = useLocalizedTime();
   const { levelList, levelMap } = useCommon();
   const STATE_MAP = useStateMap();
-  const NOTIFIED_STATE: any = useNotifiedStateMap();
   const detailRef = useRef<ModalRef>(null);
 
   const columns: ColumnsType<AlarmTableDataItem> = [
@@ -80,6 +80,12 @@ const AlarmTable: React.FC<AlarmTableProps> = ({
       width: 280,
     },
     {
+      title: t('alarms.alertContent'),
+      dataIndex: 'content',
+      key: 'content',
+      width: 250,
+    },
+    {
       title: t('alarms.incidentName'),
       dataIndex: 'incident_name',
       key: 'incident_name',
@@ -96,12 +102,6 @@ const AlarmTable: React.FC<AlarmTableProps> = ({
         </Button>
       ),
     },
-    // {
-    //   title: t('alarms.source'),
-    //   dataIndex: 'source_names',
-    //   key: 'source_names',
-    //   width: 130,
-    // },
     {
       title: t('alarms.state'),
       dataIndex: 'status',
@@ -121,28 +121,26 @@ const AlarmTable: React.FC<AlarmTableProps> = ({
       title: t('alarmCommon.operator'),
       dataIndex: 'operator_user',
       key: 'operator_user',
-      width: 200,
+      width: 240,
       shouldCellUpdate: (prev: AlarmTableDataItem, next: AlarmTableDataItem) =>
-        prev?.operator_user !== next?.operator_user,
-      render: (_: any, { operator_user }: AlarmTableDataItem) =>
-        operator_user ? <UserAvatar userName={operator_user} /> : '--',
+        prev?.operator_user !== next?.operator_user ||
+        JSON.stringify(prev?.team) !== JSON.stringify(next?.team),
+      render: (_: any, { operator_user, team }: AlarmTableDataItem) => (
+        <OperatorWithOrgCell operatorUser={operator_user} team={team} />
+      ),
     },
     {
       title: t('alarms.notificationStatus'),
       dataIndex: 'notify_status',
       key: 'notify_status',
       width: 150,
-      render: (_: any, { notify_status }: AlarmTableDataItem) => {
-        const COLOR_MAP: Record<string, string> = {
-          success: 'success',
-          failed: 'error',
-          partial_success: 'warning',
-        };
-        const key = notify_status ? notify_status : 'not_notified';
-        const color = COLOR_MAP[key] || 'default';
-        const text = NOTIFIED_STATE[key] || '--';
-        return <Tag color={color}>{text}</Tag>;
-      },
+      render: (_: any, { notify_status, notify_total, notify_records }: AlarmTableDataItem) => (
+        <NotificationStatusTooltip
+          status={notify_status}
+          total={notify_total}
+          records={notify_records}
+        />
+      ),
     },
     // {
     //   title: t('alarms.ruleId'),
@@ -150,12 +148,6 @@ const AlarmTable: React.FC<AlarmTableProps> = ({
     //   key: 'rule_id',
     //   width: 250,
     // },
-    {
-      title: t('alarms.alertContent'),
-      dataIndex: 'content',
-      key: 'content',
-      width: 250,
-    },
     {
       title: t('alarms.createTime'),
       dataIndex: 'created_at',

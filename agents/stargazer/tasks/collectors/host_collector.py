@@ -1,12 +1,14 @@
 # -- coding: utf-8 --
+import asyncio
 import json
-import time
 import logging
+import time
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Any, Dict, List
 from urllib.parse import unquote
 
 from .base_collector import BaseCollector
+from .disk_filter import should_collect_disk
 
 logger = logging.getLogger("stargazer.host_collector")
 
@@ -28,31 +30,34 @@ def _url_decode_secret(value: Any, credential_encoding: Any = "url") -> str:
         return str(value)
     return unquote(str(value))
 
+
 SCRIPTS_DIR = Path(__file__).parent / "scripts"
+MONITOR_SCRIPTS_DIR = Path(__file__).parent / "monitor_scripts"
 
 VALID_MODULES = {"cpu", "mem", "disk", "net", "diskio", "processes", "system"}
 HOST_REMOTE_CALLBACK_REQUEST_TIMEOUT = 60
 LINUX_SCRIPT_WRAPPER_EOF = "STARGAZER_HOST_COLLECT_EOF"
 
 
-def build_script(os_type: str, modules: List[str]) -> str:
+def build_script(os_type: str, modules: List[str], monitor_type: str | None = None) -> str:
     base_dir = SCRIPTS_DIR / ("linux" if os_type == "linux" else "windows")
+    monitor_base_dir = MONITOR_SCRIPTS_DIR / ("linux" if os_type == "linux" else "windows")
     ext = ".sh" if os_type == "linux" else ".ps1"
 
     parts = [_read_script(base_dir / f"header{ext}")]
     for mod in modules:
         script_file = base_dir / f"{mod}{ext}"
+        if monitor_type == "host" and mod == "disk":
+            monitor_script_file = monitor_base_dir / f"{mod}{ext}"
+            if monitor_script_file.exists():
+                script_file = monitor_script_file
         if script_file.exists():
             parts.append(_read_script(script_file))
     parts.append(_read_script(base_dir / f"footer{ext}"))
     body = "\n".join(parts)
 
     if os_type == "linux":
-        body = (
-            f"bash <<'{LINUX_SCRIPT_WRAPPER_EOF}'\n"
-            f"{body}\n"
-            f"{LINUX_SCRIPT_WRAPPER_EOF}\n"
-        )
+        body = f"bash <<'{LINUX_SCRIPT_WRAPPER_EOF}'\n" f"{body}\n" f"{LINUX_SCRIPT_WRAPPER_EOF}\n"
 
     return body
 
@@ -109,10 +114,7 @@ def _escape_prometheus_label_value(value: Any) -> str:
 
 
 def _format_prometheus_labels(**labels: Any) -> str:
-    return ",".join(
-        f'{key}="{_escape_prometheus_label_value(value)}"'
-        for key, value in labels.items()
-    )
+    return ",".join(f'{key}="{_escape_prometheus_label_value(value)}"' for key, value in labels.items())
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -137,7 +139,13 @@ def _append_gauge(lines: List[str], name: str, labels: str, value: Any, timestam
 
 
 def parse_metrics_to_prometheus(
-    data: Dict[str, Any], instance_id: str, os_type: str, timestamp: int | None = None
+    data: Dict[str, Any],
+    instance_id: str,
+    os_type: str,
+    timestamp: int | None = None,
+    *,
+    disk_include_fstypes: Any = None,
+    disk_exclude_fstypes: Any = None,
 ) -> str:
     lines = []
     timestamp = int(timestamp) if timestamp is not None else int(time.time() * 1000)
@@ -185,7 +193,15 @@ def parse_metrics_to_prometheus(
         if isinstance(disks, list):
             for disk in disks:
                 mount = disk.get("mount", "unknown")
-                disk_labels = f"{base_labels},{_format_prometheus_labels(mount=mount)}"
+                path = disk.get("path") or mount
+                fstype = disk.get("fstype") or ""
+                if not should_collect_disk(
+                    fstype,
+                    include_fstypes=disk_include_fstypes,
+                    exclude_fstypes=disk_exclude_fstypes,
+                ):
+                    continue
+                disk_labels = f"{base_labels},{_format_prometheus_labels(mount=mount, path=path, fstype=fstype)}"
                 total = disk.get("total_bytes", 0)
                 used = disk.get("used_bytes", 0)
                 free = _metric_value(disk, "free_bytes", "available_bytes", default=max(float(total or 0) - float(used or 0), 0))
@@ -196,7 +212,9 @@ def parse_metrics_to_prometheus(
                 _append_gauge(lines, "disk_total", disk_labels, total, timestamp, "Disk total bytes")
                 _append_gauge(lines, "disk_free", disk_labels, free, timestamp, "Disk free bytes")
                 _append_gauge(lines, "disk_used_percent", disk_labels, used_percent, timestamp, "Disk used percent")
-                _append_gauge(lines, "disk_inodes_used_percent", disk_labels, disk.get("inodes_used_percent", 0), timestamp, "Disk inode used percent")
+                _append_gauge(
+                    lines, "disk_inodes_used_percent", disk_labels, disk.get("inodes_used_percent", 0), timestamp, "Disk inode used percent"
+                )
 
     if "net" in data:
         nets = data["net"]
@@ -253,7 +271,6 @@ def parse_metrics_to_prometheus(
 
 
 class HostCollector(BaseCollector):
-
     def _resolve_modules(self) -> List[str]:
         raw_modules = self.params.get("metrics_modules", "cpu,mem,disk,net")
         if isinstance(raw_modules, (list, tuple)):
@@ -272,14 +289,14 @@ class HostCollector(BaseCollector):
         raw_port = self.params.get("port")
         port = int(raw_port) if raw_port not in (None, "") else (22 if os_type == "linux" else 5986)
         ansible_node_id = self.params["ansible_node_id"]
-        execute_timeout = int(self.params.get("execute_timeout", 60))
+        execute_timeout = 60  # 脚本执行上限硬编码；表单 timeout 由框架作单对象预算
 
         modules = self._resolve_modules()
         credential_encoding = self.params.get("credential_encoding") or self.params.get("credentials_encoding") or "url"
 
         logger.info(f"[Host Collector] host={host}, os={os_type}, modules={modules}")
 
-        script = build_script(os_type, modules)
+        script = build_script(os_type, modules, monitor_type=self.params.get("monitor_type"))
 
         connection = "ssh" if os_type == "linux" else "winrm"
         module = "raw" if os_type == "linux" else "win_shell"
@@ -330,9 +347,7 @@ class HostCollector(BaseCollector):
             )
         )
 
-    async def submit_collection(
-        self, task_id: str, callback_subject: str, callback_payload: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    async def submit_collection(self, task_id: str, callback_subject: str, callback_payload: Dict[str, Any]) -> Dict[str, Any]:
         callback = dict(callback_payload or {})
         callback.update(
             {
@@ -345,12 +360,10 @@ class HostCollector(BaseCollector):
             task_id=task_id,
         )
 
-    async def _execute_collection(
-        self, callback: Dict[str, Any] | None = None, task_id: str | None = None
-    ) -> Dict[str, Any]:
-        from core.ansible_rpc import ansible_adhoc
+    async def _execute_collection(self, callback: Dict[str, Any] | None = None, task_id: str | None = None) -> Dict[str, Any]:
+        from core.infra.ansible_rpc import ansible_adhoc
 
-        config = self._resolve_execution_config()
+        config = await asyncio.to_thread(self._resolve_execution_config)
         return await ansible_adhoc(
             ansible_node_id=config["ansible_node_id"],
             host_credentials=config["host_credentials"],
@@ -385,16 +398,10 @@ class HostCollector(BaseCollector):
                 try:
                     metrics_data = json.loads(extracted_payload)
                 except json.JSONDecodeError:
-                    logger.error(
-                        f"[Host Collector] JSON parse failed for {host}: {e}. "
-                        f"stdout preview: {stdout[:500]}"
-                    )
+                    logger.error(f"[Host Collector] JSON parse failed for {host}: {e}. " f"stdout preview: {stdout[:500]}")
                     raise RuntimeError(f"Failed to parse metrics JSON from {host}: {e}") from e
             else:
-                logger.error(
-                    f"[Host Collector] JSON parse failed for {host}: {e}. "
-                    f"stdout preview: {stdout[:500]}"
-                )
+                logger.error(f"[Host Collector] JSON parse failed for {host}: {e}. " f"stdout preview: {stdout[:500]}")
                 raise RuntimeError(f"Failed to parse metrics JSON from {host}: {e}") from e
 
         instance_id = self.params.get("tags", {}).get("instance_id", host)
@@ -404,6 +411,8 @@ class HostCollector(BaseCollector):
             instance_id,
             os_type,
             timestamp=callback_timestamp,
+            disk_include_fstypes=self.params.get("disk_include_fstypes"),
+            disk_exclude_fstypes=self.params.get("disk_exclude_fstypes"),
         )
 
         logger.info(f"[Host Collector] Completed: host={host}, metrics_size={len(prometheus_metrics)}")
@@ -411,7 +420,7 @@ class HostCollector(BaseCollector):
 
     async def collect(self) -> str:
         result = await self._execute_collection()
-        return self.process_adhoc_result(result)
+        return await asyncio.to_thread(self.process_adhoc_result, result)
 
     def _extract_stdout(self, result: Dict[str, Any]) -> str:
         task_result = result.get("result", {})
@@ -419,7 +428,6 @@ class HostCollector(BaseCollector):
             return task_result
         if isinstance(task_result, list):
             expected_host = self.params.get("host")
-            fallback_stdout = ""
             for host_data in task_result:
                 if not isinstance(host_data, dict):
                     continue
@@ -427,14 +435,12 @@ class HostCollector(BaseCollector):
                 host_key = host_data.get("host", "")
                 if stdout and host_key == expected_host:
                     return stdout
-                if stdout and not fallback_stdout:
-                    fallback_stdout = stdout
                 if not stdout:
                     logger.warning(
                         f"[Host Collector] No stdout for host_key={host_key}, "
                         f"status={host_data.get('status')}, stderr={host_data.get('stderr', '')[:200]}"
                     )
-            return fallback_stdout
+            raise RuntimeError(f"Host collection result missing expected host {expected_host}")
         if isinstance(task_result, dict):
             hosts_result = task_result.get("contacted", task_result)
             for host_key, host_data in hosts_result.items():

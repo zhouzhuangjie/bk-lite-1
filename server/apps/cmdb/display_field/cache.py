@@ -5,19 +5,20 @@
 职责：
 1. 项目启动时读取所有模型的 organization/user/enum 类型字段
 2. 缓存到 Redis，TTL 为 1 小时
-3. 模型字段变更时动态更新缓存
+3. 模型字段变更时失效该模型 attrs 缓存，下次按 model_id 回源查询
 4. 为全文检索提供需要排除的字段列表
 
 缓存策略：
 - 缓存key: cmdb:exclude_fields:all
 - TTL: 3600秒（1小时）
 - 数据格式: ["organization", "created_by", "status", ...]
-- 更新时机: 启动时初始化 + 模型字段变更时
+- 预热时机: 启动时若全局缓存缺失则加载一次
+- 模型字段变更: 只失效该 model 的 attrs 缓存，下次 get_model_attrs 按 model_id 回源查询；不拉全量模型预热
 
 设计原则：
-- 单次查询：所有缓存数据来自同一次模型查询，避免重复DB访问
-- 统一管理：初始化/更新/清空/刷新使用统一的内部逻辑
-- 按需构建：根据 cache_key 选择对应的数据构建策略
+- 单次查询：启动预热时所有缓存数据来自同一次模型查询，避免重复DB访问
+- 统一管理：初始化/清空/手动刷新使用统一的内部逻辑
+- 按需构建：根据 cache_key 选择对应的数据构建策略；单模型失效后按需回源
 """
 
 from typing import Any, Dict, List, Set
@@ -27,6 +28,7 @@ from django.core.cache import cache
 from apps.cmdb.constants.constants import MODEL
 from apps.cmdb.display_field.constants import (
     CACHE_KEY_EXCLUDE_FIELDS,
+    CACHE_KEY_MODEL_ATTRS_INDEX,
     CACHE_KEY_MODEL_ATTRS_PREFIX,
     CACHE_KEY_MODEL_FIELDS_MAPPING,
     CACHE_TTL_SECONDS,
@@ -41,7 +43,7 @@ class ExcludeFieldsCache:
     """
     排除字段缓存管理器
     管理全文检索时需要排除的原始字段列表（organization/user/enum类型）
-    使用 Redis 缓存，定期刷新，支持统一的缓存管理逻辑
+    使用 Redis 缓存；启动可预热，模型变更只失效对应 attrs，读取未命中时回源查询
 
     常量说明:
     - EXCLUDE_FIELDS_KEY: 缓存 key（从 constants 导入）
@@ -55,6 +57,9 @@ class ExcludeFieldsCache:
     EXCLUDE_FIELDS_KEY = CACHE_KEY_EXCLUDE_FIELDS
     MODEL_FIELDS_MAPPING_KEY = CACHE_KEY_MODEL_FIELDS_MAPPING
     MODEL_ATTRS_KEY_PREFIX = CACHE_KEY_MODEL_ATTRS_PREFIX
+    MODEL_ATTRS_INDEX_KEY = CACHE_KEY_MODEL_ATTRS_INDEX
+    STARTUP_INIT_LOCK_KEY = "cmdb:exclude_fields:startup_init_lock"
+    STARTUP_INIT_LOCK_TTL = 60
     CACHE_TTL = CACHE_TTL_SECONDS
 
     # 需要排除的字段类型（使用统一的常量）
@@ -100,6 +105,37 @@ class ExcludeFieldsCache:
 
         except Exception as e:
             logger.error(f"[ExcludeFieldsCache] 缓存初始化异常: {e}", exc_info=True)
+            return False
+
+    @classmethod
+    def initialize_on_startup(cls) -> bool:
+        """
+        项目启动时预热缓存。
+
+        启动路径以“可用即跳过”为主，避免每次进程启动都清缓存、查图库。
+        手动刷新仍使用 initialize_all/refresh_cache 的强制刷新语义；
+        模型字段变更只失效对应 model 的 attrs，不在变更路径全量预热。
+        """
+        try:
+            if cls._global_caches_ready():
+                logger.info("[ExcludeFieldsCache] 启动缓存已存在，跳过初始化")
+                return True
+
+            if not cache.add(cls.STARTUP_INIT_LOCK_KEY, "1", timeout=cls.STARTUP_INIT_LOCK_TTL):
+                logger.info("[ExcludeFieldsCache] 其他进程正在初始化启动缓存，当前进程跳过")
+                return True
+
+            try:
+                if cls._global_caches_ready():
+                    logger.info("[ExcludeFieldsCache] 启动缓存已由其他进程初始化，跳过刷新")
+                    return True
+
+                return cls.initialize_all()
+            finally:
+                cache.delete(cls.STARTUP_INIT_LOCK_KEY)
+
+        except Exception as e:
+            logger.error(f"[ExcludeFieldsCache] 启动缓存预热异常: {e}", exc_info=True)
             return False
 
     @classmethod
@@ -166,6 +202,10 @@ class ExcludeFieldsCache:
             attrs = ModelManage.search_model_attr(model_id)
 
             cache.set(cache_key, attrs, timeout=cls.CACHE_TTL)
+            # P2-2.6: 写入时同步登记到索引,供 clear_cache 精准删
+            index = cls._get_model_attrs_index()
+            index.add(model_id)
+            cls._set_model_attrs_index(index)
             return attrs
 
         except Exception as e:
@@ -175,7 +215,10 @@ class ExcludeFieldsCache:
     @classmethod
     def update_on_model_change(cls, model_id: str) -> bool:
         """
-        模型字段变更时更新所有缓存
+        模型字段变更时失效该模型的 attrs 缓存。
+
+        模型变更低频，不在这里拉全量模型预热。下次 get_model_attrs(model_id)
+        缓存未命中时按该模型回源查询。
 
         使用场景：
         - 模型新增字段
@@ -186,24 +229,17 @@ class ExcludeFieldsCache:
             model_id: 发生变更的模型ID
 
         Returns:
-            更新是否成功
+            失效是否成功
         """
-        logger.info(f"[ExcludeFieldsCache] 模型变更触发缓存更新, 模型: {model_id}")
+        logger.info(f"[ExcludeFieldsCache] 模型变更失效 attrs 缓存, 模型: {model_id}")
 
         try:
-            # 全量刷新所有缓存（确保完整性）
-            success = cls._refresh_all_caches()
-
-            if success:
-                logger.info(f"[ExcludeFieldsCache] 缓存更新成功, 模型: {model_id}")
-            else:
-                logger.error(f"[ExcludeFieldsCache] 缓存更新失败, 模型: {model_id}")
-
-            return success
-
+            cls._purge_model_attrs_cache(model_id)
+            logger.info(f"[ExcludeFieldsCache] 已失效模型 attrs 缓存, 模型: {model_id}")
+            return True
         except Exception as e:
             logger.error(
-                f"[ExcludeFieldsCache] 缓存更新异常, 模型: {model_id}, 错误: {e}",
+                f"[ExcludeFieldsCache] 失效模型 attrs 缓存异常, 模型: {model_id}, 错误: {e}",
                 exc_info=True,
             )
             return False
@@ -313,6 +349,11 @@ class ExcludeFieldsCache:
             return default_value
 
     @classmethod
+    def _global_caches_ready(cls) -> bool:
+        """判断全局缓存是否已可用。"""
+        return cache.get(cls.EXCLUDE_FIELDS_KEY) is not None and cache.get(cls.MODEL_FIELDS_MAPPING_KEY) is not None
+
+    @classmethod
     def _refresh_all_caches(cls) -> bool:
         """
         刷新所有缓存（核心逻辑：单次查询，构建所有缓存）
@@ -361,19 +402,56 @@ class ExcludeFieldsCache:
             cache.delete(cls.EXCLUDE_FIELDS_KEY)
             cache.delete(cls.MODEL_FIELDS_MAPPING_KEY)
 
-            # 清除所有模型属性缓存
-            pattern = f"{cls.MODEL_ATTRS_KEY_PREFIX}*"
-            if hasattr(cache, "delete_pattern"):
-                cache.delete_pattern(pattern)
-                logger.info(f"[ExcludeFieldsCache] 已按模式清除模型属性缓存: {pattern}")
-            else:
-                logger.warning("[ExcludeFieldsCache] 当前缓存后端不支持按模式删除模型属性缓存，" "将依赖 TTL 自动过期")
+            # P2-2.6: 本仓 cache 后端(locmem / Django 内置 RedisCache)不支持 delete_pattern,
+            # 原兜底只 log warning,导致已删除模型的 attrs 缓存会留 1h TTL。
+            # 改用索引集合记录已缓存的 model_ids,精准迭代删。
+            cls._purge_all_model_attrs_cache()
 
             logger.info("[ExcludeFieldsCache] 所有缓存已清除")
             return True
         except Exception as e:
             logger.error(f"[ExcludeFieldsCache] 清除缓存失败: {e}")
             return False
+
+    @classmethod
+    def _get_model_attrs_index(cls) -> set:
+        """读取已缓存 model_id 索引集合(失败时退化空集)。"""
+        try:
+            raw = cache.get(cls.MODEL_ATTRS_INDEX_KEY)
+            if isinstance(raw, (set, list, tuple)):
+                return set(raw)
+            return set()
+        except Exception as e:
+            logger.warning(f"[ExcludeFieldsCache] 读取 model attrs 索引失败: {e}")
+            return set()
+
+    @classmethod
+    def _set_model_attrs_index(cls, index: set) -> None:
+        """写入已缓存 model_id 索引集合。"""
+        try:
+            cache.set(cls.MODEL_ATTRS_INDEX_KEY, list(index), timeout=cls.CACHE_TTL)
+        except Exception as e:
+            logger.warning(f"[ExcludeFieldsCache] 写入 model attrs 索引失败: {e}")
+
+    @classmethod
+    def _purge_all_model_attrs_cache(cls) -> int:
+        """按索引集合精准删除所有 model attrs 缓存键,返回清理数量。"""
+        index = cls._get_model_attrs_index()
+        for model_id in list(index):
+            cache.delete(f"{cls.MODEL_ATTRS_KEY_PREFIX}{model_id}")
+        cache.delete(cls.MODEL_ATTRS_INDEX_KEY)
+        logger.info(f"[ExcludeFieldsCache] 已精准清除模型属性缓存,数量={len(index)}")
+        return len(index)
+
+    @classmethod
+    def _purge_model_attrs_cache(cls, model_id: str) -> None:
+        """精准删除单个 model 的 attrs 缓存,并从索引中移除。"""
+        if not model_id:
+            return
+        cache.delete(f"{cls.MODEL_ATTRS_KEY_PREFIX}{model_id}")
+        index = cls._get_model_attrs_index()
+        index.discard(model_id)
+        cls._set_model_attrs_index(index)
 
     # ========== 数据加载与构建逻辑 ==========
 
@@ -414,8 +492,8 @@ class ExcludeFieldsCache:
 
             try:
                 # 延迟导入避免循环依赖
-                from apps.cmdb.services.model import ModelManage
                 from apps.cmdb.model_ops.extensions import is_file_attr_type
+                from apps.cmdb.services.model import ModelManage
 
                 attrs = ModelManage.parse_attrs(attrs_json)
 
@@ -426,11 +504,7 @@ class ExcludeFieldsCache:
                     # 展示型字段（有 _display 冗余）+ 文件型字段（附件/图片，值为元数据 JSON）
                     # + 敏感型字段（pwd，密文）都排除出全文检索；
                     # 缺企业版时 is_file_attr_type 恒 False，社区行为不变。
-                    if (
-                        attr_type in cls.EXCLUDE_FIELD_TYPES
-                        or attr_type in SENSITIVE_FIELD_TYPES
-                        or is_file_attr_type(attr_type)
-                    ):
+                    if attr_type in cls.EXCLUDE_FIELD_TYPES or attr_type in SENSITIVE_FIELD_TYPES or is_file_attr_type(attr_type):
                         all_exclude_fields.add(attr_id)
 
             except Exception as e:
@@ -507,6 +581,10 @@ class ExcludeFieldsCache:
         """
         cached_count = 0
 
+        # P2-2.6: 维护已缓存 model_id 索引,供后续 _purge_* 精准删使用
+        old_index = cls._get_model_attrs_index()
+        new_index: set = set()
+
         for model in models:
             model_id = model.get("model_id")
             attrs_json = model.get("attrs", "[]")
@@ -518,12 +596,21 @@ class ExcludeFieldsCache:
 
                 cache_key = f"{cls.MODEL_ATTRS_KEY_PREFIX}{model_id}"
                 cache.set(cache_key, attrs, timeout=cls.CACHE_TTL)
+                if model_id:
+                    new_index.add(model_id)
                 cached_count += 1
 
             except Exception as e:
                 logger.warning(f"[ExcludeFieldsCache] 缓存模型 {model_id} attrs 失败: {e}")
                 continue
 
+        # P2-2.6: 删掉已下线模型的 attrs 缓存键(在旧索引但不在新索引)。
+        # 本仓 cache 后端不支持 delete_pattern,只能靠索引精准删。
+        for orphan_id in old_index - new_index:
+            cache.delete(f"{cls.MODEL_ATTRS_KEY_PREFIX}{orphan_id}")
+            logger.info(f"[ExcludeFieldsCache] 已删孤儿缓存: 模型 {orphan_id} 已下线")
+
+        cls._set_model_attrs_index(new_index)
         logger.debug(f"[ExcludeFieldsCache] 构建并缓存模型 attrs 完成, " f"成功缓存模型数: {cached_count}/{len(models)}")
         return cached_count
 
@@ -577,7 +664,7 @@ def init_all_caches_on_startup() -> bool:
     logger.info("[CacheManager] 项目启动，开始初始化所有缓存...")
 
     try:
-        success = ExcludeFieldsCache.initialize_all()
+        success = ExcludeFieldsCache.initialize_on_startup()
 
         if success:
             logger.info("[CacheManager] 项目启动缓存初始化成功")

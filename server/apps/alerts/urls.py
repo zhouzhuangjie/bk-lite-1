@@ -2,34 +2,30 @@
 # @File: urls.py
 # @Time: 2025/5/9 14:57
 # @Author: windyzhao
-from django.urls import path
+from django.urls import include, path
 from rest_framework import routers
 
+from apps.alerts.extensions.routes import alert_extension_routes
+from apps.alerts.open_api import views as open_api_views
 from apps.alerts.views import (
-    AlertSourceModelViewSet,
+    AlarmStrategyModelViewSet,
+    AlertAssignmentModelViewSet,
     AlertModelViewSet,
+    AlertShieldModelViewSet,
+    AlertSourceModelViewSet,
+    EnrichmentRuleModelViewSet,
     EventModelViewSet,
-    K8sOpenAPIViewSet,
-    LevelModelViewSet,
     IncidentModelViewSet,
     IncidentUpdateViewSet,
-    SystemSettingModelViewSet,
+    K8sOpenAPIViewSet,
+    LevelModelViewSet,
     SystemLogModelViewSet,
-    AlertAssignmentModelViewSet,
-    AlertShieldModelViewSet,
-    AlarmStrategyModelViewSet,
-    EnrichmentRuleModelViewSet,
+    SystemSettingModelViewSet,
     receiver_data,
     receiver_source_data,
     request_test,
 )
-from apps.alerts.views.action import (
-    ActionCallbackView,
-    ActionExecutionViewSet,
-    ActionJobScriptDetailView,
-    ActionJobScriptListView,
-    ActionRuleViewSet,
-)
+from apps.alerts.views.action import ActionCallbackView, ActionExecutionViewSet, ActionJobScriptDetailView, ActionJobScriptListView, ActionRuleViewSet
 
 router = routers.DefaultRouter()
 router.register(r"api/alert_source", AlertSourceModelViewSet, basename="alert_source")
@@ -42,19 +38,24 @@ router.register(r"api/shield", AlertShieldModelViewSet, basename="shield")
 router.register(r"api/enrichment", EnrichmentRuleModelViewSet, basename="enrichment")
 router.register(r"api/incident", IncidentModelViewSet, basename="incident")
 router.register(
-    r"api/incident/(?P<incident_pk>\d+)/updates",
-    IncidentUpdateViewSet,
-    basename="incident-updates",
+    r"api/incident/(?P<incident_pk>\d+)/updates", IncidentUpdateViewSet, basename="incident-updates",
 )
-router.register(
-    r"api/alarm_strategy", AlarmStrategyModelViewSet, basename="alarm_strategy"
-)
+router.register(r"api/alarm_strategy", AlarmStrategyModelViewSet, basename="alarm_strategy")
 router.register(r"api/log", SystemLogModelViewSet, basename="log")
 router.register(r"open_api/k8s", K8sOpenAPIViewSet, basename="alerts_k8s_open_api")
 router.register(r"api/action_rule", ActionRuleViewSet, basename="action_rule")
 router.register(r"api/action_execution", ActionExecutionViewSet, basename="action_execution")
 
+open_api_patterns = [
+    path("api/open/alerts/actions/<str:action>", open_api_views.OpenAlertBatchActionView.as_view()),
+    path("api/open/alerts/<str:alert_id>/events", open_api_views.OpenAlertEventsView.as_view()),
+    path("api/open/alerts/<str:alert_id>/<str:action>", open_api_views.OpenAlertActionView.as_view()),
+    path("api/open/alerts/<str:alert_id>", open_api_views.OpenAlertDetailView.as_view()),
+    path("api/open/alerts", open_api_views.OpenAlertListView.as_view()),
+]
+
 urlpatterns = [
+    path("", include(alert_extension_routes.urlpatterns)),
     path("api/test/", request_test),
     path("api/receiver_data/", receiver_data),
     path("api/source/<str:source_id>/webhook/", receiver_source_data),
@@ -63,4 +64,4 @@ urlpatterns = [
     path("api/action_job/scripts/<int:script_id>/", ActionJobScriptDetailView.as_view()),
 ]
 
-urlpatterns += router.urls
+urlpatterns += open_api_patterns + router.urls

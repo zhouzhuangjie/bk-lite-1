@@ -9,9 +9,9 @@
 
 不触 DB：通过 task= 注入 fake task，绕过 CollectModels.objects.get。
 """
-import pydantic.root_model  # noqa: F401
-
 from types import SimpleNamespace
+
+import pydantic.root_model  # noqa: F401
 
 from apps.cmdb.collection.collect_tasks.base import BaseCollect
 from apps.cmdb.constants.constants import DataCleanupStrategy
@@ -53,6 +53,22 @@ def test_format_params_ip_range_falls_back_to_params_org():
     assert c.filter_collect_task is True  # not is_host
 
 
+def test_format_params_dict_instances_falls_back_to_task_mode():
+    t = _task(
+        instances={"subnet_ids": [101], "scan_method": "icmp"},
+        team=None,
+        params={"organization": 9},
+        model_id="ip",
+        is_host=False,
+    )
+    c = BaseCollect(instance_id=None, task=t)
+    assert c.model_id == "ip"
+    assert c.inst_name is None
+    assert c.inst_id is None
+    assert c.organization == [9]
+    assert c.filter_collect_task is True
+
+
 def test_format_params_instance_mode():
     t = _task(
         instances=[{"_id": "h1", "model_id": "host", "inst_name": "10.0.0.1", "organization": 3}],
@@ -72,6 +88,17 @@ def test_format_params_instance_mode_org_from_team_when_missing():
     )
     c = BaseCollect(instance_id=None, task=t)
     assert c.organization == [5]
+
+
+def test_format_params_instance_mode_missing_graph_id():
+    t = _task(
+        instances=[{"model_id": "host", "inst_name": "10.0.0.1", "inst_uuid": "123e4567-e89b-42d3-a456-426614174000"}],
+        is_host=True,
+    )
+    c = BaseCollect(instance_id=None, task=t)
+    assert c.model_id == "host"
+    assert c.inst_name == "10.0.0.1"
+    assert c.inst_id is None
 
 
 # --------------------------------------------------------------------------
@@ -113,6 +140,7 @@ def test_task_id_returns_task_id():
 
 def test_run_raises_when_no_plugin():
     import pytest
+
     t = _task(instances=[{"_id": "h", "model_id": "host", "inst_name": "x"}])
     c = BaseCollect(instance_id=None, task=t)
     with pytest.raises(NotImplementedError):
@@ -152,6 +180,35 @@ def test_run_drives_metrics_cannula(monkeypatch):
     assert captured["inst"].kwargs["plugin_kwargs"] == {}
 
 
+def test_run_merges_custom_task_format_data(monkeypatch):
+    t = _task(instances=[{"_id": "h", "model_id": "ip", "inst_name": "10.0.0.1"}], model_id="ip", input_method=1)
+    c = BaseCollect(instance_id=None, task=t)
+    c.COLLECT_PLUGIN = object()
+
+    class FakeCannula:
+        def __init__(self, **kw):
+            self.kwargs = kw
+            self.collect_data = {
+                "__task_format_data__": {
+                    "add": [{"_status": "success", "ip_addr": "10.0.0.2"}],
+                    "update": [],
+                    "delete": [],
+                    "association": [{"_status": "success", "model_asst_id": "subnet_group_ip"}],
+                    "all": 1,
+                }
+            }
+
+        def collect_controller(self):
+            return {"__raw_data__": [], "all": 0, "ip": {"add": {"success": []}}}
+
+    monkeypatch.setattr("apps.cmdb.collection.collect_tasks.base.MetricsCannula", lambda **kw: FakeCannula(**kw))
+    _, format_data = c.run()
+
+    assert format_data["add"][0]["ip_addr"] == "10.0.0.2"
+    assert format_data["association"][0]["model_asst_id"] == "subnet_group_ip"
+    assert format_data["all"] == 1
+
+
 # --------------------------------------------------------------------------
 # format_collect_data
 # --------------------------------------------------------------------------
@@ -171,7 +228,7 @@ def test_format_collect_data_success_and_failed_buckets(monkeypatch):
                 "success": [{"inst_info": {"_id": 1, "inst_name": "ok"}, "assos_result": {}}],
                 "failed": [{"instance_info": {"inst_name": "bad"}, "error": "boom"}],
             },
-        }
+        },
     }
     out = c.format_collect_data(result)
     assert len(out["add"]) == 2

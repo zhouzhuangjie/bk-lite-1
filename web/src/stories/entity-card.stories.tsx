@@ -1,4 +1,4 @@
-import type { Meta, StoryObj } from '@storybook/react';
+import type { Meta, StoryObj } from '@storybook/nextjs';
 import EntityCard from '@/app/opspilot/components/entity-card';
 
 const meta: Meta<typeof EntityCard> = {
@@ -46,7 +46,6 @@ export const Online: Story = {
 export const WithSkillType: Story = {
   args: {
     ...baseArgs,
-    skillType: 'Q&A',
     skill_type: 1,
   },
 };

@@ -1,6 +1,6 @@
 """告警升级服务覆盖测试。
 
-对照 spec/requirements/告警中心/20260531.告警中心-新增告警升级策略.md
+对照 specs/capabilities/legacy-requirements-告警中心-20260531-告警中心-新增告警升级策略.md
 """
 import pytest
 from datetime import timedelta
@@ -187,6 +187,7 @@ def _due_task(alert, assignment, index=0, minutes_ago=15):
     task = ES.create_escalation_task(alert, assignment)
     task.current_layer_index = index
     task.layer_started_at = timezone.now() - timedelta(minutes=minutes_ago)
+    task.next_escalation_at = ES._next_escalation_at(task.layers, index, task.layer_started_at)
     task.save()
     return task
 
@@ -216,6 +217,59 @@ def test_scan_not_due_does_nothing(mock_send):
     ES.check_and_process_escalations()
     assert AlertEscalationTask.objects.get(alert=alert).current_layer_index == 0
     mock_send.assert_not_called()
+
+
+@pytest.mark.django_db
+@mock.patch("apps.alerts.service.escalation_service.EscalationService._send_escalation_notification")
+def test_scan_filters_future_tasks_before_opening_per_task_transactions(mock_send):
+    assignment = _make_assignment(escalation=_chain())
+    for index in range(10):
+        alert = _make_alert(alert_id=f"future-{index}", status="pending")
+        _due_task(alert, assignment, index=0, minutes_ago=0)
+
+    result = ES.check_and_process_escalations()
+
+    assert result == {"processed": 0, "escalated": 0}
+    mock_send.assert_not_called()
+
+
+@pytest.mark.django_db
+@mock.patch("apps.alerts.service.escalation_service.EscalationService._send_escalation_notification")
+def test_scan_backfills_legacy_future_deadline_without_escalating(mock_send):
+    alert = _make_alert(status="pending")
+    assignment = _make_assignment(escalation=_chain())
+    task = _due_task(alert, assignment, index=0, minutes_ago=0)
+    expected_deadline = task.next_escalation_at
+    AlertEscalationTask.objects.filter(pk=task.pk).update(next_escalation_at=None)
+
+    result = ES.check_and_process_escalations()
+
+    task.refresh_from_db()
+    assert result == {"processed": 1, "escalated": 0}
+    assert task.next_escalation_at == expected_deadline
+    assert task.current_layer_index == 0
+    mock_send.assert_not_called()
+
+
+@pytest.mark.django_db
+@mock.patch("apps.alerts.service.escalation_service.EscalationService._send_escalation_notification")
+def test_scan_processes_at_most_one_configured_batch(mock_send, monkeypatch):
+    monkeypatch.setattr(ES, "SCAN_BATCH_SIZE", 2)
+    assignment = _make_assignment(escalation=_chain())
+    tasks = []
+    for index in range(3):
+        alert = _make_alert(alert_id=f"due-{index}", status="pending")
+        tasks.append(_due_task(alert, assignment, index=0, minutes_ago=15))
+
+    result = ES.check_and_process_escalations()
+
+    assert result == {"processed": 2, "escalated": 2}
+    assert list(
+        AlertEscalationTask.objects.filter(pk__in=[task.pk for task in tasks])
+        .order_by("alert_id")
+        .values_list("current_layer_index", flat=True)
+    ) == [1, 1, 0]
+    assert mock_send.call_count == 2
 
 
 @pytest.mark.django_db
@@ -262,10 +316,36 @@ def test_advance_resets_reminder_counter(mock_send):
     assert reminder.is_active is True
 
 
+@pytest.mark.django_db(transaction=True)
+@mock.patch("apps.alerts.common.notify.base.NotifyParamsFormat.format_content", return_value="c")
+@mock.patch("apps.alerts.common.notify.base.NotifyParamsFormat.format_title", return_value="t")
+def test_escalation_broker_failure_keeps_layer_notification_outbox(_title, _content, monkeypatch):
+    from apps.alerts.models import AlertOutbox
+
+    alert = _make_alert(status="pending")
+    assignment = _make_assignment(
+        escalation=_chain(),
+        channels=[{"id": 7, "channel_type": "email", "name": "邮件"}],
+    )
+    task = _due_task(alert, assignment, index=0, minutes_ago=15)
+    monkeypatch.setattr(
+        "apps.alerts.tasks.deliver_alert_outbox.delay",
+        lambda _pk: (_ for _ in ()).throw(RuntimeError("broker down")),
+    )
+
+    assert ES._advance_layer(task) is True
+
+    task.refresh_from_db()
+    assert task.current_layer_index == 1
+    record = AlertOutbox.objects.get()
+    assert record.status == AlertOutbox.Status.PENDING
+    assert record.idempotency_key == f"escalation:{alert.alert_id}:1"
+
+
 @pytest.mark.django_db
 @mock.patch("apps.alerts.common.notify.base.NotifyParamsFormat.format_content", return_value="c")
 @mock.patch("apps.alerts.common.notify.base.NotifyParamsFormat.format_title", return_value="t")
-@mock.patch("apps.alerts.tasks.sync_notify.delay")
+@mock.patch("apps.alerts.tasks.deliver_alert_outbox.delay")
 def test_send_escalation_notification_enqueues_roster_and_channels(
     mock_delay, _mt, _mc, django_capture_on_commit_callbacks
 ):
@@ -281,8 +361,9 @@ def test_send_escalation_notification_enqueues_roster_and_channels(
             alert, assignment, roster=["u2", "u3"], layer_channels=[]
         )
     assert sent is True
+    from apps.alerts.models import AlertOutbox
     mock_delay.assert_called_once()
-    params = mock_delay.call_args[0][0]
+    params = AlertOutbox.objects.get().payload["params"]
     assert params[0]["username_list"] == ["u2", "u3"]
     # 本层未配渠道 -> 沿用 assignment.notify_channels
     assert params[0]["channel_id"] == 7
@@ -293,7 +374,7 @@ def test_send_escalation_notification_enqueues_roster_and_channels(
 @pytest.mark.django_db
 @mock.patch("apps.alerts.common.notify.base.NotifyParamsFormat.format_content", return_value="c")
 @mock.patch("apps.alerts.common.notify.base.NotifyParamsFormat.format_title", return_value="t")
-@mock.patch("apps.alerts.tasks.sync_notify.delay")
+@mock.patch("apps.alerts.tasks.deliver_alert_outbox.delay")
 def test_send_escalation_notification_uses_layer_channels_when_set(
     mock_delay, _mt, _mc, django_capture_on_commit_callbacks
 ):
@@ -305,7 +386,8 @@ def test_send_escalation_notification_uses_layer_channels_when_set(
             layer_channels=[{"id": 9, "channel_type": "sms", "name": "短信"}],
         )
     assert sent is True
-    params = mock_delay.call_args[0][0]
+    from apps.alerts.models import AlertOutbox
+    params = AlertOutbox.objects.get().payload["params"]
     assert params[0]["channel_id"] == 9
     assert params[0]["channel_type"] == "sms"
 
@@ -330,7 +412,7 @@ def test_active_roster_for_reminder_none_when_no_task():
 
 
 @pytest.mark.django_db(transaction=True)
-@mock.patch("apps.alerts.tasks.sync_notify.delay")
+@mock.patch("apps.alerts.tasks.deliver_alert_outbox.delay")
 def test_reminder_send_uses_escalation_roster(mock_delay):
     from apps.alerts.models.models import Level
     from apps.alerts.constants.constants import LevelType
@@ -351,8 +433,8 @@ def test_reminder_send_uses_escalation_roster(mock_delay):
     task.current_layer_index = 1
     task.save()
     ReminderService._send_reminder_notification(assignment=assignment, alert=alert, reminder_id=None)
-    args, _ = mock_delay.call_args
-    sent_usernames = args[0][0]["username_list"]
+    from apps.alerts.models import AlertOutbox
+    sent_usernames = AlertOutbox.objects.get().payload["params"][0]["username_list"]
     # 有效链 [orig, u1, u2]：第1层 = u1（提醒改读升级在岗集合）
     assert sent_usernames == ["u1"]
 

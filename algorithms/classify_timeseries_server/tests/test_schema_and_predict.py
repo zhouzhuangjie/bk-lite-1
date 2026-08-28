@@ -7,11 +7,16 @@
 - MLService.predict() 的验证失败路径和正常预测路径（使用 DummyModel）
 """
 
+import asyncio
+import importlib
 import sys
+import time
 import types
+from io import StringIO
 from unittest.mock import MagicMock, patch
 
 import pytest
+from loguru import logger as real_logger
 from pydantic import ValidationError
 
 
@@ -21,8 +26,11 @@ from pydantic import ValidationError
 
 def _stub_bentoml():
     bentoml = types.ModuleType("bentoml")
+    bentoml.service_options = []
 
     def service(**kwargs):
+        bentoml.service_options.append(kwargs)
+
         def decorator(cls):
             return cls
         return decorator
@@ -188,6 +196,68 @@ class TestDummyModel:
 # ---------------------------------------------------------------------------
 
 
+class TestServiceTimeoutBudget:
+    def _reload_service(self):
+        module_name = "classify_timeseries_server.serving.service"
+        sys.modules.pop(module_name, None)
+        sys.modules["bentoml"].service_options.clear()
+        return importlib.import_module(module_name)
+
+    def test_default_timeout_covers_large_prediction_budget(self, monkeypatch):
+        monkeypatch.delenv("TIMESERIES_PREDICT_TIMEOUT_SECONDS", raising=False)
+
+        service_module = self._reload_service()
+
+        assert service_module.TIMESERIES_PREDICT_TIMEOUT_SECONDS == 120
+        assert sys.modules["bentoml"].service_options[-1]["traffic"] == {"timeout": 120}
+
+    def test_timeout_budget_can_be_configured(self, monkeypatch):
+        monkeypatch.setenv("TIMESERIES_PREDICT_TIMEOUT_SECONDS", "75")
+
+        service_module = self._reload_service()
+
+        assert service_module.TIMESERIES_PREDICT_TIMEOUT_SECONDS == 75
+        assert sys.modules["bentoml"].service_options[-1]["traffic"] == {"timeout": 75}
+
+    @pytest.mark.parametrize("invalid_timeout", ["0", "291", "not-a-number"])
+    def test_timeout_budget_rejects_invalid_values(self, monkeypatch, invalid_timeout):
+        monkeypatch.setenv("TIMESERIES_PREDICT_TIMEOUT_SECONDS", invalid_timeout)
+
+        with pytest.raises(ValueError, match="integer between 1 and 290"):
+            self._reload_service()
+
+    def test_recursive_feature_work_budget_defaults_to_benchmark_limit(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv(
+            "MAX_RECURSIVE_FEATURE_ENGINEERING_WORK", raising=False
+        )
+
+        service_module = self._reload_service()
+
+        assert service_module.MAX_RECURSIVE_FEATURE_ENGINEERING_WORK == 2_000_000
+
+    def test_recursive_feature_work_budget_can_be_configured(self, monkeypatch):
+        monkeypatch.setenv(
+            "MAX_RECURSIVE_FEATURE_ENGINEERING_WORK", "123456"
+        )
+
+        service_module = self._reload_service()
+
+        assert service_module.MAX_RECURSIVE_FEATURE_ENGINEERING_WORK == 123456
+
+    @pytest.mark.parametrize("invalid_limit", ["0", "-1", "not-a-number"])
+    def test_recursive_feature_work_budget_rejects_invalid_values(
+        self, monkeypatch, invalid_limit
+    ):
+        monkeypatch.setenv(
+            "MAX_RECURSIVE_FEATURE_ENGINEERING_WORK", invalid_limit
+        )
+
+        with pytest.raises(ValueError, match="must be a positive integer"):
+            self._reload_service()
+
+
 class TestMLServicePredict:
     def _make_service(self, steps=3):
         from classify_timeseries_server.serving.service import MLService
@@ -216,10 +286,88 @@ class TestMLServicePredict:
         """
         steps = 3
         svc = self._make_service(steps=steps)
+        logger = MagicMock()
         # 规则间隔 60 秒，可以被 infer_freq 识别为 "min"
         data = [{"timestamp": 1700000000 + i * 60, "value": float(i)} for i in range(5)]
         config = {"steps": steps}
-        response = await svc.predict(data, config)
+        with patch.dict(svc.predict.__func__.__globals__, {"logger": logger}):
+            response = await svc.predict(data, config)
+        assert response.success is True
+        assert response.prediction is not None
+        assert len(response.prediction) == steps
+        logger.debug.assert_any_call(
+            "event=timeseries_request_received steps={} data_points={}",
+            steps,
+            len(data),
+        )
+        assert any(call.args[0].startswith("event=timeseries_prediction_completed") for call in logger.info.call_args_list)
+        assert "📥" not in repr(logger.mock_calls)
+
+    @pytest.mark.asyncio
+    async def test_predict_failure_keeps_response_and_owns_one_traceback(self):
+        secret = "model-response-secret-must-not-enter-logs"
+        frame_secret = "frame-local-secret-must-not-enter-logs"
+        svc = self._make_service(steps=3)
+        error = RuntimeError(secret)
+        def fail_with_sensitive_local(*_args, **_kwargs):
+            sensitive_local = frame_secret
+            assert sensitive_local
+            raise error
+
+        svc.model.predict.side_effect = fail_with_sensitive_local
+        data = [{"timestamp": 1700000000 + i * 60, "value": float(i)} for i in range(5)]
+        output = StringIO()
+        configure_logger = svc.predict.__func__.__globals__["_configure_production_logger"]
+        configure_logger(output)
+        try:
+            with patch.dict(svc.predict.__func__.__globals__, {"logger": real_logger}):
+                response = await svc.predict(data, {"steps": 3})
+        finally:
+            configure_logger()
+
+        assert response.success is False
+        assert response.error.code == "E2002"
+        assert secret in response.error.message
+        safe_exception_info = svc.predict.__func__.__globals__["_safe_exception_info"]
+        safe_type, safe_error, safe_traceback = safe_exception_info(error)
+        assert safe_traceback is error.__traceback__
+        assert safe_error is not error
+        assert safe_type.__name__ == "_SafeLogException"
+        assert isinstance(safe_error, RuntimeError)
+        assert str(safe_error) == "RuntimeError"
+        assert str(error) == secret
+        rendered = output.getvalue()
+        assert "event=timeseries_prediction_failed failed_stage=model_predict error_type=RuntimeError" in rendered
+        assert "call_chain=" in rendered
+        assert "Traceback" in rendered
+        assert "service.py" in rendered
+        assert secret not in rendered
+        assert frame_secret not in rendered
+
+    @pytest.mark.asyncio
+    async def test_max_steps_completes_within_scaled_service_budget(self):
+        """时间缩放的负载契约：旧 30 秒预算会红，默认 120 秒预算可完成 1000 步。"""
+        from classify_timeseries_server.serving.service import TIMESERIES_PREDICT_TIMEOUT_SECONDS
+
+        steps = 1000
+        svc = self._make_service(steps=steps)
+
+        def slow_predict(features):
+            assert features["steps"] == steps
+            time.sleep(0.35)
+            return [1.0] * steps
+
+        svc.model.predict.side_effect = slow_predict
+        data = [{"timestamp": 1700000000 + i * 60, "value": float(i)} for i in range(5)]
+        scaled_timeout = TIMESERIES_PREDICT_TIMEOUT_SECONDS / 100
+
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: asyncio.run(svc.predict(data, {"steps": steps})),
+            ),
+            timeout=scaled_timeout,
+        )
+
         assert response.success is True
         assert response.prediction is not None
         assert len(response.prediction) == steps
@@ -257,3 +405,46 @@ class TestMLServicePredict:
         config = {"steps": 2}
         response = await svc.predict(data, config)
         assert response.metadata.input_data_points == 6
+
+    @pytest.mark.asyncio
+    async def test_recursive_feature_work_budget_rejects_before_model_predict(
+        self, monkeypatch
+    ):
+        service_module = importlib.import_module(
+            "classify_timeseries_server.serving.service"
+        )
+        wrapper_type = type(
+            "GradientBoostingWrapper",
+            (),
+            {
+                "__module__": (
+                    "classify_timeseries_server.training.models.test_wrapper"
+                )
+            },
+        )
+        wrapper = wrapper_type()
+        wrapper.use_feature_engineering = True
+        wrapper.feature_engineer = object()
+
+        svc = self._make_service(steps=3)
+        svc.model.unwrap_python_model.return_value = wrapper
+        monkeypatch.setattr(
+            service_module, "MAX_RECURSIVE_FEATURE_ENGINEERING_WORK", 17
+        )
+        data = [
+            {"timestamp": 1700000000 + i * 60, "value": float(i)}
+            for i in range(5)
+        ]
+
+        response = await svc.predict(data, {"steps": 3})
+
+        assert response.success is False
+        assert response.error.code == "E1002"
+        assert response.error.details == {
+            "error_type": "RecursiveFeatureEngineeringBudgetExceeded",
+            "history_points": 5,
+            "steps": 3,
+            "estimated_work": 18,
+            "limit": 17,
+        }
+        svc.model.predict.assert_not_called()

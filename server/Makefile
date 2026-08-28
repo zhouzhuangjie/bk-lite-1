@@ -30,8 +30,11 @@ i18n:
 collect-static:
 	uv run python manage.py collectstatic --noinput
 
+DEV_HOST ?= 0.0.0.0
+DEV_PORT ?= 8011
+
 dev:
-	uv run uvicorn asgi:application --host 0.0.0.0 --port 8011 --reload --workers 1
+	uv run uvicorn asgi:application --host $(DEV_HOST) --port $(DEV_PORT) --reload --workers 1
 
 clean-migrate:
 	cd apps &&\
@@ -52,6 +55,9 @@ celery-inspect:
 
 start-nats:
 	uv run python manage.py nats_listener
+
+devshell:
+	uv run python manage.py shell
 
 test:
 	uv run pytest
@@ -98,3 +104,17 @@ test-db-down:
 test-db:
 	DB_ENGINE=postgresql DB_NAME=bklite DB_USER=postgres DB_PASSWORD=testpass \
 		DB_HOST=localhost DB_PORT=$(TEST_DB_PORT) uv run pytest
+
+# CMDB e2e 字段漂移报告 —— 扫描 fixtures 跟 model schema 字段对齐
+# 用法:make e2e-drift-report(默认 markdown 到 stdout)
+#      make e2e-drift-report-fmt(写文件到 apps/cmdb/tests/e2e/drift_report.md)
+E2E_DRIFT_OUTPUT ?= apps/cmdb/tests/e2e/drift_report.md
+e2e-drift-report:
+	uv run python -m apps.cmdb.tests.e2e.utils.drift_report --format markdown
+
+e2e-drift-report-fmt:
+	uv run python -m apps.cmdb.tests.e2e.utils.drift_report --format markdown --output $(E2E_DRIFT_OUTPUT)
+
+# 字段漂移报告对应的测试(2 tests)
+e2e-drift-report-test:
+	uv run pytest apps/cmdb/tests/e2e/test_drift_report.py -v --no-cov

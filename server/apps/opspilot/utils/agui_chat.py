@@ -13,13 +13,16 @@ from asgiref.sync import sync_to_async
 from django.http import StreamingHttpResponse
 
 from apps.core.logger import opspilot_logger as logger
+from apps.opspilot.metis.llm.common.llm_error_diagnostics import classify_llm_error, format_llm_failure_log, summarize_llm_endpoint
+from apps.opspilot.metis.llm.common.token_usage import TokenUsageAccumulator
 from apps.opspilot.models import LLMModel, SkillRequestLog
 from apps.opspilot.services.chat_service import chat_service
+from apps.opspilot.services.wiki.active_generation_query_service import ActiveGenerationReadError
+from apps.opspilot.services.wiki.wiki_budget_service import WikiBudgetExceeded
 from apps.opspilot.utils.agent_factory import create_agent_instance, create_sse_response_headers
 from apps.opspilot.utils.stream_common import is_interrupt_requested_async
 from apps.opspilot.utils.stream_common import process_think_content as _process_think_content
 from apps.opspilot.utils.stream_common import split_think_content as _split_think_content
-
 
 # 工具结果后的桥接型自述内容匹配模式，供提取与剥离两处复用（避免重复编译）。
 _META_PREAMBLE_PATTERN = re.compile(
@@ -425,9 +428,7 @@ def _prepare_agui_chat_kwargs(params):
     return chat_kwargs
 
 
-async def _generate_agui_stream(
-    params, skill_name, skill_type, show_think, final_stats, kwargs, current_ip, user_message, skill_id, history_log
-):
+async def _generate_agui_stream(params, skill_name, skill_type, show_think, final_stats, kwargs, current_ip, user_message, skill_id, history_log):
     try:
         logger.info(f"[AGUI Chat] 开始异步流处理 - skill_name: {skill_name}, skill_type: {skill_type}, show_think: {show_think}")
         # F044: 把取模型 / 格式化参数 / 创建 Agent 实例（构造 request/graph）的同步前置工作
@@ -435,6 +436,7 @@ async def _generate_agui_stream(
         # 仍处于 try 内，任何异常仍以原有 ERROR 事件形状返回，线缆形状不变。
         chat_kwargs = await sync_to_async(_prepare_agui_chat_kwargs, thread_sensitive=True)(params)
         graph, request = await sync_to_async(create_agent_instance, thread_sensitive=True)(skill_type, chat_kwargs)
+        token_usage_accumulator = TokenUsageAccumulator()
         accumulated_content = []
         state = _init_agui_stream_state()
         enable_thinking_split = _supports_thinking_events(request)
@@ -450,29 +452,69 @@ async def _generate_agui_stream(
             accumulated_content.append(skill_view_event)
             yield _build_sse_line(skill_view_event)
 
-        async for sse_line in graph.agui_stream(request):
-            if execution_id and await is_interrupt_requested_async(execution_id):
-                interrupt_data = {"type": "INTERRUPTED", "error": "执行已中断", "execution_id": execution_id, "timestamp": int(time.time() * 1000)}
-                yield _build_sse_line(interrupt_data)
-                return
-            output_line = sse_line
-            immediate_lines = []
-            if sse_line.startswith("data: "):
-                try:
-                    data_json = json.loads(sse_line[6:].strip())
-                    output_line, immediate_lines = _handle_agui_data_event(data_json, state, show_think, enable_thinking_split)
-                    accumulated_content.append(data_json)
-                except (json.JSONDecodeError, ValueError) as parse_err:
-                    sample = sse_line[6:].strip()[:200]
-                    logger.warning(f"[AGUI Chat] 跳过无法解析的 SSE 行: {parse_err}; 内容样本: {sample!r}")
+        # Wiki 知识库引用:chat_service.format_chat_server_kwargs 在 prepare 阶段已检索 wiki 文档
+        # 并把 citations 放入 extra_config["wiki_citations"],但 augment_prompt 不在 langgraph 节点
+        # coroutine 内,无法直接 dispatch_custom_event。这里在 AGUI 流开始前补一个 CUSTOM event,
+        # 前端 aguiMessageHandler.handleWikiCitations 监听 name === 'wiki_citations' 渲染 WikiCitations。
+        # 同步已有的 skill_view_event 模式;空列表不发送,避免空事件污染。
+        wiki_citations = (request.extra_config or {}).get("wiki_citations")
+        if wiki_citations:
+            wiki_citations_event = {
+                "type": "CUSTOM",
+                "name": "wiki_citations",
+                "value": {"citations": wiki_citations},
+                "timestamp": int(time.time() * 1000),
+            }
+            accumulated_content.append(wiki_citations_event)
+            yield _build_sse_line(wiki_citations_event)
 
-            for line in immediate_lines:
-                yield line
+        logger.info(f"[AGUI Chat] 开始 graph.agui_stream, request_id={getattr(request, 'thread_id', '?')}")
+        try:
+            async for sse_line in graph.agui_stream(
+                request,
+                token_usage_accumulator=token_usage_accumulator,
+            ):
+                if execution_id and await is_interrupt_requested_async(execution_id):
+                    interrupt_data = {
+                        "type": "INTERRUPTED",
+                        "error": "执行已中断",
+                        "execution_id": execution_id,
+                        "timestamp": int(time.time() * 1000),
+                    }
+                    yield _build_sse_line(interrupt_data)
+                    return
+                output_line = sse_line
+                immediate_lines = []
+                if sse_line.startswith("data: "):
+                    try:
+                        data_json = json.loads(sse_line[6:].strip())
+                        output_line, immediate_lines = _handle_agui_data_event(data_json, state, show_think, enable_thinking_split)
+                        if not (data_json.get("type") == "CUSTOM" and data_json.get("name") == "stream_keepalive"):
+                            accumulated_content.append(data_json)
+                    except (json.JSONDecodeError, ValueError) as parse_err:
+                        sample = sse_line[6:].strip()[:200]
+                        logger.warning(f"[AGUI Chat] 跳过无法解析的 SSE 行: {parse_err}; 内容样本: {sample!r}")
 
-            if output_line:
-                yield output_line
+                for line in immediate_lines:
+                    yield line
+
+                if output_line:
+                    yield output_line
+        except Exception as stream_err:
+            classification = classify_llm_error(stream_err)
+            logger.error(
+                format_llm_failure_log(
+                    stage="agui_chat.graph_stream",
+                    classification=classification,
+                    endpoint=summarize_llm_endpoint(request),
+                )
+            )
+            raise
 
         final_stats["content"] = accumulated_content
+        final_stats["usage"] = token_usage_accumulator.as_openai_usage()
+        final_stats["llm_call_count"] = token_usage_accumulator.call_count
+        final_stats["usage_calls"] = token_usage_accumulator.as_call_details()
         if final_stats["content"]:
 
             def log_in_background():
@@ -480,9 +522,41 @@ async def _generate_agui_stream(
 
             threading.Thread(target=log_in_background, daemon=True).start()
 
+    except (WikiBudgetExceeded, ActiveGenerationReadError) as e:
+        logger.warning(
+            "[AGUI Chat] Wiki request rejected: code=%s details=%s",
+            e.code,
+            e.details,
+        )
+        yield _build_sse_line(
+            {
+                "type": "ERROR",
+                "error": str(e),
+                "error_code": e.code,
+                "error_details": e.details,
+                "timestamp": int(time.time() * 1000),
+            }
+        )
     except Exception as e:
-        logger.error(f"[AGUI Chat] async stream error: {e}", exc_info=True)
-        error_data = {"type": "ERROR", "error": f"聊天错误: {str(e)}", "timestamp": int(time.time() * 1000)}
+        classification = classify_llm_error(e)
+        endpoint = summarize_llm_endpoint(
+            model=str((kwargs or {}).get("model") or (params or {}).get("model") or ""),
+            api_base=str((kwargs or {}).get("openai_api_base") or (params or {}).get("openai_api_base") or ""),
+        )
+        logger.error(
+            format_llm_failure_log(
+                stage="agui_chat",
+                classification=classification,
+                endpoint=endpoint,
+            ),
+            exc_info=True,
+        )
+        error_data = {
+            "type": "ERROR",
+            "error": f"{classification['user_message']}: {classification['detail']}"[:1000],
+            "error_code": classification["code"],
+            "timestamp": int(time.time() * 1000),
+        }
         yield _build_sse_line(error_data)
 
 
@@ -494,12 +568,21 @@ def _log_and_update_tokens_agui(final_stats, skill_name, skill_id, current_ip, k
         final_content = final_stats.get("content", "")
         if not final_content:
             return
+        usage = final_stats.get("usage") or {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        usage_calls = final_stats.get("usage_calls") or []
+        llm_call_count = final_stats.get("llm_call_count")
+        if not isinstance(llm_call_count, int) or llm_call_count < 0:
+            llm_call_count = len(usage_calls)
 
         # 创建或更新日志
         if history_log:
-            history_log.completion_tokens = 0
-            history_log.prompt_tokens = 0
-            history_log.total_tokens = 0
+            history_log.completion_tokens = usage["completion_tokens"]
+            history_log.prompt_tokens = usage["prompt_tokens"]
+            history_log.total_tokens = usage["total_tokens"]
             history_log.response = final_content
             history_log.save()
         else:
@@ -510,9 +593,9 @@ def _log_and_update_tokens_agui(final_stats, skill_name, skill_id, current_ip, k
 
             # 构建response_detail，包含token统计和响应内容
             response_detail = {
-                "completion_tokens": 0,
-                "prompt_tokens": 0,
-                "total_tokens": 0,
+                "usage": usage,
+                "llm_call_count": llm_call_count,
+                "usage_calls": usage_calls,
                 "response": final_content,
             }
 
@@ -532,7 +615,29 @@ def _log_and_update_tokens_agui(final_stats, skill_name, skill_id, current_ip, k
                 user_message=user_message,
             )
 
-        logger.info(f"AGUI log created/updated for skill: {skill_name}")
+        for call in usage_calls:
+            logger.info(
+                "AGUI token usage call recorded: skill_id=%s, skill_name=%s, "
+                "call_index=%s, visible_tool_count=%s, visible_tools=%s, "
+                "prompt_tokens=%s, completion_tokens=%s, total_tokens=%s",
+                skill_id,
+                skill_name,
+                call.get("call_index"),
+                call.get("visible_tool_count", 0),
+                call.get("visible_tools", []),
+                call.get("prompt_tokens", 0),
+                call.get("completion_tokens", 0),
+                call.get("total_tokens", 0),
+            )
+        logger.info(
+            "AGUI token usage recorded: skill_id=%s, skill_name=%s, llm_call_count=%s, " "prompt_tokens=%s, completion_tokens=%s, total_tokens=%s",
+            skill_id,
+            skill_name,
+            llm_call_count,
+            usage["prompt_tokens"],
+            usage["completion_tokens"],
+            usage["total_tokens"],
+        )
     except Exception as e:
         logger.error(f"AGUI log update error: {e}")
 
@@ -559,9 +664,20 @@ def stream_agui_chat(params, skill_name, kwargs, current_ip, user_message, skill
     skill_type = params.get("skill_type")
     params.pop("group", 0)
     params["execution_id"] = params.get("execution_id") or params.get("thread_id") or str(int(time.time() * 1000))
+    # 技能测试入口无 workflow node_id；显式标记便于 HITL submit_choice 归属放行
+    params["node_id"] = params.get("node_id") or "skill_test"
 
     # 用于存储最终统计信息的共享变量
-    final_stats = {"content": []}
+    final_stats = {
+        "content": [],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
+        "llm_call_count": 0,
+        "usage_calls": [],
+    }
     response = StreamingHttpResponse(
         _generate_agui_stream(
             params,

@@ -26,11 +26,19 @@ import {
   DownOutlined,
   UpOutlined,
   QuestionCircleOutlined,
+  SyncOutlined,
 } from '@ant-design/icons';
 import { useInstanceApi } from '@/app/cmdb/api';
 import useAssetDataStore from '@/app/cmdb/store/useAssetDataStore';
 import { useUserInfoContext } from '@/context/userInfo';
-import TagCapsuleGroup from '@/app/cmdb/components/tag-capsule-group';
+import { useClientData } from '@/context/client';
+import TagCapsuleGroup from '@/components/tag-capsule-group';
+import {
+  canSyncMonitor,
+  showNodeId,
+  isMonitorSold,
+  resolveMonitorLinkMessage,
+} from '@/app/cmdb/utils/systemLinkage';
 
 const { Panel } = Collapse;
 const InfoList: React.FC<AssetDataFieldProps> = ({
@@ -47,14 +55,16 @@ const InfoList: React.FC<AssetDataFieldProps> = ({
   const [isBatchSaving, setIsBatchSaving] = useState<boolean>(false);
   const [editScenario, setEditScenario] = useState<string>('ordinary_attribute_change');
   const [collapsedTableFields, setCollapsedTableFields] = useState<Record<string, boolean>>({});
+  const [isSyncingMonitor, setIsSyncingMonitor] = useState(false);
   const { t } = useTranslation();
   const { flatGroups } = useUserInfoContext();
+  const { clientData } = useClientData();
 
-  const { updateInstance, getInstanceProxys } = useInstanceApi();
+  const { updateInstance, getInstanceProxys, pushToMonitor } = useInstanceApi();
 
   const searchParams = useSearchParams();
   const modelId: string = searchParams.get('model_id') || '';
-  const instId: string = searchParams.get('inst_id') || '';
+  const instUuid: string = searchParams.get('inst_uuid') || '';
 
   const cloudOptions = (useAssetDataStore.getState().cloud_list || []).map((item: any) => ({
     proxy_id: String(item.proxy_id),
@@ -62,7 +72,7 @@ const InfoList: React.FC<AssetDataFieldProps> = ({
   }));
 
   useEffect(() => {
-    if (modelId == 'host') {
+    if (['host', 'subnet'].includes(modelId)) {
       getInstanceProxys()
         .then((data: any[]) => {
           useAssetDataStore.getState().setCloudList(data || []);
@@ -74,7 +84,16 @@ const InfoList: React.FC<AssetDataFieldProps> = ({
   }, []);
 
   useEffect(() => {
-    const list = deepClone(propertyList);
+    const list = deepClone(propertyList)
+      .map((group: any) => ({
+        ...group,
+        attrs: (group.attrs || []).filter(
+          (item: any) =>
+            !item?.is_system_link &&
+            !['node_id', 'monitor_id'].includes(item?.attr_id)
+        ),
+      }))
+      .filter((group: any) => (group.attrs || []).length > 0);
     setAttrList(list);
   }, [propertyList]);
 
@@ -99,7 +118,7 @@ const InfoList: React.FC<AssetDataFieldProps> = ({
 
     const params: any = { _scenario: editScenario };
     params[fieldKey] = fieldValue;
-    await updateInstance(instId, params);
+    await updateInstance(instUuid, params);
     message.success(t('successfullyModified'));
     const list = deepClone(attrList);
 
@@ -136,7 +155,7 @@ const InfoList: React.FC<AssetDataFieldProps> = ({
       );
       value = filtered.length > 0 ? filtered : undefined;
     }
-    if (fieldKey === 'cloud') {
+    if (fieldKey === 'cloud' || fieldKey === 'cloud_id') {
       return String(value);
     }
     return value;
@@ -197,7 +216,7 @@ const InfoList: React.FC<AssetDataFieldProps> = ({
       });
 
       params._scenario = editScenario;
-      await updateInstance(instId, params);
+      await updateInstance(instUuid, params);
       message.success(t('successfullyModified'));
 
       const list = deepClone(attrList);
@@ -240,12 +259,14 @@ const InfoList: React.FC<AssetDataFieldProps> = ({
           <div className="flex items-start justify-between gap-2">
             <div className="min-w-0 flex-1">
               {item.attr_name}
-              {item.is_required && <span className={informationList.required}></span>}
-              {item.user_prompt && (
+              {item.is_required ? (
+                <span className={informationList.required}></span>
+              ) : null}
+              {item.user_prompt ? (
                 <Tooltip title={item.user_prompt}>
                   <QuestionCircleOutlined className="ml-1 text-gray-400 cursor-help" />
                 </Tooltip>
-              )}
+              ) : null}
             </div>
             {item.attr_type === 'table' && !item.isEdit && (
               <Button
@@ -285,7 +306,10 @@ const InfoList: React.FC<AssetDataFieldProps> = ({
                     className="mb-0 w-full"
                   >
                     <>
-                      {item.attr_id === 'cloud' && modelId === 'host' ? (
+                      {(
+                        (item.attr_id === 'cloud' && modelId === 'host') ||
+                        (item.attr_id === 'cloud_id' && modelId === 'subnet')
+                      ) ? (
                         <Select placeholder={t('common.selectTip')}>
                           {cloudOptions.map((opt) => (
                             <Select.Option key={opt.proxy_id} value={opt.proxy_id}>
@@ -293,14 +317,14 @@ const InfoList: React.FC<AssetDataFieldProps> = ({
                             </Select.Option>
                           ))}
                         </Select>
-                      ) : (
-                        getFieldItem({
-                          fieldItem: item,
-                          userList,
-                          isEdit: true,
-                          modelId,
-                        })
-                      )}
+                        ) : (
+                          getFieldItem({
+                            fieldItem: item,
+                            userList,
+                            isEdit: true,
+                            modelId,
+                          })
+                        )}
                     </>
                   </Form.Item>
                 ) : (
@@ -315,6 +339,7 @@ const InfoList: React.FC<AssetDataFieldProps> = ({
                         userList,
                         isEdit: false,
                         value: item.value,
+                        modelId,
                       })
                     )}
                   </>
@@ -457,6 +482,7 @@ const InfoList: React.FC<AssetDataFieldProps> = ({
       value,
       hideUserAvatar: true,
       flatGroups,
+      modelId,
     }) as string;
     navigator.clipboard.writeText(copyVal);
     message.success(t('successfulCopied'));
@@ -498,6 +524,59 @@ const InfoList: React.FC<AssetDataFieldProps> = ({
       (item: any) => item.editable
     )
   );
+
+  const showSystemLinkage =
+    canSyncMonitor(modelId) ||
+    instDetail?.node_id ||
+    instDetail?.monitor_id;
+  const systemLinkageItems = showSystemLinkage
+    ? [
+      ...(showNodeId(modelId)
+        ? [
+          {
+            key: 'node_id',
+            label: t('Model.systemLinkageNodeId'),
+            children: (
+              <span className="font-mono text-[13px] break-all">
+                {instDetail?.node_id || t('Model.systemLinkageEmpty')}
+              </span>
+            ),
+          },
+        ]
+        : []),
+      {
+        key: 'monitor_id',
+        label: t('Model.systemLinkageMonitorId'),
+        children: (
+          <span className="font-mono text-[13px] break-all">
+            {instDetail?.monitor_id || t('Model.systemLinkageEmpty')}
+          </span>
+        ),
+      },
+    ]
+    : [];
+
+  const handleSyncMonitor = async () => {
+    setIsSyncingMonitor(true);
+    try {
+      const res = await pushToMonitor(instUuid);
+      const key = resolveMonitorLinkMessage(res);
+      const text = t(key);
+      const status = res?.link_status;
+      if (status === 'ok') {
+        message.success(text);
+        onsuccessEdit?.();
+      } else if (status === 'not_found' || status === 'conflict') {
+        message.warning(text);
+      } else {
+        message.error(text);
+      }
+    } catch {
+      message.error(t('Model.systemLinkageSyncFailed'));
+    } finally {
+      setIsSyncingMonitor(false);
+    }
+  };
 
   return (
     <div>
@@ -564,18 +643,14 @@ const InfoList: React.FC<AssetDataFieldProps> = ({
           )}
         </div>
       )}
-      {/* 通过遍历 fieldList，自动添加Collapse折叠面板容器，并设置默认展开 */}
       {displayGroups && displayGroups.length > 0 && (
         <Collapse
           style={{ background: 'var(--color-bg-1) ' }}
           bordered={false}
           className={informationList.list}
-          // accordion // 手风琴效果先不用，看后面需求来决定是否使用
-          // 默认展开的相关逻辑（后端传一个默认展开的id数组）
           defaultActiveKey={displayGroups
             .filter((item: any) => !item.is_collapsed)
             .map((item: any) => String(item.id))}
-          // 折叠面板的展开图标
           expandIcon={({ isActive }) => (
             <CaretRightOutlined rotate={isActive ? 90 : 0} />
           )}
@@ -595,6 +670,34 @@ const InfoList: React.FC<AssetDataFieldProps> = ({
             )
           })}
         </Collapse>
+      )}
+      {showSystemLinkage && (
+        <div className="mt-4 rounded border border-[var(--color-border-2)] bg-[var(--color-bg-2)] px-4 py-3">
+          <div className="mb-1 flex items-center justify-between gap-2">
+            <div className="text-sm font-medium text-[var(--color-text-1)]">
+              {t('Model.systemLinkage')}
+            </div>
+            {canSyncMonitor(modelId) && isMonitorSold(clientData) && (
+              <PermissionWrapper
+                requiredPermissions={['Edit']}
+                instPermissions={instDetail.permission}
+              >
+                <Button
+                  size="small"
+                  icon={<SyncOutlined />}
+                  loading={isSyncingMonitor}
+                  onClick={handleSyncMonitor}
+                >
+                  {t('Model.systemLinkageSync')}
+                </Button>
+              </PermissionWrapper>
+            )}
+          </div>
+          <div className="mb-3 text-xs text-[var(--color-text-3)]">
+            {t('Model.systemLinkageHint')}
+          </div>
+          <Descriptions bordered size="small" column={1} items={systemLinkageItems} />
+        </div>
       )}
     </div>
   );

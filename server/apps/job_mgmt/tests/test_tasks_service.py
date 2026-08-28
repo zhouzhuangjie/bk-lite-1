@@ -4,16 +4,16 @@
 """
 
 from datetime import timedelta
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from django.utils import timezone
 
 from apps.job_mgmt import tasks
-from apps.job_mgmt.constants import ConcurrencyPolicy, DangerousLevel, ExecutionStatus, JobType
-from apps.job_mgmt.models import DangerousPath, DangerousRule, DistributionFile, JobExecution, ScheduledTask
+from apps.job_mgmt.constants import ConcurrencyPolicy, DangerousLevel, ExecutionStatus, JobType, TriggerSource
+from apps.job_mgmt.models import DangerousPath, DangerousRule, DistributionFile, JobExecution, ScheduledTask, Script
 
-pytestmark = [pytest.mark.unit, pytest.mark.django_db]
+pytestmark = [pytest.mark.integration, pytest.mark.django_db]
 
 
 def _task(**over):
@@ -54,13 +54,16 @@ class TestThinTaskWrappers:
 
 class TestExecuteScheduledTask:
     def test_missing_task_returns_silently(self):
+        before_count = JobExecution.objects.count()
         tasks.execute_scheduled_task(999999)  # 不抛
-        assert JobExecution.objects.count() == 0
+        assert JobExecution.objects.count() == before_count
 
     def test_disabled_task_skips(self):
         st = _task(is_enabled=False)
-        tasks.execute_scheduled_task(st.id)
+        with patch("apps.job_mgmt.services.scheduled_task_authz.ScheduledTaskService.toggle_periodic_task_or_raise", return_value=True) as toggle:
+            tasks.execute_scheduled_task(st.id)
         assert JobExecution.objects.filter(scheduled_task=st).count() == 0
+        toggle.assert_called_once_with(st.id, False)
 
     def test_happy_path_creates_execution_and_dispatches(self):
         st = _task()
@@ -79,21 +82,58 @@ class TestExecuteScheduledTask:
         ex = JobExecution.objects.get(scheduled_task=st)
         assert ex.status == ExecutionStatus.FAILED
 
-    def test_no_target_returns_without_execution(self):
-        st = _task(target_list=[])
-        tasks.execute_scheduled_task(st.id)
+    def test_no_manual_target_disables_task_without_execution(self):
+        st = _task(target_source="manual", target_list=[])
+        with patch("apps.job_mgmt.tasks.SCHEDULED_TASK_TEAM_BOUNDARY_ENFORCED", True), patch(
+            "apps.job_mgmt.services.scheduled_task_authz.ScheduledTaskService.toggle_periodic_task_or_raise",
+            return_value=True,
+        ) as toggle:
+            tasks.execute_scheduled_task(st.id)
+
+        st.refresh_from_db()
+        assert st.is_enabled is False
         assert JobExecution.objects.filter(scheduled_task=st).count() == 0
+        toggle.assert_called_once_with(st.id, False)
 
     def test_concurrency_skip_when_running_exists(self):
         st = _task(concurrency_policy=ConcurrencyPolicy.SKIP)
-        JobExecution.objects.create(name="r", job_type=JobType.SCRIPT, status=ExecutionStatus.RUNNING, scheduled_task=st, team=[1])
+        JobExecution.objects.create(
+            name="r",
+            job_type=JobType.SCRIPT,
+            trigger_source=TriggerSource.SCHEDULED,
+            status=ExecutionStatus.RUNNING,
+            scheduled_task=st,
+            team=[1],
+        )
         tasks.execute_scheduled_task(st.id)
         # 仍只有那条 running，未新建
         assert JobExecution.objects.filter(scheduled_task=st).count() == 1
 
+    def test_concurrency_skip_does_not_treat_run_now_as_scheduled_overlap(self):
+        st = _task(concurrency_policy=ConcurrencyPolicy.SKIP)
+        JobExecution.objects.create(
+            name="[手动触发] st",
+            job_type=JobType.SCRIPT,
+            status=ExecutionStatus.RUNNING,
+            scheduled_task=st,
+            team=[1],
+        )
+
+        with patch("apps.job_mgmt.tasks._dispatch_execution_job", return_value=True):
+            tasks.execute_scheduled_task(st.id)
+
+        assert JobExecution.objects.filter(scheduled_task=st).count() == 2
+
     def test_concurrency_queue_retries(self):
         st = _task(concurrency_policy=ConcurrencyPolicy.QUEUE)
-        JobExecution.objects.create(name="r", job_type=JobType.SCRIPT, status=ExecutionStatus.PENDING, scheduled_task=st, team=[1])
+        JobExecution.objects.create(
+            name="r",
+            job_type=JobType.SCRIPT,
+            trigger_source=TriggerSource.SCHEDULED,
+            status=ExecutionStatus.PENDING,
+            scheduled_task=st,
+            team=[1],
+        )
         with patch.object(tasks.execute_scheduled_task, "apply_async") as retry:
             tasks.execute_scheduled_task(st.id)
         retry.assert_called_once()
@@ -102,6 +142,15 @@ class TestExecuteScheduledTask:
         DangerousRule.objects.create(name="no-rm", pattern="rm -rf", level=DangerousLevel.FORBIDDEN, is_enabled=True, team=[])
         st = _task(script_content="rm -rf /")
         tasks.execute_scheduled_task(st.id)
+        assert JobExecution.objects.filter(scheduled_task=st).count() == 0
+
+    def test_dangerous_script_library_content_blocks(self):
+        DangerousRule.objects.create(name="no-rm", pattern="rm -rf", level=DangerousLevel.FORBIDDEN, is_enabled=True, team=[])
+        script = Script.objects.create(name="lib", content="rm -rf /", script_type="shell", team=[1])
+        st = _task(script=script, script_content="")
+
+        tasks.execute_scheduled_task(st.id)
+
         assert JobExecution.objects.filter(scheduled_task=st).count() == 0
 
     def test_dangerous_path_blocks_file_distribution(self):
@@ -118,10 +167,10 @@ class TestDispatchExecutionJob:
     def test_script_dispatch_sets_celery_id(self):
         ex = self._exec(JobType.SCRIPT)
         with patch("apps.job_mgmt.tasks.current_app") as app:
-            app.send_task.return_value = MagicMock(id="celery-1")
             assert tasks._dispatch_execution_job(JobType.SCRIPT, ex.id) is True
+            persisted_task_id = app.send_task.call_args.kwargs["task_id"]
         ex.refresh_from_db()
-        assert ex.celery_task_id == "celery-1"
+        assert ex.celery_task_id == persisted_task_id
 
     def test_unknown_job_type_returns_false(self):
         ex = self._exec(JobType.SCRIPT)
@@ -132,13 +181,18 @@ class TestDispatchExecutionJob:
         with patch("apps.job_mgmt.tasks.current_app") as app:
             app.send_task.side_effect = ConnectionError("broker down")
             assert tasks._dispatch_execution_job(JobType.PLAYBOOK, ex.id) is False
+        ex.refresh_from_db()
+        assert ex.celery_task_id
 
 
 class TestCleanupExpiredFiles:
     def test_deletes_expired_only(self):
         expired = DistributionFile.objects.create(original_name="old", file_key="k1", expire_at=timezone.now() - timedelta(days=1), team=1)
         fresh = DistributionFile.objects.create(original_name="new", file_key="k2", expire_at=timezone.now() + timedelta(days=1), team=1)
-        with patch("apps.job_mgmt.tasks.async_to_sync", lambda fn: (lambda *a, **k: None)):
+        with patch(
+            "apps.job_mgmt.tasks.async_to_sync",
+            lambda fn: (lambda file_keys, **kwargs: {file_key: None for file_key in file_keys}),
+        ):
             tasks.cleanup_expired_distribution_files_task()
         assert not DistributionFile.objects.filter(id=expired.id).exists()
         assert DistributionFile.objects.filter(id=fresh.id).exists()

@@ -13,9 +13,9 @@
     sec_name = "{{ sec_name }}"
     sec_level = "{{ sec_level }}"
     auth_protocol = "{{ auth_protocol }}"
-    auth_password = "{{ auth_password }}"
+    auth_password = "${AUTH_PASSWORD__{{ config_id }}}"
     priv_protocol = "{{ priv_protocol }}"
-    priv_password = "{{ priv_password }}"
+    priv_password = "${PRIV_PASSWORD__{{ config_id }}}"
     {% else %}
     {% endif %}
     [inputs.snmp.tags]
@@ -30,11 +30,4 @@
         oid = "1.3.6.1.2.1.1.5.0"
         name = "source"
         is_tag = true
-    [[inputs.snmp.table]]
-        oid = "1.3.6.1.2.1.2.2"
-        name = "interface"
-        inherit_tags = ["source"]
-    [[inputs.snmp.table.field]]
-        oid = "1.3.6.1.2.1.2.2.1.2"
-        name = "ifDescr"
-        is_tag = true
+# @bk_include_ifmib_table

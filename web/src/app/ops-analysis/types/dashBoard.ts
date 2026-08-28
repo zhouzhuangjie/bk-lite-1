@@ -1,12 +1,25 @@
 import { TopologyNodeData } from './topology';
-import type { ParamItem, DatasourceItem } from './dataSource';
+import type {
+  ParamItem,
+  DatasourceItem,
+  InputControlConfig,
+} from './dataSource';
 import type { ValueMapping } from '@/app/ops-analysis/utils/valueMapping';
+import type {
+  CardListConfig,
+  CardListLeadingConfig,
+} from '@/app/ops-analysis/utils/cardList';
+
+export type { CardListConfig, CardListLeadingConfig };
+import type { ThresholdColorConfig } from '@/app/ops-analysis/utils/thresholdUtils';
 import type { Dayjs } from 'dayjs';
 import type { OpsChartThemeMode } from '@/app/ops-analysis/utils/chartTheme';
 import type {
   NetworkStatusTopologyConfig,
   SceneWidgetType,
 } from './sceneWidget';
+import type { OpsAnalysisWidgetSurface } from '@/app/ops-analysis/utils/chartTypeSurface';
+import type { DateRangeValue } from './dateRange';
 
 export type FilterType = 'selector' | 'fixed';
 
@@ -75,6 +88,12 @@ export interface TableColumnConfigItem {
   order: number;
   width?: number;
   columnType?: 'data' | 'actions';
+  /** 单元格展示形态；缺省为 text */
+  cellType?: 'text' | 'colorBackground';
+  /** 列级值映射（枚举/范围等 → 文案/颜色） */
+  valueMappings?: ValueMapping[];
+  /** 列级数值阈值配色 */
+  cellThresholdColors?: ThresholdColorConfig[];
 }
 
 /** 表格组件配置 */
@@ -83,8 +102,6 @@ export interface TableConfig {
   columns?: TableColumnConfigItem[];
 }
 
-import { ThresholdColorConfig } from '@/app/ops-analysis/utils/thresholdUtils';
-
 export interface ValueConfig {
   chartType?: string;
   sceneWidgetType?: SceneWidgetType;
@@ -92,11 +109,14 @@ export interface ValueConfig {
   chartThemeMode?: OpsChartThemeMode;
   dataSource?: string | number;
   compare?: boolean;
+  compareMode?: 'percent' | 'value';
   params?: Record<string, string | number | boolean | [number, number] | null>;
   dataSourceParams?: ParamItem[];
   tableConfig?: TableConfig;
   filterBindings?: FilterBindings;
   selectedFields?: string[];
+  /** 单值可选说明字段；未设置时不渲染说明行 */
+  descriptionField?: string;
   topNLabelField?: string;
   topNValueField?: string;
   unit?: string;
@@ -111,7 +131,24 @@ export interface ValueConfig {
   gaugeMin?: number;
   gaugeMax?: number;
   gaugeShape?: 'semicircle' | 'circle';
+  eventTimeline?: {
+    sortOrder?: 'asc' | 'desc';
+  };
+  radar?: {
+    min?: number;
+    max?: number;
+    indicators?: Array<{
+      key: string;
+      label?: string;
+    }>;
+  };
+  cardList?: CardListConfig;
   actions?: DashboardActionConfig[];
+  appearance?: ScreenWidgetAppearance;
+}
+
+export interface ScreenWidgetAppearance {
+  frame?: 'panel' | 'bare';
 }
 
 export interface ScreenRenderContext {
@@ -179,11 +216,13 @@ export type ViewConfigItem = LayoutItem | TopologyNodeData;
 
 export interface ViewConfigProps {
   open: boolean;
-  item: ViewConfigItem;
+  /** Dashboard keeps ViewConfig mounted and may pass undefined while closed. */
+  item?: ViewConfigItem | null;
   onConfirm?: (values: WidgetConfig) => void;
   onClose?: () => void;
   builtinNamespaceId?: number;
   showChartThemeMode?: boolean;
+  surface?: OpsAnalysisWidgetSurface;
 }
 
 export interface ComponentSelectorConfigItem extends DatasourceItem {
@@ -198,6 +237,7 @@ export interface ComponentSelectorProps {
   visible: boolean;
   onCancel: () => void;
   onOpenConfig?: (item: ComponentSelectorConfigItem) => void;
+  surface?: OpsAnalysisWidgetSurface;
 }
 
 export interface BaseWidgetProps {
@@ -231,7 +271,13 @@ export interface TimeRangeValue {
 }
 
 /** 筛选值类型 */
-export type FilterValue = string | number | TimeRangeValue | null;
+export type FilterValue =
+  | string
+  | number
+  | Array<string | number>
+  | TimeRangeValue
+  | DateRangeValue
+  | null;
 
 /** 筛选选项（用于下拉选择） */
 export interface FilterOption {
@@ -244,12 +290,17 @@ export interface UnifiedFilterDefinition {
   id: string;
   key: string; // 参数 key（如 "time_range", "env", "namespace"）
   name: string; // 显示名称（用户可编辑）
-  type: 'timeRange' | 'string'; // 参数类型，用于绑定匹配
+  type: 'timeRange' | 'dateRange' | 'string'; // 参数类型，用于绑定匹配；列表传参由 inputConfig.multiple 表达
   defaultValue?: FilterValue; // 默认值
   order: number; // 显示顺序
   enabled: boolean; // 是否启用
   inputMode?: 'input' | 'select' | 'radio' | 'organization'; // 输入方式（仅 string 类型有效）
-  options?: FilterOption[]; // 选项（仅 inputMode 为 select/radio 时有效）
+  /**
+   * 旧字段：手动下拉选项（仅 inputMode 为 select/radio 时有效）。
+   * 读取时由 normalizeInputConfig 自动按 static 模式处理。
+   */
+  options?: FilterOption[];
+  inputConfig?: InputControlConfig;
 }
 
 /** Dashboard.filters 运行时结构（hook 内部使用） */
@@ -269,7 +320,7 @@ export interface FilterBindings {
 /** 扫描结果结构（用于配置弹窗） */
 export interface ScannedFilterParam {
   key: string;
-  type: 'string' | 'timeRange';
+  type: 'string' | 'timeRange' | 'dateRange';
   componentCount: number;
   sampleAlias: string;
   sampleDefaultValue: FilterValue;

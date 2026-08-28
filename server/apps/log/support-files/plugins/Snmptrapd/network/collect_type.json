@@ -11,8 +11,8 @@
     "event_type",
     "node_ip",
     "timestamp",
+    "collect_timestamp",
     "received_at",
-    "trap_message",
-    "raw_message"
+    "message"
   ]
 }

@@ -8,7 +8,8 @@ from django.db import transaction
 
 from apps.core.logger import operation_analysis_logger as logger
 from apps.operation_analysis.models.datasource_models import DataSourceAPIModel
-from apps.operation_analysis.models.models import Architecture, Dashboard, Directory, Topology
+from apps.operation_analysis.models.models import Directory
+from apps.operation_analysis.services.canvas.registry import CANVAS_TYPE_REGISTRY
 
 
 def get_default_group_id():
@@ -45,9 +46,7 @@ class Command(BaseCommand):
         # 定义需要初始化的模型列表
         models_to_init = [
             (Directory, "目录"),
-            (Dashboard, "仪表盘"),
-            (Topology, "拓扑图"),
-            (Architecture, "架构图"),
+            *((meta.model, meta.node_label) for meta in CANVAS_TYPE_REGISTRY.values()),
             (DataSourceAPIModel, "数据源API"),
         ]
 
@@ -93,6 +92,11 @@ class Command(BaseCommand):
         self.stdout.write(f"  [{model_name}] 共 {total_count} 条记录")
 
         for record in all_records:
+            # 内置数据源空组织表示全员可见，不回填 Default。
+            if model_class is DataSourceAPIModel and getattr(record, "is_build_in", False):
+                skipped_count += 1
+                continue
+
             # 获取当前 groups 字段值
             current_groups = record.groups
 

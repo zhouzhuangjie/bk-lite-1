@@ -1,8 +1,10 @@
 import dayjs from 'dayjs';
 import type { ValueConfig, FilterBindings, UnifiedFilterDefinition, FilterValue } from '@/app/ops-analysis/types/dashBoard';
 import type { DatasourceItem, ParamItem } from '@/app/ops-analysis/types/dataSource';
-import { buildWidgetRequestParams, formatTimeRange } from '@/app/ops-analysis/utils/widgetDataTransform';
+import { buildWidgetRequestParams } from '@/app/ops-analysis/utils/widgetDataTransform';
 import { getValueByPath } from '@/app/ops-analysis/utils/objectPath';
+import type { DateRangeResolutionContext } from '@/app/ops-analysis/utils/dateRange';
+import type { SourceDataResult } from '@/app/ops-analysis/utils/sourceDataResponse';
 
 type RequestParams = Record<string, any>;
 
@@ -12,6 +14,7 @@ type MinimalDataSource = Pick<DatasourceItem, 'params'> | { params: ParamItem[] 
 export interface CompareQueryResult<T = unknown> {
   currentData: T | null;
   baselineData: T | null;
+  warnings?: string[];
 }
 
 interface BuildRequestParamsInput {
@@ -21,12 +24,18 @@ interface BuildRequestParamsInput {
   unifiedFilterValues?: Record<string, FilterValue>;
   filterBindings?: FilterBindings;
   filterDefinitions?: UnifiedFilterDefinition[];
+  resolutionContext?: DateRangeResolutionContext;
 }
 
 interface FetchCompareDataInput extends BuildRequestParamsInput {
   dataSourceId: number;
-  getSourceDataByApiId: (id: number, params?: any) => Promise<any>;
+  getSourceDataByApiId: (id: number, params?: any) => Promise<SourceDataResult>;
 }
+
+const mergeWarnings = (...groups: Array<string[] | undefined>): string[] | undefined => {
+  const merged = Array.from(new Set(groups.flatMap((group) => group ?? [])));
+  return merged.length > 0 ? merged : undefined;
+};
 
 const isTimeRangeTuple = (value: unknown): value is [string, string] =>
   Array.isArray(value) && value.length === 2 && value.every((item) => typeof item === 'string' && item.trim().length > 0);
@@ -50,12 +59,37 @@ const deriveBaselineTimeRange = (timeRange: [string, string]): [string, string] 
   ];
 };
 
-const getTimeRangeParamName = (params?: ValueConfig['dataSourceParams']): string | null => {
-  const timeRangeParams = (Array.isArray(params) ? params : []).filter((param) => param.type === 'timeRange');
-  if (timeRangeParams.length !== 1) {
+const deriveBaselineDateRange = (dateRange: [string, string]): [string, string] | null => {
+  const [start, end] = dateRange;
+  const startAt = dayjs(start, 'YYYY-MM-DD', true);
+  const endAt = dayjs(end, 'YYYY-MM-DD', true);
+  if (!startAt.isValid() || !endAt.isValid() || endAt.isBefore(startAt, 'day')) {
     return null;
   }
-  return timeRangeParams[0].name;
+
+  const duration = endAt.diff(startAt, 'day') + 1;
+  return [
+    startAt.subtract(duration, 'day').format('YYYY-MM-DD'),
+    startAt.subtract(1, 'day').format('YYYY-MM-DD'),
+  ];
+};
+
+const isDateRangeTuple = (value: unknown): value is [string, string] =>
+  Array.isArray(value)
+  && value.length === 2
+  && value.every((item) => typeof item === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(item));
+
+const getComparableRangeParam = (params?: ValueConfig['dataSourceParams']): { name: string; type: 'timeRange' | 'dateRange' } | null => {
+  const rangeParams = (Array.isArray(params) ? params : []).filter(
+    (param) => param.type === 'timeRange' || param.type === 'dateRange',
+  );
+  if (rangeParams.length !== 1) {
+    return null;
+  }
+  return {
+    name: rangeParams[0].name,
+    type: rangeParams[0].type as 'timeRange' | 'dateRange',
+  };
 };
 
 export const canEnableCompare = ({
@@ -65,7 +99,7 @@ export const canEnableCompare = ({
   const sourceParams = Array.isArray(config?.dataSourceParams) && config.dataSourceParams.length > 0
     ? config.dataSourceParams
     : dataSource?.params;
-  return getTimeRangeParamName(sourceParams) !== null;
+  return getComparableRangeParam(sourceParams) !== null;
 };
 
 export const buildCompareRequestParams = ({
@@ -75,6 +109,7 @@ export const buildCompareRequestParams = ({
   unifiedFilterValues,
   filterBindings,
   filterDefinitions,
+  resolutionContext,
 }: BuildRequestParamsInput): { currentParams: RequestParams; baselineParams: RequestParams | null } => {
   const currentParams = buildWidgetRequestParams({
     config,
@@ -83,6 +118,7 @@ export const buildCompareRequestParams = ({
     unifiedFilterValues,
     filterBindings,
     filterDefinitions,
+    resolutionContext,
   });
 
   if (!config?.compare) {
@@ -92,18 +128,16 @@ export const buildCompareRequestParams = ({
   const sourceParams = Array.isArray(config?.dataSourceParams) && config.dataSourceParams.length > 0
     ? config.dataSourceParams
     : dataSource?.params;
-  const timeRangeParamName = getTimeRangeParamName(sourceParams);
-  if (!timeRangeParamName) {
+  const comparableRangeParam = getComparableRangeParam(sourceParams);
+  if (!comparableRangeParam) {
     return { currentParams, baselineParams: null };
   }
 
-  const rawTimeRange = currentParams[timeRangeParamName];
-  if (!isTimeRangeTuple(rawTimeRange)) {
-    return { currentParams, baselineParams: null };
-  }
-
-  const baselineTimeRange = deriveBaselineTimeRange(rawTimeRange);
-  if (!baselineTimeRange) {
+  const rawRange = currentParams[comparableRangeParam.name];
+  const baselineRange = comparableRangeParam.type === 'dateRange'
+    ? isDateRangeTuple(rawRange) ? deriveBaselineDateRange(rawRange) : null
+    : isTimeRangeTuple(rawRange) ? deriveBaselineTimeRange(rawRange) : null;
+  if (!baselineRange) {
     return { currentParams, baselineParams: null };
   }
 
@@ -111,7 +145,7 @@ export const buildCompareRequestParams = ({
     currentParams,
     baselineParams: {
       ...currentParams,
-      [timeRangeParamName]: baselineTimeRange,
+      [comparableRangeParam.name]: baselineRange,
     },
   };
 };
@@ -122,19 +156,21 @@ export const fetchCompareData = async ({
   ...rest
 }: FetchCompareDataInput): Promise<CompareQueryResult> => {
   const { currentParams, baselineParams } = buildCompareRequestParams(rest);
-  const currentData = await getSourceDataByApiId(dataSourceId, currentParams);
+  const currentResult = await getSourceDataByApiId(dataSourceId, currentParams);
 
   if (!baselineParams) {
     return {
-      currentData,
+      currentData: currentResult.data,
       baselineData: null,
+      warnings: mergeWarnings(currentResult.warnings),
     };
   }
 
-  const baselineData = await getSourceDataByApiId(dataSourceId, baselineParams);
+  const baselineResult = await getSourceDataByApiId(dataSourceId, baselineParams);
   return {
-    currentData,
-    baselineData,
+    currentData: currentResult.data,
+    baselineData: baselineResult.data,
+    warnings: mergeWarnings(currentResult.warnings, baselineResult.warnings),
   };
 };
 
@@ -205,19 +241,6 @@ export const getChangePercent = (
   }
   if (currentValue > 0) {
     return 100;
-  }
-  return null;
-};
-
-export const resolveRequestTimeRange = (value: unknown): [string, string] | null => {
-  if (typeof value === 'number') {
-    return formatTimeRange(value) as [string, string];
-  }
-  if (Array.isArray(value) && value.length === 2) {
-    return formatTimeRange(value) as [string, string];
-  }
-  if (value && typeof value === 'object' && 'start' in (value as any) && 'end' in (value as any)) {
-    return formatTimeRange(value) as [string, string];
   }
   return null;
 };

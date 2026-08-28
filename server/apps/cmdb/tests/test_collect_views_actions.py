@@ -11,15 +11,15 @@
 视图测试经 DRF as_view 完整 dispatch（force_authenticate + superuser 绕过 HasPermission）；
 service / NodeMgmt / 权限规则在真实边界打桩，断言真实 JSON 响应与 DB 副作用。
 """
-import pydantic.root_model  # noqa: F401
-
 import json
 
+import pydantic.root_model  # noqa: F401
 import pytest
 from rest_framework.test import APIRequestFactory, force_authenticate
 
 from apps.cmdb.constants.constants import CollectPluginTypes, CollectRunStatusType
 from apps.cmdb.models.collect_model import CollectModels, OidMapping
+from apps.cmdb.models.node_mgmt_sync import NodeMgmtSyncConfig
 from apps.cmdb.views.collect import CollectModelViewSet, OidModelViewSet
 
 
@@ -58,6 +58,24 @@ def _bypass_permission(monkeypatch):
     monkeypatch.setattr("apps.cmdb.views.collect.get_permission_rules", lambda *a, **k: {})
     monkeypatch.setattr("apps.core.utils.serializers.get_permission_rules", lambda *a, **k: {})
     monkeypatch.setattr("apps.core.utils.permission_utils.get_permission_rules", lambda *a, **k: {})
+    monkeypatch.setattr(
+        CollectModelViewSet,
+        "get_queryset_by_permission",
+        lambda self, request, queryset, permission_key=None: queryset,
+    )
+
+
+def _system_collect_task():
+    return CollectModels.objects.create(
+        name="节点管理系统采集",
+        task_type=CollectPluginTypes.HOST,
+        model_id="host",
+        cycle_value_type="cycle",
+        team=[1],
+        is_system=True,
+        is_visible=False,
+        system_code="node_mgmt_region_1",
+    )
 
 
 # --------------------------------------------------------------------------
@@ -88,10 +106,49 @@ def test_parse_positive_int_below_one_raises():
 @pytest.mark.django_db
 def test_apply_visibility_filter_excludes_hidden():
     CollectModels.objects.create(name="vis", task_type=CollectPluginTypes.HOST, model_id="host", cycle_value_type="cycle", is_visible=True, team=[1])
-    CollectModels.objects.create(name="hid", task_type=CollectPluginTypes.HOST, model_id="host", driver_type="snmp", cycle_value_type="cycle", is_visible=False, team=[1])
+    CollectModels.objects.create(
+        name="hid", task_type=CollectPluginTypes.HOST, model_id="host", driver_type="snmp", cycle_value_type="cycle", is_visible=False, team=[1]
+    )
     qs = CollectModelViewSet.apply_visibility_filter(CollectModels.objects.all())
     names = sorted(qs.values_list("name", flat=True))
     assert names == ["vis"]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("method", "action", "data"),
+    [
+        ("get", "retrieve", None),
+        ("put", "update", {}),
+        ("delete", "destroy", None),
+        ("post", "exec_task", {}),
+    ],
+)
+def test_regular_detail_actions_cannot_access_node_mgmt_system_task(superuser, monkeypatch, mocker, method, action, data):
+    _bypass_permission(monkeypatch)
+    task = _system_collect_task()
+    submit = mocker.patch("apps.cmdb.views.collect.CollectModelService.exec_task")
+
+    request = _req(method, superuser, data=data, current_team="1")
+    response = CollectModelViewSet.as_view({method: action})(request, pk=task.id)
+
+    assert response.status_code == 404
+    assert CollectModels.objects.filter(pk=task.pk).exists()
+    submit.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_disabled_auto_collect_cannot_be_bypassed_through_regular_exec_endpoint(superuser, monkeypatch, mocker):
+    _bypass_permission(monkeypatch)
+    NodeMgmtSyncConfig.objects.create(auto_collect_enabled=False)
+    task = _system_collect_task()
+    submit = mocker.patch("apps.cmdb.views.collect.CollectModelService.exec_task")
+
+    request = _req("post", superuser, data={}, current_team="1")
+    response = CollectModelViewSet.as_view({"post": "exec_task"})(request, pk=task.id)
+
+    assert response.status_code == 404
+    submit.assert_not_called()
 
 
 # --------------------------------------------------------------------------
@@ -124,6 +181,21 @@ def test_model_doc_not_found_returns_placeholder(superuser):
     assert body["data"] == "未找到对应的文档！"
 
 
+@pytest.mark.django_db
+def test_model_doc_pc_returns_operator_guide(superuser):
+    request = _req("get", superuser, query={"id": "pc"})
+    resp = CollectModelViewSet.as_view({"get": "model_doc"})(request)
+    body = _body(resp)
+
+    assert body["result"] is True
+    assert "Windows" in body["data"]
+    assert "macOS" in body["data"]
+    assert "同步最新结果" in body["data"]
+    assert "安装软件" in body["data"]
+    assert "WinRM" in body["data"]
+    assert "SSH" in body["data"]
+
+
 # --------------------------------------------------------------------------
 # nodes（NodeMgmt 打桩）
 # --------------------------------------------------------------------------
@@ -138,14 +210,19 @@ def test_nodes_invalid_page(superuser):
 @pytest.mark.django_db
 def test_nodes_success(superuser, monkeypatch):
     request = _req("get", superuser, query={"page": "1", "page_size": "10"}, current_team="1")
-    monkeypatch.setattr(
-        "apps.cmdb.views.collect.NodeMgmt.node_list",
-        lambda self, query_data: {"count": 1, "nodes": [{"id": "n1"}]},
-    )
+    captured_query = {}
+
+    def fake_node_list(self, query_data):
+        captured_query.update(query_data)
+        return {"count": 1, "nodes": [{"id": "n1"}]}
+
+    monkeypatch.setattr("apps.cmdb.views.collect.NodeMgmt.node_list", fake_node_list)
     resp = CollectModelViewSet.as_view({"get": "nodes"})(request)
     body = _body(resp)
     assert body["result"] is True
     assert body["data"]["count"] == 1
+    assert captured_query["is_container"] is True
+    assert "node_type" not in captured_query
 
 
 # --------------------------------------------------------------------------
@@ -164,9 +241,7 @@ def test_list_regions_unknown_cloud_id(superuser, monkeypatch):
 @pytest.mark.django_db
 def test_list_regions_success(superuser, monkeypatch):
     monkeypatch.setattr("apps.cmdb.views.collect.NodeMgmt.cloud_region_list", lambda self: [{"id": "aws", "name": "AWS"}])
-    monkeypatch.setattr(
-        CollectModelViewSet, "_build_region_query_credential", lambda self, req, params, task_id=None: {"k": "v"}
-    )
+    monkeypatch.setattr(CollectModelViewSet, "_build_region_query_credential", lambda self, req, params, task_id=None: {"k": "v"})
     monkeypatch.setattr(
         "apps.cmdb.views.collect.CollectModelService.list_regions",
         lambda credential, cloud_name: {"success": True, "result": [{"region": "cn-north"}]},
@@ -181,9 +256,7 @@ def test_list_regions_success(superuser, monkeypatch):
 @pytest.mark.django_db
 def test_list_regions_service_failure(superuser, monkeypatch):
     monkeypatch.setattr("apps.cmdb.views.collect.NodeMgmt.cloud_region_list", lambda self: [{"id": "aws", "name": "AWS"}])
-    monkeypatch.setattr(
-        CollectModelViewSet, "_build_region_query_credential", lambda self, req, params, task_id=None: {}
-    )
+    monkeypatch.setattr(CollectModelViewSet, "_build_region_query_credential", lambda self, req, params, task_id=None: {})
     monkeypatch.setattr(
         "apps.cmdb.views.collect.CollectModelService.list_regions",
         lambda credential, cloud_name: {"success": False, "message": "鉴权失败"},
@@ -201,8 +274,18 @@ def test_list_regions_service_failure(superuser, monkeypatch):
 @pytest.mark.django_db
 def test_task_status_aggregates_by_status(superuser, monkeypatch):
     _bypass_permission(monkeypatch)
-    CollectModels.objects.create(name="t1", task_type=CollectPluginTypes.HOST, model_id="host", cycle_value_type="cycle", exec_status=CollectRunStatusType.SUCCESS, team=[1])
-    CollectModels.objects.create(name="t2", task_type=CollectPluginTypes.HOST, model_id="host", driver_type="snmp", cycle_value_type="cycle", exec_status=CollectRunStatusType.ERROR, team=[1])
+    CollectModels.objects.create(
+        name="t1", task_type=CollectPluginTypes.HOST, model_id="host", cycle_value_type="cycle", exec_status=CollectRunStatusType.SUCCESS, team=[1]
+    )
+    CollectModels.objects.create(
+        name="t2",
+        task_type=CollectPluginTypes.HOST,
+        model_id="host",
+        driver_type="snmp",
+        cycle_value_type="cycle",
+        exec_status=CollectRunStatusType.ERROR,
+        team=[1],
+    )
     request = _req("get", superuser, current_team="1")
     resp = CollectModelViewSet.as_view({"get": "task_status"})(request)
     body = _body(resp)
@@ -215,8 +298,18 @@ def test_task_status_aggregates_by_status(superuser, monkeypatch):
 @pytest.mark.django_db
 def test_task_overview_counts(superuser, monkeypatch):
     _bypass_permission(monkeypatch)
-    CollectModels.objects.create(name="o1", task_type=CollectPluginTypes.HOST, model_id="host", cycle_value_type="cycle", exec_status=CollectRunStatusType.SUCCESS, team=[1])
-    CollectModels.objects.create(name="o2", task_type=CollectPluginTypes.HOST, model_id="switch", driver_type="snmp", cycle_value_type="cycle", exec_status=CollectRunStatusType.ERROR, team=[1])
+    CollectModels.objects.create(
+        name="o1", task_type=CollectPluginTypes.HOST, model_id="host", cycle_value_type="cycle", exec_status=CollectRunStatusType.SUCCESS, team=[1]
+    )
+    CollectModels.objects.create(
+        name="o2",
+        task_type=CollectPluginTypes.HOST,
+        model_id="switch",
+        driver_type="snmp",
+        cycle_value_type="cycle",
+        exec_status=CollectRunStatusType.ERROR,
+        team=[1],
+    )
     request = _req("get", superuser, current_team="1")
     resp = CollectModelViewSet.as_view({"get": "task_overview"})(request)
     body = _body(resp)["data"]
@@ -227,20 +320,47 @@ def test_task_overview_counts(superuser, monkeypatch):
 
 
 @pytest.mark.django_db
-def test_model_instances_filters_empty_instances(superuser, monkeypatch):
+def test_model_instances_skips_legacy_targets_without_inst_uuid(superuser, monkeypatch):
     _bypass_permission(monkeypatch)
     CollectModels.objects.create(
-        name="mi1", task_type=CollectPluginTypes.HOST, model_id="host", cycle_value_type="cycle", team=[1],
+        name="mi1",
+        task_type=CollectPluginTypes.HOST,
+        model_id="host",
+        cycle_value_type="cycle",
+        team=[1],
         instances=[{"_id": "h1", "inst_name": "10.0.0.1"}],
     )
     CollectModels.objects.create(
-        name="mi-empty", task_type=CollectPluginTypes.HOST, model_id="host", driver_type="x", cycle_value_type="cycle", team=[1],
+        name="mi-empty",
+        task_type=CollectPluginTypes.HOST,
+        model_id="host",
+        driver_type="x",
+        cycle_value_type="cycle",
+        team=[1],
         instances=[],
     )
     request = _req("get", superuser, query={"task_type": CollectPluginTypes.HOST}, current_team="1")
     resp = CollectModelViewSet.as_view({"get": "model_instances"})(request)
     body = _body(resp)["data"]
-    assert body == [{"id": "h1", "inst_name": "10.0.0.1"}]
+    assert body == []
+
+
+@pytest.mark.django_db
+def test_model_instances_prefers_inst_uuid(superuser, monkeypatch):
+    _bypass_permission(monkeypatch)
+    inst_uuid = "63e4a531-b6bb-43cc-9eae-8eb8a09f795e"
+    CollectModels.objects.create(
+        name="mi-uuid",
+        task_type=CollectPluginTypes.HOST,
+        model_id="host",
+        cycle_value_type="cycle",
+        team=[1],
+        instances=[{"_id": 7, "inst_uuid": inst_uuid, "inst_name": "10.0.0.1"}],
+    )
+    request = _req("get", superuser, query={"task_type": CollectPluginTypes.HOST}, current_team="1")
+    resp = CollectModelViewSet.as_view({"get": "model_instances"})(request)
+    body = _body(resp)["data"]
+    assert body == [{"id": inst_uuid, "inst_name": "10.0.0.1"}]
 
 
 @pytest.mark.django_db
@@ -272,7 +392,11 @@ def test_tree_returns_obj_tree(superuser, monkeypatch):
 def test_info_returns_instance_info(superuser, monkeypatch):
     _bypass_permission(monkeypatch)
     task = CollectModels.objects.create(
-        name="info1", task_type=CollectPluginTypes.HOST, model_id="host", cycle_value_type="cycle", team=[1],
+        name="info1",
+        task_type=CollectPluginTypes.HOST,
+        model_id="host",
+        cycle_value_type="cycle",
+        team=[1],
         format_data={"add": [{"x": 1}], "update": [], "delete": [], "association": [], "__raw_data__": []},
     )
     request = _req("get", superuser, current_team="1")

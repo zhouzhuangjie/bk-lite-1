@@ -1,0 +1,621 @@
+import * as assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+import {
+  getRoom3DDisplayOptions,
+  getRoom3DRackDevices,
+  getRoom3DColumnLabel,
+  getRoom3DPositionLabel,
+  getRoom3DSceneRacks,
+  getRoom3DStandardLocation,
+  validateRoom3DData,
+} from "../src/app/ops-analysis/components/widgets/room3D/room3DData";
+import {
+  filterChartTypesForSurface,
+  hasSupportedChartTypeForSurface,
+} from "../src/app/ops-analysis/utils/chartTypeSurface";
+import {
+  resolveWidgetDataSourceState,
+  shouldWaitForInitialWidgetData,
+} from "../src/app/ops-analysis/utils/widgetRequestVersion";
+import { shouldShowInitialWidgetLoading } from "../src/app/ops-analysis/utils/widgetDataTransform";
+import {
+  getDefaultScreenWidgetAppearance,
+  normalizeScreenWidgetAppearance,
+  addConfiguredScreenWidget,
+  createScreenWidgetItem,
+} from "../src/app/ops-analysis/(pages)/view/screen/utils/layoutUtils";
+import {
+  ROOM3D_COL_GAP,
+  ROOM3D_DEVICE_PULL_OUT_DISTANCE,
+  ROOM3D_ROW_GAP,
+  buildRoomFloorSize,
+  getRoom3DRackScenePosition,
+  resolveRoomObjectClickState,
+  resolveRackClickState,
+  shouldAutoFocusRack,
+} from "../src/app/ops-analysis/components/widgets/room3D/room3DScene";
+import { createRackVisual } from "../src/app/ops-analysis/components/widgets/room3D/room3DMeshes";
+
+const installCanvasStub = () => {
+  const noop = () => undefined;
+  const context = {
+    arc: noop,
+    beginPath: noop,
+    clearRect: noop,
+    createLinearGradient: () => ({ addColorStop: noop }),
+    fill: noop,
+    fillRect: noop,
+    fillText: (text: string) => {
+      context.fillTextCalls.push(text);
+    },
+    lineTo: noop,
+    moveTo: noop,
+    stroke: noop,
+    strokeRect: noop,
+    strokeText: noop,
+    fillStyle: "",
+    font: "",
+    lineWidth: 1,
+    strokeStyle: "",
+    textAlign: "",
+    textBaseline: "",
+    fillTextCalls: [] as string[],
+  };
+  globalThis.document = {
+    createElement: (tagName: string) => {
+      assert.equal(tagName, "canvas");
+      return {
+        height: 0,
+        width: 0,
+        getContext: () => context,
+      };
+    },
+  } as unknown as Document;
+  return context;
+};
+
+const validRoom = {
+  room: { id: "7", name: "一号机房" },
+  racks: [
+    {
+      rack_id: "5",
+      rack_name: "A03",
+      location: "A03",
+      row: 1,
+      col: 3,
+      rack_type: "2",
+      rack_type_name: "网络",
+      u_count: 42,
+      used_u: 21,
+      free_u: 21,
+      device_count: 8,
+      devices: [
+        {
+          device_id: "10",
+          device_name: "SW-01",
+          model_id: "switch",
+          rack_u_start: 1,
+          u_size: 2,
+          status: "running",
+        },
+        {
+          device_id: "11",
+          device_name: "Host-01",
+          model_id: "host",
+          rack_u_start: 8,
+          u_size: 4,
+          status: null,
+        },
+      ],
+    },
+  ],
+  notice: "部分设备缺少有效 U 位，未在机柜内展示",
+};
+
+const validResult = validateRoom3DData(validRoom);
+assert.equal(validResult.ok, true);
+assert.equal(validResult.data?.room.name, "一号机房");
+assert.equal(validResult.data?.racks[0].rack_id, "5");
+assert.equal(validResult.data?.racks[0].location, "A03");
+assert.equal(validResult.data?.racks[0].rack_type_name, "网络");
+assert.equal(validResult.data?.racks[0].devices?.length, 2);
+assert.equal(validResult.data?.notice, "部分设备缺少有效 U 位，未在机柜内展示");
+assert.equal(getRoom3DPositionLabel(validResult.data!.racks[0]), "A03");
+
+const staleBackendCoordinates = validateRoom3DData({
+  room: { id: "7", name: "一号机房" },
+  racks: [
+    { rack_id: "stale-a", rack_name: "A01", location: "A01", row: 1, col: 1 },
+    { rack_id: "stale-b", rack_name: "B01", location: "B01", row: 1, col: 2 },
+  ],
+});
+assert.equal(staleBackendCoordinates.ok, true);
+assert.deepEqual(
+  staleBackendCoordinates.data?.racks.map((rack) => ({
+    id: rack.rack_id,
+    row: rack.row,
+    col: rack.col,
+    location: rack.location,
+  })),
+  [
+    { id: "stale-a", row: 1, col: 1, location: "A01" },
+    { id: "stale-b", row: 2, col: 1, location: "B01" },
+  ],
+);
+
+const realDevices = getRoom3DRackDevices(validResult.data!.racks[0]);
+assert.deepEqual(
+  realDevices.map((item) => ({
+    id: item.device_id,
+    name: item.device_name,
+    uStart: item.rack_u_start,
+    uSize: item.u_size,
+  })),
+  [
+    { id: "10", name: "SW-01", uStart: 1, uSize: 2 },
+    { id: "11", name: "Host-01", uStart: 8, uSize: 4 },
+  ],
+);
+
+const fallbackDevices = getRoom3DRackDevices({
+  rack_id: "6",
+  rack_name: "A04",
+  row: 1,
+  col: 4,
+  u_count: 42,
+  used_u: 12,
+  device_count: 3,
+});
+assert.deepEqual(fallbackDevices, []);
+
+const invalidDevicePosition = validateRoom3DData({
+  room: { id: "7", name: "一号机房" },
+  racks: [
+    {
+      rack_id: "5",
+      rack_name: "A03",
+      row: 1,
+      col: 3,
+      devices: [
+        {
+          device_id: "10",
+          device_name: "SW-01",
+          rack_u_start: null,
+          u_size: 2,
+        },
+      ],
+    },
+  ],
+});
+assert.equal(invalidDevicePosition.ok, false);
+assert.match(invalidDevicePosition.error || "", /room3DDeviceRequiredError/);
+
+assert.deepEqual(
+  resolveRackClickState(
+    { selectedRackId: "rack-a", openRackId: "rack-a" },
+    null,
+  ),
+  { selectedRackId: "rack-a", openRackId: "rack-a" },
+);
+assert.deepEqual(
+  resolveRackClickState(
+    { selectedRackId: "rack-a", openRackId: "rack-a" },
+    "rack-a",
+  ),
+  { selectedRackId: "rack-a", openRackId: "" },
+);
+assert.deepEqual(
+  resolveRackClickState(
+    { selectedRackId: "rack-a", openRackId: "rack-a" },
+    "rack-b",
+  ),
+  { selectedRackId: "rack-b", openRackId: "rack-b" },
+);
+assert.deepEqual(
+  resolveRoomObjectClickState(
+    {
+      selectedRackId: "rack-a",
+      openRackId: "rack-a",
+      selectedDeviceId: "device-a",
+    },
+    null,
+  ),
+  {
+    selectedRackId: "rack-a",
+    openRackId: "rack-a",
+    selectedDeviceId: "device-a",
+  },
+);
+assert.deepEqual(
+  resolveRoomObjectClickState(
+    { selectedRackId: "rack-a", openRackId: "", selectedDeviceId: "" },
+    { rackId: "rack-a", deviceId: "device-a" },
+  ),
+  {
+    selectedRackId: "rack-a",
+    openRackId: "rack-a",
+    selectedDeviceId: "device-a",
+  },
+);
+assert.deepEqual(
+  resolveRoomObjectClickState(
+    {
+      selectedRackId: "rack-a",
+      openRackId: "rack-a",
+      selectedDeviceId: "device-a",
+    },
+    { rackId: "rack-a", deviceId: "device-a" },
+  ),
+  { selectedRackId: "rack-a", openRackId: "rack-a", selectedDeviceId: "" },
+);
+assert.deepEqual(
+  resolveRoomObjectClickState(
+    {
+      selectedRackId: "rack-a",
+      openRackId: "rack-a",
+      selectedDeviceId: "device-a",
+    },
+    { rackId: "rack-a" },
+  ),
+  { selectedRackId: "rack-a", openRackId: "rack-a", selectedDeviceId: "" },
+);
+assert.deepEqual(
+  resolveRoomObjectClickState(
+    {
+      selectedRackId: "rack-a",
+      openRackId: "rack-a",
+      selectedDeviceId: "device-a",
+    },
+    { rackId: "rack-a", target: "door" },
+  ),
+  { selectedRackId: "", openRackId: "", selectedDeviceId: "" },
+);
+assert.deepEqual(
+  resolveRoomObjectClickState(
+    {
+      selectedRackId: "",
+      openRackId: "",
+      selectedDeviceId: "",
+    },
+    { rackId: "rack-a", target: "door" },
+  ),
+  { selectedRackId: "rack-a", openRackId: "rack-a", selectedDeviceId: "" },
+);
+
+const emptyResult = validateRoom3DData({
+  room: { id: "8", name: "空机房" },
+  racks: [],
+});
+assert.equal(emptyResult.ok, true);
+assert.equal(emptyResult.data?.racks.length, 0);
+assert.equal(emptyResult.data?.notice, undefined);
+
+const missingRoom = validateRoom3DData({ racks: [] });
+assert.equal(missingRoom.ok, false);
+assert.match(missingRoom.error || "", /room3DFormatError/);
+
+const missingRackField = validateRoom3DData({
+  room: { id: "7", name: "一号机房" },
+  racks: [{ rack_id: "5", rack_name: "A03", row: 1 }],
+});
+assert.equal(missingRackField.ok, false);
+assert.match(missingRackField.error || "", /room3DRackRequiredError/);
+
+const invalidPosition = validateRoom3DData({
+  room: { id: "7", name: "一号机房" },
+  racks: [{ rack_id: "5", rack_name: "A03", row: 0, col: 1 }],
+});
+assert.equal(invalidPosition.ok, false);
+assert.match(invalidPosition.error || "", /room3DRackRequiredError/);
+
+const duplicatedPosition = validateRoom3DData({
+  room: { id: "7", name: "一号机房" },
+  racks: [
+    { rack_id: "5", rack_name: "A03", location: "A03", row: 1, col: 3 },
+    { rack_id: "6", rack_name: "A3", location: "A03", row: 1, col: 3 },
+    { rack_id: "7", rack_name: "B03", location: "B03", row: 2, col: 3 },
+  ],
+});
+assert.equal(duplicatedPosition.ok, true);
+const duplicatedSceneRacks = getRoom3DSceneRacks(duplicatedPosition.data!);
+assert.equal(duplicatedSceneRacks.length, 2);
+assert.equal(duplicatedSceneRacks[0].is_conflict, true);
+assert.equal(duplicatedSceneRacks[0].location, "A03");
+assert.deepEqual(
+  duplicatedSceneRacks[0].conflict_racks?.map((rack) => rack.rack_name),
+  ["A03", "A3"],
+);
+assert.equal(duplicatedSceneRacks[1].rack_id, "7");
+
+assert.equal(getRoom3DColumnLabel(1), "A");
+assert.equal(getRoom3DColumnLabel(26), "Z");
+assert.equal(getRoom3DColumnLabel(27), "AA");
+assert.equal(getRoom3DStandardLocation(1, 1), "A01");
+assert.equal(getRoom3DStandardLocation(1, 2), "A02");
+assert.equal(getRoom3DStandardLocation(1, 9), "A09");
+assert.equal(getRoom3DStandardLocation(21, 2), "U02");
+assert.equal(ROOM3D_COL_GAP > 1, true);
+assert.equal(ROOM3D_COL_GAP < 1.4, true);
+assert.equal(ROOM3D_ROW_GAP > ROOM3D_COL_GAP * 2.5, true);
+assert.equal(ROOM3D_DEVICE_PULL_OUT_DISTANCE >= 0.3, true);
+assert.equal(ROOM3D_DEVICE_PULL_OUT_DISTANCE <= 0.4, true);
+const columnDominantFloor = buildRoomFloorSize(3, 8);
+assert.equal(
+  columnDominantFloor.floorDepth > columnDominantFloor.floorWidth,
+  true,
+);
+const compactColumnFloor = buildRoomFloorSize(1, 4);
+const compactColumnAspect =
+  compactColumnFloor.floorDepth / compactColumnFloor.floorWidth;
+const columnDominantAspect =
+  columnDominantFloor.floorDepth / columnDominantFloor.floorWidth;
+assert.equal(
+  compactColumnFloor.floorWidth > compactColumnFloor.floorDepth,
+  true,
+);
+assert.equal(
+  compactColumnFloor.floorDepth < columnDominantFloor.floorDepth,
+  true,
+);
+assert.equal(compactColumnAspect < columnDominantAspect, true);
+assert.equal(compactColumnFloor.floorDepth >= 7.5, true);
+assert.equal(compactColumnFloor.floorDepth < 10, true);
+assert.equal(compactColumnFloor.floorWidth < 8.5, true);
+const firstRackPosition = getRoom3DRackScenePosition(
+  { row: 1, col: 1 },
+  { maxRow: 4, maxCol: 6 },
+);
+const lastRackPosition = getRoom3DRackScenePosition(
+  { row: 4, col: 1 },
+  { maxRow: 4, maxCol: 6 },
+);
+assert.equal(firstRackPosition.x, lastRackPosition.x);
+assert.equal(firstRackPosition.z > lastRackPosition.z, true);
+
+assert.equal(shouldAutoFocusRack(8.1), true);
+assert.equal(shouldAutoFocusRack(5.2), false);
+
+const canvasContext = installCanvasStub();
+const rackWithManyDevices = createRackVisual(
+  {
+    rack_id: "dense-rack",
+    rack_name: "Dense Rack",
+    rack_type: "2",
+    rack_type_name: "Network",
+    row: 1,
+    col: 1,
+    u_count: 42,
+    devices: Array.from({ length: 20 }, (_, index) => ({
+      device_id: `device-${index + 1}`,
+      device_name: `Device ${index + 1}`,
+      rack_u_start: index + 1,
+      u_size: 1,
+    })),
+  },
+  0,
+  0,
+);
+assert.equal(rackWithManyDevices.deviceMeshes.length, 20);
+assert.equal(canvasContext.fillTextCalls.includes("A01"), true);
+assert.equal(canvasContext.fillTextCalls.includes("Network"), true);
+
+canvasContext.fillTextCalls.length = 0;
+createRackVisual(
+  {
+    rack_id: "raw-type-rack",
+    rack_name: "Raw Type Rack",
+    rack_type: "2",
+    row: 1,
+    col: 2,
+  },
+  0,
+  0,
+);
+// row=1,col=2 → A02（一整排是 A，过道方向递增）
+assert.equal(canvasContext.fillTextCalls.includes("A02"), true);
+assert.equal(canvasContext.fillTextCalls.includes("B01"), false);
+assert.equal(canvasContext.fillTextCalls.includes("2"), false);
+
+assert.deepEqual(filterChartTypesForSurface(["line", "room3D"], "screen"), [
+  "line",
+  "room3D",
+]);
+assert.deepEqual(filterChartTypesForSurface(["line", "room3D"], "dashboard"), [
+  "line",
+]);
+assert.equal(hasSupportedChartTypeForSurface(["room3D"], "dashboard"), false);
+assert.equal(hasSupportedChartTypeForSurface(["room3D"], "screen"), true);
+assert.equal(
+  hasSupportedChartTypeForSurface(["room3D", "line"], "dashboard"),
+  true,
+);
+assert.equal(
+  shouldWaitForInitialWidgetData({
+    isSceneWidget: false,
+    isTableLikeChart: false,
+    hasDataSourceId: true,
+    hasResolvedDataSource: false,
+    dataSourceLookupLoading: true,
+    hasRawPayload: false,
+    hasDataValidation: false,
+    requestEnabled: true,
+    hasRequested: false,
+  }),
+  true,
+);
+assert.equal(
+  shouldWaitForInitialWidgetData({
+    isSceneWidget: false,
+    isTableLikeChart: false,
+    hasDataSourceId: true,
+    hasResolvedDataSource: false,
+    dataSourceLookupLoading: false,
+    hasRawPayload: false,
+    hasDataValidation: false,
+    requestEnabled: false,
+    hasRequested: false,
+  }),
+  false,
+  "已删除的数据源匹配结束后不应继续等待",
+);
+assert.equal(
+  resolveWidgetDataSourceState({
+    hasDataSourceId: true,
+    hasResolvedDataSource: false,
+    lookupStatus: "error",
+  }),
+  "data-source-load-error",
+  "数据源元数据请求失败不能误报为数据源不存在",
+);
+assert.equal(
+  resolveWidgetDataSourceState({
+    hasDataSourceId: true,
+    hasResolvedDataSource: false,
+    lookupStatus: "success",
+  }),
+  "data-source-not-found",
+  "元数据请求成功但目标缺失时才显示数据源不存在",
+);
+assert.equal(
+  resolveWidgetDataSourceState({
+    hasDataSourceId: true,
+    hasResolvedDataSource: false,
+    lookupStatus: "loading",
+  }),
+  "loading",
+);
+assert.equal(
+  shouldWaitForInitialWidgetData({
+    isSceneWidget: false,
+    isTableLikeChart: false,
+    hasDataSourceId: true,
+    hasResolvedDataSource: true,
+    dataSourceLookupLoading: false,
+    hasRawPayload: false,
+    hasDataValidation: false,
+    requestEnabled: false,
+    hasRequested: false,
+  }),
+  false,
+);
+assert.equal(
+  shouldWaitForInitialWidgetData({
+    isSceneWidget: false,
+    isTableLikeChart: true,
+    hasDataSourceId: true,
+    hasResolvedDataSource: true,
+    dataSourceLookupLoading: false,
+    hasRawPayload: false,
+    hasDataValidation: false,
+    requestEnabled: true,
+    hasRequested: false,
+  }),
+  true,
+);
+assert.equal(
+  shouldShowInitialWidgetLoading({
+    loading: true,
+    isTableLikeChart: true,
+    hasRawPayload: false,
+    hasSettledRequest: false,
+  }),
+  true,
+);
+assert.equal(
+  shouldWaitForInitialWidgetData({
+    isSceneWidget: false,
+    isTableLikeChart: false,
+    hasDataSourceId: true,
+    hasResolvedDataSource: true,
+    dataSourceLookupLoading: false,
+    hasRawPayload: true,
+    hasDataValidation: false,
+    requestEnabled: true,
+    hasRequested: false,
+  }),
+  false,
+);
+
+assert.deepEqual(normalizeScreenWidgetAppearance(undefined), {
+  frame: "panel",
+});
+assert.deepEqual(normalizeScreenWidgetAppearance({ frame: "bare" }), {
+  frame: "bare",
+});
+assert.deepEqual(
+  normalizeScreenWidgetAppearance({ frame: "unknown" as "bare" }),
+  { frame: "panel" },
+);
+assert.deepEqual(getDefaultScreenWidgetAppearance("room3D"), { frame: "bare" });
+assert.deepEqual(getDefaultScreenWidgetAppearance("line"), { frame: "panel" });
+assert.deepEqual(getRoom3DDisplayOptions({ appearance: { frame: "bare" } }), {
+  immersive: true,
+});
+assert.deepEqual(getRoom3DDisplayOptions({ appearance: { frame: "panel" } }), {
+  immersive: false,
+});
+
+const room3DWidget = createScreenWidgetItem("room3D", []);
+assert.deepEqual(room3DWidget.valueConfig.appearance, { frame: "bare" });
+
+const screenWithUnsupportedBareLine = addConfiguredScreenWidget(
+  {
+    viewport: { width: 1920, height: 1080 },
+    decorations: {},
+    items: [],
+  },
+  {
+    name: "透明折线",
+    chartType: "line",
+    dataSource: 1,
+    appearance: { frame: "bare" },
+  },
+);
+assert.equal(screenWithUnsupportedBareLine.items[0].chartType, "line");
+assert.deepEqual(screenWithUnsupportedBareLine.items[0].valueConfig.appearance, {
+  frame: "panel",
+});
+
+const room3DComponentSource = readFileSync(
+  new URL(
+    "../src/app/ops-analysis/components/widgets/room3D/index.tsx",
+    import.meta.url,
+  ),
+  "utf8",
+);
+const room3DStyleSource = readFileSync(
+  new URL(
+    "../src/app/ops-analysis/components/widgets/room3D/room3D.module.scss",
+    import.meta.url,
+  ),
+  "utf8",
+);
+const screenWidgetFrameSource = readFileSync(
+  new URL(
+    "../src/app/ops-analysis/(pages)/view/screen/components/screenWidgetFrame.tsx",
+    import.meta.url,
+  ),
+  "utf8",
+);
+const componentSwitchSource = readFileSync(
+  new URL(
+    "../src/app/ops-analysis/components/componentParamSwitchControl.tsx",
+    import.meta.url,
+  ),
+  "utf8",
+);
+assert.match(room3DComponentSource, /roomSwitchOverlay/);
+assert.match(room3DComponentSource, /chromeVisible|room3DChromeVisible/);
+assert.match(room3DComponentSource, /showRoomSummary = !componentSwitchControl/);
+assert.match(room3DComponentSource, /styles\.roomTitle/);
+assert.match(room3DComponentSource, /roomSummaryText/);
+assert.match(room3DStyleSource, /\.roomTitle\b/);
+assert.match(room3DStyleSource, /\.room3DImmersive:hover/);
+assert.doesNotMatch(
+  room3DStyleSource,
+  /\.room3DImmersive[^\{]*\.roomSwitchOverlay/,
+);
+assert.match(screenWidgetFrameSource, /screen-widget-frame__drag-surface/);
+assert.doesNotMatch(componentSwitchSource, /component-param-switch-control/);
+assert.match(componentSwitchSource, /ScreenWidgetThemeProvider/);

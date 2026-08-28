@@ -1,3 +1,5 @@
+import re
+
 from apps.core.exceptions.base_app_exception import BaseAppException
 from apps.core.logger import monitor_logger as logger
 from apps.core.utils.loader import LanguageLoader
@@ -6,6 +8,7 @@ from apps.monitor.constants.plugin import PluginConstants
 from apps.monitor.models import CollectConfig, MonitorObject, MonitorPlugin
 from apps.monitor.utils.dimension import parse_instance_id
 from apps.monitor.utils.victoriametrics_api import VictoriaMetricsAPI
+from apps.monitor.utils.vm_query_batch import run_unique_vm_queries
 
 
 class MonitorEffectivePluginService:
@@ -60,12 +63,58 @@ class MonitorEffectivePluginService:
 
     @staticmethod
     def _get_configured_plugin_ids(instance_id: str) -> set[int]:
-        return set(
+        """Exact instance_id match, plus multi-key child configs sharing the same primary.
+
+        Process CollectConfig rows are keyed as ``('host_id', 'process_name')``. Host
+        dashboard process metrics call this API with the host storage id
+        ``('host_id',)``; without primary-prefix matching those configs never count.
+        """
+        plugin_ids = set(
             CollectConfig.objects.filter(
                 monitor_instance_id=instance_id,
                 monitor_plugin_id__isnull=False,
             ).values_list("monitor_plugin_id", flat=True)
         )
+        parsed = parse_instance_id(instance_id)
+        if not parsed:
+            return plugin_ids
+
+        primary = str(parsed[0])
+        # Loose startswith then parse — avoids host_01 matching host_011 via prefix alone.
+        # monitor_instance is a FK; filter on related MonitorInstance.id (CharField PK).
+        loose_prefix = f"('{primary}'"
+        for monitor_instance_id, plugin_id in CollectConfig.objects.filter(
+            monitor_instance__id__startswith=loose_prefix,
+            monitor_plugin_id__isnull=False,
+        ).values_list("monitor_instance_id", "monitor_plugin_id"):
+            if monitor_instance_id == instance_id:
+                continue
+            child_parsed = parse_instance_id(monitor_instance_id)
+            if child_parsed and str(child_parsed[0]) == primary:
+                plugin_ids.add(plugin_id)
+        return plugin_ids
+
+    @staticmethod
+    def _inject_label_matcher(query: str, key: str, value: str) -> str:
+        """Inject ``key="value"`` into every PromQL selector to scope status queries."""
+        escaped = (
+            str(value)
+            .replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+        )
+        matcher = f'{key}="{escaped}"'
+        key_pattern = re.compile(rf"(?:^|,)\s*{re.escape(key)}\s*(=~?|!=)")
+
+        def _replacer(match: re.Match) -> str:
+            body = match.group(1).strip()
+            if key_pattern.search(body):
+                return match.group(0)
+            if not body:
+                return "{" + matcher + "}"
+            return "{" + matcher + "," + body + "}"
+
+        return re.sub(r"\{([^{}]*)\}", _replacer, query)
 
     @staticmethod
     def _get_reported_plugin_ids(plugins: list[MonitorPlugin], instance_id: str, instance_id_keys: list[str]) -> set[int]:
@@ -73,16 +122,35 @@ class MonitorEffectivePluginService:
         parsed = parse_instance_id(instance_id)
         primary_key = instance_id_keys[0] if instance_id_keys else "instance_id"
         target_primary = str(parsed[0]) if parsed else None
-        vm_api = VictoriaMetricsAPI()
+        plugin_queries = []
         for plugin in plugins:
             query = (plugin.status_query or "").strip()
             if not query:
                 continue
-            try:
-                response = vm_api.query(query, step="20m")
-            except Exception:
-                logger.exception("Failed to query monitor plugin status. plugin_id=%s instance_id=%s", plugin.id, instance_id)
+            # Process (and other multi-key) status_query can return every series in the
+            # cluster; scope by primary label so host→process metrics does not hang.
+            if target_primary is not None:
+                query = MonitorEffectivePluginService._inject_label_matcher(
+                    query, primary_key, target_primary
+                )
+            plugin_queries.append((plugin, query))
+
+        vm_api = VictoriaMetricsAPI()
+        responses, errors = run_unique_vm_queries(
+            (query for _, query in plugin_queries),
+            lambda query: vm_api.query(query, step="20m"),
+        )
+        for plugin, query in plugin_queries:
+            if query in errors:
+                error = errors[query]
+                logger.warning(
+                    "Failed to query monitor plugin status. plugin_id=%s instance_id=%s",
+                    plugin.id,
+                    instance_id,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
                 continue
+            response = responses[query]
 
             for metric in response.get("data", {}).get("result", []):
                 labels = metric.get("metric", {})

@@ -1,3 +1,4 @@
+'use client';
 import React, {
   useState,
   useEffect,
@@ -7,7 +8,7 @@ import React, {
   useRef,
   useId
 } from 'react';
-import { Empty } from 'antd';
+import ChartEmptyState from '@/components/chart-empty-state';
 import {
   XAxis,
   YAxis,
@@ -40,6 +41,7 @@ import { LEVEL_MAP, CHART_COLORS } from '@/app/monitor/constants';
 import { useLevelList } from '@/app/monitor/hooks';
 import {
   GAP_INTERVAL_AREA_STYLE,
+  GAP_INTERVAL_BOUNDARY_STYLE,
   getChartDataWithGapBreaks,
   getRenderedGapIntervals
 } from '@/app/monitor/utils/gapIntervals';
@@ -62,15 +64,21 @@ interface LineChartProps {
   syncId?: string;
   onXRangeChange?: (arr: [Dayjs, Dayjs]) => void;
   seriesStyles?: Array<{
+    dataKey?: string;
     color?: string;
     strokeDasharray?: string;
     fillOpacity?: number;
     strokeOpacity?: number;
     strokeWidth?: number;
     unit?: string;
+    name?: string;
+    dotStyle?: 'solid' | 'hollow';
   }>;
   xAxisTimeFormat?: string;
   leftAxisWidthOverride?: number;
+  xAxisDomain?: [number, number];
+  /** 默认 samples：仪表盘/阈值告警的采样中点空窗。plot：无数据告警贴边铺满。 */
+  gapFit?: 'samples' | 'plot';
 }
 
 const getChartAreaKeys = (arr: ChartData[]): string[] => {
@@ -98,7 +106,35 @@ interface ResolvedSeriesStyle {
   strokeOpacity: number;
   strokeWidth: number;
   unit?: string;
+  name?: string;
+  dotStyle?: 'solid' | 'hollow';
 }
+
+const resolveSeriesStyleInput = (
+  seriesStyles: LineChartProps['seriesStyles'] = [],
+  dataKey: string,
+  index: number
+) => seriesStyles.find((item) => item.dataKey === dataKey) || seriesStyles[index] || {};
+
+const resolveSeriesDot = (style: ResolvedSeriesStyle, active = false) => {
+  if (style.dotStyle === 'solid') {
+    return {
+      r: active ? 4 : 3,
+      fill: style.color,
+      stroke: style.color,
+      strokeWidth: active ? 2 : 1
+    };
+  }
+  if (style.dotStyle === 'hollow') {
+    return {
+      r: active ? 4.5 : 3.5,
+      fill: 'var(--color-bg-1)',
+      stroke: style.color,
+      strokeWidth: active ? 2 : 1.5
+    };
+  }
+  return active ? { r: 4, strokeWidth: 2, fill: style.color } : false;
+};
 
 const getNiceStep = (rawStep: number) => {
   if (!Number.isFinite(rawStep) || rawStep <= 0) {
@@ -128,6 +164,29 @@ const formatAxisNumber = (value: number) => {
   }
 
   return value.toFixed(2).replace(/\.0+$/, '').replace(/(\.\d*[1-9])0+$/, '$1');
+};
+
+/** 与 Y 轴 tick 渲染、左侧宽度预留共用，避免长枚举名撑宽后实际短文案导致漂移。 */
+const Y_AXIS_TICK_LABEL_MAX_LENGTH = 6;
+
+const formatYAxisTickLabel = (value: number | string, unit?: string) => {
+  let label = String(value);
+  if (isStringArray(unit || '')) {
+    try {
+      const unitName = (JSON.parse(unit as string) as ListItem[]).find(
+        (item) => item.id === Number(value)
+      )?.name;
+      label = unitName || formatAxisNumber(Number(value));
+    } catch {
+      label = formatAxisNumber(Number(value));
+    }
+  } else {
+    label = formatAxisNumber(Number(value));
+  }
+  if (label.length > Y_AXIS_TICK_LABEL_MAX_LENGTH) {
+    return `${label.slice(0, Y_AXIS_TICK_LABEL_MAX_LENGTH - 1)}...`;
+  }
+  return label;
 };
 
 const buildNiceAxis = (
@@ -176,7 +235,9 @@ const LineChart: React.FC<LineChartProps> = memo(
     onXRangeChange,
     seriesStyles = [],
     xAxisTimeFormat,
-    leftAxisWidthOverride
+    leftAxisWidthOverride,
+    xAxisDomain,
+    gapFit = 'samples'
   }) => {
     const { formatTime } = useFormatTime();
     const levelList = useLevelList();
@@ -211,17 +272,22 @@ const LineChart: React.FC<LineChartProps> = memo(
 
     const resolvedSeriesStyles = useMemo<ResolvedSeriesStyle[]>(
       () =>
-        chartAreaKeys.map((_, index) => ({
-          color:
-            seriesStyles[index]?.color ||
-            (index === 0 && metric && typeof metric.color === 'string' ? metric.color : '') ||
-            CHART_COLORS[index % CHART_COLORS.length],
-          strokeDasharray: seriesStyles[index]?.strokeDasharray,
-          fillOpacity: seriesStyles[index]?.fillOpacity ?? DEFAULT_FILL_OPACITY,
-          strokeOpacity: seriesStyles[index]?.strokeOpacity ?? 1,
-          strokeWidth: seriesStyles[index]?.strokeWidth ?? DEFAULT_STROKE_WIDTH,
-          unit: seriesStyles[index]?.unit
-        })),
+        chartAreaKeys.map((key, index) => {
+          const matched = resolveSeriesStyleInput(seriesStyles, key, index);
+          return {
+            color:
+              matched.color ||
+              (index === 0 && metric && typeof metric.color === 'string' ? metric.color : '') ||
+              CHART_COLORS[index % CHART_COLORS.length],
+            strokeDasharray: matched.strokeDasharray,
+            fillOpacity: matched.fillOpacity ?? DEFAULT_FILL_OPACITY,
+            strokeOpacity: matched.strokeOpacity ?? 1,
+            strokeWidth: matched.strokeWidth ?? DEFAULT_STROKE_WIDTH,
+            unit: matched.unit,
+            name: matched.name,
+            dotStyle: matched.dotStyle
+          };
+        }),
       [chartAreaKeys, metric, seriesStyles]
     );
 
@@ -231,13 +297,13 @@ const LineChart: React.FC<LineChartProps> = memo(
     );
 
     const renderedGapIntervals = useMemo(
-      () => getRenderedGapIntervals(data, data[0]?.gapIntervals || []),
-      [data]
+      () => getRenderedGapIntervals(data, data[0]?.gapIntervals || [], xAxisDomain),
+      [data, xAxisDomain]
     );
 
     const chartDataWithGapBreaks = useMemo(
-      () => getChartDataWithGapBreaks(data, data[0]?.gapIntervals || []),
-      [data]
+      () => getChartDataWithGapBreaks(data, data[0]?.gapIntervals || [], xAxisDomain),
+      [data, xAxisDomain]
     );
 
     const yAxisTickCount = useMemo(() => {
@@ -289,12 +355,31 @@ const LineChart: React.FC<LineChartProps> = memo(
     }, []);
 
     const { minTime, maxTime } = useMemo(() => {
+      if (xAxisDomain) {
+        return {
+          minTime: xAxisDomain[0],
+          maxTime: xAxisDomain[1]
+        };
+      }
       const times = data.map((d) => d.time);
       return {
         minTime: +new Date(Math.min(...times)),
         maxTime: +new Date(Math.max(...times))
       };
-    }, [data]);
+    }, [data, xAxisDomain]);
+
+    const gapBoundaryTimes = useMemo(
+      () => Array.from(new Set(
+        renderedGapIntervals
+          .flatMap((gap) => [gap.start, gap.end])
+          .filter((time) =>
+            gapFit === 'plot'
+              ? time >= minTime && time <= maxTime
+              : time > minTime && time < maxTime
+          )
+      )),
+      [gapFit, maxTime, minTime, renderedGapIntervals]
+    );
 
     // 计算 Y 轴范围，确保阈值线能显示
     const yAxisDomain = useMemo((): [number | 'auto', number | 'auto'] => {
@@ -380,16 +465,21 @@ const LineChart: React.FC<LineChartProps> = memo(
         return leftAxisWidthOverride;
       }
 
-      if (isStringArray(unit)) {
-        return 56;
-      }
-
-      const maxLabelLength = Math.max(
-        ...niceYAxis.ticks.map((tick) => formatAxisNumber(Number(tick)).length),
-        1
+      // 必须与 formatYAxisTickLabel 最终展示的文案一致，否则枚举长文案会把左侧撑得过宽，
+      // 而实际刻度是短数字时就会出现「整图往右漂」的观感。
+      const tickLabels = niceYAxis.ticks.map((tick) =>
+        formatYAxisTickLabel(tick, unit)
       );
 
-      return Math.min(Math.max(maxLabelLength * 8 + 8, 32), 50);
+      const maxLabelLength = Math.max(
+        ...tickLabels.map((label) => label.length),
+        1
+      );
+      const hasWideChars = tickLabels.some((label) =>
+        /[\u4e00-\u9fff]/.test(label)
+      );
+      const charWidth = hasWideChars ? 12 : 8;
+      return Math.min(Math.max(maxLabelLength * charWidth + 12, 36), 80);
     }, [leftAxisWidthOverride, niceYAxis.ticks, unit]);
 
     // 计算阈值标签信息（包含格式化文本和偏移量）
@@ -611,16 +701,21 @@ const LineChart: React.FC<LineChartProps> = memo(
     const renderYAxisTick = useCallback(
       (props: any) => {
         const { x, y, payload } = props;
-        let label = String(payload.value);
-        if (isStringArray(unit)) {
-          const unitName = JSON.parse(unit).find(
-            (item: ListItem) => item.id === +label
-          )?.name;
-          label = unitName || label;
-        } else {
-          label = formatAxisNumber(Number(payload.value));
-        }
-        const maxLength = 6; // 设置标签的最大长度
+        const label = formatYAxisTickLabel(payload.value, unit);
+        const fullText =
+          isStringArray(unit || '')
+            ? (() => {
+              try {
+                return (
+                  (JSON.parse(unit as string) as ListItem[]).find(
+                    (item) => item.id === Number(payload.value)
+                  )?.name || String(payload.value)
+                );
+              } catch {
+                return String(payload.value);
+              }
+            })()
+            : formatAxisNumber(Number(payload.value));
         return (
           <text
             x={x}
@@ -629,12 +724,12 @@ const LineChart: React.FC<LineChartProps> = memo(
             fontSize={12}
             fill="var(--color-text-3)"
             dy={4}
-            dx={2}
+            dx={0}
           >
-            {label.length > maxLength && <title>{label}</title>}
-            {label.length > maxLength
-              ? `${label.slice(0, maxLength - 1)}...`
-              : label}
+            {fullText.length > Y_AXIS_TICK_LABEL_MAX_LENGTH && (
+              <title>{fullText}</title>
+            )}
+            {label}
           </text>
         );
       },
@@ -667,9 +762,9 @@ const LineChart: React.FC<LineChartProps> = memo(
                 syncId={syncId}
                 margin={{
                   top: 10,
-                  right: rightMargin,
-                  left: 0,
-                  bottom: 6
+                  right: Math.max(rightMargin, 8),
+                  left: 4,
+                  bottom: 10
                 }}
                 onMouseDown={handleMouseDown}
                 onMouseMove={handleMouseMove}
@@ -678,7 +773,8 @@ const LineChart: React.FC<LineChartProps> = memo(
                 <XAxis
                   dataKey="time"
                   type="number"
-                  domain={['dataMin', 'dataMax']}
+                  domain={xAxisDomain || ['dataMin', 'dataMax']}
+                  allowDataOverflow={!!xAxisDomain}
                   tick={{ fill: 'var(--color-text-3)', fontSize: 12 }}
                   tickFormatter={formatXAxisTick}
                   tickCount={xAxisTickCount}
@@ -687,6 +783,7 @@ const LineChart: React.FC<LineChartProps> = memo(
                 />
                 <YAxis
                   yAxisId="left"
+                  orientation="left"
                   axisLine={false}
                   tickLine={false}
                   tick={renderYAxisTick}
@@ -702,13 +799,29 @@ const LineChart: React.FC<LineChartProps> = memo(
                     key={`gap-${gap.start}-${gap.end}`}
                     x1={gap.start}
                     x2={gap.end}
+                    {...(gapFit === 'plot'
+                      ? {
+                          y1: niceYAxis.domain[0],
+                          y2: niceYAxis.domain[1],
+                        }
+                      : {})}
                     yAxisId="left"
                     {...GAP_INTERVAL_AREA_STYLE}
-                    ifOverflow="extendDomain"
+                    ifOverflow={gapFit === 'plot' ? 'visible' : 'hidden'}
+                  />
+                ))}
+                {gapBoundaryTimes.map((time) => (
+                  <ReferenceLine
+                    key={`gap-boundary-${time}`}
+                    x={time}
+                    yAxisId="left"
+                    {...GAP_INTERVAL_BOUNDARY_STYLE}
+                    ifOverflow="hidden"
                   />
                 ))}
                 <Tooltip
                   offset={-1}
+                  filterNull={gapFit !== 'plot'}
                   cursor={{
                     stroke: 'var(--color-text-3)',
                     strokeWidth: 1,
@@ -756,6 +869,7 @@ const LineChart: React.FC<LineChartProps> = memo(
                       key={key}
                       type="linear"
                       dataKey={key}
+                      name={resolvedSeriesStyles[index]?.name || key}
                       yAxisId="left"
                       stroke={resolvedSeriesStyles[index]?.color}
                       strokeDasharray={resolvedSeriesStyles[index]?.strokeDasharray}
@@ -763,10 +877,11 @@ const LineChart: React.FC<LineChartProps> = memo(
                     fillOpacity={1}
                     fill={`url(#${gradientId}-${index})`}
                     strokeWidth={resolvedSeriesStyles[index]?.strokeWidth ?? DEFAULT_STROKE_WIDTH}
-                    dot={false}
-                    activeDot={{ r: 4, strokeWidth: 2, fill: resolvedSeriesStyles[index]?.color }}
+                    dot={resolveSeriesDot(resolvedSeriesStyles[index])}
+                    activeDot={resolveSeriesDot(resolvedSeriesStyles[index], true)}
+                    connectNulls={false}
                     isAnimationActive={false}
-                    strokeLinecap="round"
+                    strokeLinecap={resolvedSeriesStyles[index]?.dotStyle === 'hollow' ? 'butt' : 'round'}
                     strokeLinejoin="round"
                     hide={!visibleAreas.includes(key)}
                   />
@@ -949,7 +1064,7 @@ const LineChart: React.FC<LineChartProps> = memo(
           </>
         ) : (
           <div className={`${chartLineStyle.chart} ${chartLineStyle.noData}`}>
-            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} />
+            <ChartEmptyState compact />
           </div>
         )}
       </div>

@@ -1,13 +1,11 @@
-import logging
-from django.db import IntegrityError, transaction
-from apps.alerts.models.action import ActionRule, ActionExecution
+from apps.alerts.action.handlers.registry import get_handler
 from apps.alerts.action.matcher import event_matches
 from apps.alerts.action.payload import build_match_payload
-from apps.alerts.action.handlers.registry import get_handler
 from apps.alerts.constants.constants import LogAction, LogTargetType
+from apps.alerts.models.action import ActionExecution, ActionRule
 from apps.alerts.utils.operator_log import record_operator_log
-
-logger = logging.getLogger(__name__)
+from apps.core.logger import alert_logger as logger
+from django.db import IntegrityError, transaction
 
 
 class ActionEngine:
@@ -28,12 +26,14 @@ class ActionEngine:
 
     @staticmethod
     def dispatch_async(alert_id: str, event_name: str):
-        """入队异步任务；任何入队异常都吞掉，绝不阻塞告警主流程。"""
-        try:
-            from apps.alerts.tasks.action_tasks import process_alert_actions
-            process_alert_actions.delay(alert_id, event_name)
-        except Exception:
-            logger.exception("[ActionEngine] 入队失败 alert=%s event=%s", alert_id, event_name)
+        """持久化动作投递意图；broker 故障时由 outbox 扫描器补投。"""
+        from apps.alerts.service.outbox import enqueue_outbox
+
+        return enqueue_outbox(
+            "action",
+            {"alert_id": alert_id, "event_name": event_name},
+            f"action:{alert_id}:{event_name}",
+        )
 
     def _dispatch(self, rule, alert, event_name):
         key = f"{rule.id}:{alert.alert_id}:{event_name}"

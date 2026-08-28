@@ -1,0 +1,62 @@
+# 模块 ARD：算法服务（BentoML）
+
+> Migrated from `spec/ARD/modules/algorithms.md` as legacy capability evidence.
+
+> 路径 `algorithms/classify_*_server`
+
+## 1. 职责【已实现/已存在】
+以 BentoML 微服务承载 AI 推理能力，集成 MLflow 做模型加载与训练跟踪。
+
+## 2. 服务清单【已实现/已存在】
+| 服务 | 能力 |
+|------|------|
+| classify_anomaly_server | 时序异常检测（pyod/sklearn/hyperopt） |
+| classify_timeseries_server | 时序预测 |
+| classify_log_server | 日志聚类/模板提取 |
+| classify_text_classification_server | 文本分类（NLP） |
+| classify_image_classification_server | 图像分类（CNN） |
+| classify_object_detection_server | 目标检测（YOLO/ultralytics/torch） |
+
+## 3. 统一模式【已实现/已存在】
+> 包目录为双层结构：`<server>/<server>/serving/...`（如 `classify_anomaly_server/classify_anomaly_server/serving/service.py`），以下相对路径均省略外层包目录。
+
+- `serving/service.py`：`@bentoml.service` 装饰的服务类，6 个服务统一命名为 **`MLService`**；`health()` 入口同构。`predict` 请求/响应 schema 由各服务各自定义，并非全部统一为 `PredictResponse`：日志聚类服务当前返回 `LogClusterResponseV2`（`classify_log_server/serving/service.py:80-81`、`schemas/api_schema.py:101`）。该类名是对外/部署契约：`make serving` 入口固定为 `<pkg>.serving.service:MLService`。
+- `serving/models/loader.py`：按 `config.source` 取值（`'mlflow'`/`'local'`/`'dummy'`）三态分发。`dummy` 仍是显式可用的开发/测试来源；`mlflow`/`local` 缺参或加载失败时默认向上抛错，使发布失败并触发容器回滚。仅当 `ALLOW_DUMMY_FALLBACK=true` 时，loader 与服务层才允许降级 `DummyModel`，生产发布链固定注入 `false`【已实现】。
+- `serving/schemas/api_schema.py`：对外响应契约（`PredictResponse` 等），是 `predict` API 的返回类型。
+- `serving/config/model_config.py`：`ModelConfig`（含 `source` 字段，驱动 loader 三态分发）。
+- `serving/models/dummy_model.py`：`DummyModel` 占位模型；`serving/exceptions.py`：服务异常类型；`cli/bootstrap.py`：CLI 引导。
+- `training/mlflow_utils.py`：以单一类 **`MLFlowUtils`** 的静态方法形式提供——实验设置（`setup_experiment`）、参数/指标批量日志（`log_params_batch`/`log_metrics_batch`）、artifact 上传（`log_artifact`）、可视化（`plot_*`）。
+- `serving/metrics.py`：Prometheus 指标（加载/预测/耗时）。
+- 端口 :3000（`make serving` → `bentoml serve ...`，BentoML 默认端口，Makefile 未显式绑定）。
+- **打包配置不一致**：仅 `classify_object_detection_server/bentofile.yaml` 存在，其余 5 个服务无 `bentofile.yaml`（均有 `pyproject.toml`）【已实现，技术债】。
+- 训练数据策略（见 `CLAUDE.md`）：传统 ML 合并 train+val 再训练；深度学习（图像/目标检测）保持 train/val 分离（YOLO 要求）。
+- 安全与稳健性补强【已实现/已存在】：多服务在 `serving/service.py` 与 `serving/schemas/api_schema.py` 增加输入边界校验、模型文件 checksum 校验、训练脚本 shell 安全保护，以及日志最小披露。文本分类服务不再记录原始文本内容，改记录批次摘要，并在可用时提取真实特征重要性（`classify_text_classification_server/.../serving/service.py:132-152,255-260`）。
+
+## 4. 运行安全配置【已实现/已存在】
+- 异常检测服务：`PREDICT_MAX_DATA_POINTS` 限制单次预测数据点数（`classify_anomaly_server/serving/schemas/api_schema.py:8-9`），服务层在预测入口执行上限校验（`service.py:148`）。
+- 时序预测服务：`MAX_PREDICTION_STEPS` 与 `MAX_INPUT_DATA_POINTS` 分别限制预测步长与输入数据点（`classify_timeseries_server/serving/schemas/api_schema.py:9-11`），服务层在预测入口执行上限校验（`service.py:222`）。
+- 时序预测服务预算：`TIMESERIES_PREDICT_TIMEOUT_SECONDS` 取值 1～290 秒、默认 120 秒，由 MLOps 发布链注入新建或重启的算法容器；非法值在 BentoML 装载时快速失败。存量容器升级后需停止并重新启动以采用新预算。
+- 时序递归特征工程预算：GradientBoosting / RandomForest 的特征工程 wrapper 在推理前按 `H × S + S × (S - 1) / 2` 估算累计处理行数；`MAX_RECURSIVE_FEATURE_ENGINEERING_WORK` 为正整数、默认 2,000,000，由 MLOps 发布链注入新建或重启的算法容器。超限返回 `E1002` 及 `history_points/steps/estimated_work/limit`，不进入模型；需要兼容更大存量请求时可提高该值并重启服务，回滚时恢复原值。
+- 图片分类与目标检测 serving 统一观测单图编码量、批次编码量、批次解码字节、累计像素、预计 RGB 字节、解码/推理耗时和进程峰值 RSS；用量与 RSS 直方图采用覆盖 MiB～GiB 的显式桶，供灰度基线校准。`MLOPS_PREDICT_IMAGE_BUDGET_MODE` 默认 `observe`，只记录用量和超限指标并保留旧请求行为；基线确认后可切为 `enforce`，按四项正整数预算拒绝超限输入并启用严格 Base64。Server→webhookd→Docker/Kubernetes 发布链会把模式和预算一起注入新建或重启的图片 serving；灰度异常时切回 `observe` 并重启即可保留观测、恢复旧行为。任一显式非法模式或预算在数据库或运行中容器变更前失败；更新后的新容器启动失败时恢复旧配置并尝试重新启动旧服务。运行中更新用 owner token 互斥，15 分钟租约覆盖 webhook 硬超时；过期 owner 先查询远端状态、按原 token 条件回收并强制重启对账，不能仅凭时间覆盖活跃 owner。
+- Docker 模型发布的 `startup_timeout_seconds` 是从 webhookd 请求进入到业务健康检查成功的总预算；初次启动使用 `restart=no`，六类内置算法的业务 `/health` 均回显本次随机 `SERVING_INSTANCE_ID`，匹配后才切换为 `unless-stopped`。失败、超时或中断按本次启动标签/CID 有界回滚，外层进程被强制终止时由独立清理 watcher 继续完成回滚；watcher 在回滚预算内重试瞬态 Docker 失败，最终失败保留 CID 与错误恢复标记。Serving 的 GPU 探针缺少本地探针镜像时在同一预算内显式拉取，训练链保持原有按需拉取行为。混合版本升级阶段，bridge 网络可临时兼容尚无实例标识的旧镜像，host 始终强制标识匹配；内置镜像全部升级后以 `SERVING_REQUIRE_INSTANCE_ID=true` 关闭兼容。算法容器设置 `BENTOML_CONTAINERIZED=true`，模型 worker 初始化失败不得被父进程无限拉起并伪装为可用。
+- 本地模型加载支持 `MODEL_SHA256` 校验：异常检测与日志聚类 loader 在配置该环境变量时校验本地模型文件摘要；未配置时不强制校验（`classify_anomaly_server/serving/models/loader.py:84`、`classify_log_server/serving/models/loader.py:80`）。
+
+## 5. 集成关系【已实现/已存在 / 推断】
+- 后端 `apps/mlops` 通过 MLflow + AlgorithmConfig（Docker 镜像）管理训练；推理 serving_url 指向本服务【推断】。
+- monitor 异常/无数据检测是否调用 anomaly 服务【待确认】。
+
+## 2026-07-01 Code-ARD 校准
+- `[algorithms#20260701-034]` 修正 predict 契约描述：保留 `MLService`/`health`/Makefile 入口统一结论，但 `predict` schema 按服务分化，日志聚类返回 `LogClusterResponseV2`。
+- `[algorithms#20260701-035]` 补录请求上限与本地模型 SHA256 校验配置。
+
+## 6. 证据来源
+> 注意双层包目录：源码实为 `algorithms/<server>/<server>/serving/...`（如 `algorithms/classify_anomaly_server/classify_anomaly_server/serving/service.py`）。
+
+- 服务类统一命名 `MLService` 与部署入口：`algorithms/classify_anomaly_server/classify_anomaly_server/serving/service.py:20-24`（`@bentoml.service` 装饰 `class MLService`）、`:103`（`predict(...) -> PredictResponse`）；`algorithms/classify_anomaly_server/Makefile:18`（`bentoml serve classify_anomaly_server.serving.service:MLService`）；其余 5 服务同名 `MLService` 且 Makefile:18 入口同构（`classify_timeseries_server`/`classify_log_server`/`classify_text_classification_server`/`classify_image_classification_server`/`classify_object_detection_server` 的 `serving/service.py` 与各自 `Makefile:18`）。日志聚类响应例外：`algorithms/classify_log_server/classify_log_server/serving/service.py:80-81`、`serving/schemas/api_schema.py:101`。
+- loader 按 `config.source` 三态分发 + 显式降级门控：异常、图像、日志、目标检测与时序五类服务通过 `_fallback_or_raise` 在默认情况下抛错，仅 `ALLOW_DUMMY_FALLBACK=true` 时返回 `DummyModel`；文本分类服务始终对非显式 `dummy` 的缺参/加载失败抛错。
+- 服务层降级受 `ALLOW_DUMMY_FALLBACK` 门控、默认抛错：`algorithms/classify_anomaly_server/classify_anomaly_server/serving/service.py:58-86`（`except` 中 `os.getenv("ALLOW_DUMMY_FALLBACK")` 为真才用 `DummyModel`，否则 `raise RuntimeError`）。
+- serving 稳定子结构：`serving/schemas/api_schema.py:93`（`class PredictResponse`）、`serving/config/model_config.py:9`（`class ModelConfig`）、`serving/models/dummy_model.py`、`serving/exceptions.py`、`cli/bootstrap.py`（均以 `classify_anomaly_server` 双层包为例）。
+- `MLFlowUtils` 类静态方法：`algorithms/classify_anomaly_server/classify_anomaly_server/training/mlflow_utils.py:24`（`class MLFlowUtils`）、`:28`（`setup_experiment`）、`:108`（`log_params_batch`）、`:167`（`log_metrics_batch`）、`:193`（`log_artifact`）、`:209`/`:352`/`:409`/`:468` 等（`plot_*`）。
+- 其余：`algorithms/classify_*_server/.../serving/metrics.py`、`bentofile.yaml`、`pyproject.toml`；`algorithms/{AGENTS.md,DESIGN_GUIDE.md}`；`config/components/mlflow.py`。
+- 本轮安全改动样例：`algorithms/classify_text_classification_server/classify_text_classification_server/serving/service.py:132-152,255-260`；同类约束与测试同时覆盖 `classify_anomaly_server`、`classify_log_server`、`classify_timeseries_server`、`classify_image_classification_server` 等服务的 loader / schema / train script。
+- 运行安全配置：`algorithms/classify_anomaly_server/classify_anomaly_server/serving/schemas/api_schema.py:8-9`、`serving/service.py:148`、`serving/models/loader.py:84`；`algorithms/classify_timeseries_server/classify_timeseries_server/serving/schemas/api_schema.py:9-11`、`serving/service.py:222`；`algorithms/classify_log_server/classify_log_server/serving/models/loader.py:80`。

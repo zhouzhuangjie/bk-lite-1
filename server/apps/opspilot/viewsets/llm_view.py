@@ -1,8 +1,13 @@
+import json
 import os
+import shutil
 import tempfile
+from pathlib import Path
+from urllib.parse import urlparse
 
-from django.http import JsonResponse
+import yaml
 from django.db.models import Q
+from django.http import JsonResponse
 from django_filters import filters
 from django_filters.rest_framework import FilterSet
 from redis.exceptions import RedisError
@@ -19,12 +24,16 @@ from apps.core.utils.ssrf_validator import SSRFError, SSRFValidator
 from apps.core.utils.viewset_utils import AuthViewSet, LanguageViewSet
 from apps.opspilot.metis.llm.tools.elasticsearch.connection import normalize_es_instance, test_es_instance
 from apps.opspilot.metis.llm.tools.jenkins.connection import normalize_jenkins_instance, test_jenkins_instance
-from apps.opspilot.metis.llm.tools.kubernetes.connection import normalize_kubernetes_instance, test_kubernetes_instance
+from apps.opspilot.metis.llm.tools.kubernetes.connection import (
+    build_kubernetes_config_from_instance,
+    normalize_kubernetes_instance,
+    test_kubernetes_instance,
+)
 from apps.opspilot.metis.llm.tools.mysql.connection import normalize_mysql_instance, test_mysql_instance
 from apps.opspilot.metis.llm.tools.oracle.connection import normalize_oracle_instance, test_oracle_instance
 from apps.opspilot.metis.llm.tools.postgres.connection import normalize_postgres_instance, test_postgres_instance
 from apps.opspilot.metis.llm.tools.redis.connection import normalize_redis_instance, test_redis_instance
-from apps.opspilot.models import KnowledgeBase, LLMModel, LLMSkill, SkillPackage, SkillRequestLog, SkillTools, UserPin
+from apps.opspilot.models import LLMModel, LLMSkill, SkillPackage, SkillRequestLog, SkillTools, UserPin
 from apps.opspilot.serializers.llm_serializer import (
     LLMModelSerializer,
     LLMSerializer,
@@ -46,16 +55,23 @@ from apps.opspilot.services.builtin_tools import (
     build_builtin_oracle_tool,
     build_builtin_redis_tool,
 )
-from apps.opspilot.services.skill_package.importer import SkillPackageImporter
+from apps.opspilot.services.caller_identity import CALLER_IDENTITY_CONFIG_KEY, CallerIdentityError, capture_caller_identity
+from apps.opspilot.services.mcp_client import MCPClient
+from apps.opspilot.services.skill_channel_service import sync_skill_channel_usage_teams
+from apps.opspilot.services.skill_package.importer import DEFAULT_SKILL_PACKAGE_ROOT, SkillPackageImporter
 from apps.opspilot.services.skill_package.runtime import build_skill_package_prompt, build_skill_package_strategy, hydrate_skill_packages
+from apps.opspilot.services.usage_team import merge_usage_team
 from apps.opspilot.utils.agui_chat import stream_agui_chat
 from apps.opspilot.utils.mcp_cache import get_cached_mcp_tools, set_cached_mcp_tools
-from apps.opspilot.services.mcp_client import MCPClient
 from apps.opspilot.utils.pin_mixin import PinMixin
+from apps.opspilot.utils.prompt_utils import merge_skill_params
 from apps.opspilot.utils.skill_execution_params import resolve_request_tools
-from apps.opspilot.utils.sse_chat import stream_chat
+from apps.opspilot.utils.skill_package_params import annotate_packages_missing_params, merge_package_params, validate_package_params
+from apps.opspilot.utils.sse_chat import create_error_stream_response, stream_chat
 from apps.opspilot.utils.vendor_model_mixin import VendorModelMixin
+from apps.system_mgmt.utils.network_whitelist_error import build_network_whitelist_error_payload
 from apps.system_mgmt.utils.operation_log_utils import log_operation
+from config.drf.renderers import CustomRenderer, EventStreamRenderer
 
 
 class LLMFilter(FilterSet):
@@ -81,8 +97,8 @@ class LLMViewSet(PinMixin, AuthViewSet):
 
     # F017: 明确允许通过 update 直接写入的标量模型字段白名单。
     # 排除主键 / 审计 / 域 / 内建标记等受保护字段，避免任意 request.data
-    # 键被盲目 setattr 到模型上（mass-assignment）。team / knowledge_base /
-    # rag_score_threshold 等关系字段及派生字段由下方专门逻辑处理，不在此列。
+    # 键被盲目 setattr 到模型上（mass-assignment）。team 等关系字段由下方
+    # 专门逻辑处理，不在此列。
     UPDATABLE_SKILL_FIELDS = frozenset(
         {
             "name",
@@ -90,21 +106,17 @@ class LLMViewSet(PinMixin, AuthViewSet):
             "skill_prompt",
             "enable_conversation_history",
             "conversation_window_size",
-            "enable_rag",
-            "enable_rag_knowledge_source",
-            "rag_score_threshold_map",
             "introduction",
             "team",
+            "usage_team",
             "show_think",
             "tools",
             "skill_params",
             "skill_packages",
+            "skill_package_params",
             "temperature",
             "skill_type",
-            "enable_rag_strict_mode",
             "is_template",
-            "enable_km_route",
-            "km_llm_model_id",
             "guide",
             "enable_suggest",
             "enable_query_rewrite",
@@ -148,6 +160,9 @@ class LLMViewSet(PinMixin, AuthViewSet):
         params["team"] = params.get("team", []) or [int(request.COOKIES.get("current_team"))]
         # 校验用户是否有目标组织的权限
         self._validate_org_field_permission(request, params["team"])
+        usage_team = params.get("usage_team") or []
+        self._validate_org_field_permission(request, [org for org in usage_team if org not in params["team"]])
+        params["usage_team"] = merge_usage_team(params["team"], usage_team)
         validate_msg = self._validate_name(params["name"], request.user.group_list, params["team"])
         if validate_msg:
             message = (
@@ -167,9 +182,19 @@ class LLMViewSet(PinMixin, AuthViewSet):
         for item in params.get("skill_params", []):
             if item.get("type") == "password":
                 EncryptMixin.encrypt_field("value", item)
+        if "skill_package_params" in params:
+            try:
+                validated = validate_package_params(params.get("skill_package_params"))
+                params["skill_package_params"] = merge_package_params(validated, {})
+            except ValueError as exc:
+                return JsonResponse({"result": False, "message": str(exc)})
         serializer = self.get_serializer(data=params)
         serializer.is_valid(raise_exception=True)
         self.perform_create(serializer)
+        instance = getattr(serializer, "instance", None)
+        if instance is not None and "skill_package_params" in params:
+            instance.skill_package_params = params["skill_package_params"]
+            instance.save(update_fields=["skill_package_params"])
         headers = self.get_success_headers(serializer.data)
         response = Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
         skill_name = response.data.get("name") if isinstance(response.data, dict) else None
@@ -177,6 +202,38 @@ class LLMViewSet(PinMixin, AuthViewSet):
             skill_name = request.data.get("name", "")
         log_operation(request, "create", "opspilot", f"新增智能体: {skill_name}")
         return response
+
+    @staticmethod
+    def _normalize_skill_param_passwords(params, instance: LLMSkill) -> None:
+        old_skill_params = {p.get("key"): p for p in (instance.skill_params or [])}
+        for item in params.get("skill_params", []):
+            if item.get("type") != "password":
+                continue
+            if item.get("value") == "******":
+                old_param = old_skill_params.get(item.get("key"))
+                if old_param:
+                    item["value"] = old_param["value"]
+            else:
+                EncryptMixin.encrypt_field("value", item)
+
+    @staticmethod
+    def _normalize_skill_package_params_for_update(request, params, instance: LLMSkill):
+        """校验并合并 skill_package_params；失败返回 JsonResponse，成功返回 None。"""
+        if "skill_package_params" not in params:
+            return None
+        try:
+            validated = validate_package_params(params.get("skill_package_params"))
+            params["skill_package_params"] = merge_package_params(validated, instance.skill_package_params or {})
+        except ValueError as exc:
+            return JsonResponse({"result": False, "message": str(exc)})
+        param_names = []
+        for items in (params.get("skill_package_params") or {}).values():
+            for item in items or []:
+                if isinstance(item, dict) and item.get("key"):
+                    param_names.append(str(item["key"]))
+        if param_names:
+            log_operation(request, "update", "opspilot", f"编辑智能体技能包参数: {instance.name} 变量: {','.join(param_names)}")
+        return None
 
     @HasPermission("skill_setting-Edit")
     def update(self, request, *args, **kwargs):
@@ -214,44 +271,62 @@ class LLMViewSet(PinMixin, AuthViewSet):
         if "team" in params:
             delete_team = [i for i in instance.team if i not in params["team"]]
             self.delete_rules(instance.id, delete_team)
+            self._validate_org_field_permission(request, [org for org in params["team"] if org not in instance.team])
+        if "usage_team" in params:
+            extra_orgs = [org for org in (params["usage_team"] or []) if org not in (params.get("team") or instance.team)]
+            self._validate_org_field_permission(request, extra_orgs)
         if "llm_model" in params:
             params["llm_model_id"] = params.pop("llm_model")
-        if "km_llm_model" in params:
-            params["km_llm_model_id"] = params.pop("km_llm_model")
         for tool in params.get("tools", []):
             for i in tool.get("kwargs", []):
                 if i.get("type") == "password":
                     EncryptMixin.decrypt_field("value", i)
                     EncryptMixin.encrypt_field("value", i)
-        # 处理 skill_params 中 password 类型的加密/保留
-        old_skill_params = {p.get("key"): p for p in (instance.skill_params or [])}
-        for item in params.get("skill_params", []):
-            if item.get("type") == "password":
-                if item.get("value") == "******":
-                    old_param = old_skill_params.get(item.get("key"))
-                    if old_param:
-                        item["value"] = old_param["value"]
-                else:
-                    EncryptMixin.encrypt_field("value", item)
+        self._normalize_skill_param_passwords(params, instance)
+        package_params_error = self._normalize_skill_package_params_for_update(request, params, instance)
+        if package_params_error is not None:
+            return package_params_error
         # F017: 仅允许写入显式白名单内的字段，杜绝把任意 request.data 键
         # 盲目 setattr 到模型（mass-assignment）。受保护字段（id/created_by/
         # domain/is_builtin 等）即便随请求传入也被忽略。
         for key in self.UPDATABLE_SKILL_FIELDS:
             if key in params and hasattr(instance, key):
                 setattr(instance, key, params[key])
+        # 使用组织不变式：显式传 usage_team，或仅改 team 时重新并入。
+        if "usage_team" in params or "team" in params:
+            instance.usage_team = merge_usage_team(instance.team, instance.usage_team)
         instance.updated_by = request.user.username
-        if "rag_score_threshold" in params:
-            score_threshold_map = {i["knowledge_base"]: i["score"] for i in params["rag_score_threshold"]}
-            instance.rag_score_threshold_map = score_threshold_map
-            knowledge_base_list = KnowledgeBase.objects.filter(id__in=list(score_threshold_map.keys()))
-            instance.knowledge_base.set(knowledge_base_list)
-        # 当 enable_rag=False 时，清空知识库和阈值配置
-        if "enable_rag" in params and not params["enable_rag"]:
-            instance.knowledge_base.clear()
-            instance.rag_score_threshold_map = {}
         instance.save()
+        sync_skill_channel_usage_teams(instance)
+        # wiki_knowledge_bases 是 ManyToMany,Django 禁止直接 setattr 赋值,需在保存后用 set() 持久化关联。
+        # 否则智能体选择的 Wiki 知识库不会入库(保存后刷新即丢失)。
+        if "wiki_knowledge_bases" in params:
+            instance.wiki_knowledge_bases.set(params.get("wiki_knowledge_bases") or [])
         log_operation(request, "update", "opspilot", f"编辑智能体: {instance.name}")
         return JsonResponse({"result": True})
+
+    @HasPermission("skill_setting-Edit")
+    @action(methods=["POST"], detail=True)
+    def authorize_usage_team(self, request, pk=None):
+        """授权使用组织：与 Bot.authorize_usage_team 对齐；变更后同步到所有渠道组副本。"""
+        obj: LLMSkill = self.get_object()
+        if not request.user.is_superuser:
+            current_team = self._validate_current_team_permission(request)
+            include_children = request.COOKIES.get("include_children", "0") == "1"
+            has_permission = self.get_has_permission(request.user, obj, current_team, include_children=include_children)
+            if not has_permission:
+                msg = self.loader.get("error.permission_update_denied") if self.loader else "You do not have permission to update this instance"
+                return JsonResponse({"result": False, "message": msg})
+        requested = request.data.get("usage_team", []) or []
+        extra_orgs = [org for org in requested if org not in obj.team]
+        self._validate_org_field_permission(request, extra_orgs)
+        obj.usage_team = merge_usage_team(obj.team, requested)
+        obj.updated_by = request.user.username
+        obj.save(update_fields=["usage_team", "updated_by"])
+        sync_skill_channel_usage_teams(obj)
+        response = JsonResponse({"result": True, "data": {"usage_team": obj.usage_team}})
+        log_operation(request, "update", "opspilot", f"授权使用组织: {obj.name}")
+        return response
 
     @staticmethod
     def create_error_stream_response(error_message):
@@ -261,7 +336,6 @@ class LLMViewSet(PinMixin, AuthViewSet):
         实际实现位于 utils.sse_chat.create_error_stream_response，此处保留
         静态方法仅为兼容既有调用方。
         """
-        from apps.opspilot.utils.sse_chat import create_error_stream_response
 
         return create_error_stream_response(error_message)
 
@@ -273,20 +347,20 @@ class LLMViewSet(PinMixin, AuthViewSet):
             "user_message": "你好", # 用户消息
             "llm_model": 1, # 大模型ID
             "skill_prompt": "abc", # Prompt
-            "enable_rag": True, # 是否启用RAG
-            "enable_rag_knowledge_source": True, # 是否显示RAG知识来源
-            "rag_score_threshold": [{"knowledge_base": 1, "score": 0.7}], # RAG分数阈值
             "chat_history": "abc", # 对话历史
             "conversation_window_size": 10, # 对话窗口大小
             "show_think": True, # 是否展示think的内容
             "group": 1,
-            "enable_rag_strict_mode": False,
             "skill_name": "test"
         }
         """
         params = request.data
         params["username"] = request.user.username
         params["user_id"] = request.user.id
+        try:
+            params[CALLER_IDENTITY_CONFIG_KEY] = capture_caller_identity(request, request.user)
+        except CallerIdentityError as e:
+            return self.create_error_stream_response(str(e))
         try:
             # 获取客户端IP
             skill_obj = LLMSkill.objects.get(id=int(params["skill_id"]))
@@ -315,15 +389,18 @@ class LLMViewSet(PinMixin, AuthViewSet):
             params["skill_type"] = skill_obj.skill_type
             params["tools"] = resolve_request_tools(params.get("tools"), skill_obj.tools)
             params["group"] = params["group"] if params.get("group") else skill_obj.team[0]
-            params["enable_km_route"] = params["enable_km_route"] if params.get("enable_km_route") else skill_obj.enable_km_route
-            params["km_llm_model"] = params["km_llm_model"] if params.get("km_llm_model") else skill_obj.km_llm_model
             params["enable_suggest"] = params["enable_suggest"] if params.get("enable_suggest") else skill_obj.enable_suggest
             params["enable_query_rewrite"] = params["enable_query_rewrite"] if params.get("enable_query_rewrite") else skill_obj.enable_query_rewrite
             params["show_think"] = params["show_think"] if params.get("show_think") is not None else skill_obj.show_think
             params["locale"] = getattr(request.user, "locale", "en")  # 用户语言设置
+            # 透传技能绑定的 Wiki 知识库,触发 format_chat_server_kwargs 的检索增强;
+            # 否则智能体对话不会引用知识库内容,易凭 LLM 自身知识作答(幻觉)。
+            params["wiki_kb_ids"] = list(skill_obj.wiki_knowledge_bases.values_list("id", flat=True))
+            error_message = self._prepare_skill_package_params(params, skill_obj)
+            if error_message:
+                return self.create_error_stream_response(error_message)
             self._apply_skill_packages_to_params(params, skill_obj)
             # 合并前端传入的 skill_params 和 DB 中的值（处理 ****** 掩码）
-            from apps.opspilot.utils.prompt_utils import merge_skill_params
 
             params["skill_params"] = merge_skill_params(params.get("skill_params", []), skill_obj.skill_params or [])
             # 调用stream_chat函数返回流式响应
@@ -335,7 +412,11 @@ class LLMViewSet(PinMixin, AuthViewSet):
             logger.exception("Skill execute failed: skill_id=%s", params.get("skill_id"))
             return self.create_error_stream_response(str(e))
 
-    @action(methods=["POST"], detail=False)
+    @action(
+        methods=["POST"],
+        detail=False,
+        renderer_classes=[CustomRenderer, EventStreamRenderer],
+    )
     @HasPermission("skill_setting-View")
     def execute_agui(self, request):
         """
@@ -348,14 +429,10 @@ class LLMViewSet(PinMixin, AuthViewSet):
             "user_message": "你好",
             "llm_model": 1,
             "skill_prompt": "abc",
-            "enable_rag": True,
-            "enable_rag_knowledge_source": True,
-            "rag_score_threshold": [{"knowledge_base": 1, "score": 0.7}],
             "chat_history": "abc",
             "conversation_window_size": 10,
             "show_think": True,
             "group": 1,
-            "enable_rag_strict_mode": False,
             "skill_name": "test"
         }
 
@@ -364,6 +441,10 @@ class LLMViewSet(PinMixin, AuthViewSet):
         params = request.data
         params["username"] = request.user.username
         params["user_id"] = request.user.id
+        try:
+            params[CALLER_IDENTITY_CONFIG_KEY] = capture_caller_identity(request, request.user)
+        except CallerIdentityError as e:
+            return self.create_error_stream_response(str(e))
         try:
             skill_obj = LLMSkill.objects.get(id=int(params["skill_id"]))
             if not request.user.is_superuser:
@@ -391,21 +472,30 @@ class LLMViewSet(PinMixin, AuthViewSet):
             params["skill_type"] = skill_obj.skill_type
             params["tools"] = resolve_request_tools(params.get("tools"), skill_obj.tools)
             params["group"] = params["group"] if params.get("group") else skill_obj.team[0]
-            params["enable_km_route"] = params["enable_km_route"] if params.get("enable_km_route") else skill_obj.enable_km_route
-            params["km_llm_model"] = params["km_llm_model"] if params.get("km_llm_model") else skill_obj.km_llm_model
             params["enable_suggest"] = params["enable_suggest"] if params.get("enable_suggest") else skill_obj.enable_suggest
             params["enable_query_rewrite"] = params["enable_query_rewrite"] if params.get("enable_query_rewrite") else skill_obj.enable_query_rewrite
             params["show_think"] = params["show_think"] if params.get("show_think") is not None else skill_obj.show_think
             params["locale"] = getattr(request.user, "locale", "en")  # 用户语言设置
             params["browser_use_force_task"] = True
+            # 同 execute:透传 Wiki 知识库以触发检索增强,避免智能体不查知识库而凭空作答。
+            params["wiki_kb_ids"] = list(skill_obj.wiki_knowledge_bases.values_list("id", flat=True))
+            error_message = self._prepare_skill_package_params(params, skill_obj)
+            if error_message:
+                return self.create_error_stream_response(error_message)
             self._apply_skill_packages_to_params(params, skill_obj)
             # 合并前端传入的 skill_params 和 DB 中的值（处理 ****** 掩码）
-            from apps.opspilot.utils.prompt_utils import merge_skill_params
 
             params["skill_params"] = merge_skill_params(params.get("skill_params", []), skill_obj.skill_params or [])
 
             # 调用AGUI协议的流式响应
-            return stream_agui_chat(params, skill_obj.name, {}, current_ip, params["user_message"])
+            return stream_agui_chat(
+                params,
+                skill_obj.name,
+                {},
+                current_ip,
+                params["user_message"],
+                skill_id=skill_obj.id,
+            )
         except LLMSkill.DoesNotExist:
             message = self.loader.get("error.skill_not_found_detail") if self.loader else "Skill not found."
             return self.create_error_stream_response(message)
@@ -417,8 +507,29 @@ class LLMViewSet(PinMixin, AuthViewSet):
     def _tool_names(tools):
         return {tool.get("name") for tool in (tools or []) if isinstance(tool, dict) and tool.get("name")}
 
+    @staticmethod
+    def _prepare_skill_package_params(params, skill_obj: LLMSkill) -> str | None:
+        """合并测试面板未保存值与库中密文。失败返回错误文案。"""
+        stored = getattr(skill_obj, "skill_package_params", None) or {}
+        if "skill_package_params" not in params:
+            if stored:
+                params["skill_package_params_overlay"] = stored
+            return None
+        try:
+            validated = validate_package_params(params.get("skill_package_params"))
+            merged = merge_package_params(validated, stored)
+        except ValueError as exc:
+            return str(exc)
+        params["skill_package_params"] = merged
+        params["skill_package_params_overlay"] = merged
+        return None
+
     def _apply_skill_packages_to_params(self, params, skill_obj: LLMSkill):
         skill_packages = hydrate_skill_packages(getattr(skill_obj, "skill_packages", []) or [])
+        configured = params.get("skill_package_params")
+        if configured is None:
+            configured = getattr(skill_obj, "skill_package_params", None) or {}
+        skill_packages = annotate_packages_missing_params(skill_packages, configured)
         base_prompt = params.get("skill_prompt") or skill_obj.skill_prompt or ""
         skill_prompt, matched_skill_packages = build_skill_package_prompt(
             base_prompt=base_prompt,
@@ -428,6 +539,11 @@ class LLMViewSet(PinMixin, AuthViewSet):
         )
         params["skill_prompt"] = skill_prompt
         params["matched_skill_packages"] = matched_skill_packages
+        # 用户显式选中的全集:不受 substring 匹配限制,用于 backend 物化。
+        # 解决"用户在设置里选了 N 个包,但用户消息不含描述关键词 → 后端一个都没物化"的丢包问题。
+        params["enabled_skill_packages"] = skill_packages
+        # 报告门禁只看 matched：避免寒暄轮仅因「包已启用」就打开
+        # config_analysis_report / repair_diff_report。物化仍用 enabled 全集。
         params.update(build_skill_package_strategy(matched_skill_packages))
 
 
@@ -443,6 +559,80 @@ class ObjFilter(FilterSet):
             return qs
         enabled = value == "1"
         return qs.filter(enabled=enabled)
+
+    @action(methods=["POST"], detail=False)
+    def fetch_k8s_deployment_yaml(self, request):
+        """按 namespace + name 拉真实 k8s deployment YAML(给前端 diff 模态按需用)。
+
+        前端 modal 默认显示文字描述(issue + 修复建议),点"查看实际 deployment"
+        才 fetch 一次,减少不必要请求。SSRF 校验复用 _guard_kubeconfig。
+        前端传 skill_id,后端按 skill_id → cluster_name 找 kubeconfig,不暴露给前端。
+        """
+        from kubernetes import client
+
+        namespace = (request.data.get("namespace") or "").strip()
+        name = (request.data.get("name") or "").strip()
+        cluster_name = (request.data.get("cluster_name") or "").strip()
+        skill_id = request.data.get("skill_id")
+        if not namespace or not name or not skill_id or not cluster_name:
+            return Response(
+                {"result": False, "message": "namespace, name, cluster_name, skill_id are required", "code": "40000"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            # 按 skill_id 查 LLMSkill 找匹配的 kubernetes_instances
+
+            skill = LLMSkill.objects.filter(id=skill_id).first()
+            if not skill or not skill.tools:
+                return Response(
+                    {"result": False, "message": "skill not found or no tools", "code": "40400"},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            kubeconfig_data = None
+            for tool in skill.tools:
+                if tool.get("name") != "kubernetes":
+                    continue
+                for kw in tool.get("kwargs") or []:
+                    if kw.get("key") != "kubernetes_instances":
+                        continue
+                    instances = kw.get("value")
+                    if not isinstance(instances, list):
+                        try:
+                            instances = json.loads(instances)
+                        except Exception:
+                            continue
+                    for inst in instances:
+                        if isinstance(inst, dict) and inst.get("name") == cluster_name:
+                            kubeconfig_data = inst.get("kubeconfig_data")
+                            break
+                if kubeconfig_data:
+                    break
+            if not kubeconfig_data:
+                return Response(
+                    {"result": False, "message": f"cluster {cluster_name} not found in skill tools", "code": "40400"},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            self._guard_kubeconfig(kubeconfig_data)
+
+            instance_cfg = build_kubernetes_config_from_instance({"kubeconfig_data": kubeconfig_data})
+            configuration = client.Configuration()
+            if instance_cfg.get("verify_ssl") is not None:
+                configuration.verify_ssl = instance_cfg["verify_ssl"]
+            api_client = client.ApiClient(configuration=configuration)
+            apps_v1 = client.AppsV1Api(api_client=api_client)
+            dep = apps_v1.read_namespaced_deployment(name, namespace)
+            manifest = api_client.sanitize_for_serialization(dep)
+            yaml_str = yaml.safe_dump(manifest, allow_unicode=True, sort_keys=False)
+            return Response(
+                {"result": True, "data": {"yaml": yaml_str, "name": name, "namespace": namespace}, "code": "20000"},
+                status=status.HTTP_200_OK,
+            )
+        except Exception as e:
+            logger.warning(f"fetch_k8s_deployment_yaml failed: {e}")
+            return Response(
+                {"result": False, "message": str(e), "code": "50000"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 
 class LLMModelViewSet(VendorModelMixin, AuthViewSet):
@@ -630,6 +820,35 @@ class SkillPackageViewSet(AuthViewSet):
     queryset = SkillPackage.objects.all().order_by("-id")
     permission_key = "tools"
 
+    @staticmethod
+    def _cleanup_storage_path(storage_path_text: str) -> bool:
+        """删技能包时清掉磁盘 storage_path(物化的 SKILL.md + extracted 资源)。
+
+        Safety:目标路径必须落在 DEFAULT_SKILL_PACKAGE_ROOT 之下,避免 storage_path
+        被恶意改成 host 任意路径后误删。失败只 warn 不抛——留个孤儿目录比
+        直接拒绝删除友好,管理员可以手动 rmtree。
+        """
+        if not storage_path_text:
+            return False
+        try:
+            target = Path(storage_path_text).resolve()
+            root = DEFAULT_SKILL_PACKAGE_ROOT.resolve()
+            if root in target.parents and target.exists():
+                shutil.rmtree(target)
+                logger.info("[skill-package] 清理磁盘目录: %s", target)
+                return True
+        except Exception as e:
+            logger.warning("[skill-package] 清理磁盘目录失败 %s: %r", storage_path_text, e)
+        return False
+
+    def destroy(self, request, *args, **kwargs):
+        """删技能包:DRF 默认 destroy 删 DB 行,再调 _cleanup_storage_path 清磁盘。"""
+        instance = self.get_object()
+        storage_path_text = str(getattr(instance, "storage_path", "") or "")
+        response = super().destroy(request, *args, **kwargs)
+        self._cleanup_storage_path(storage_path_text)
+        return response
+
     def get_queryset(self):
         queryset = super().get_queryset()
         is_enabled = self.request.query_params.get("is_enabled")
@@ -639,10 +858,7 @@ class SkillPackageViewSet(AuthViewSet):
         keyword = (self.request.query_params.get("search") or "").strip()
         if keyword:
             queryset = queryset.filter(
-                Q(name__icontains=keyword)
-                | Q(package_id__icontains=keyword)
-                | Q(description__icontains=keyword)
-                | Q(category__icontains=keyword)
+                Q(name__icontains=keyword) | Q(package_id__icontains=keyword) | Q(description__icontains=keyword) | Q(category__icontains=keyword)
             )
         return queryset
 
@@ -661,10 +877,6 @@ class SkillPackageViewSet(AuthViewSet):
     @HasPermission("tools_list-Edit")
     def partial_update(self, request, *args, **kwargs):
         return super().partial_update(request, *args, **kwargs)
-
-    @HasPermission("tools_list-Delete")
-    def destroy(self, request, *args, **kwargs):
-        return super().destroy(request, *args, **kwargs)
 
     @action(methods=["POST"], detail=False)
     @HasPermission("tools_list-Add")
@@ -725,6 +937,65 @@ class SkillPackageViewSet(AuthViewSet):
                 except OSError:
                     pass
 
+    @action(methods=["POST"], detail=False)
+    @HasPermission("tools_list-Add")
+    def import_local(self, request):
+        """从本地服务器目录导入技能包。
+
+        适配 Anthropic Agent Skills 风格的本地目录(如从 GitHub 下载的
+        ``<repo>/<skill-name>/SKILL.md`` 布局)。
+        与 ``import_zip`` 共享同一存储布局,DB 行通过 ``package_id+version+domain``
+        去重,多次导入同一包会覆盖。
+
+        请求参数:
+          source_dir: 绝对路径,必须在 ``DEFAULT_SKILL_PACKAGE_ROOT`` 之下(防越界)。
+        """
+        source_dir = (request.data.get("source_dir") or "").strip()
+        if not source_dir:
+            return Response(
+                {"result": False, "message": "请提供技能包目录路径(source_dir)"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            organization_id = str(request.COOKIES.get("current_team") or "default")
+            result = SkillPackageImporter().import_local_dir(source_dir, organization_id=organization_id)
+            domain = getattr(request.user, "domain", "domain.com") or "domain.com"
+            team = [int(organization_id)] if organization_id.isdigit() else []
+            package, created = SkillPackage.objects.update_or_create(
+                package_id=result.skill_id,
+                version=result.version,
+                domain=domain,
+                defaults={
+                    "name": result.name,
+                    "description": result.description,
+                    "category": result.category,
+                    "source_type": "local",
+                    "source_url": source_dir,
+                    "storage_path": str(result.storage_path),
+                    "manifest": result.manifest,
+                    "skill_markdown": result.skill_markdown,
+                    "required_tools": result.required_tools,
+                    "triggers": result.triggers,
+                    "team": team,
+                    "updated_by": request.user.username,
+                    "updated_by_domain": domain,
+                    "is_enabled": True,
+                },
+            )
+            if created:
+                package.created_by = request.user.username
+                package.domain = domain
+                package.save(update_fields=["created_by", "domain"])
+            serializer = self.get_serializer(package)
+            log_operation(request, "create", "opspilot", f"导入技能包(本地): {package.name}")
+            return Response({"result": True, "data": serializer.data})
+        except ValueError as exc:
+            return Response({"result": False, "message": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:
+            logger.exception("Import local skill package failed")
+            return Response({"result": False, "message": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 class ToolsFilter(FilterSet):
     display_name = filters.CharFilter(field_name="display_name", lookup_expr="icontains")
@@ -737,9 +1008,23 @@ class SkillToolsViewSet(AuthViewSet):
     permission_key = "tools"
 
     def _ssrf_error_response(self, error):
-        """统一的 SSRF 拦截响应（保持 {result, message} 形状）。"""
-        message = self.loader.get("error.connection_target_forbidden") if self.loader else "Connection target is not allowed"
-        return JsonResponse({"result": False, "message": f"{message}: {error}"}, status=status.HTTP_400_BAD_REQUEST)
+        """统一 SSRF 拦截响应，并为可通过白名单放行的目标提供稳定契约。"""
+        error_code = getattr(error, "code", "CONNECTION_TARGET_FORBIDDEN")
+        if error_code == "NETWORK_WHITELIST_REQUIRED":
+            return JsonResponse(
+                build_network_whitelist_error_payload(self.loader),
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        message = (
+            self.loader.get("error.connection_target_forbidden", "Connection target is not allowed")
+            if self.loader
+            else "Connection target is not allowed"
+        )
+        return JsonResponse(
+            {"result": False, "code": error_code, "message": message},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     @staticmethod
     def _guard_connection_host(host, port=None):
@@ -758,8 +1043,6 @@ class SkillToolsViewSet(AuthViewSet):
         # 去除可能误带的协议前缀，仅取主机名用于校验。
         netloc = host
         if "://" in netloc:
-            from urllib.parse import urlparse
-
             netloc = urlparse(host).hostname or host
         target = f"http://{netloc}"
         if port not in (None, ""):
@@ -782,7 +1065,6 @@ class SkillToolsViewSet(AuthViewSet):
         """
         if not kubeconfig_data or not str(kubeconfig_data).strip():
             return
-        import yaml
 
         try:
             kubeconfig = yaml.safe_load(kubeconfig_data)

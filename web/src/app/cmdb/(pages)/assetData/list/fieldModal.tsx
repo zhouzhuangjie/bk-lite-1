@@ -29,8 +29,12 @@ import styles from './filterBar.module.scss';
 import useAssetDataStore from '@/app/cmdb/store/useAssetDataStore';
 
 interface FieldModalProps {
-  onSuccess: (instId?: string) => void;
+  onSuccess: (instUuid?: string) => void;
   userList: UserItem[];
+  createHandler?: (payload: {
+    model_id: string;
+    instance_info: Record<string, unknown>;
+  }) => Promise<any>;
 }
 
 export interface FieldModalRef {
@@ -38,7 +42,7 @@ export interface FieldModalRef {
 }
 
 const FieldMoadal = forwardRef<FieldModalRef, FieldModalProps>(
-  ({ onSuccess, userList }, ref) => {
+  ({ onSuccess, userList, createHandler }, ref) => {
     const { selectedGroup } = useUserInfoContext();
     const [groupVisible, setGroupVisible] = useState<boolean>(false);
     const [confirmLoading, setConfirmLoading] = useState<boolean>(false);
@@ -49,6 +53,8 @@ const FieldMoadal = forwardRef<FieldModalRef, FieldModalProps>(
     const [instanceData, setInstanceData] = useState<any>({});
     const [selectedRows, setSelectedRows] = useState<any[]>([]);
     const [modelId, setModelId] = useState<string>('');
+    const [lockedAttrIds, setLockedAttrIds] = useState<string[]>([]);
+    const [hideAssociate, setHideAssociate] = useState<boolean>(false);
     const [enabledFields, setEnabledFields] = useState<Record<string, boolean>>(
       {}
     );
@@ -68,10 +74,24 @@ const FieldMoadal = forwardRef<FieldModalRef, FieldModalProps>(
     }, [groupVisible, instanceData]);
 
     useEffect(() => {
-      if (groupVisible && modelId === 'host') {
-        setProxyOptions(useAssetDataStore.getState().cloud_list || []);
+      if (!groupVisible || !['host', 'subnet'].includes(modelId)) {
+        return;
       }
-    }, [groupVisible, modelId]);
+      const cachedOptions = useAssetDataStore.getState().cloud_list || [];
+      if (cachedOptions.length > 0) {
+        setProxyOptions(cachedOptions);
+        return;
+      }
+      instanceApi.getInstanceProxys()
+        .then((data: any[]) => {
+          const nextOptions = data || [];
+          setProxyOptions(nextOptions);
+          useAssetDataStore.getState().setCloudList(nextOptions);
+        })
+        .catch(() => {
+          setProxyOptions([]);
+        });
+    }, [groupVisible, modelId, instanceApi]);
 
     const ipValue = Form.useWatch('ip_addr', form);
     const cloudValue = Form.useWatch('cloud', form);
@@ -98,6 +118,8 @@ const FieldMoadal = forwardRef<FieldModalRef, FieldModalProps>(
         formInfo,
         model_id,
         list,
+        lockedAttrIds: nextLockedAttrIds,
+        hideAssociate: nextHideAssociate,
       }) => {
         setGroupVisible(true);
         setSubTitle(subTitle);
@@ -106,6 +128,8 @@ const FieldMoadal = forwardRef<FieldModalRef, FieldModalProps>(
         setModelId(model_id);
         setFormItems(attrList);
         setSelectedRows(list);
+        setLockedAttrIds(nextLockedAttrIds || []);
+        setHideAssociate(Boolean(nextHideAssociate));
         const forms = deepClone(formInfo);
 
         const allAttrs = attrList.flatMap((group) => group.attrs || []);
@@ -206,15 +230,20 @@ const FieldMoadal = forwardRef<FieldModalRef, FieldModalProps>(
     };
 
     const renderFormField = (item: FullInfoAttrItem) => {
+      const locked = lockedAttrIds.includes(item.attr_id);
       const fieldDisabled =
-        type === 'batchEdit'
+        locked ||
+        (type === 'batchEdit'
           ? !enabledFields[item.attr_id]
-          : !item.editable && type !== 'add';
+          : !item.editable && type !== 'add');
 
       const hostDisabled = modelId === 'host' && item.attr_id === 'inst_name';
 
-      // 特殊处理-主机的云区域为下拉选项（弹窗中）
-      if (item.attr_id === 'cloud') {
+      // 特殊处理-主机/子网的云区域为下拉选项（弹窗中）
+      if (
+        (item.attr_id === 'cloud' && modelId === 'host') ||
+        (item.attr_id === 'cloud_id' && modelId === 'subnet')
+      ) {
         return (
           <Select
             disabled={fieldDisabled}
@@ -275,6 +304,9 @@ const FieldMoadal = forwardRef<FieldModalRef, FieldModalProps>(
           if (values.cloud) {
             values.cloud = String(values.cloud);
           }
+          if (values.cloud_id) {
+            values.cloud_id = String(values.cloud_id);
+          }
           operateAttr(values, confirmType);
         })
         .catch((errorInfo) => {
@@ -317,19 +349,26 @@ const FieldMoadal = forwardRef<FieldModalRef, FieldModalProps>(
         );
         let result: any;
         if (type === 'add') {
-          result = await instanceApi.createInstance({
-            model_id: modelId,
-            instance_info: formData,
-          });
+          if (createHandler) {
+            result = await createHandler({
+              model_id: modelId,
+              instance_info: formData,
+            });
+          } else {
+            result = await instanceApi.createInstance({
+              model_id: modelId,
+              instance_info: formData,
+            });
+          }
         } else {
           result = await instanceApi.batchUpdateInstances({
-            inst_ids: type === 'edit' ? [instanceData._id] : selectedRows,
+            inst_uuids: type === 'edit' ? [instanceData.inst_uuid] : selectedRows.map((id: any) => String(id)),
             update_data: formData,
           });
         }
-        const instId = result?._id;
+        const instUuid = result?.inst_uuid;
         message.success(msg);
-        onSuccess(confirmType ? instId : '');
+        onSuccess(confirmType ? instUuid : '');
         handleCancel();
       } catch (error) {
         console.log(error);
@@ -360,7 +399,7 @@ const FieldMoadal = forwardRef<FieldModalRef, FieldModalProps>(
               >
                 {t('common.confirm')}
               </Button>
-              {type === 'add' && (
+              {type === 'add' && !hideAssociate && (
                 <Button
                   className="mr-[10px]"
                   loading={confirmLoading}

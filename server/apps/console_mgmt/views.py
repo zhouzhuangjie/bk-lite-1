@@ -9,6 +9,7 @@ from django.db import transaction
 from django.http import JsonResponse
 from django.utils import timezone as django_timezone
 
+from apps.core.utils.builtin_app_i18n import localized_app_display_name
 from apps.core.utils.loader import LanguageLoader
 from apps.rpc.system_mgmt import SystemMgmt
 from apps.system_mgmt.models import Group, Role, User
@@ -26,6 +27,19 @@ _EMAIL_CODE_TTL = int(os.getenv("EMAIL_CODE_TTL", "600"))
 def _email_code_cache_key(username: str, email: str) -> str:
     """生成验证码 cache key，按用户+邮箱隔离。"""
     return f"vc:{username}:{email}"
+
+
+def _email_change_verified_cache_key(username: str, email: str) -> str:
+    """生成邮箱变更一次性授权 cache key，按用户+邮箱隔离。"""
+    return f"email_change_verified:{username}:{email}"
+
+
+def _consume_email_change_authorization(username: str, email: str) -> bool:
+    cache_key = _email_change_verified_cache_key(username, email)
+    if cache.get(cache_key) is None:
+        return False
+    cache.delete(cache_key)
+    return True
 
 
 def _format_datetime_for_user(value, timezone_name=None):
@@ -138,10 +152,22 @@ def update_user_base_info(request):
     try:
         # 通过username和domain获取用户
         user = User.objects.get(username=username, domain=domain)
+        requested_email = params.get("email") or user.email
+        if requested_email != user.email and not _consume_email_change_authorization(username, requested_email):
+            return JsonResponse(
+                {
+                    "result": False,
+                    "message": loader.get(
+                        "error.email_change_verification_required",
+                        "Email change requires verification",
+                    ),
+                },
+                status=403,
+            )
 
         with transaction.atomic():
             user.display_name = params.get("display_name") or user.display_name
-            user.email = params.get("email") or user.email
+            user.email = requested_email
             user.locale = params.get("locale") or user.locale
             user.timezone = params.get("timezone") or user.timezone
             user.save()
@@ -207,11 +233,14 @@ def validate_email_code(request):
 
         if stored_code is None:
             # 验证码不存在：已过期或从未发送
-            return JsonResponse({"result": False, "message": loader.get("error.verification_code_expired", "Verification code has expired or does not exist")})
+            return JsonResponse(
+                {"result": False, "message": loader.get("error.verification_code_expired", "Verification code has expired or does not exist")}
+            )
 
         if secrets.compare_digest(str(stored_code), str(input_code)):
             # 验证通过：立即删除（一次性使用）
             cache.delete(cache_key)
+            cache.set(_email_change_verified_cache_key(username, email), "1", timeout=_EMAIL_CODE_TTL)
             return JsonResponse({"result": True, "message": loader.get("success.verification_success", "Verification successful")})
 
         return JsonResponse({"result": False, "message": loader.get("error.verification_code_incorrect", "Verification code is incorrect")})
@@ -314,7 +343,11 @@ def get_user_info(request):
 
         # 一次性获取所有app数据并构建映射
         all_apps = App.objects.all()
-        app_map = {app.name: app.display_name for app in all_apps}
+        core_loader = LanguageLoader(app="core", default_lang=locale)
+        app_map = {
+            app.name: (localized_app_display_name(app.name, core_loader, app.display_name) if app.is_build_in else app.display_name)
+            for app in all_apps
+        }
 
         # 收集用户角色ID：包含用户直接角色和所属组的角色（去重）
         role_ids = set(user.role_list) if user.role_list else set()

@@ -11,7 +11,10 @@ import type {
   DatasourceItem,
   ParamItem,
 } from '@/app/ops-analysis/types/dataSource';
+import type { DateRangeValue } from '@/app/ops-analysis/types/dateRange';
+import { validateDateRangeValue } from '@/app/ops-analysis/utils/dateRange';
 import {
+  type BindableParamType,
   buildDefaultFilterBindings,
   getBindableFilterParams,
   getFilterDefinitionId,
@@ -66,7 +69,7 @@ export const buildFiltersFromDashboardLayout = ({
 }): UnifiedFilterDefinition[] => {
   const discoveredParams = new Map<
     string,
-    ParamItem & { type: 'string' | 'timeRange' }
+    ParamItem & { type: BindableParamType }
   >();
 
   layout.forEach((item) => {
@@ -121,6 +124,13 @@ export const buildFiltersFromDashboardLayout = ({
         }
       }
 
+      if (param.type === 'dateRange') {
+        defaultValue = validateDateRangeValue(defaultValue).valid
+          && defaultValue !== null
+          ? { ...(defaultValue as DateRangeValue) }
+          : null;
+      }
+
       return {
         id,
         key: param.name,
@@ -131,6 +141,7 @@ export const buildFiltersFromDashboardLayout = ({
         enabled: existing?.enabled ?? true,
         inputMode: existing?.inputMode,
         options: existing?.options,
+        inputConfig: existing ? existing.inputConfig : param.inputConfig,
       };
     },
   );

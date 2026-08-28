@@ -1,35 +1,59 @@
 'use client';
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Bubble, Sender } from '@ant-design/x';
+import React, {
+  useState,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useCallback,
+  useMemo,
+} from 'react';
 import {
   SessionManager,
   StateMachine,
-  WebChatConfig,
-  ChatState,
+  SSEStreamParser,
   Message,
+  MessageContent,
   MessageType,
   generateId,
+  isSilentCustomEvent,
+  normalizeWebChatConfig,
 } from '@webchat/core';
-import { AGUIHandler, AGUIConfig, AGUIEvent } from './agui';
-import { type ToolCall } from './components/ToolCallDisplay';
-import { MessageBubble } from './components/MessageBubble';
+import { AGUIHandler, AGUIEvent, type CustomProtocolEvent } from './agui';
+import type { ChatProps } from './chatProps';
+import { createAGUIEventHandler, shouldShowTypingPlaceholder } from './aguiEventHandler';
+import { parseLegacyMessage } from './legacyMessage';
 import { useMessageHandlers } from './hooks/useMessageHandlers';
 import { ConfirmDialog } from './components/ConfirmDialog';
-import './styles/tailwind.css';
+import { formatDegradedCustomEvent, HitlPanels, isBlockingHitlEvent } from './components/HitlPanels';
+import { ConversationSkeleton } from './components/ConversationSkeleton';
+import { PillComposer } from './components/PillComposer';
+import {
+  pendingImagesReducer,
+  readFileAsDataUrl,
+  readImageBatch,
+  inspectImageBatch,
+  resolveImageBudget,
+  validateImageBatch,
+  validateImagePixelBudget,
+  type ImageBudgetViolation,
+  type PendingImage,
+  type PendingImageAction,
+} from './imageBudget';
+import {
+  isAbortError,
+  runOwnedStream,
+  StreamLifecycle,
+  toError,
+} from './streamLifecycle';
+import { WC } from './chrome';
 
-export interface ChatProps extends WebChatConfig {
-  onStateChange?: (state: ChatState) => void;
-  onMessageReceived?: (message: Message) => void;
-  onError?: (error: Error) => void;
-  onClose?: () => void;
-  botAvatarUrl?: string;
-  userAvatarUrl?: string;
-  agui?: AGUIConfig;
-  showFullscreenButton?: boolean;
-  showClearButton?: boolean;
-  apiKey?: string;
-}
+export type { ChatProps };
+
+const MessageBubble = React.lazy(async () => {
+  const mod = await import('./components/MessageBubble');
+  return { default: mod.MessageBubble };
+});
 
 // 图片大小上限（字节），默认 4MB，可通过 NEXT_PUBLIC_MAX_IMAGE_SIZE 环境变量覆盖
 const MAX_IMAGE_SIZE =
@@ -37,35 +61,65 @@ const MAX_IMAGE_SIZE =
     ? parseInt(process.env.NEXT_PUBLIC_MAX_IMAGE_SIZE, 10)
     : 0) || 4 * 1024 * 1024;
 
-const defaultBotAvatar = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzIiIGhlaWdodD0iMzIiIHZpZXdCb3g9IjAgMCAzMiAzMiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KICA8Y2lyY2xlIGN4PSIxNiIgY3k9IjE2IiByPSIxNiIgZmlsbD0iIzgxODVmZiIvPgogIDxjaXJjbGUgY3g9IjExIiBjeT0iMTIiIHI9IjIiIGZpbGw9IndoaXRlIi8+CiAgPGNpcmNsZSBjeD0iMjEiIGN5PSIxMiIgcj0iMiIgZmlsbD0id2hpdGUiLz4KICA8cGF0aCBkPSJNIDEwIDIwIFEgMTYgMjQgMjIgMjAiIHN0cm9rZT0id2hpdGUiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBmaWxsPSJub25lIi8+Cjwvc3ZnPg==';
-const defaultUserAvatar = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzIiIGhlaWdodD0iMzIiIHZpZXdCb3g9IjAgMCAzMiAzMiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KICA8Y2lyY2xlIGN4PSIxNiIgY3k9IjE2IiByPSIxNiIgZmlsbD0iIzEwYjk4MSIvPgogIDxjaXJjbGUgY3g9IjE2IiBjeT0iMTIiIHI9IjUiIGZpbGw9IndoaXRlIi8+CiAgPHBhdGggZD0iTSA2IDI4IFEgNiAyMCAxNiAyMCBRIDI2IDIwIDI2IDI4IiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4=';
-
-export const Chat = React.forwardRef<any, ChatProps>((props, ref) => {
+const ChatInner = React.forwardRef<HTMLDivElement, ChatProps>((props, ref) => {
   const {
     sseUrl,
-    // socketUrl,
-    // socketPath,
     customData,
     // theme = 'light',
     title = 'Chat',
     subtitle,
     placeholder = 'Type a message...',
-    // reconnectAttempts = 5,
-    // reconnectDelay = 1000,
-    // enableSSE = true,
     enableStorage = true,
     storageKey = 'webchat_session',
+    storageScope,
     onStateChange,
     onMessageReceived,
     onError,
     onClose,
-    botAvatarUrl,
-    userAvatarUrl,
     agui,
     showFullscreenButton = true,
     showClearButton = false,
+    showHeader = true,
     apiKey,
-  } = props;
+    credentials,
+    requestHeaders,
+    initialMessages,
+    historyLoading = false,
+    wideLayout = false,
+    fullscreen,
+    onFullscreenChange,
+    onStreamingStop,
+    onCustomEvent,
+    platform,
+    kickoffMessage,
+    onKickoffConsumed,
+    streamingTextBatching = true,
+    maxImageCount,
+    maxImagePixels,
+    maxTotalImageBytes,
+    maxTotalImagePixels,
+    imageReadConcurrency,
+    allowUnknownImagePreview,
+    collectContext,
+  } = normalizeWebChatConfig(props) as ChatProps;
+  const imageBudget = React.useMemo(
+    () => resolveImageBudget({
+      allowUnknownImagePreview,
+      imageReadConcurrency,
+      maxImageCount,
+      maxImagePixels,
+      maxTotalImageBytes,
+      maxTotalImagePixels,
+    }),
+    [
+      allowUnknownImagePreview,
+      imageReadConcurrency,
+      maxImageCount,
+      maxImagePixels,
+      maxTotalImageBytes,
+      maxTotalImagePixels,
+    ],
+  );
 
   // State
   const [messages, setMessages] = useState<Message[]>([]);
@@ -74,7 +128,9 @@ export const Chat = React.forwardRef<any, ChatProps>((props, ref) => {
   const [isThinking, setIsThinking] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
-  const [uploadedImages, setUploadedImages] = useState<string[]>([]);
+  const [imageSelectionError, setImageSelectionError] = useState<string | null>(null);
+  const [uploadedImages, setUploadedImages] = useState<PendingImage[]>([]);
+  const [hitlEvent, setHitlEvent] = useState<CustomProtocolEvent | null>(null);
 
   // Refs
   const sessionManagerRef = useRef<SessionManager | null>(null);
@@ -83,56 +139,78 @@ export const Chat = React.forwardRef<any, ChatProps>((props, ref) => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const streamingContentRef = useRef<string>('');
   const currentMessageIdRef = useRef<string | null>(null);
+  const streamingTextBatchingRef = useRef(streamingTextBatching);
+  streamingTextBatchingRef.current = streamingTextBatching;
+  const streamLifecycleRef = useRef<StreamLifecycle | null>(null);
+  const uploadedImagesRef = useRef<PendingImage[]>([]);
+  const pendingImageBatchesRef = useRef(new Map<symbol, { controller: AbortController; files: readonly File[] }>());
+  const imageBatchQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const imageSelectionGenerationRef = useRef(0);
+  if (!streamLifecycleRef.current) {
+    streamLifecycleRef.current = new StreamLifecycle();
+  }
+  const cancelPendingImageBatches = useCallback(() => {
+    imageSelectionGenerationRef.current += 1;
+    pendingImageBatchesRef.current.forEach(({ controller }) => controller.abort());
+    pendingImageBatchesRef.current.clear();
+  }, []);
+  const onStateChangeRef = useRef(onStateChange);
+  useLayoutEffect(() => {
+    onStateChangeRef.current = onStateChange;
+  }, [onStateChange]);
   // 保持 onMessageReceived 最新引用，避免 useEffect 空 deps 闭包固化旧 prop
   const onMessageReceivedRef = useRef(onMessageReceived);
   useEffect(() => {
     onMessageReceivedRef.current = onMessageReceived;
   }, [onMessageReceived]);
 
-  // Cache avatar elements to prevent re-fetching on every render
-  const botAvatar = React.useMemo(
-    () => <img src={botAvatarUrl || defaultBotAvatar} alt="bot" style={{ width: '32px', height: '32px', minWidth: '32px', minHeight: '32px', flexShrink: 0 }} className="rounded-full object-cover" />,
-    [botAvatarUrl]
-  );
-  
-  const userAvatar = React.useMemo(
-    () => <img src={userAvatarUrl || defaultUserAvatar} alt="user" style={{ width: '32px', height: '32px', minWidth: '32px', minHeight: '32px', flexShrink: 0 }} className="rounded-full object-cover" />,
-    [userAvatarUrl]
-  );
-
   // Initialize core components
   useEffect(() => {
+    const streamLifecycle = streamLifecycleRef.current;
+    streamLifecycle?.mount();
+    handleAGUIEvent.cancelPendingText();
+    streamingContentRef.current = '';
+    currentMessageIdRef.current = null;
+    setIsLoading(false);
+    setIsThinking(false);
+    setHitlEvent(null);
+
     // Initialize SessionManager
     sessionManagerRef.current = new SessionManager({
       enableStorage,
       storageKey,
+      storageScope,
       customData,
     });
 
     // Initialize StateMachine
     stateMachineRef.current = new StateMachine('idle');
     const unsubscribeState = stateMachineRef.current.on((event) => {
-      onStateChange?.(event.to);
+      onStateChangeRef.current?.(event.to);
     });
 
     // Initialize SSEHandler - 不再需要，我们用 fetch 直接处理
     // Initialize AGUIHandler (默认启用)
-    aguiHandlerRef.current = new AGUIHandler(agui || { enabled: true, debug: true });
+    aguiHandlerRef.current = new AGUIHandler(agui || { enabled: true, debug: false });
     const aguiSubscription = setupAGUIEventHandlers();
-
     // Load previous session
     const session = sessionManagerRef.current.initSession();
-    if (session && session.messages.length > 0) {
-      setMessages(session.messages);
-    }
+    const restoredMessages = initialMessages && initialMessages.length > 0
+      ? [...initialMessages]
+      : [...session.messages];
+    session.messages = [...restoredMessages];
+    setMessages(restoredMessages);
 
     return () => {
+      handleAGUIEvent.cancelPendingText();
+      cancelPendingImageBatches();
+      void streamLifecycle?.dispose();
       aguiSubscription?.unsubscribe();
       aguiHandlerRef.current?.destroy();
       unsubscribeState();
       stateMachineRef.current?.destroy();
     };
-  }, []);
+  }, [cancelPendingImageBatches, enableStorage, storageKey, storageScope]);
 
   // Setup AG-UI event handlers
   const setupAGUIEventHandlers = () => {
@@ -143,583 +221,231 @@ export const Chat = React.forwardRef<any, ChatProps>((props, ref) => {
     });
   };
 
-  // 确保当前存在一条 bot 消息，若尚未创建则新建并通知外部。
-  // TEXT_MESSAGE_START 和 TOOL_CALL_START 均需此逻辑，提取以消除重复。
-  const ensureCurrentMessage = () => {
-    if (currentMessageIdRef.current) return;
-    const newAssistantMsg: Message = {
-      id: generateId(),
-      type: 'text',
-      content: '',
-      sender: 'bot',
-      timestamp: Date.now(),
-      metadata: { contentChunks: [] },
-    };
-    currentMessageIdRef.current = newAssistantMsg.id;
-    setMessages((prev) => [...prev, newAssistantMsg]);
-    sessionManagerRef.current?.addMessage(newAssistantMsg);
-    onMessageReceivedRef.current?.(newAssistantMsg);
-  };
-
-  // Handle AG-UI protocol events
-  const handleAGUIEvent = (event: AGUIEvent) => {
-    const eventType = event.type as any;  // Cast to any to handle additional event types
-
-    switch (eventType) {
-      case 'RUN_STARTED':
-        setIsThinking(true);
-        stateMachineRef.current?.transition('chatting');
-        
-        streamingContentRef.current = '';
-        currentMessageIdRef.current = null;
-        setIsLoading(true);
-        
-        break;
-
-      case 'THINKING_START':
-        setIsThinking(true);
-        break;
-
-      case 'THINKING_END':
-        setIsThinking(false);
-        break;
-
-      case 'RUN_ERROR':
-        setIsThinking(false);
-        setIsLoading(false);
-        const error = (event as any).error || 'Unknown error';
-        const errorContent = `\n\n❌ **错误**: ${error}`;
-        
-        // 如果有当前消息，追加错误信息到末尾
-        if (currentMessageIdRef.current) {
-          streamingContentRef.current += errorContent;
-          
-          setMessages((prev) => {
-            return prev.map(msg => {
-              if (msg.id === currentMessageIdRef.current) {
-                const chunks = msg.metadata?.contentChunks || [];
-                const lastChunk = chunks[chunks.length - 1];
-                
-                let newChunks;
-                if (lastChunk && lastChunk.type === 'text') {
-                  newChunks = [
-                    ...chunks.slice(0, -1),
-                    { type: 'text', content: streamingContentRef.current }
-                  ];
-                } else {
-                  newChunks = [
-                    ...chunks,
-                    { type: 'text', content: streamingContentRef.current }
-                  ];
-                }
-                
-                return {
-                  ...msg,
-                  content: streamingContentRef.current,
-                  metadata: {
-                    ...msg.metadata,
-                    contentChunks: newChunks
-                  }
-                };
-              }
-              return msg;
-            });
-          });
-          
-          // 同步更新 session 数据
-          const session = sessionManagerRef.current?.getSession();
-          if (session) {
-            const msgIndex = session.messages.findIndex((m: Message) => m.id === currentMessageIdRef.current);
-            if (msgIndex !== -1) {
-              const chunks = session.messages[msgIndex].metadata?.contentChunks || [];
-              const lastChunk = chunks[chunks.length - 1];
-              
-              let newChunks;
-              if (lastChunk && lastChunk.type === 'text') {
-                newChunks = [
-                  ...chunks.slice(0, -1),
-                  { type: 'text', content: streamingContentRef.current }
-                ];
-              } else {
-                newChunks = [
-                  ...chunks,
-                  { type: 'text', content: streamingContentRef.current }
-                ];
-              }
-              
-              session.messages[msgIndex] = { 
-                ...session.messages[msgIndex], 
-                content: streamingContentRef.current,
-                metadata: {
-                  ...session.messages[msgIndex].metadata,
-                  contentChunks: newChunks
-                }
-              };
-            }
-          }
-          
-          // 保存到 session
-          if (sessionManagerRef.current) {
-            sessionManagerRef.current.saveSession();
-          }
-        } else {
-          // 没有当前消息，创建新的错误消息
-          const errorMsg: Message = {
-            id: generateId(),
-            type: 'text',
-            content: `❌ **错误**\n\n${error}`,
-            sender: 'bot',
-            timestamp: Date.now(),
-          };
-          addMessage(errorMsg);
-        }
-        break;
-
-      case 'TEXT_MESSAGE_START':
-        const startEvent = event as any;
-        const startRole = startEvent.role || startEvent.sender;
-        
-        // 如果是用户消息，跳过（用户消息已经在发送时添加了）
-        if (startRole === 'user') {
-          break;
-        }
-        
-        // 如果还没有创建消息，现在创建
-        ensureCurrentMessage();
-
-        // 重置当前文本内容累加器
-        streamingContentRef.current = '';
-        setIsThinking(false);
-        setIsLoading(true);
-        
-        break;
-
-      case 'TEXT_MESSAGE_CONTENT':  // 流式内容输出
-        const chunkEvent = event as any;
-        const delta = chunkEvent.delta || chunkEvent.content || '';
-        const contentRole = chunkEvent.role || chunkEvent.sender;
-        
-        
-        // 如果是用户消息，跳过
-        if (contentRole === 'user') {
-          break;
-        }
-        
-        // 如果没有当前消息 ID，说明没有收到 START 事件，忽略
-        if (!currentMessageIdRef.current) {
-          console.warn('⚠️ Received CONTENT without START, ignoring');
-          break;
-        }
-        
-        // 收到第一个内容块时关闭 loading 状态
-        if (streamingContentRef.current === '' && delta) {
-          setIsLoading(false);
-        }
-        
-        // 累加内容到 ref
-        streamingContentRef.current += delta;
-        
-        // 更新消息的 contentChunks，更新或添加最后一个文本 chunk
-        setMessages((prev) => {
-          return prev.map(msg => {
-            if (msg.id === currentMessageIdRef.current) {
-              const chunks = msg.metadata?.contentChunks || [];
-              const lastChunk = chunks[chunks.length - 1];
-              
-              let newChunks;
-              if (lastChunk && lastChunk.type === 'text') {
-                // 更新最后一个文本 chunk
-                newChunks = [
-                  ...chunks.slice(0, -1),
-                  { type: 'text', content: streamingContentRef.current }
-                ];
-              } else {
-                // 添加新的文本 chunk
-                newChunks = [
-                  ...chunks,
-                  { type: 'text', content: streamingContentRef.current }
-                ];
-              }
-              
-              return {
-                ...msg,
-                content: streamingContentRef.current, // 保留 content 用于复制等操作
-                metadata: {
-                  ...msg.metadata,
-                  contentChunks: newChunks
-                }
-              };
-            }
-            return msg;
-          });
-        });
-        
-        // 同步更新 session（内存中，不保存到 localStorage）
-        const session = sessionManagerRef.current?.getSession();
-        if (session) {
-          const msgIndex = session.messages.findIndex((m: Message) => m.id === currentMessageIdRef.current);
-          if (msgIndex !== -1) {
-            const chunks = session.messages[msgIndex].metadata?.contentChunks || [];
-            const lastChunk = chunks[chunks.length - 1];
-            
-            let newChunks;
-            if (lastChunk && lastChunk.type === 'text') {
-              newChunks = [
-                ...chunks.slice(0, -1),
-                { type: 'text', content: streamingContentRef.current }
-              ];
-            } else {
-              newChunks = [
-                ...chunks,
-                { type: 'text', content: streamingContentRef.current }
-              ];
-            }
-            
-            session.messages[msgIndex] = { 
-              ...session.messages[msgIndex], 
-              content: streamingContentRef.current,
-              metadata: {
-                ...session.messages[msgIndex].metadata,
-                contentChunks: newChunks
-              }
-            };
-          }
-        }
-        break;
-
-      case 'TEXT_MESSAGE_END':
-        // 保存最终内容到 localStorage
-        if (currentMessageIdRef.current && sessionManagerRef.current) {
-          sessionManagerRef.current.saveSession();
-        }
-        break;
-
-      case 'TOOL_CALL_START':
-        const toolStartEvent = event as any;
-        const newToolCall: ToolCall = {
-          id: toolStartEvent.toolCallId,
-          name: toolStartEvent.toolCallName || toolStartEvent.name || 'Unknown Tool',
-          status: 'running' as const,
-        };
-
-        // 如果还没有创建消息，现在创建（与 TEXT_MESSAGE_START 共用同一逻辑）
-        ensureCurrentMessage();
-
-        // Add tool call as a new separate chunk
-        setMessages((prev) => {
-          return prev.map(msg => {
-            if (msg.id === currentMessageIdRef.current) {
-              const chunks = msg.metadata?.contentChunks || [];
-              
-              // Check if this tool already exists in any chunk to prevent duplicates
-              const toolExists = chunks.some((chunk: any) => 
-                chunk.type === 'toolCalls' && 
-                chunk.toolCalls.some((t: ToolCall) => t.id === newToolCall.id)
-              );
-              
-              if (toolExists) {
-                console.warn('⚠️ Tool call already exists:', newToolCall.id);
-                return msg;
-              }
-              
-              // Add as a new separate chunk for each tool call
-              const newChunks = [
-                ...chunks,
-                { type: 'toolCalls', toolCalls: [newToolCall] }
-              ];
-              
-              return { 
-                ...msg, 
-                metadata: { 
-                  ...msg.metadata, 
-                  contentChunks: newChunks
-                } 
-              };
-            }
-            return msg;
-          });
-        });
-        
-        // Also update session
-        const session1 = sessionManagerRef.current?.getSession();
-        if (session1) {
-          const msgIndex1 = session1.messages.findIndex((m: Message) => m.id === currentMessageIdRef.current);
-          if (msgIndex1 !== -1) {
-            const chunks = session1.messages[msgIndex1].metadata?.contentChunks || [];
-            
-            // Check if this tool already exists to prevent duplicates
-            const toolExists = chunks.some((chunk: any) => 
-              chunk.type === 'toolCalls' && 
-              chunk.toolCalls.some((t: ToolCall) => t.id === newToolCall.id)
-            );
-            
-            if (!toolExists) {
-              // Add as a new separate chunk
-              const newChunks = [
-                ...chunks,
-                { type: 'toolCalls', toolCalls: [newToolCall] }
-              ];
-              
-              session1.messages[msgIndex1].metadata = {
-                ...session1.messages[msgIndex1].metadata,
-                contentChunks: newChunks
-              };
-            }
-          }
-        }
-        break;
-
-      case 'TOOL_CALL_ARGS':
-        const toolArgsEvent = event as any;
-        setMessages((prev) => {
-          return prev.map(msg => {
-            if (msg.id === currentMessageIdRef.current && msg.metadata?.contentChunks) {
-              const chunks = msg.metadata.contentChunks;
-              const newChunks = chunks.map((chunk: any) => {
-                if (chunk.type === 'toolCalls') {
-                  return {
-                    ...chunk,
-                    toolCalls: chunk.toolCalls.map((tool: ToolCall) =>
-                      tool.id === toolArgsEvent.toolCallId
-                        ? { ...tool, args: toolArgsEvent.delta || toolArgsEvent.arguments }
-                        : tool
-                    )
-                  };
-                }
-                return chunk;
-              });
-              
-              return {
-                ...msg,
-                metadata: {
-                  ...msg.metadata,
-                  contentChunks: newChunks
-                }
-              };
-            }
-            return msg;
-          });
-        });
-        
-        // Also update session
-        const session2 = sessionManagerRef.current?.getSession();
-        if (session2) {
-          const msgIndex2 = session2.messages.findIndex((m: Message) => m.id === currentMessageIdRef.current);
-          if (msgIndex2 !== -1 && session2.messages[msgIndex2].metadata?.contentChunks) {
-            const chunks = session2.messages[msgIndex2].metadata.contentChunks;
-            session2.messages[msgIndex2].metadata.contentChunks = chunks.map((chunk: any) => {
-              if (chunk.type === 'toolCalls') {
-                return {
-                  ...chunk,
-                  toolCalls: chunk.toolCalls.map((tool: ToolCall) =>
-                    tool.id === toolArgsEvent.toolCallId
-                      ? { ...tool, args: toolArgsEvent.delta || toolArgsEvent.arguments }
-                      : tool
-                  )
-                };
-              }
-              return chunk;
-            });
-          }
-        }
-        break;
-
-      case 'TOOL_CALL_END':
-        const toolEndEvent = event as any;
-        setMessages((prev) => {
-          return prev.map(msg => {
-            if (msg.id === currentMessageIdRef.current && msg.metadata?.contentChunks) {
-              const chunks = msg.metadata.contentChunks;
-              const newChunks = chunks.map((chunk: any) => {
-                if (chunk.type === 'toolCalls') {
-                  return {
-                    ...chunk,
-                    toolCalls: chunk.toolCalls.map((tool: ToolCall) =>
-                      tool.id === toolEndEvent.toolCallId
-                        ? { ...tool, status: 'completed' as const }
-                        : tool
-                    )
-                  };
-                }
-                return chunk;
-              });
-              
-              return {
-                ...msg,
-                metadata: {
-                  ...msg.metadata,
-                  contentChunks: newChunks
-                }
-              };
-            }
-            return msg;
-          });
-        });
-        
-        // Also update session
-        const session3 = sessionManagerRef.current?.getSession();
-        if (session3) {
-          const msgIndex3 = session3.messages.findIndex((m: Message) => m.id === currentMessageIdRef.current);
-          if (msgIndex3 !== -1 && session3.messages[msgIndex3].metadata?.contentChunks) {
-            const chunks = session3.messages[msgIndex3].metadata.contentChunks;
-            session3.messages[msgIndex3].metadata.contentChunks = chunks.map((chunk: any) => {
-              if (chunk.type === 'toolCalls') {
-                return {
-                  ...chunk,
-                  toolCalls: chunk.toolCalls.map((tool: ToolCall) =>
-                    tool.id === toolEndEvent.toolCallId
-                      ? { ...tool, status: 'completed' as const }
-                      : tool
-                  )
-                };
-              }
-              return chunk;
-            });
-          }
-        }
-        break;
-
-      case 'TOOL_CALL_RESULT':
-        const toolResultEvent = event as any;
-        setMessages((prev) => {
-          return prev.map(msg => {
-            if (msg.id === currentMessageIdRef.current && msg.metadata?.contentChunks) {
-              const chunks = msg.metadata.contentChunks;
-              const newChunks = chunks.map((chunk: any) => {
-                if (chunk.type === 'toolCalls') {
-                  return {
-                    ...chunk,
-                    toolCalls: chunk.toolCalls.map((tool: ToolCall) =>
-                      tool.id === toolResultEvent.toolCallId
-                        ? { ...tool, result: toolResultEvent.content }
-                        : tool
-                    )
-                  };
-                }
-                return chunk;
-              });
-              
-              return {
-                ...msg,
-                metadata: {
-                  ...msg.metadata,
-                  contentChunks: newChunks
-                }
-              };
-            }
-            return msg;
-          });
-        });
-        
-        // Also update session
-        const session4 = sessionManagerRef.current?.getSession();
-        if (session4) {
-          const msgIndex4 = session4.messages.findIndex((m: Message) => m.id === currentMessageIdRef.current);
-          if (msgIndex4 !== -1 && session4.messages[msgIndex4].metadata?.contentChunks) {
-            const chunks = session4.messages[msgIndex4].metadata.contentChunks;
-            session4.messages[msgIndex4].metadata.contentChunks = chunks.map((chunk: any) => {
-              if (chunk.type === 'toolCalls') {
-                return {
-                  ...chunk,
-                  toolCalls: chunk.toolCalls.map((tool: ToolCall) =>
-                    tool.id === toolResultEvent.toolCallId
-                      ? { ...tool, result: toolResultEvent.content }
-                      : tool
-                  )
-                };
-              }
-              return chunk;
-            });
-          }
-        }
-        break;
-
-      case 'RUN_FINISHED':
-        if (currentMessageIdRef.current && sessionManagerRef.current) {
-          sessionManagerRef.current.saveSession();
-        }
-        setIsLoading(false);
-        setIsThinking(false);
-        stateMachineRef.current?.transition('connected');
-        break;
-
-      default:
-        console.log('AG-UI event:', event);
-    }
-  };
-
-  // Setup SSE handlers - 已移除，使用 fetch 直接处理
-
-  // Handle legacy message format (fallback)
-  const handleLegacyMessage = (data: any) => {
-    if (data.content) {
-      const botMsg: Message = {
-        id: data.id || generateId(),
-        type: data.type || 'text',
-        content: data.content,
-        sender: 'bot',
-        timestamp: Date.now(),
-        metadata: data.metadata,
-      };
-      addMessage(botMsg);
-      setIsLoading(false);
-    }
-  };
-
   // Add message to state and session
   const addMessage = useCallback((message: Message) => {
     setMessages((prev) => {
-      // 防止重复添加：检查是否已存在相同 id 的消息
-      if (prev.some(msg => msg.id === message.id)) {
-        console.warn('⚠️ Duplicate message detected, skipping:', message.id);
+      if (prev.some((msg) => msg.id === message.id)) {
+        console.warn('Duplicate message detected, skipping:', message.id);
         return prev;
       }
       return [...prev, message];
     });
     sessionManagerRef.current?.addMessage(message);
-    // 通过 ref 调用，确保始终使用最新的 onMessageReceived prop
     onMessageReceivedRef.current?.(message);
   }, []);
+
+  const handleAGUIEvent = useMemo(
+    () =>
+      createAGUIEventHandler({
+        currentMessageIdRef,
+        streamingContentRef,
+        sessionManagerRef,
+        stateMachineRef,
+        onMessageReceivedRef,
+        setMessages,
+        setIsLoading,
+        setIsThinking,
+        addMessage,
+        streamingTextBatchingRef,
+      }),
+    [addMessage]
+  );
+
+  const sessionId =
+    customData && typeof customData.session_id === 'string' ? customData.session_id : '';
+  const appliedSessionRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!sessionId) {
+      return;
+    }
+    if (appliedSessionRef.current === null) {
+      appliedSessionRef.current = sessionId;
+      if (initialMessages && initialMessages.length > 0) {
+        setMessages(initialMessages);
+      }
+      return;
+    }
+    if (appliedSessionRef.current === sessionId) {
+      if (initialMessages && initialMessages.length > 0) {
+        setMessages((prev) => {
+          if (
+            prev.length === initialMessages.length &&
+            prev.every((item, index) => item.id === initialMessages[index]?.id)
+          ) {
+            return prev;
+          }
+          return initialMessages;
+        });
+      }
+      return;
+    }
+    appliedSessionRef.current = sessionId;
+    handleAGUIEvent.cancelPendingText();
+    cancelPendingImageBatches();
+    streamingContentRef.current = '';
+    currentMessageIdRef.current = null;
+    setIsLoading(false);
+    setIsThinking(false);
+    setHitlEvent(null);
+    sessionManagerRef.current?.clearSession();
+    sessionManagerRef.current?.initSession();
+    setMessages(initialMessages && initialMessages.length > 0 ? initialMessages : []);
+  }, [cancelPendingImageBatches, handleAGUIEvent, initialMessages, sessionId]);
+
+  // Handle legacy message format (fallback)
+  const handleLegacyMessage = (data: unknown) => {
+    const legacy = parseLegacyMessage(data);
+    if (!legacy) return;
+
+    const botMsg: Message = {
+      id: legacy.id || generateId(),
+      type: legacy.type,
+      content: legacy.content,
+      sender: 'bot',
+      timestamp: Date.now(),
+      metadata: legacy.metadata,
+    };
+    addMessage(botMsg);
+  };
+
+  const applyCustomEvent = (event: CustomProtocolEvent) => {
+    onCustomEvent?.(event);
+    if (isBlockingHitlEvent(event)) {
+      setHitlEvent(event);
+      return;
+    }
+    // 进度/元数据类事件（规划步骤、步骤进度、引用等）不降级成聊天气泡
+    if (isSilentCustomEvent(event.name)) {
+      return;
+    }
+    const degraded = formatDegradedCustomEvent(event);
+    if (!degraded.trim()) {
+      return;
+    }
+    addMessage({
+      id: generateId(),
+      type: 'text',
+      content: degraded,
+      sender: 'bot',
+      timestamp: Date.now(),
+    });
+  };
+
+  const updateUploadedImages = useCallback((action: PendingImageAction) => {
+    const next = pendingImagesReducer(uploadedImagesRef.current, action);
+    uploadedImagesRef.current = next;
+    setUploadedImages(next);
+  }, []);
+
+  const reportImageError = useCallback((error: Error) => {
+    setImageSelectionError(error.message);
+    onError?.(error);
+  }, [onError]);
+
+  const reportImageBudgetViolation = useCallback((violation: ImageBudgetViolation) => {
+    if (violation.reason === 'count') {
+      reportImageError(new Error(`每条消息最多选择 ${violation.limit} 张图片，本批次未添加。`));
+      return;
+    }
+    if (violation.reason === 'bytes') {
+      const limitMB = violation.limit / (1024 * 1024);
+      reportImageError(new Error(`每条消息的图片总大小不能超过 ${limitMB}MB，本批次未添加。`));
+      return;
+    }
+    const limitMP = Math.round((violation.limit / 1_000_000) * 10) / 10;
+    const scope = violation.reason === 'image-pixels' ? '单张图片' : '每条消息的图片总计';
+    reportImageError(new Error(`${scope}不能超过 ${limitMP} 百万像素，本批次未添加。`));
+  }, [reportImageError]);
+
+  const queueImageFiles = useCallback((files: readonly File[]) => {
+    if (files.length === 0) return;
+
+    const pendingFiles = Array.from(pendingImageBatchesRef.current.values()).flatMap(({ files }) => files);
+    const accountedImages = [...uploadedImagesRef.current, ...pendingFiles];
+    const validation = validateImageBatch(accountedImages, files, imageBudget);
+    if (validation.ok === false) {
+      reportImageBudgetViolation(validation);
+      return;
+    }
+
+    const batchToken = Symbol('pending-image-batch');
+    const controller = new AbortController();
+    pendingImageBatchesRef.current.set(batchToken, { controller, files });
+    const generation = imageSelectionGenerationRef.current;
+    imageBatchQueueRef.current = imageBatchQueueRef.current.then(async () => {
+      try {
+        if (generation !== imageSelectionGenerationRef.current) return;
+
+        const inspectedFiles = await inspectImageBatch(
+          files,
+          imageBudget.imageReadConcurrency,
+          controller.signal,
+        );
+        const pixelValidation = validateImagePixelBudget(
+          uploadedImagesRef.current,
+          inspectedFiles,
+          imageBudget,
+        );
+        if (pixelValidation.ok === false) {
+          reportImageBudgetViolation(pixelValidation);
+          return;
+        }
+
+        const images = (await readImageBatch(
+          inspectedFiles,
+          imageBudget.imageReadConcurrency,
+          readFileAsDataUrl,
+          controller.signal,
+        )).map((image) => ({
+          ...image,
+          previewable: image.previewable || imageBudget.allowUnknownImagePreview,
+        }));
+        if (generation !== imageSelectionGenerationRef.current) return;
+
+        const latestValidation = validateImageBatch(uploadedImagesRef.current, files, imageBudget);
+        if (latestValidation.ok === false) {
+          reportImageBudgetViolation(latestValidation);
+          return;
+        }
+        setImageSelectionError(null);
+        updateUploadedImages({ images, type: 'append' });
+      } catch (error) {
+        if (generation !== imageSelectionGenerationRef.current) return;
+        reportImageError(toError(error));
+      } finally {
+        pendingImageBatchesRef.current.delete(batchToken);
+      }
+    });
+  }, [imageBudget, reportImageBudgetViolation, reportImageError, updateUploadedImages]);
 
   // Handle image upload
   const handleImageUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
 
-    const readers: Promise<string>[] = [];
+    const imageFiles: File[] = [];
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       if (!file.type.startsWith('image/')) continue;
       if (file.size > MAX_IMAGE_SIZE) {
         const limitMB = MAX_IMAGE_SIZE / (1024 * 1024);
-        onError?.(new Error(`图片"${file.name}"超过 ${limitMB}MB 大小限制，已跳过。`));
+        reportImageError(new Error(`图片"${file.name}"超过 ${limitMB}MB 大小限制，已跳过。`));
         continue;
       }
 
-      const reader = new FileReader();
-      const promise = new Promise<string>((resolve) => {
-        reader.onload = (event) => {
-          const base64 = event.target?.result as string;
-          resolve(base64);
-        };
-        reader.readAsDataURL(file);
-      });
-      readers.push(promise);
+      imageFiles.push(file);
     }
-
-    Promise.all(readers).then((results) => {
-      setUploadedImages((prev) => [...prev, ...results]);
-    });
+    queueImageFiles(imageFiles);
 
     // Reset input
     e.target.value = '';
-  }, [onError]);
+  }, [queueImageFiles, reportImageError]);
 
   // Remove uploaded image
   const handleRemoveImage = useCallback((index: number) => {
-    setUploadedImages((prev) => prev.filter((_, i) => i !== index));
-  }, []);
+    updateUploadedImages({ index, type: 'remove' });
+  }, [updateUploadedImages]);
 
   // Handle paste event for images
   const handlePaste = useCallback((e: React.ClipboardEvent) => {
@@ -734,7 +460,7 @@ export const Chat = React.forwardRef<any, ChatProps>((props, ref) => {
         if (file) {
           if (file.size > MAX_IMAGE_SIZE) {
             const limitMB = MAX_IMAGE_SIZE / (1024 * 1024);
-            onError?.(new Error(`粘贴的图片超过 ${limitMB}MB 大小限制，已跳过。`));
+            reportImageError(new Error(`粘贴的图片超过 ${limitMB}MB 大小限制，已跳过。`));
             continue;
           }
           imageFiles.push(file);
@@ -744,37 +470,23 @@ export const Chat = React.forwardRef<any, ChatProps>((props, ref) => {
 
     if (imageFiles.length > 0) {
       e.preventDefault(); // 阻止默认粘贴行为
-      
-      const readers: Promise<string>[] = imageFiles.map(file => {
-        return new Promise<string>((resolve) => {
-          const reader = new FileReader();
-          reader.onload = (event) => {
-            const base64 = event.target?.result as string;
-            resolve(base64);
-          };
-          reader.readAsDataURL(file);
-        });
-      });
-
-      Promise.all(readers).then((results) => {
-        setUploadedImages((prev) => [...prev, ...results]);
-      });
+      queueImageFiles(imageFiles);
     }
-  }, [onError]);
+  }, [queueImageFiles, reportImageError]);
 
   // Send message
   const handleSendMessage = useCallback(async (value: string) => {
     if ((!value.trim() && uploadedImages.length === 0) || isLoading) return;
 
     // Build message content
-    let messageContent: string | any[];
+    let messageContent: string | MessageContent[];
     let messageType: MessageType = 'text';
 
     if (uploadedImages.length > 0) {
       // Multimodal message with images and text
       messageContent = [
-        ...uploadedImages.map(url => ({ type: 'image_url', image_url: url })),
-        ...(value.trim() ? [{ type: 'message', message: value.trim() }] : [])
+        ...uploadedImages.map(({ dataUrl }) => ({ type: 'image_url' as const, image_url: dataUrl })),
+        ...(value.trim() ? [{ type: 'message' as const, message: value.trim() }] : []),
       ];
       messageType = 'multimodal';
     } else {
@@ -789,29 +501,57 @@ export const Chat = React.forwardRef<any, ChatProps>((props, ref) => {
       content: messageContent,
       sender: 'user',
       timestamp: Date.now(),
+      ...(uploadedImages.some(({ previewable }) => !previewable)
+        ? {
+            metadata: {
+              unpreviewedImageIndexes: uploadedImages.flatMap(({ previewable }, index) =>
+                previewable ? [] : [index],
+              ),
+            },
+          }
+        : {}),
     };
 
     addMessage(userMsg);
     setInputValue('');
-    setUploadedImages([]);
+    setHitlEvent(null);
+    cancelPendingImageBatches();
+    setImageSelectionError(null);
+    updateUploadedImages({ type: 'clear' });
     setIsLoading(true);
 
     try {
-      stateMachineRef.current?.transition('chatting');
+      stateMachineRef.current?.transitionToChatting();
 
       if (sseUrl) {
+        const streamLifecycle = streamLifecycleRef.current;
+        const stream = streamLifecycle?.begin();
+        if (!streamLifecycle || !stream) {
+          return;
+        }
+
         // Get current session data
         const currentSession = sessionManagerRef.current?.getSession();
-        
+        let pageContext: unknown = null;
+        if (collectContext) {
+          try {
+            pageContext = await collectContext({ message: value.trim() });
+          } catch (error) {
+            console.warn('page context collect failed', error);
+          }
+        }
+
         const requestBody = {
           message: messageType === 'multimodal' ? messageContent : value.trim(),
           sessionId: currentSession?.sessionId,
           ...customData,
+          ...(pageContext ? { page_context: pageContext } : {}),
         };
         
         // Use fetch with POST to send message and stream response
         const headers: HeadersInit = {
           'Content-Type': 'application/json',
+          ...(requestHeaders || {}),
         };
         
         // Add Authorization header if apiKey is provided
@@ -819,65 +559,51 @@ export const Chat = React.forwardRef<any, ChatProps>((props, ref) => {
           headers['Authorization'] = `Bearer ${apiKey}`;
         }
         
-        const response = await fetch(sseUrl, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(requestBody),
-        });
-
-        if (!response.ok || !response.body) {
-          throw new Error(`HTTP error! status: ${response.status}`);
-        }
-
-        // Process SSE stream
-        const reader = response.body.getReader();
         const decoder = new TextDecoder();
-        
-        try {
-          while (true) {
-            const { done, value: chunk } = await reader.read();
-            if (done) {
-              console.log('✅ Stream complete');
-              // Ensure loading state is reset when stream completes
-              setIsLoading(false);
-              setIsThinking(false);
-              break;
-            }
-
+        const sseParser = new SSEStreamParser();
+        await runOwnedStream({
+          lifecycle: streamLifecycle,
+          stream,
+          request: (signal) =>
+            fetch(sseUrl, {
+              method: 'POST',
+              headers,
+              credentials: credentials ?? 'same-origin',
+              body: JSON.stringify(requestBody),
+              ...(signal ? { signal } : {}),
+            }),
+          onChunk: (chunk) => {
             const text = decoder.decode(chunk, { stream: true });
-            // console.log('📦 Received chunk:', text.substring(0, 100));
-            const lines = text.split('\n');
+            for (const data of sseParser.push(text)) {
+              if (typeof data !== 'object' || data === null) {
+                continue;
+              }
 
-            for (const line of lines) {
-              if (line.startsWith('data: ')) {
-                const dataStr = line.slice(6);
-                if (dataStr.trim()) {
-                  try {
-                    const data = JSON.parse(dataStr);
-                    
-                    // Process through AG-UI handler
-                    if (aguiHandlerRef.current) {
-                      const result = aguiHandlerRef.current.processSSEData(data);
-                      // AG-UI events are handled via Observable stream
-                      // Only handle legacy messages here
-                      if (result.type === 'legacy-message' && result.message) {
-                        handleLegacyMessage(result.message);
-                      }
-                    } else {
-                      handleLegacyMessage(data);
-                    }
-                  } catch (e) {
-                    console.error('Error parsing SSE data:', e);
-                  }
+              // Process through AG-UI handler; fall back to legacy messages
+              if (aguiHandlerRef.current) {
+                const result = aguiHandlerRef.current.processSSEData(data);
+                if (result.type === 'legacy-message' && result.message) {
+                  handleLegacyMessage(result.message);
+                } else if (result.type === 'custom-event') {
+                  applyCustomEvent(result.event);
                 }
+              } else {
+                handleLegacyMessage(data);
               }
             }
-          }
-        } catch (streamError) {
-          console.error('Error reading stream:', streamError);
-          setIsLoading(false);
-          setIsThinking(false);
-        }
+          },
+          onError: (error) => {
+            handleAGUIEvent.flushPendingText();
+            console.error('Error reading stream:', error);
+            onError?.(error);
+          },
+          onComplete: () => {
+            handleAGUIEvent.flushPendingText();
+            setIsLoading(false);
+            setIsThinking(false);
+            stateMachineRef.current?.transition('connected');
+          },
+        });
       } else {
         // Simulate response for demo
         setTimeout(() => {
@@ -893,15 +619,46 @@ export const Chat = React.forwardRef<any, ChatProps>((props, ref) => {
         }, 1000);
       }
     } catch (error) {
+      handleAGUIEvent.flushPendingText();
+      if (isAbortError(error)) {
+        return;
+      }
       console.error('Error sending message:', error);
-      onError?.(error as Error);
+      onError?.(toError(error));
       setIsLoading(false);
     }
-  }, [isLoading, sseUrl, customData, addMessage, onError, aguiHandlerRef, uploadedImages]);
+  }, [
+    isLoading,
+    sseUrl,
+    customData,
+    addMessage,
+    onError,
+    uploadedImages,
+    handleAGUIEvent,
+    updateUploadedImages,
+    cancelPendingImageBatches,
+    apiKey,
+    credentials,
+    requestHeaders,
+    collectContext,
+  ]);
+
+  const handleStopStreaming = useCallback(() => {
+    handleAGUIEvent.flushPendingText();
+    void streamLifecycleRef.current?.cancel('user-stopped');
+    setIsLoading(false);
+    setIsThinking(false);
+    onStreamingStop?.();
+  }, [handleAGUIEvent, onStreamingStop]);
 
   // Clear messages
   const handleClear = useCallback(() => {
+    handleAGUIEvent.cancelPendingText();
+    void streamLifecycleRef.current?.cancel('session-cleared');
     setMessages([]);
+    cancelPendingImageBatches();
+    setImageSelectionError(null);
+    updateUploadedImages({ type: 'clear' });
     // Clear and reinitialize session
     sessionManagerRef.current?.clearSession();
     sessionManagerRef.current?.initSession();
@@ -914,7 +671,7 @@ export const Chat = React.forwardRef<any, ChatProps>((props, ref) => {
     stateMachineRef.current?.transition('idle');
     // Close the confirmation dialog
     setShowClearConfirm(false);
-  }, []);
+  }, [cancelPendingImageBatches, handleAGUIEvent, updateUploadedImages]);
 
   // Use message handlers hook
   const { handleRegenerate, handleCopy, handleDelete } = useMessageHandlers({
@@ -924,10 +681,23 @@ export const Chat = React.forwardRef<any, ChatProps>((props, ref) => {
     handleSendMessage,
   });
 
+  const consumedKickoffRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!kickoffMessage?.trim() || consumedKickoffRef.current === kickoffMessage) {
+      return;
+    }
+    consumedKickoffRef.current = kickoffMessage;
+    void handleSendMessage(kickoffMessage);
+    onKickoffConsumed?.();
+  }, [handleSendMessage, kickoffMessage, onKickoffConsumed]);
+
   // Toggle fullscreen
+  const panelFullscreen = fullscreen ?? isFullscreen;
   const toggleFullscreen = useCallback(() => {
-    setIsFullscreen(prev => !prev);
-  }, []);
+    const next = !panelFullscreen;
+    setIsFullscreen(next);
+    onFullscreenChange?.(next);
+  }, [onFullscreenChange, panelFullscreen]);
 
   // Scroll to bottom
   useEffect(() => {
@@ -936,32 +706,44 @@ export const Chat = React.forwardRef<any, ChatProps>((props, ref) => {
 
   return (
     <div 
-      className={`flex flex-col bg-white rounded-lg shadow-lg overflow-hidden transition-all duration-300 ${
-        isFullscreen 
-          ? 'fixed inset-4 z-50 h-auto' 
+      className={`flex min-h-0 flex-1 flex-col overflow-hidden ${
+        showHeader ? 'rounded-lg' : ''
+      } ${
+        panelFullscreen && !onFullscreenChange
+          ? 'fixed inset-0 z-50 h-full'
           : 'h-full'
-      }`} 
+      }`}
+      style={{ background: WC.stage }}
       ref={ref}
     >
-      {/* Header */}
-      <div className="bg-gradient-to-r from-indigo-600 to-purple-600 text-white px-6 py-4 flex items-center justify-between flex-shrink-0">
+      {showHeader && (
+      <div className="flex-shrink-0">
+        <div
+          className="flex items-center justify-between px-4 py-3"
+          style={{
+            background: WC.headerBg,
+            color: WC.headerInk,
+            borderBottom: `1px solid ${WC.botBorder}`,
+          }}
+        >
         <div>
-          <div className="text-lg font-semibold">{title}</div>
-          {subtitle && <div className="text-sm opacity-90">{subtitle}</div>}
+          <div className="text-[13px] font-medium tracking-wide">{title}</div>
+          <div className="mt-0.5 text-xs" style={{ color: WC.muted }}>{subtitle || '随时为你提供帮助'}</div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1">
           {showFullscreenButton && (
             <button
               onClick={toggleFullscreen}
-              className="text-white hover:bg-white/20 rounded-full p-2 transition-colors w-10 h-10 flex items-center justify-center"
-              title={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+              className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-[var(--color-fill-2,#f4f5f8)]"
+              style={{ color: WC.muted }}
+              title={panelFullscreen ? '退出全屏' : '全屏'}
             >
-              {isFullscreen ? (
-                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              {panelFullscreen ? (
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/>
                 </svg>
               ) : (
-                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
                 </svg>
               )}
@@ -969,31 +751,42 @@ export const Chat = React.forwardRef<any, ChatProps>((props, ref) => {
           )}
           <button
             onClick={onClose}
-            className="text-white hover:bg-white/20 rounded-full p-2 transition-colors w-10 h-10 flex items-center justify-center"
-            title="Close chat"
+            className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-[var(--color-fill-2,#f4f5f8)]"
+            style={{ color: WC.muted }}
+            title="关闭对话"
           >
             ✕
           </button>
         </div>
+        </div>
       </div>
+      )}
 
       {/* Messages Area */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-3 flex flex-col">
-        {messages.length === 0 ? (
-          <div className="flex items-center justify-center h-full text-gray-400">
-            <p className="text-sm">No messages yet. Start a conversation!</p>
+      <div
+        className={`flex min-h-0 flex-1 flex-col overflow-y-auto ${wideLayout || panelFullscreen ? 'px-6 py-5' : 'px-4 py-4'}`}
+        style={{ background: WC.stage }}
+      >
+        <div className="flex min-h-0 w-full flex-1 flex-col space-y-5">
+        {historyLoading ? (
+          <ConversationSkeleton />
+        ) : messages.length === 0 ? (
+          <div className="flex h-full items-center justify-center">
+            <p className="text-sm" style={{ color: WC.muted }}>
+              发一条消息开始对话
+            </p>
           </div>
-        ) : (
-          messages.map((msg, index) => {
-            // Find the last bot message in the conversation
-            let lastBotMessageIndex = -1;
-            for (let i = messages.length - 1; i >= 0; i--) {
-              if (messages[i].sender === 'bot') {
-                lastBotMessageIndex = i;
-                break;
-              }
+        ) : (() => {
+          let lastBotMessageIndex = -1;
+          for (let index = messages.length - 1; index >= 0; index -= 1) {
+            if (messages[index].sender === 'bot') {
+              lastBotMessageIndex = index;
+              break;
             }
-            
+          }
+          return (
+            <React.Suspense fallback={null}>
+              {messages.map((msg, index) => {
             // Check if this message is part of the last Q&A pair
             // A message is part of last Q&A if:
             // - It's the last bot message, OR
@@ -1008,37 +801,59 @@ export const Chat = React.forwardRef<any, ChatProps>((props, ref) => {
               <MessageBubble
                 key={msg.id}
                 message={msg}
-                botAvatar={botAvatar}
-                userAvatar={userAvatar}
                 isLastBotMessage={isPartOfLastQA}
+                fillWidth={wideLayout || panelFullscreen}
                 onRegenerate={handleRegenerate}
                 onCopy={handleCopy}
                 onDelete={handleDelete}
               />
             );
-          })
-        )}
+              })}
+            </React.Suspense>
+          );
+        })()}
         
         {/* Show loading/thinking state */}
-        {(isLoading || isThinking) && (
-          <Bubble
-            content={isThinking ? "思考中..." : "正在输入..."}
-            avatar={botAvatar}
-            placement="start"
-            loading={true}
-          />
+        {shouldShowTypingPlaceholder(isLoading, isThinking, messages) && (
+          <div className="flex w-full items-center gap-1.5" role="status" aria-live="polite">
+            <span
+              className={`text-xs font-medium ${isThinking ? 'webchat-thinking-shimmer' : ''}`}
+              style={isThinking ? undefined : { color: WC.muted }}
+            >
+              {isThinking ? '思考中' : '正在回复'}
+            </span>
+            <span className="webchat-thinking-dots" aria-hidden>
+              <span />
+              <span />
+              <span />
+            </span>
+          </div>
         )}
+
+        <HitlPanels
+          event={hitlEvent}
+          approvalUrl={platform?.approvalUrl}
+          choiceUrl={platform?.choiceUrl}
+          apiKey={apiKey}
+          credentials={credentials}
+          headers={requestHeaders}
+          onResolved={() => setHitlEvent(null)}
+        />
         
         <div ref={messagesEndRef} />
+        </div>
       </div>
 
       {/* Input Area */}
-      <div className="border-t border-gray-200 flex-shrink-0 relative">
+      <div
+        className={`relative flex-shrink-0 ${wideLayout || panelFullscreen ? 'px-5 py-3.5' : 'px-3 py-3'}`}
+        style={{ background: WC.composerWash }}
+      >
         {showClearButton && (
           <button
             onClick={() => setShowClearConfirm(true)}
-            className="absolute right-4 z-10 p-1.5 bg-white hover:bg-gray-100 transition-colors text-gray-400 hover:text-gray-600"
-            style={{ top: '-2rem' }}
+            className="absolute right-4 z-10 rounded p-1.5"
+            style={{ color: WC.muted, top: '-2rem' }}
             title="清除对话"
           >
             <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -1048,18 +863,32 @@ export const Chat = React.forwardRef<any, ChatProps>((props, ref) => {
         )}
         
         {/* Image preview area */}
+        {imageSelectionError && (
+          <p role="alert" className="px-4 pt-2 text-xs" style={{ color: 'var(--color-fail)' }}>
+            {imageSelectionError}
+          </p>
+        )}
         {uploadedImages.length > 0 && (
           <div className="px-4 pt-2 pb-1 flex flex-wrap gap-2">
             {uploadedImages.map((img, index) => (
               <div key={index} className="relative group">
-                <img 
-                  src={img} 
-                  alt={`Upload ${index + 1}`}
-                  className="w-16 h-16 object-cover rounded border border-gray-200"
-                />
+                {img.previewable ? (
+                  <img
+                    src={img.dataUrl}
+                    alt={`Upload ${index + 1}`}
+                    className="h-16 w-16 rounded-md border border-[var(--color-border-1,#e8eaf0)] object-cover"
+                  />
+                ) : (
+                  <div role="status" aria-label={`${img.name} 已添加（安全占位，不在浏览器预览）`}>
+                    <p className="max-w-[10rem] rounded-md px-2 py-1 text-xs text-[var(--color-text-3,#86909c)]">
+                      {img.name} 已添加（安全占位，不在浏览器预览）
+                    </p>
+                  </div>
+                )}
                 <button
                   onClick={() => handleRemoveImage(index)}
-                  className="absolute -top-1 -right-1 w-4 h-4 bg-red-500 text-white rounded-full flex items-center justify-center text-xs opacity-0 group-hover:opacity-100 transition-opacity"
+                  className="absolute -top-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full text-xs opacity-0 transition-opacity group-hover:opacity-100"
+                  style={{ background: WC.fail, color: WC.onPrimary }}
                 >
                   ×
                 </button>
@@ -1068,40 +897,56 @@ export const Chat = React.forwardRef<any, ChatProps>((props, ref) => {
           </div>
         )}
         
-        <div className="p-2 relative">
-          <div className="relative">
-            {/* Image upload button positioned inside Sender */}
-            <label className="absolute left-3 top-1/2 -translate-y-1/2 z-10 cursor-pointer text-gray-400 hover:text-gray-600 transition-colors">
-              <input
-                type="file"
-                accept="image/*"
-                multiple
-                onChange={handleImageUpload}
-                className="hidden"
-              />
-              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-                <circle cx="8.5" cy="8.5" r="1.5"/>
-                <polyline points="21 15 16 10 5 21"/>
-              </svg>
-            </label>
-            
-            <div onPaste={handlePaste}>
-              <Sender
+              <PillComposer
                 value={inputValue}
                 onChange={setInputValue}
-                onSubmit={handleSendMessage}
+                onSubmit={(text) => {
+                  void handleSendMessage(text);
+                }}
+                onCancel={handleStopStreaming}
                 placeholder={placeholder}
                 loading={isLoading}
-                styles={{
-                  input: {
-                    paddingLeft: '25px',
-                  }
-                }}
+                onPaste={handlePaste}
+                imageSlot={
+                  <label
+                    style={{
+                      display: 'flex',
+                      width: 28,
+                      height: 28,
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      margin: 0,
+                      cursor: 'pointer',
+                      color: WC.muted,
+                      lineHeight: 0,
+                    }}
+                  >
+                    <input
+                      type="file"
+                      accept="image/*"
+                      multiple
+                      onChange={handleImageUpload}
+                      style={{ display: 'none' }}
+                    />
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      width="16"
+                      height="16"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      style={{ display: 'block' }}
+                    >
+                      <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                      <circle cx="8.5" cy="8.5" r="1.5"/>
+                      <polyline points="21 15 16 10 5 21"/>
+                    </svg>
+                  </label>
+                }
               />
-            </div>
-          </div>
-        </div>
       </div>
 
       {/* Clear Confirmation Dialog */}
@@ -1118,6 +963,9 @@ export const Chat = React.forwardRef<any, ChatProps>((props, ref) => {
   );
 });
 
+ChatInner.displayName = 'Chat';
+
+export const Chat = React.memo(ChatInner);
 Chat.displayName = 'Chat';
 
 export default Chat;

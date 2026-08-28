@@ -5,6 +5,7 @@ from apps.core.utils.loader import LanguageLoader
 from apps.core.utils.serializers import AuthSerializer, TeamSerializer
 from apps.opspilot.models import LLMModel, LLMSkill, SkillPackage, SkillRequestLog, SkillTools, UserPin
 from apps.opspilot.serializers.model_vendor_serializer import CustomProviderSerializer
+from apps.opspilot.utils.skill_package_params import mask_package_params
 
 
 class LLMModelSerializer(AuthSerializer, CustomProviderSerializer):
@@ -27,6 +28,7 @@ class LLMModelSerializer(AuthSerializer, CustomProviderSerializer):
             "team",
             "is_build_in",
             "is_demo",
+            "is_multimodal",
             "vendor",
             "model",
             "label",
@@ -41,10 +43,11 @@ class LLMModelSerializer(AuthSerializer, CustomProviderSerializer):
 class LLMSerializer(TeamSerializer, AuthSerializer):
     permission_key = "skill"
 
-    rag_score_threshold = serializers.SerializerMethodField()
     llm_model_name = serializers.SerializerMethodField()
     is_pinned = serializers.SerializerMethodField()
     skill_params = serializers.SerializerMethodField()
+    usage_team_name = serializers.SerializerMethodField()
+    skill_package_params = serializers.SerializerMethodField()
 
     def __init__(self, instance=None, data=empty, **kwargs):
         super().__init__(instance=instance, data=data, **kwargs)
@@ -76,31 +79,27 @@ class LLMSerializer(TeamSerializer, AuthSerializer):
             "skill_prompt",
             "enable_conversation_history",
             "conversation_window_size",
-            "enable_rag",
-            "enable_rag_knowledge_source",
-            "knowledge_base",
-            "rag_score_threshold_map",
             "introduction",
             "team",
+            "usage_team",
             "show_think",
             "tools",
             "skill_params",
             "skill_packages",
+            "skill_package_params",
             "temperature",
             "skill_type",
-            "enable_rag_strict_mode",
             "is_template",
-            "enable_km_route",
-            "km_llm_model",
             "guide",
             "enable_suggest",
             "enable_query_rewrite",
             "instance_id",
             "is_builtin",
+            "wiki_knowledge_bases",
             # 只读派生字段（保持现有读取输出不变）
             "permissions",
             "team_name",
-            "rag_score_threshold",
+            "usage_team_name",
             "llm_model_name",
             "is_pinned",
         ]
@@ -116,16 +115,15 @@ class LLMSerializer(TeamSerializer, AuthSerializer):
             "is_builtin",
         ]
 
-    @staticmethod
-    def get_rag_score_threshold(instance: LLMSkill):
-        return [{"knowledge_base": k, "score": v} for k, v in instance.rag_score_threshold_map.items()]
-
     def get_llm_model_name(self, instance: LLMSkill):
         return instance.llm_model.name if instance.llm_model is not None else ""
 
     def get_is_pinned(self, instance: LLMSkill) -> bool:
         """获取当前用户对此 LLMSkill 的置顶状态"""
         return instance.id in self.pinned_skill_ids
+
+    def get_usage_team_name(self, instance: LLMSkill):
+        return [self.group_map.get(i) for i in (instance.usage_team or []) if i in self.group_map]
 
     @staticmethod
     def get_skill_params(instance: LLMSkill):
@@ -139,9 +137,15 @@ class LLMSerializer(TeamSerializer, AuthSerializer):
             result.append(item)
         return result
 
+    @staticmethod
+    def get_skill_package_params(instance: LLMSkill):
+        """返回技能包参数，password 类型的 value 掩码为 '******'。"""
+        return mask_package_params(getattr(instance, "skill_package_params", None))
+
 
 class SkillPackageSerializer(AuthSerializer):
     permission_key = "tools"
+    variables = serializers.SerializerMethodField()
 
     class Meta:
         model = SkillPackage
@@ -168,6 +172,7 @@ class SkillPackageSerializer(AuthSerializer):
             "team",
             "is_enabled",
             "permissions",
+            "variables",
         ]
         read_only_fields = [
             "id",
@@ -180,6 +185,14 @@ class SkillPackageSerializer(AuthSerializer):
             "storage_path",
             "manifest",
         ]
+
+    @staticmethod
+    def get_variables(instance: SkillPackage):
+        from apps.opspilot.services.skill_package.runtime import _manifest_with_storage_overlay
+
+        manifest = _manifest_with_storage_overlay(instance)
+        variables = manifest.get("variables") if isinstance(manifest, dict) else None
+        return variables if isinstance(variables, list) else []
 
 
 class SkillRequestLogSerializer(serializers.ModelSerializer):

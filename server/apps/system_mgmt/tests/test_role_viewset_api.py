@@ -51,13 +51,31 @@ def test_get_role_tree(super_client):
     Role.objects.create(name="ra", app="cmdb")
     resp = super_client.post(
         f"{BASE}/get_role_tree/",
-        {"client_list": [{"id": 2, "name": "cmdb", "is_build_in": False}]},
+        {"client_list": [{"id": 2, "name": "cmdb", "is_build_in": False, "display_name": "CMDB"}]},
         format="json",
     )
     assert resp.status_code == 200
     tree = resp.json()["data"]
     assert tree[0]["id"] == 2 * 886
     assert any(c["name"] == "ra" for c in tree[0]["children"])
+    # 应用层 display_name 透传
+    assert tree[0]["display_name"] == "CMDB"
+
+
+def test_get_role_tree_display_name_missing(super_client):
+    """display_name 缺失时不影响原有路径，且应用层兜底为空串，角色层不携带该字段。"""
+    Role.objects.create(name="rb", app="cmdb")
+    resp = super_client.post(
+        f"{BASE}/get_role_tree/",
+        {"client_list": [{"id": 2, "name": "cmdb", "is_build_in": False}]},
+        format="json",
+    )
+    assert resp.status_code == 200
+    tree = resp.json()["data"]
+    assert tree[0]["display_name"] == ""
+    assert tree[0]["name"] == "cmdb"
+    assert tree[0]["children"][0]["name"] == "rb"
+    assert "display_name" not in tree[0]["children"][0]
 
 
 def test_create_role(super_client):
@@ -142,6 +160,32 @@ def test_set_role_menus(super_client):
     assert role.menu_list == [m1.id]
 
 
+def test_set_role_menus_invalidates_inherited_group_users(super_client):
+    menu = Menu.objects.create(name="inherited-menu", display_name="I-x", order=1, app="cmdb", menu_type="t")
+    role = Role.objects.create(name="inherited-role", app="cmdb", menu_list=[])
+    parent = Group.objects.create(name="MenuParent", parent_id=0, allow_inherit_roles=True)
+    parent.roles.add(role)
+    child = Group.objects.create(name="MenuChild", parent_id=parent.id)
+    User.objects.create(
+        username="inherited-menu-user",
+        password="x",
+        display_name="Inherited",
+        email="inherited@x.com",
+        group_list=[child.id],
+    )
+
+    with patch("apps.system_mgmt.viewset.role_viewset.clear_users_permission_cache") as clear_cache:
+        resp = super_client.post(
+            f"{BASE}/set_role_menus/",
+            {"role_id": role.id, "menus": [menu.name]},
+            format="json",
+        )
+
+    assert resp.json()["result"] is True
+    affected_users = clear_cache.call_args.args[0]
+    assert {user["username"] for user in affected_users} == {"inherited-menu-user"}
+
+
 def test_batch_assign_and_revoke_group_roles(super_client):
     role = Role.objects.create(name="grouprole", app="cmdb")
     g1 = Group.objects.create(name="GR1", parent_id=0)
@@ -163,6 +207,31 @@ def test_batch_assign_and_revoke_group_roles(super_client):
     assert role.group_set.count() == 1
 
 
+def test_revoke_group_role_invalidates_descendant_users(super_client):
+    role = Role.objects.create(name="inherited-revoke", app="cmdb")
+    parent = Group.objects.create(name="RevokeParent", parent_id=0, allow_inherit_roles=True)
+    child = Group.objects.create(name="RevokeChild", parent_id=parent.id)
+    parent.roles.add(role)
+    User.objects.create(
+        username="inherited-revoke-user",
+        password="x",
+        display_name="Inherited",
+        email="revoke@x.com",
+        group_list=[child.id],
+    )
+
+    with patch("apps.system_mgmt.viewset.role_viewset.clear_users_permission_cache") as clear_cache:
+        resp = super_client.post(
+            f"{BASE}/revoke_group_roles/",
+            {"group_ids": [parent.id], "role_id": role.id},
+            format="json",
+        )
+
+    assert resp.json()["result"] is True
+    affected_users = clear_cache.call_args.args[0]
+    assert {user["username"] for user in affected_users} == {"inherited-revoke-user"}
+
+
 def test_batch_assign_missing_params(super_client):
     resp = super_client.post(f"{BASE}/batch_assign_group_roles/", {"group_ids": []}, format="json")
     assert resp.json()["result"] is False
@@ -178,14 +247,41 @@ def test_batch_assign_nonexistent_group(super_client):
     assert resp.json()["result"] is False
 
 
+def test_batch_assign_rejects_archived_group(super_client):
+    role = Role.objects.create(name="assign-archived", app="cmdb")
+    archived = Group.objects.create(name="AssignArchived", parent_id=0, is_delete=True)
+    resp = super_client.post(
+        f"{BASE}/batch_assign_group_roles/",
+        {"group_ids": [archived.id], "role_id": role.id},
+        format="json",
+    )
+    assert resp.json()["result"] is False
+    assert not role.group_set.filter(id=archived.id).exists()
+
+
+def test_revoke_rejects_archived_group(super_client):
+    role = Role.objects.create(name="revoke-archived", app="cmdb")
+    archived = Group.objects.create(name="RevokeArchived", parent_id=0, is_delete=True)
+    role.group_set.add(archived)
+    resp = super_client.post(
+        f"{BASE}/revoke_group_roles/",
+        {"group_ids": [archived.id], "role_id": role.id},
+        format="json",
+    )
+    assert resp.json()["result"] is False
+    assert role.group_set.filter(id=archived.id).exists()
+
+
 def test_get_role_groups(super_client):
     role = Role.objects.create(name="rg", app="cmdb")
     g = Group.objects.create(name="RGGroup", parent_id=0)
-    role.group_set.add(g)
+    archived = Group.objects.create(name="RGArchived", parent_id=0, is_delete=True)
+    role.group_set.add(g, archived)
     resp = super_client.get(f"{BASE}/get_role_groups/?role_id={role.id}")
     assert resp.status_code == 200
-    items = resp.json()["data"]["items"]
-    assert any(i["name"] == "RGGroup" for i in items)
+    names = {i["name"] for i in resp.json()["data"]["items"]}
+    assert "RGGroup" in names
+    assert "RGArchived" not in names
 
 
 def test_get_role_groups_missing_role_id(super_client):

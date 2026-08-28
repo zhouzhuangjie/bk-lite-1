@@ -6,13 +6,15 @@ from rest_framework import serializers
 from apps.job_mgmt.constants import TargetSource
 from apps.job_mgmt.models import ScheduledTask
 from apps.job_mgmt.serializers.validators import validate_scheduled_task_payload
+from apps.job_mgmt.services.scheduled_task_authz import ScheduledTaskTeamBoundaryError, resolve_single_task_team
 from apps.job_mgmt.services.scheduled_task_service import ScheduledTaskService
+from apps.job_mgmt.utils.i18n import choice_message
 
 
 class ScheduledTaskListSerializer(serializers.ModelSerializer):
     """定时任务列表序列化器"""
 
-    job_type_display = serializers.CharField(source="get_job_type_display", read_only=True)
+    job_type_display = serializers.SerializerMethodField()
     schedule_type_display = serializers.CharField(source="get_schedule_type_display", read_only=True)
     target_count = serializers.SerializerMethodField()
 
@@ -42,11 +44,14 @@ class ScheduledTaskListSerializer(serializers.ModelSerializer):
         target_list = obj.target_list or []
         return len(target_list)
 
+    def get_job_type_display(self, obj):
+        return choice_message(self, "job_type", obj.job_type, obj.get_job_type_display())
+
 
 class ScheduledTaskDetailSerializer(serializers.ModelSerializer):
     """定时任务详情序列化器"""
 
-    job_type_display = serializers.CharField(source="get_job_type_display", read_only=True)
+    job_type_display = serializers.SerializerMethodField()
     schedule_type_display = serializers.CharField(source="get_schedule_type_display", read_only=True)
     script_type_display = serializers.CharField(source="get_script_type_display", read_only=True)
     script_name = serializers.CharField(source="script.name", read_only=True, default=None)
@@ -90,6 +95,9 @@ class ScheduledTaskDetailSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields
 
+    def get_job_type_display(self, obj):
+        return choice_message(self, "job_type", obj.job_type, obj.get_job_type_display())
+
 
 class ScheduledTaskCreateSerializer(serializers.ModelSerializer):
     """定时任务创建序列化器"""
@@ -132,7 +140,12 @@ class ScheduledTaskCreateSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         """验证定时任务配置（共用校验见 :mod:`serializers.validators`）"""
-        return validate_scheduled_task_payload(attrs, instance=None)
+        attrs = validate_scheduled_task_payload(attrs, instance=None)
+        try:
+            resolve_single_task_team(attrs, instance=None)
+        except ScheduledTaskTeamBoundaryError as exc:
+            raise serializers.ValidationError({exc.field: exc.message}) from exc
+        return attrs
 
     def create(self, validated_data):
         request = self.context.get("request")
@@ -198,7 +211,14 @@ class ScheduledTaskUpdateSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         """验证定时任务配置（共用校验见 :mod:`serializers.validators`）"""
-        return validate_scheduled_task_payload(attrs, instance=self.instance)
+        if attrs.get("is_enabled") is False and set(attrs) == {"is_enabled"}:
+            return attrs
+        attrs = validate_scheduled_task_payload(attrs, instance=self.instance)
+        try:
+            resolve_single_task_team(attrs, instance=self.instance)
+        except ScheduledTaskTeamBoundaryError as exc:
+            raise serializers.ValidationError({exc.field: exc.message}) from exc
+        return attrs
 
     def update(self, instance, validated_data):
         request = self.context.get("request")

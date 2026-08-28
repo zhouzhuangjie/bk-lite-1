@@ -1,14 +1,17 @@
-import React, { useEffect, useRef, useCallback, useState } from 'react';
+import React, { useRef, useCallback, useMemo, useState } from 'react';
 import ReactEcharts from 'echarts-for-react';
-import { Spin, Empty } from 'antd';
+import { Spin } from 'antd';
 import { randomColorForLegend } from '@/app/ops-analysis/utils/randomColorForChart';
 import { ChartDataTransformer } from '@/app/ops-analysis/utils/chartDataTransform';
 import {
   getOpsChartColorsByMode,
   getOpsChartThemeByMode,
+  isScreenChartThemeMode,
   resolveOpsChartThemeName,
 } from '@/app/ops-analysis/utils/chartTheme';
 import ChartLegend from '@/app/ops-analysis/components/chartLegend';
+import { isSameChartLegendSelection } from '@/components/chart-legend/selection';
+import WidgetState from '@/app/ops-analysis/components/widget-state';
 import type {
   ScreenRenderContext,
   ValueConfig,
@@ -17,6 +20,8 @@ import {
   getScreenWidgetScale,
   scaleScreenMetric,
 } from './shared/screenMetrics';
+import { useEchartsFinishedReady } from '@/app/ops-analysis/hooks/useEchartsFinishedReady';
+import { formatVisibleChartValue } from '@/app/ops-analysis/utils/chartValueFormat';
 
 interface OsPieProps {
   rawData: any;
@@ -35,36 +40,41 @@ const OsPie: React.FC<OsPieProps> = ({
 }) => {
   const chartRef = useRef<any>(null);
   const themeName = resolveOpsChartThemeName();
-  const usesScreenChartTheme =
-    config?.chartThemeMode === 'screen-dark' ||
-    config?.chartThemeMode === 'screen-light';
-  const chartTheme = getOpsChartThemeByMode(config?.chartThemeMode);
-  const chartColors = usesScreenChartTheme
-    ? getOpsChartColorsByMode(config?.chartThemeMode, themeName)
-    : randomColorForLegend(themeName);
+  const usesScreenChartTheme = isScreenChartThemeMode(config?.chartThemeMode);
+  const chartTheme = useMemo(
+    () => getOpsChartThemeByMode(config?.chartThemeMode),
+    [config?.chartThemeMode],
+  );
+  const chartColors = useMemo(
+    () =>
+      usesScreenChartTheme
+        ? getOpsChartColorsByMode(config?.chartThemeMode, themeName)
+        : randomColorForLegend(themeName),
+    [config?.chartThemeMode, themeName, usesScreenChartTheme],
+  );
   const widgetScale = getScreenWidgetScale(screenRenderContext);
   const [legendSelected, setLegendSelected] = useState<Record<string, boolean>>({});
 
   const handleLegendChange = useCallback((selected: Record<string, boolean>) => {
-    setLegendSelected(selected);
+    setLegendSelected((prev) =>
+      isSameChartLegendSelection(prev, selected) ? prev : selected,
+    );
   }, []);
 
-  const transformData = (rawData: any) => {
-    return ChartDataTransformer.transformToPieData(rawData);
-  };
-
-  const chartData = transformData(rawData);
-  const isDataReady = chartData.length > 0;
-  const showLegend = chartData.length > 0;
-
-  useEffect(() => {
-    if (!loading) {
-      if (onReady) {
-        onReady(isDataReady);
-      }
-    }
-  }, [isDataReady, loading, onReady]);
-  const option: any = {
+  const chartData = useMemo(
+    () => ChartDataTransformer.transformToPieData(rawData),
+    [rawData],
+  );
+  const isDataReady = chartData.some(
+    (item) => Number.isFinite(item.value) && item.value > 0,
+  );
+  const showLegend = isDataReady;
+  const { onEvents } = useEchartsFinishedReady({
+    loading,
+    isDataReady,
+    onReady,
+  });
+  const option = useMemo(() => ({
     color: chartColors,
     animation: true,
     calculable: true,
@@ -93,7 +103,7 @@ const OsPie: React.FC<OsPieProps> = ({
             <div style="margin-bottom: ${tooltipGap}px; font-weight: bold;">${params.seriesName}</div>
             <div style="display: flex; align-items: center;">
               <span style="display: inline-block; width: ${markerSize}px; height: ${markerSize}px; background-color: ${params.color}; border-radius: 50%; margin-right: ${markerGap}px;"></span>
-              <span>${params.name}: ${params.value} (${percent.toFixed(1)}%)</span>
+              <span>${params.name}: ${formatVisibleChartValue(params.value, config)} (${percent.toFixed(1)}%)</span>
             </div>
           </div>
         `;
@@ -119,7 +129,7 @@ const OsPie: React.FC<OsPieProps> = ({
               (sum: number, item: any) => sum + item.value,
               0,
             );
-            return `{title|总数}\n{value|${total}}`;
+            return `{title|总数}\n{value|${formatVisibleChartValue(total, config)}}`;
           },
           rich: {
             title: {
@@ -159,7 +169,15 @@ const OsPie: React.FC<OsPieProps> = ({
         data: chartData || [],
       },
     ],
-  };
+  }), [
+    chartColors,
+    chartData,
+    chartTheme,
+    config,
+    legendSelected,
+    screenRenderContext,
+    usesScreenChartTheme,
+  ]);
 
   if (loading) {
     return (
@@ -170,11 +188,7 @@ const OsPie: React.FC<OsPieProps> = ({
   }
 
   if (!isDataReady || !chartData || chartData.length === 0) {
-    return (
-      <div className="h-full flex flex-col items-center justify-center">
-        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} />
-      </div>
-    );
+    return <WidgetState />;
   }
 
   return (
@@ -185,6 +199,7 @@ const OsPie: React.FC<OsPieProps> = ({
           ref={chartRef}
           option={option}
           notMerge={true}
+          onEvents={onEvents}
           style={{ height: '100%', width: '100%' }}
         />
       </div>

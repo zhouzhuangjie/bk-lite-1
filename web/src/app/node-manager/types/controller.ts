@@ -28,10 +28,12 @@ export type InstallerTaskStatus =
 
 export type InstallerStepCode =
   | 'fetch_session'
+  | 'clock_check'
   | 'prepare_dirs'
   | 'prepare_directories'
   | 'download'
   | 'download_package'
+  | 'stop_service'
   | 'extract'
   | 'extract_package'
   | 'write_config'
@@ -61,6 +63,11 @@ export interface InstallerFailureContext {
   install_dir?: string;
   target_path?: string;
   exit_code?: number;
+  node_time?: string;
+  server_time?: string;
+  clock_offset_seconds?: number;
+  clock_skew_seconds?: number;
+  max_clock_skew_seconds?: number;
 }
 
 export interface InstallerFailure {
@@ -83,6 +90,11 @@ export interface InstallerStepDetails {
   error?: string;
   installer_message?: string;
   failure?: InstallerFailure;
+  node_time?: string;
+  server_time?: string;
+  clock_offset_seconds?: number;
+  clock_skew_seconds?: number;
+  max_clock_skew_seconds?: number;
 }
 
 export interface InstallerProgressSummary {
@@ -117,11 +129,13 @@ export type ControllerInstallDisplayState =
   | 'installer_waiting'
   | 'installer_no_report'
   | 'installer_running'
+  | 'installer_finalizing'
   | 'installer_failed'
   | 'connectivity_waiting'
   | 'connectivity_failed'
   | 'success'
   | 'success_without_detail'
+  | 'success_with_incomplete_detail'
   | (string & {});
 
 export type ControllerInstallDisplayPhase =
@@ -147,6 +161,10 @@ export interface ControllerInstallDisplay {
 }
 
 export interface OperationTaskResult {
+  overall_status?: InstallerTaskStatus;
+  connectivity_observed?: boolean;
+  connectivity_observed_node_id?: string;
+  connectivity_observed_at?: string;
   steps?: LogStep[];
   installer_progress?: InstallerProgressSummary;
   installer_summary?: InstallerEventSummary;
@@ -163,6 +181,11 @@ export interface ControllerInstallProgressRow {
   os?: string;
   cpu_architecture?: string;
   organizations?: string[];
+  port?: number;
+  username?: string;
+  winrm_scheme?: 'http' | 'https';
+  winrm_transport?: 'ntlm';
+  winrm_cert_validation?: boolean;
   status?: InstallerTaskStatus | null;
   result?: OperationTaskResult | null;
 }
@@ -188,6 +211,9 @@ export interface RetryInstallParams {
   port?: string | number;
   username?: string;
   private_key?: string;
+  winrm_scheme?: 'http' | 'https';
+  winrm_transport?: 'ntlm';
+  winrm_cert_validation?: boolean;
 }
 
 export interface InstallingProps {

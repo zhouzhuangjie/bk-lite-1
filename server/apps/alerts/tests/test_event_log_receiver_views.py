@@ -1,6 +1,6 @@
 """事件视图、操作日志视图与告警接收器覆盖测试。
 
-对照 spec/prd/告警中心·集成：外部告警源经接收器校验来源/密钥后归一化入库。
+对照 specs/capabilities/legacy-prd-告警中心-集成.md：外部告警源经接收器校验来源/密钥后归一化入库。
 """
 
 import json
@@ -229,6 +229,91 @@ def test_receiver_full_flow_success(monkeypatch):
     response = receiver_module.receiver_data(request)
     assert response.status_code == 200
     assert json.loads(response.content)["status"] == "success"
+
+
+@pytest.mark.django_db
+def test_receiver_reports_partial_ingestion(monkeypatch):
+    from apps.alerts.views import receiver as receiver_module
+
+    _make_source(source_id="src-partial", source_type="restful")
+
+    class FakeAdapter:
+        def __init__(self, alert_source=None, secret=None, events=None):
+            self.events = events
+
+        def normalize_payload(self, data):
+            return [{"title": "ok"}, {"bad": True}]
+
+        def authenticate(self):
+            return True
+
+        def main(self):
+            return {"received": 2, "accepted": 1, "skipped": 1, "errored": 0}
+
+    monkeypatch.setattr(
+        receiver_module.AlertSourceAdapterFactory,
+        "get_adapter",
+        staticmethod(lambda src: FakeAdapter),
+    )
+
+    response = receiver_module.receiver_data(_post_body({"source_id": "src-partial"}, secret="sec"))
+    payload = json.loads(response.content)
+
+    assert response.status_code == 207
+    assert payload["status"] == "partial"
+    assert payload["ingestion"] == {"received": 2, "accepted": 1, "skipped": 1, "errored": 0}
+
+
+@pytest.mark.django_db
+def test_receiver_real_adapter_preserves_partial_response_and_safe_log(caplog):
+    from apps.alerts.constants.constants import LevelType
+    from apps.alerts.models.models import Level
+    from apps.alerts.utils.util import encode_team_secret
+    from apps.alerts.views import receiver as receiver_module
+
+    for level_id in (0, 1, 2, 3):
+        Level.objects.create(
+            level_id=level_id,
+            level_name=f"L{level_id}",
+            level_display_name=f"等级{level_id}",
+            level_type=LevelType.EVENT,
+        )
+    team_secret = encode_team_secret("source-secret", "1")
+    _make_source(
+        source_id="src-real-partial",
+        source_type="restful",
+        secret="source-secret",
+        team_secrets={"1": team_secret},
+        config={"event_fields_mapping": {"title": "title", "level": "level"}},
+    )
+    marker = "SECRET-HTTP-4671"
+
+    response = receiver_module.receiver_data(
+        _post_body(
+            {
+                "source_id": "src-real-partial",
+                "events": [
+                    {"title": "HTTP 正常事件", "level": "0"},
+                    {"description": marker, "secret": marker},
+                ],
+            },
+            secret=team_secret,
+        )
+    )
+    payload = json.loads(response.content)
+
+    assert response.status_code == 207
+    assert payload["status"] == "partial"
+    assert payload["ingestion"] == {
+        "received": 2,
+        "accepted": 1,
+        "skipped": 1,
+        "errored": 0,
+        "duplicates": 0,
+        "rejected": 1,
+    }
+    assert Event.objects.filter(title="HTTP 正常事件", team=[1]).exists()
+    assert marker not in caplog.text
 
 
 @pytest.mark.django_db

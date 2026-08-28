@@ -10,7 +10,7 @@ import {
   resolveConfiguredNodeSize,
   resolveNodePosition,
 } from './nodeStyleUtils';
-import { iconList } from '@/app/cmdb/utils/common';
+import { getModelIconUrl, DEFAULT_MODEL_ICON_URL } from '@/app/cmdb/utils/modelIcon';
 import type {
   TopologyNodeData,
   BaseNodeData,
@@ -25,7 +25,19 @@ const NODE_TYPE_MAP = {
   'basic-shape': 'basic-shape-node'
 } as const;
 
-const DEFAULT_ICON_PATH = '/assets/icons/cc-default_默认.svg';
+const DEFAULT_ICON_PATH = DEFAULT_MODEL_ICON_URL;
+
+const getIconUrl = (nodeConfig: TopologyNodeData): string => {
+  if (nodeConfig.logoType === 'default' && nodeConfig.logoIcon) {
+    return getModelIconUrl({ icn: nodeConfig.logoIcon, model_id: '' });
+  }
+
+  if (nodeConfig.logoType === 'custom' && nodeConfig.logoUrl) {
+    return nodeConfig.logoUrl;
+  }
+
+  return DEFAULT_ICON_PATH;
+};
 
 const registerIconNode = () => {
   const { ICON_NODE } = NODE_DEFAULTS;
@@ -72,6 +84,10 @@ const registerIconNode = () => {
   }, true);
 };
 
+const SINGLE_VALUE_WARNING_ICON = '\u26A0';
+
+const getSingleValueValueRefY = (hasName: boolean) => (hasName ? '38%' : '50%');
+
 const registerSingleValueNode = () => {
   const { SINGLE_VALUE_NODE } = NODE_DEFAULTS;
 
@@ -81,8 +97,9 @@ const registerSingleValueNode = () => {
     height: SINGLE_VALUE_NODE.height,
     markup: [
       { tagName: 'rect', selector: 'body' },
+      { tagName: 'text', selector: 'errorIcon' },
       { tagName: 'text', selector: 'label' },
-      { tagName: 'text', selector: 'nameLabel' }
+      { tagName: 'text', selector: 'nameLabel' },
     ],
     attrs: {
       body: {
@@ -92,6 +109,18 @@ const registerSingleValueNode = () => {
         rx: SINGLE_VALUE_NODE.borderRadius,
         ry: SINGLE_VALUE_NODE.borderRadius,
       },
+      errorIcon: {
+        text: SINGLE_VALUE_WARNING_ICON,
+        display: 'none',
+        fill: '#faad14',
+        fontFamily: SINGLE_VALUE_NODE.fontFamily,
+        fontSize: SINGLE_VALUE_NODE.fontSize,
+        textAnchor: 'middle',
+        textVerticalAnchor: 'middle',
+        refX: '50%',
+        refY: getSingleValueValueRefY(false),
+        textWrap: false,
+      },
       label: {
         fill: SINGLE_VALUE_NODE.textColor,
         fontSize: SINGLE_VALUE_NODE.fontSize,
@@ -99,8 +128,8 @@ const registerSingleValueNode = () => {
         textAnchor: 'middle',
         textVerticalAnchor: 'middle',
         refX: '50%',
-        refY: '38%',
-        textWrap: false
+        refY: getSingleValueValueRefY(false),
+        textWrap: false,
       },
       nameLabel: {
         fill: '#666666',
@@ -111,9 +140,9 @@ const registerSingleValueNode = () => {
         refX: '50%',
         refY: '72%',
         textWrap: { width: '90%', ellipsis: true },
-        display: 'none'
-      }
-    }
+        display: 'none',
+      },
+    },
   }, true);
 };
 
@@ -226,24 +255,6 @@ export const getRegisteredNodeShape = (nodeType: string): string => {
   return NODE_TYPE_MAP[nodeType as keyof typeof NODE_TYPE_MAP] || 'icon-node';
 };
 
-const getIconUrl = (nodeConfig: TopologyNodeData): string => {
-  if (nodeConfig.logoType === 'default' && nodeConfig.logoIcon) {
-    if (iconList) {
-      const iconItem = iconList.find(item => item.key === nodeConfig.logoIcon);
-      if (iconItem) {
-        return `/assets/icons/${iconItem.url}.svg`;
-      }
-    }
-    return `/assets/icons/${nodeConfig.logoIcon}.svg`;
-  }
-
-  if (nodeConfig.logoType === 'custom' && nodeConfig.logoUrl) {
-    return nodeConfig.logoUrl;
-  }
-
-  return DEFAULT_ICON_PATH;
-};
-
 const createIconNode = (nodeConfig: TopologyNodeData, baseNodeData: BaseNodeData): CreatedNodeConfig => {
   const logoUrl = getIconUrl(nodeConfig);
   const { ICON_NODE } = NODE_DEFAULTS;
@@ -297,6 +308,7 @@ const createSingleValueNode = (nodeConfig: TopologyNodeData, baseNodeData: BaseN
   const hasDataSource = !!(valueConfig.dataSource && (valueConfig.selectedFields?.length ?? 0) > 0);
   const hasName = !!(nodeConfig.name && nodeConfig.name.trim());
   const initialText = hasDataSource ? 'loading' : '--';
+  const valueRefY = getSingleValueValueRefY(hasName);
   const { width, height } = resolveConfiguredNodeSize(
     nodeConfig.styleConfig,
     {
@@ -311,9 +323,10 @@ const createSingleValueNode = (nodeConfig: TopologyNodeData, baseNodeData: BaseN
     height,
     data: {
       ...baseNodeData.data,
-      valueConfig: valueConfig,
+      valueConfig,
       isLoading: hasDataSource,
-      hasError: false
+      hasError: false,
+      fetchError: false,
     },
     attrs: {
       body: {
@@ -321,21 +334,27 @@ const createSingleValueNode = (nodeConfig: TopologyNodeData, baseNodeData: BaseN
         stroke: nodeConfig.styleConfig?.borderColor || 'transparent',
         strokeWidth: NODE_DEFAULTS.SINGLE_VALUE_NODE.strokeWidth,
       },
+      errorIcon: {
+        display: 'none',
+        refY: valueRefY,
+        fontSize: nodeConfig.styleConfig?.fontSize,
+      },
       label: {
         fill: nodeConfig.styleConfig?.textColor,
         fontSize: nodeConfig.styleConfig?.fontSize,
-        refY: hasName ? '38%' : '50%',
+        refY: valueRefY,
         text: initialText,
-        textWrap: false
+        textWrap: false,
+        display: 'block',
       },
       nameLabel: {
         text: hasName ? nodeConfig.name : '',
         fill: nodeConfig.styleConfig?.nameColor || '#666666',
         fontSize: nodeConfig.styleConfig?.nameFontSize || 12,
-        display: hasName ? 'block' : 'none'
-      }
+        display: hasName ? 'block' : 'none',
+      },
     },
-    ports: createPortConfig(PORT_DEFAULTS.FILL_COLOR, { width, height })
+    ports: createPortConfig(PORT_DEFAULTS.FILL_COLOR, { width, height }),
   };
 };
 
@@ -505,6 +524,7 @@ const updateIconNodeAttributes = (node: Node, nodeConfig: TopologyNodeData) => {
 
 const updateSingleValueNodeAttributes = (node: Node, nodeConfig: TopologyNodeData) => {
   const hasName = !!(nodeConfig.name && nodeConfig.name.trim());
+  const valueRefY = getSingleValueValueRefY(hasName);
   const { width, height } = resolveConfiguredNodeSize(
     nodeConfig.styleConfig,
     {
@@ -515,8 +535,9 @@ const updateSingleValueNodeAttributes = (node: Node, nodeConfig: TopologyNodeDat
 
   const nodeData = node.getData();
   const isLoading = nodeData?.isLoading;
+  const fetchError = nodeData?.fetchError;
 
-  const shouldSetDefaultText = !isLoading;
+  const shouldSetDefaultText = !isLoading && !fetchError;
   let displayText = '';
 
   if (shouldSetDefaultText) {
@@ -533,18 +554,24 @@ const updateSingleValueNodeAttributes = (node: Node, nodeConfig: TopologyNodeDat
       stroke: nodeConfig.styleConfig?.borderColor || 'transparent',
       strokeWidth: NODE_DEFAULTS.SINGLE_VALUE_NODE.strokeWidth,
     },
+    errorIcon: {
+      refY: valueRefY,
+      fontSize: nodeConfig.styleConfig?.fontSize,
+      display: fetchError ? 'block' : 'none',
+    },
     label: {
       fill: nodeConfig.styleConfig?.textColor,
       fontSize: nodeConfig.styleConfig?.fontSize,
-      refY: hasName ? '38%' : '50%',
-      textWrap: false
+      refY: valueRefY,
+      textWrap: false,
+      display: fetchError ? 'none' : 'block',
     },
     nameLabel: {
       text: hasName ? nodeConfig.name : '',
       fill: nodeConfig.styleConfig?.nameColor || '#666666',
       fontSize: nodeConfig.styleConfig?.nameFontSize || 12,
-      display: hasName ? 'block' : 'none'
-    }
+      display: hasName ? 'block' : 'none',
+    },
   };
 
   if (shouldSetDefaultText && displayText) {

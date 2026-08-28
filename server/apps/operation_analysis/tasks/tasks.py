@@ -1,4 +1,198 @@
 # -- coding: utf-8 --
-# @File: tasks.py
-# @Time: 2025/7/14 16:34
-# @Author: windyzhao
+from celery import shared_task
+
+from apps.operation_analysis.models.subscription_models import (
+    DashboardReportExecution,
+)
+from apps.operation_analysis.services.due_subscription_scanner import (
+    DueSubscriptionScanner,
+)
+from apps.operation_analysis.services.execution_orchestrator import (
+    ExecutionOrchestrator,
+)
+from apps.operation_analysis.services.execution_retention_cleanup_service import (
+    ExecutionRetentionCleanupService,
+)
+from apps.operation_analysis.services.execution_service import (
+    DashboardReportExecutionService,
+)
+from apps.operation_analysis.services.execution_timeout_checker import (
+    ExecutionTimeoutChecker,
+)
+from apps.operation_analysis.services.pdf_artifact_cleanup_service import (
+    PdfArtifactCleanupService,
+)
+
+
+@shared_task(
+    name="operation_analysis.render_dashboard_report",
+    queue="dashboard_report_render",
+    max_retries=0,
+)
+def render_dashboard_report_task(execution_id: int) -> dict:
+    if not DashboardReportExecutionService.claim_execution(execution_id):
+        return {
+            "claimed": False,
+            "execution_id": execution_id,
+        }
+
+    execution = ExecutionOrchestrator.execute(execution_id)
+    rendered = DashboardReportExecution.objects.filter(
+        pk=execution_id,
+        pdf_artifact__isnull=False,
+    ).exists()
+    return {
+        "claimed": True,
+        "execution_id": execution_id,
+        "status": execution.status,
+        "rendered": rendered,
+    }
+
+
+@shared_task(
+    name="operation_analysis.scan_due_dashboard_report_subscriptions",
+    max_retries=0,
+)
+def scan_due_dashboard_report_subscriptions_task() -> dict:
+    """扫描到期订阅并创建 scheduled Execution；不执行 Render/Delivery。"""
+    stats = DueSubscriptionScanner.scan()
+    return {
+        "scanned": stats.scanned,
+        "created": stats.created,
+        "skipped_in_flight": stats.skipped_in_flight,
+        "already_exists": stats.already_exists,
+        "skipped_other": stats.skipped_other,
+    }
+
+
+@shared_task(
+    name="operation_analysis.converge_timed_out_dashboard_report_executions",
+    max_retries=0,
+)
+def converge_timed_out_dashboard_report_executions_task() -> dict:
+    """收敛超时/orphan running Execution；不重 claim、不重发。"""
+    stats = ExecutionTimeoutChecker.sweep()
+    return {
+        "scanned": stats.scanned,
+        "failed": stats.failed,
+        "succeeded": stats.succeeded,
+        "unknown": stats.unknown,
+        "skipped": stats.skipped,
+    }
+
+
+@shared_task(
+    name="operation_analysis.cleanup_expired_dashboard_report_pdf_artifacts",
+    max_retries=0,
+)
+def cleanup_expired_dashboard_report_pdf_artifacts_task() -> dict:
+    """清理已过期且所属 Execution 已终态的 PDF artifact（A7）。"""
+    stats = PdfArtifactCleanupService.cleanup()
+    return {
+        "scanned": stats.scanned,
+        "deleted": stats.deleted,
+        "file_missing": stats.file_missing,
+        "errors": stats.errors,
+    }
+
+
+@shared_task(
+    name="operation_analysis.cleanup_expired_dashboard_report_executions",
+    max_retries=0,
+)
+def cleanup_expired_dashboard_report_executions_task() -> dict:
+    """分批清理超过保留期的终态 Execution 及级联 Snapshot（A8）。"""
+    stats = ExecutionRetentionCleanupService.cleanup()
+    return {
+        "scanned": stats.scanned,
+        "deleted": stats.deleted,
+        "errors": stats.errors,
+        "retention_days": stats.retention_days,
+    }
+
+
+@shared_task(
+    name="operation_analysis.materialize_excel_candidate",
+    max_retries=0,
+)
+def materialize_excel_candidate_task(slot_id: int) -> dict:
+    """异步物化 Excel 候选槽；失败保留旧成功结果，旧任务晚到不覆盖新候选。"""
+    from apps.operation_analysis.services.excel_materialize import ExcelMaterializer
+
+    return ExcelMaterializer().materialize_candidate(int(slot_id))
+
+
+@shared_task(
+    name="operation_analysis.resubmit_excel_from_saved_source",
+    max_retries=0,
+)
+def resubmit_excel_from_saved_source_task(datasource_id: int) -> dict:
+    """在 Worker 内从已保存原文件复制候选并投递物化，避免 API 请求线程读 MinIO。"""
+    from apps.operation_analysis.models.datasource_models import DataSourceAPIModel
+    from apps.operation_analysis.services.excel_materialize import (
+        submit_excel_candidate_from_saved_source,
+    )
+
+    try:
+        datasource = DataSourceAPIModel.objects.get(pk=int(datasource_id))
+    except DataSourceAPIModel.DoesNotExist:
+        return {"ok": False, "code": "datasource_missing", "datasource_id": datasource_id}
+
+    if datasource.source_type != DataSourceAPIModel.SOURCE_TYPE_EXCEL:
+        return {"ok": False, "code": "not_excel", "datasource_id": datasource_id}
+
+    try:
+        slot = submit_excel_candidate_from_saved_source(
+            datasource,
+            transform_config=datasource.transform_config if isinstance(datasource.transform_config, dict) else {},
+            schedule=True,
+        )
+    except ValueError as exc:
+        return {"ok": False, "code": "excel_resubmit_failed", "message": str(exc)}
+
+    return {"ok": True, "slot_id": slot.id, "generation": slot.generation}
+
+
+@shared_task(
+    name="operation_analysis.rescan_pending_excel_materializations",
+    max_retries=0,
+)
+def rescan_pending_excel_materializations_task(*, older_than_seconds: int = 60, limit: int = 50) -> dict:
+    """补投长时间停留在 PENDING 的候选（broker 瞬时失败兜底）。"""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from apps.core.logger import operation_analysis_logger as logger
+    from apps.operation_analysis.models.datasource_models import DataSourceAPIModel
+    from apps.operation_analysis.models.excel_materialization_models import ExcelMaterializationSlot
+    from apps.operation_analysis.services.excel_materialize import sweep_abandoned_excel_materializations
+    from apps.operation_analysis.tasks.tasks import materialize_excel_candidate_task
+
+    cutoff = timezone.now() - timedelta(seconds=max(15, int(older_than_seconds)))
+    pending = list(
+        ExcelMaterializationSlot.objects.filter(
+            role=ExcelMaterializationSlot.ROLE_CANDIDATE,
+            status=ExcelMaterializationSlot.STATUS_PENDING,
+            updated_at__lte=cutoff,
+            datasource__source_type=DataSourceAPIModel.SOURCE_TYPE_EXCEL,
+        )
+        .order_by("id")
+        .values_list("id", flat=True)[: max(1, int(limit))]
+    )
+    enqueued = 0
+    for slot_id in pending:
+        try:
+            materialize_excel_candidate_task.delay(int(slot_id))
+            enqueued += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[ExcelMaterialize] rescan enqueue failed slot_id=%s err=%s",
+                slot_id,
+                type(exc).__name__,
+            )
+    return {
+        "scanned": len(pending),
+        "enqueued": enqueued,
+        "sweep": sweep_abandoned_excel_materializations(limit=limit),
+    }

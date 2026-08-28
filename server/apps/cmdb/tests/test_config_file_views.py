@@ -1,6 +1,6 @@
 """CMDB 配置文件版本视图覆盖测试（patch InstanceManage/ConfigFileService + 真实 DB）。
 
-对照 spec/prd/CMDB·配置文件采集：版本列表/内容/对比/文件清单/手动创建/删除的接口层
+对照 specs/capabilities/legacy-prd-cmdb-自动发现.md：版本列表/内容/对比/文件清单/手动创建/删除的接口层
 参数校验、权限校验与错误码映射。MinIO 内容读取分支不在单测范围（无对象存储）。
 """
 
@@ -11,7 +11,9 @@ from rest_framework import status
 from rest_framework.test import APIRequestFactory, force_authenticate
 
 from apps.cmdb.models.config_file_version import ConfigFileVersion
+from apps.cmdb.services.config_file_content_lifecycle import ConfigFileContentLifecycle
 from apps.cmdb.views.config_file import ConfigFileVersionViewSet
+from apps.core.utils.web_utils import WebUtils
 
 VIEWS = "apps.cmdb.views.config_file"
 
@@ -25,6 +27,9 @@ def superuser(authenticated_user):
     return u
 
 
+SAMPLE_UUID = "550e8400-e29b-41d4-a716-446655440000"
+
+
 @pytest.fixture(autouse=True)
 def _perm(monkeypatch):
     monkeypatch.setattr(
@@ -33,15 +38,36 @@ def _perm(monkeypatch):
     )
     monkeypatch.setattr(
         f"{VIEWS}.InstanceManage.query_entity_by_id",
-        lambda pk: {"_id": pk, "model_id": "host", "organization": [1], "inst_name": "h"},
+        lambda pk: {
+            "_id": pk,
+            "model_id": "host",
+            "organization": [1],
+            "inst_name": "h",
+            "inst_uuid": SAMPLE_UUID,
+        },
+    )
+    monkeypatch.setattr(
+        f"{VIEWS}.InstanceManage.query_entity_by_uuid",
+        lambda uid: {
+            "_id": 5,
+            "id": 5,
+            "model_id": "host",
+            "organization": [1],
+            "inst_name": "h",
+            "inst_uuid": str(uid),
+        },
     )
 
 
 @pytest.fixture
 def version(db):
     return ConfigFileVersion.objects.create(
-        instance_id="5", model_id="host", version="v1",
-        file_path="/etc/app.conf", file_name="app.conf", status="success",
+        instance_id="5",
+        model_id="host",
+        version="v1",
+        file_path="/etc/app.conf",
+        file_name="app.conf",
+        status="success",
     )
 
 
@@ -76,18 +102,40 @@ def test_list_missing_params(superuser):
 @pytest.mark.django_db
 def test_list_instance_not_found(superuser, monkeypatch):
     monkeypatch.setattr(f"{VIEWS}.InstanceManage.query_entity_by_id", lambda pk: {})
-    response = ConfigFileVersionViewSet.as_view({"get": "list"})(
-        _req("get", superuser, query="instance_id=5&file_path=/etc/app.conf")
-    )
+    response = ConfigFileVersionViewSet.as_view({"get": "list"})(_req("get", superuser, query="instance_id=5&file_path=/etc/app.conf"))
     assert response.status_code == status.HTTP_404_NOT_FOUND
 
 
 @pytest.mark.django_db
 def test_list_ok(superuser, version):
-    response = ConfigFileVersionViewSet.as_view({"get": "list"})(
-        _req("get", superuser, query="instance_id=5&file_path=/etc/app.conf")
-    )
+    response = ConfigFileVersionViewSet.as_view({"get": "list"})(_req("get", superuser, query="instance_id=5&file_path=/etc/app.conf"))
     assert response.status_code == status.HTTP_200_OK
+
+
+@pytest.mark.django_db
+def test_list_by_instance_uuid_ok(superuser, db):
+    ConfigFileVersion.objects.create(
+        instance_id="5",
+        instance_uuid=SAMPLE_UUID,
+        model_id="host",
+        version="v1",
+        file_path="/etc/app.conf",
+        file_name="app.conf",
+        status="success",
+    )
+    response = ConfigFileVersionViewSet.as_view({"get": "list"})(_req("get", superuser, query=f"instance_uuid={SAMPLE_UUID}&file_path=/etc/app.conf"))
+    assert response.status_code == status.HTTP_200_OK
+    assert len(_body(response)["data"]) == 1
+
+
+@pytest.mark.django_db
+def test_list_by_uuid_includes_unmigrated_numeric_instance_id(superuser, version):
+    response = ConfigFileVersionViewSet.as_view({"get": "list"})(_req("get", superuser, query=f"instance_uuid={SAMPLE_UUID}&file_path=/etc/app.conf"))
+    assert response.status_code == status.HTTP_200_OK
+    items = _body(response)["data"]
+    assert len(items) == 1
+    assert items[0]["instance_id"] == "5"
+    assert items[0].get("instance_uuid") in (None, "")
 
 
 # --------------------------------------------------------------------------
@@ -121,23 +169,155 @@ def test_diff_missing_params(superuser):
 
 @pytest.mark.django_db
 def test_diff_versions_not_found(superuser):
-    response = ConfigFileVersionViewSet.as_view({"get": "diff"})(
-        _req("get", superuser, query="version_id_1=88888&version_id_2=99999")
-    )
+    response = ConfigFileVersionViewSet.as_view({"get": "diff"})(_req("get", superuser, query="version_id_1=88888&version_id_2=99999"))
     assert response.status_code == status.HTTP_404_NOT_FOUND
 
 
 @pytest.mark.django_db
 def test_diff_no_content(superuser, version):
     v2 = ConfigFileVersion.objects.create(
-        instance_id="5", model_id="host", version="v2",
-        file_path="/etc/app.conf", file_name="app.conf", status="success",
+        instance_id="5",
+        model_id="host",
+        version="v2",
+        file_path="/etc/app.conf",
+        file_name="app.conf",
+        status="success",
     )
-    response = ConfigFileVersionViewSet.as_view({"get": "diff"})(
-        _req("get", superuser, query=f"version_id_1={version.id}&version_id_2={v2.id}")
-    )
+    response = ConfigFileVersionViewSet.as_view({"get": "diff"})(_req("get", superuser, query=f"version_id_1={version.id}&version_id_2={v2.id}"))
     # 两个版本均无 content → 仅支持对比成功版本
     assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+@pytest.mark.django_db
+def test_diff_denies_version_2_without_permission_and_does_not_read_it(superuser, monkeypatch):
+    v1 = ConfigFileVersion.objects.create(
+        instance_id="5",
+        model_id="host",
+        version="v1",
+        file_path="/etc/app.conf",
+        file_name="app.conf",
+        status="success",
+        content="v1.txt",
+        content_status="ready",
+    )
+    v2 = ConfigFileVersion.objects.create(
+        instance_id="6",
+        model_id="host",
+        version="v2",
+        file_path="/etc/app.conf",
+        file_name="app.conf",
+        status="success",
+        content="v2.txt",
+    )
+    monkeypatch.setattr(
+        f"{VIEWS}.InstanceManage.query_entity_by_id",
+        lambda pk: {"_id": pk, "model_id": "host", "organization": [1] if pk == 5 else [2], "inst_name": "h"},
+    )
+
+    def require_permission(self, request, instance, operator=None):
+        if instance["_id"] == 6:
+            return WebUtils.response_error(error_message="denied", status_code=status.HTTP_403_FORBIDDEN)
+        return None
+
+    read_ids = []
+    monkeypatch.setattr(f"{VIEWS}.ConfigFileVersionViewSet.require_instance_permission", require_permission)
+    monkeypatch.setattr(
+        f"{VIEWS}.ConfigFileVersion.read_content",
+        lambda self: read_ids.append(self.id) or f"content-{self.id}",
+    )
+
+    response = ConfigFileVersionViewSet.as_view({"get": "diff"})(_req("get", superuser, query=f"version_id_1={v1.id}&version_id_2={v2.id}"))
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert v2.id not in read_ids
+
+
+@pytest.mark.django_db
+def test_diff_rejects_different_instance(superuser, monkeypatch):
+    v1 = ConfigFileVersion.objects.create(
+        instance_id="5",
+        model_id="host",
+        version="v1",
+        file_path="/etc/app.conf",
+        file_name="app.conf",
+        status="success",
+        content="v1.txt",
+    )
+    v2 = ConfigFileVersion.objects.create(
+        instance_id="6",
+        model_id="host",
+        version="v2",
+        file_path="/etc/app.conf",
+        file_name="app.conf",
+        status="success",
+        content="v2.txt",
+    )
+    monkeypatch.setattr(f"{VIEWS}.ConfigFileVersion.read_content", lambda self: f"content-{self.id}")
+
+    response = ConfigFileVersionViewSet.as_view({"get": "diff"})(_req("get", superuser, query=f"version_id_1={v1.id}&version_id_2={v2.id}"))
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+@pytest.mark.django_db
+def test_diff_rejects_different_file_path(superuser, monkeypatch):
+    v1 = ConfigFileVersion.objects.create(
+        instance_id="5",
+        model_id="host",
+        version="v1",
+        file_path="/etc/app.conf",
+        file_name="app.conf",
+        status="success",
+        content="v1.txt",
+    )
+    v2 = ConfigFileVersion.objects.create(
+        instance_id="5",
+        model_id="host",
+        version="v2",
+        file_path="/etc/other.conf",
+        file_name="other.conf",
+        status="success",
+        content="v2.txt",
+    )
+    monkeypatch.setattr(f"{VIEWS}.ConfigFileVersion.read_content", lambda self: f"content-{self.id}")
+
+    response = ConfigFileVersionViewSet.as_view({"get": "diff"})(_req("get", superuser, query=f"version_id_1={v1.id}&version_id_2={v2.id}"))
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+@pytest.mark.django_db
+def test_diff_ok_for_same_instance_and_file_with_permission(superuser, monkeypatch):
+    v1 = ConfigFileVersion.objects.create(
+        instance_id="5",
+        model_id="host",
+        version="v1",
+        file_path="/etc/app.conf",
+        file_name="app.conf",
+        status="success",
+        content="v1.txt",
+        content_status="ready",
+    )
+    v2 = ConfigFileVersion.objects.create(
+        instance_id="5",
+        model_id="host",
+        version="v2",
+        file_path="/etc/app.conf",
+        file_name="app.conf",
+        status="success",
+        content="v2.txt",
+        content_status="ready",
+    )
+    monkeypatch.setattr(
+        f"{VIEWS}.ConfigFileVersion.read_content",
+        lambda self: "old" if self.id == v1.id else "new",
+    )
+
+    response = ConfigFileVersionViewSet.as_view({"get": "diff"})(_req("get", superuser, query=f"version_id_1={v1.id}&version_id_2={v2.id}"))
+
+    assert response.status_code == status.HTTP_200_OK
+    assert _body(response)["data"]["version_1"] == "v1"
+    assert _body(response)["data"]["version_2"] == "v2"
 
 
 # --------------------------------------------------------------------------
@@ -153,11 +333,24 @@ def test_file_list_missing(superuser):
 
 @pytest.mark.django_db
 def test_file_list_ok(superuser, monkeypatch):
-    monkeypatch.setattr(f"{VIEWS}.ConfigFileService.get_file_list", lambda iid: [])
-    response = ConfigFileVersionViewSet.as_view({"get": "file_list"})(
-        _req("get", superuser, query="instance_id=5")
-    )
+    monkeypatch.setattr(f"{VIEWS}.ConfigFileService.get_file_list", lambda **kwargs: [])
+    response = ConfigFileVersionViewSet.as_view({"get": "file_list"})(_req("get", superuser, query="instance_id=5"))
     assert response.status_code == status.HTTP_200_OK
+
+
+@pytest.mark.django_db
+def test_file_list_by_instance_uuid_ok(superuser, monkeypatch):
+    captured = {}
+
+    def _fake_get_file_list(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(f"{VIEWS}.ConfigFileService.get_file_list", _fake_get_file_list)
+    response = ConfigFileVersionViewSet.as_view({"get": "file_list"})(_req("get", superuser, query=f"instance_uuid={SAMPLE_UUID}"))
+    assert response.status_code == status.HTTP_200_OK
+    assert captured.get("instance_uuid") == SAMPLE_UUID
+    assert captured.get("instance_id") == "5"
 
 
 # --------------------------------------------------------------------------
@@ -171,9 +364,7 @@ def test_receive_result_ok(superuser, monkeypatch):
         f"{VIEWS}.ConfigFileService.process_collect_result",
         lambda data: {"version_obj": None, "changed": False, "task_updated": True},
     )
-    response = ConfigFileVersionViewSet.as_view({"post": "receive_result"})(
-        _req("post", superuser, data={"instance_id": "5"})
-    )
+    response = ConfigFileVersionViewSet.as_view({"post": "receive_result"})(_req("post", superuser, data={"instance_id": "5"}))
     assert response.status_code == status.HTTP_200_OK
     assert _body(response)["data"]["task_updated"] is True
 
@@ -185,9 +376,7 @@ def test_receive_result_ok(superuser, monkeypatch):
 
 @pytest.mark.django_db
 def test_create_manual_missing_fields(superuser):
-    response = ConfigFileVersionViewSet.as_view({"post": "create_manual"})(
-        _req("post", superuser, data={"instance_id": "5"})
-    )
+    response = ConfigFileVersionViewSet.as_view({"post": "create_manual"})(_req("post", superuser, data={"instance_id": "5"}))
     assert response.status_code == status.HTTP_400_BAD_REQUEST
 
 
@@ -201,9 +390,7 @@ def test_create_manual_empty_content(superuser):
 
 @pytest.mark.django_db
 def test_create_manual_unchanged(superuser, monkeypatch):
-    monkeypatch.setattr(
-        f"{VIEWS}.ConfigFileService.create_manual_version", lambda **k: {"unchanged": True}
-    )
+    monkeypatch.setattr(f"{VIEWS}.ConfigFileService.create_manual_version", lambda **k: {"unchanged": True})
     response = ConfigFileVersionViewSet.as_view({"post": "create_manual"})(
         _req("post", superuser, data={"instance_id": "5", "model_id": "host", "file_path": "/a", "content": "x"})
     )
@@ -235,7 +422,17 @@ def test_destroy_not_found(superuser):
 
 
 @pytest.mark.django_db
-def test_destroy_ok(superuser, version):
+def test_destroy_ok(superuser, version, monkeypatch):
+    requested_deletes = []
+    monkeypatch.setattr(
+        ConfigFileContentLifecycle,
+        "request_delete",
+        staticmethod(lambda version_id: requested_deletes.append(version_id) or True),
+    )
+
     response = ConfigFileVersionViewSet.as_view({"delete": "destroy"})(_req("delete", superuser), pk=version.id)
+
     assert response.status_code == status.HTTP_200_OK
     assert _body(response)["data"]["deleted_id"] == version.id
+    assert _body(response)["data"]["content_status"] == "delete_pending"
+    assert requested_deletes == [version.id]

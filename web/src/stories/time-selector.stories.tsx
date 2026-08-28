@@ -1,4 +1,4 @@
-import { Meta, StoryObj } from '@storybook/react';
+import { Meta, StoryObj } from '@storybook/nextjs';
 import TimeSelector from '@/components/time-selector';
 import dayjs from 'dayjs';
 
@@ -25,6 +25,22 @@ export const Default: Story = {
   },
 };
 
+export const Toolbar: Story = {
+  args: {
+    appearance: 'toolbar',
+    defaultValue: {
+      selectValue: 15,
+      rangePickerVaule: null,
+    },
+    onFrequenceChange: (frequency: number) => {
+      console.log('Frequency changed:', frequency);
+    },
+    onRefresh: () => {
+      console.log('Refresh clicked');
+    },
+  },
+};
+
 export const OnlyTimeSelect: Story = {
   args: {
     defaultValue: {
@@ -38,6 +54,23 @@ export const OnlyTimeSelect: Story = {
 export const OnlyRefresh: Story = {
   args: {
     onlyRefresh: true,
+    frequenceValue: 0,
+    onFrequenceChange: (frequency: number) => {
+      console.log('Frequency changed:', frequency);
+    },
+    onRefresh: () => {
+      console.log('Refresh clicked');
+    },
+  },
+};
+
+export const OnlyRefreshEveryMinute: Story = {
+  args: {
+    onlyRefresh: true,
+    frequenceValue: 60000,
+    onFrequenceChange: (frequency: number) => {
+      console.log('Frequency changed:', frequency);
+    },
     onRefresh: () => {
       console.log('Refresh clicked');
     },

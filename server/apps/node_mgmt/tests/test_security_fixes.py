@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from apps.core.exceptions.base_app_exception import BaseAppException
 from apps.node_mgmt.constants.node import NodeConstants
 from apps.node_mgmt.models import CloudRegion, Node, PackageVersion, SidecarEnv
 from apps.node_mgmt.models.sidecar import NodeOrganization
@@ -64,6 +65,12 @@ def test_issue_2879_installer_session_prefers_dedicated_credentials(monkeypatch)
     SidecarEnv.objects.create(
         key=NodeConstants.NATS_INSTALLER_PASSWORD_KEY,
         value="installer_pass",
+        type="text",
+        cloud_region=cloud_region,
+    )
+    SidecarEnv.objects.create(
+        key=NodeConstants.NATS_INSTALLER_CREDENTIALS_MODE_KEY,
+        value=NodeConstants.NATS_INSTALLER_CREDENTIALS_MODE_STRICT,
         type="text",
         cloud_region=cloud_region,
     )
@@ -149,6 +156,12 @@ def test_issue_2879_installer_session_falls_back_to_admin_credentials(monkeypatc
         type="text",
         cloud_region=cloud_region,
     )
+    installer_credentials_mode = SidecarEnv.objects.create(
+        key=NodeConstants.NATS_INSTALLER_CREDENTIALS_MODE_KEY,
+        value=NodeConstants.NATS_INSTALLER_CREDENTIALS_MODE_STRICT,
+        type="text",
+        cloud_region=cloud_region,
+    )
 
     package_obj = PackageVersion.objects.create(
         type="controller",
@@ -185,6 +198,11 @@ def test_issue_2879_installer_session_falls_back_to_admin_credentials(monkeypatc
         lambda obj: "linux/Controller/1.0.0/test-package.zip",
     )
 
+    with pytest.raises(BaseAppException, match="dedicated NATS_INSTALLER"):
+        InstallerSessionService.build_session_config("token")
+
+    installer_credentials_mode.value = NodeConstants.NATS_INSTALLER_CREDENTIALS_MODE_LEGACY
+    installer_credentials_mode.save(update_fields=["value"])
     config = InstallerSessionService.build_session_config("token")
 
     # Should fall back to admin credentials

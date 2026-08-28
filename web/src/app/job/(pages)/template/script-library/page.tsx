@@ -4,7 +4,7 @@ import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import {
   Button,
   Tag,
-  Modal,
+  Popconfirm,
   message,
   Form,
   Input,
@@ -23,6 +23,7 @@ import GroupTreeSelect from '@/components/group-tree-select';
 import SearchCombination from '@/components/search-combination';
 import { SearchFilters, FieldConfig } from '@/components/search-combination/types';
 import ScriptEditor from '@/app/job/components/script-editor';
+import OrganizationTags, { getOrganizationColumnWidth } from '@/app/job/components/organization-tags';
 import { useRouter } from 'next/navigation';
 import styles from './page.module.scss';
 
@@ -253,19 +254,10 @@ const ScriptLibraryPage = () => {
     })();
   };
 
-  const handleDelete = (record: Script) => {
-    Modal.confirm({
-      title: t('job.deleteScript'),
-      content: t('job.deleteScriptConfirm'),
-      okText: t('job.confirm'),
-      cancelText: t('job.cancel'),
-      centered: true,
-      onOk: async () => {
-        await deleteScript(record.id);
-        message.success(t('job.deleteScript'));
-        fetchData();
-      },
-    });
+  const handleDelete = async (record: Script) => {
+    await deleteScript(record.id);
+    message.success(t('job.deleteScript'));
+    fetchData();
   };
 
   const handleSubmit = async () => {
@@ -389,16 +381,23 @@ const ScriptLibraryPage = () => {
           >
             {t('job.editRule')}
           </a>
-          <a
-            className="text-red-500 cursor-pointer"
-            onClick={() => handleDeleteParam(index)}
+          <Popconfirm
+            title={t('common.deleteConfirm')}
+            okText={t('job.confirm')}
+            cancelText={t('job.cancel')}
+            okButtonProps={{ danger: true }}
+            onConfirm={() => handleDeleteParam(index)}
           >
-            <DeleteOutlined />
-          </a>
+            <a className="text-red-500 cursor-pointer">
+              <DeleteOutlined />
+            </a>
+          </Popconfirm>
         </div>
       ),
     },
   ];
+
+  const organizationColumnWidth = getOrganizationColumnWidth(data);
 
   const columns: ColumnItem[] = [
     {
@@ -413,7 +412,7 @@ const ScriptLibraryPage = () => {
       key: 'script_type',
       width: 120,
       render: (_: unknown, record: Script) => (
-        <Tag color={SCRIPT_TYPE_COLOR[record.script_type] || 'default'} style={{ margin: 0 }}>
+        <Tag color={SCRIPT_TYPE_COLOR[record.script_type] || 'default'} className="m-0">
           {record.script_type_display || record.script_type?.toUpperCase()}
         </Tag>
       ),
@@ -422,16 +421,8 @@ const ScriptLibraryPage = () => {
       title: t('job.organization'),
       dataIndex: 'team_name',
       key: 'team_name',
-      width: 120,
-      render: (_: unknown, record: Script) => (
-        <div className="flex flex-wrap gap-1">
-          {(record.team_name && record.team_name.length > 0)
-            ? record.team_name.map((name: string, idx: number) => (
-              <Tag key={idx}>{name}</Tag>
-            ))
-            : '-'}
-        </div>
-      ),
+      width: organizationColumnWidth,
+      render: (_: unknown, record: Script) => <OrganizationTags names={record.team_name} />,
     },
     {
       title: t('job.creator'),
@@ -458,6 +449,7 @@ const ScriptLibraryPage = () => {
       dataIndex: 'action',
       key: 'action',
       width: 220,
+      fixed: 'right',
       render: (_: unknown, record: Script) => (
         <div className="flex items-center gap-3">
           <a
@@ -478,12 +470,18 @@ const ScriptLibraryPage = () => {
           >
             {t('job.executeScript')}
           </a>
-          <a
-            className="text-[var(--color-primary)] cursor-pointer"
-            onClick={() => handleDelete(record)}
+          <Popconfirm
+            title={t('job.deleteScript')}
+            description={t('job.deleteScriptConfirm')}
+            okText={t('job.confirm')}
+            cancelText={t('job.cancel')}
+            okButtonProps={{ danger: true }}
+            onConfirm={() => handleDelete(record)}
           >
-            {t('job.deleteScript')}
-          </a>
+            <a className="text-[var(--color-primary)] cursor-pointer">
+              {t('job.deleteScript')}
+            </a>
+          </Popconfirm>
         </div>
       ),
     },
@@ -495,30 +493,21 @@ const ScriptLibraryPage = () => {
     <div className="w-full h-full flex flex-col overflow-hidden">
       {/* Header */}
       <div
-        className="rounded-lg px-6 py-4 mb-4 flex-shrink-0"
-        style={{
-          background: 'var(--color-bg-1)',
-          border: '1px solid var(--color-border-1)',
-        }}
+        className="rounded-lg px-6 py-4 mb-4 flex-shrink-0 bg-[var(--color-bg-1)] border border-[var(--color-border-1)]"
       >
         <h2
-          className="text-base font-medium m-0 mb-1"
-          style={{ color: 'var(--color-text-1)' }}
+          className="text-base font-medium m-0 mb-1 text-[var(--color-text-1)]"
         >
           {t('job.scriptLibraryTitle')}
         </h2>
-        <p className="text-sm m-0" style={{ color: 'var(--color-text-3)' }}>
+        <p className="text-sm m-0 text-[var(--color-text-3)]">
           {t('job.scriptLibraryDesc')}
         </p>
       </div>
 
       {/* Table Section */}
       <div
-        className="rounded-lg px-6 py-6 flex-1 min-h-0 flex flex-col"
-        style={{
-          background: 'var(--color-bg-1)',
-          border: '1px solid var(--color-border-1)',
-        }}
+        className="rounded-lg px-6 py-6 flex-1 min-h-0 flex flex-col bg-[var(--color-bg-1)] border border-[var(--color-border-1)]"
       >
         {/* Toolbar */}
         <div className="flex justify-between mb-4 flex-shrink-0">
@@ -562,7 +551,7 @@ const ScriptLibraryPage = () => {
               : t('job.viewScript')
         }
         open={modalOpen}
-        destroyOnClose
+        destroyOnHidden
         confirmLoading={confirmLoading}
         onCancel={() => setModalOpen(false)}
         footer={
@@ -621,7 +610,7 @@ const ScriptLibraryPage = () => {
         {/* Parameter Definition（置于主表单之外，内联表单使用独立的 paramForm 实例，避免 Form 嵌套） */}
         <div className="mb-2">
           <div className="mb-2">
-            <span className="text-sm font-medium" style={{ color: 'var(--color-text-1)' }}>
+            <span className="text-sm font-medium text-[var(--color-text-1)]">
               {t('job.paramDefinition')}
             </span>
           </div>
@@ -650,10 +639,9 @@ const ScriptLibraryPage = () => {
 
           {!isViewMode && paramFormVisible && (
             <div
-              className="mt-2 rounded-md p-4"
-              style={{ border: '1px solid var(--color-border-1)', background: 'var(--color-fill-1)' }}
+              className="mt-2 rounded-md border border-[var(--color-border-1)] bg-[var(--color-fill-1)] p-4"
             >
-              <div className="mb-3 text-sm font-medium" style={{ color: 'var(--color-text-1)' }}>
+              <div className="mb-3 text-sm font-medium text-[var(--color-text-1)]">
                 {editingParamIndex !== null ? t('job.editParam') : t('job.addParamTitle')}
               </div>
               <Form form={paramForm} layout="vertical" colon={false}>

@@ -1,8 +1,11 @@
 """数据源过滤器、序列化器校验与 schema 校验的覆盖测试。
 
-对照 spec/prd/运营分析·管理：数据源支持按名称/REST/标签/图表类型搜索，
+对照 specs/capabilities/legacy-prd-运营分析-管理.md：数据源支持按名称/REST/标签/图表类型搜索，
 field_schema 列定义需 key 非空且不重复。
 """
+
+import json
+from pathlib import Path
 
 import pytest
 from rest_framework import serializers
@@ -71,6 +74,20 @@ def test_validate_field_schema_non_list_rejected():
         _validate_field_schema({"key": "x"})
 
 
+@pytest.mark.parametrize("value", [[1], [None], ["x"], [{"key": 1}]])
+@pytest.mark.django_db
+def test_validate_field_schema_malformed_items_return_serializer_error(value, authenticated_user):
+    from apps.operation_analysis.serializers.datasource_serializers import DataSourceAPIModelSerializer
+
+    serializer = DataSourceAPIModelSerializer(
+        data=_nats_datasource_payload(field_schema=value),
+        context={"request": _serializer_request(authenticated_user)},
+    )
+
+    assert serializer.is_valid() is False
+    assert "field_schema" in serializer.errors
+
+
 def test_validate_field_schema_empty_key_rejected():
     with pytest.raises(serializers.ValidationError):
         _validate_field_schema([{"key": "  "}])
@@ -86,6 +103,45 @@ def test_validate_field_schema_valid():
     assert _validate_field_schema(value) == value
 
 
+def _validate_params(value):
+    from apps.operation_analysis.serializers.datasource_serializers import DataSourceAPIModelSerializer
+
+    serializer = DataSourceAPIModelSerializer.__new__(DataSourceAPIModelSerializer)
+    return DataSourceAPIModelSerializer.validate_params(serializer, value)
+
+
+@pytest.mark.parametrize("param_type", ["number", "boolean", "date"])
+@pytest.mark.unit
+def test_validate_params_rejects_unsupported_unified_filter_types(param_type):
+    with pytest.raises(serializers.ValidationError):
+        _validate_params(
+            [
+                {
+                    "name": "invalid_filter",
+                    "alias_name": "非法筛选",
+                    "type": param_type,
+                    "filterType": "filter",
+                    "value": None,
+                }
+            ]
+        )
+
+
+@pytest.mark.parametrize("param_type", ["string", "timeRange", "dateRange"])
+@pytest.mark.unit
+def test_validate_params_accepts_supported_unified_filter_types(param_type):
+    value = [
+        {
+            "name": "valid_filter",
+            "alias_name": "合法筛选",
+            "type": param_type,
+            "filterType": "filter",
+            "value": None,
+        }
+    ]
+    assert _validate_params(value) == value
+
+
 def _serializer_request(user):
     request = APIRequestFactory().post("/operation_analysis/api/data_source/", data={}, format="json")
     request.COOKIES["current_team"] = "1"
@@ -93,6 +149,160 @@ def _serializer_request(user):
     request.user = user
     force_authenticate(request, user=user)
     return request
+
+
+def _nats_datasource_payload(**overrides):
+    payload = {
+        "name": "自定义监控查询",
+        "rest_api": "monitor/query_safe",
+        "source_type": "nats",
+        "connection_config": {},
+        "query_config": {},
+        "params": [],
+        "chart_type": ["line"],
+        "field_schema": [],
+        "groups": [1],
+        "namespaces": [],
+        "tag": [],
+    }
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("rest_api", ["monitor/mm_query", "monitor/mm_query_range"])
+def test_datasource_serializer_rejects_new_raw_monitor_query_routes(authenticated_user, rest_api):
+    from apps.operation_analysis.serializers.datasource_serializers import DataSourceAPIModelSerializer
+
+    serializer = DataSourceAPIModelSerializer(
+        context={"request": _serializer_request(authenticated_user)},
+        data=_nats_datasource_payload(rest_api=rest_api),
+    )
+
+    assert not serializer.is_valid()
+    assert serializer.errors["rest_api"] == ["该监控裸查询接口已停止新增，仅保留存量数据源兼容"]
+
+
+@pytest.mark.django_db
+def test_datasource_serializer_rejects_raw_monitor_query_with_default_source_type(authenticated_user):
+    from apps.operation_analysis.serializers.datasource_serializers import DataSourceAPIModelSerializer
+
+    payload = _nats_datasource_payload(rest_api="monitor/mm_query")
+    payload.pop("source_type")
+    serializer = DataSourceAPIModelSerializer(
+        context={"request": _serializer_request(authenticated_user)},
+        data=payload,
+    )
+
+    assert not serializer.is_valid()
+    assert serializer.errors["rest_api"] == ["该监控裸查询接口已停止新增，仅保留存量数据源兼容"]
+
+
+@pytest.mark.django_db
+def test_datasource_serializer_preserves_existing_raw_monitor_query_route(authenticated_user):
+    from apps.operation_analysis.serializers.datasource_serializers import DataSourceAPIModelSerializer
+
+    datasource = DataSourceAPIModel.objects.create(
+        name="历史监控查询",
+        rest_api="monitor/mm_query_range",
+        source_type="nats",
+        groups=[1],
+        created_by="system",
+        updated_by="system",
+    )
+    serializer = DataSourceAPIModelSerializer(
+        datasource,
+        context={"request": _serializer_request(authenticated_user)},
+        data=_nats_datasource_payload(name="历史监控查询", rest_api="monitor/mm_query_range"),
+    )
+
+    assert serializer.is_valid(), serializer.errors
+
+
+@pytest.mark.django_db
+def test_serializer_rejects_empty_groups_on_create(authenticated_user):
+    from apps.operation_analysis.serializers.datasource_serializers import DataSourceAPIModelSerializer
+
+    serializer = DataSourceAPIModelSerializer(
+        context={"request": _serializer_request(authenticated_user)},
+        data=_nats_datasource_payload(groups=[]),
+    )
+
+    assert not serializer.is_valid()
+    assert "groups" in serializer.errors
+
+
+@pytest.mark.django_db
+def test_serializer_rejects_create_that_omits_groups(authenticated_user):
+    from apps.operation_analysis.serializers.datasource_serializers import DataSourceAPIModelSerializer
+
+    payload = _nats_datasource_payload()
+    payload.pop("groups")
+    serializer = DataSourceAPIModelSerializer(
+        context={"request": _serializer_request(authenticated_user)},
+        data=payload,
+    )
+
+    assert not serializer.is_valid()
+    assert "groups" in serializer.errors
+
+
+@pytest.mark.django_db
+def test_serializer_rejects_empty_groups_on_update(authenticated_user):
+    from apps.operation_analysis.serializers.datasource_serializers import DataSourceAPIModelSerializer
+
+    datasource = DataSourceAPIModel.objects.create(
+        name="自定义源",
+        rest_api="custom/query",
+        source_type="nats",
+        groups=[1],
+        created_by="s",
+        updated_by="s",
+    )
+    serializer = DataSourceAPIModelSerializer(
+        datasource,
+        context={"request": _serializer_request(authenticated_user)},
+        data={"groups": []},
+        partial=True,
+    )
+
+    assert not serializer.is_valid()
+    assert "groups" in serializer.errors
+    datasource.refresh_from_db()
+    assert datasource.groups == [1]
+
+
+@pytest.mark.django_db
+def test_serializer_allows_empty_groups_for_builtin_instance(authenticated_user):
+    from apps.operation_analysis.serializers.datasource_serializers import DataSourceAPIModelSerializer
+
+    datasource = DataSourceAPIModel.objects.create(
+        name="内置源",
+        rest_api="builtin/query",
+        source_type="nats",
+        groups=[1],
+        is_build_in=True,
+        build_in_key="builtin::query",
+        created_by="s",
+        updated_by="s",
+    )
+    serializer = DataSourceAPIModelSerializer(
+        datasource,
+        context={"request": _serializer_request(authenticated_user)},
+        data={"groups": []},
+        partial=True,
+    )
+
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_data["groups"] == []
+
+
+def test_builtin_datasource_registry_stops_publishing_raw_monitor_query_routes():
+    source_file = Path(__file__).parents[1] / "support-files" / "source_api.json"
+    rest_apis = {item["rest_api"] for item in json.loads(source_file.read_text())}
+
+    assert "monitor/mm_query" not in rest_apis
+    assert "monitor/mm_query_range" not in rest_apis
 
 
 @pytest.mark.django_db
@@ -150,6 +360,35 @@ def test_datasource_serializer_rejects_unknown_source_type(authenticated_user):
 
 
 @pytest.mark.django_db
+@pytest.mark.integration
+def test_datasource_serializer_cannot_forge_builtin_identity(authenticated_user):
+    from apps.operation_analysis.serializers.datasource_serializers import DataSourceAPIModelSerializer
+
+    serializer = DataSourceAPIModelSerializer(
+        context={"request": _serializer_request(authenticated_user)},
+        data={
+            "name": "custom",
+            "rest_api": "custom/query",
+            "source_type": "nats",
+            "connection_config": {},
+            "query_config": {},
+            "params": [],
+            "chart_type": ["single"],
+            "field_schema": [],
+            "groups": [1],
+            "namespaces": [],
+            "tag": [],
+            "is_build_in": True,
+            "build_in_key": "forged",
+        },
+    )
+
+    assert serializer.is_valid(), serializer.errors
+    assert "is_build_in" not in serializer.validated_data
+    assert "build_in_key" not in serializer.validated_data
+
+
+@pytest.mark.django_db
 def test_datasource_serializer_preserves_redacted_connection_secret(authenticated_user):
     from apps.operation_analysis.serializers.datasource_serializers import DataSourceAPIModelSerializer
 
@@ -199,6 +438,206 @@ def test_datasource_serializer_preserves_redacted_connection_secret(authenticate
     assert serializer.validated_data["connection_config"]["password"] == "real-password"
 
 
+@pytest.mark.django_db
+def test_datasource_serializer_redacts_and_preserves_nested_separator_variants(authenticated_user):
+    from apps.operation_analysis.serializers.datasource_serializers import DataSourceAPIModelSerializer
+
+    datasource = DataSourceAPIModel.objects.create(
+        name="rest-source",
+        rest_api="",
+        source_type="rest_api",
+        connection_config={"headers": {"X-API-Key": "real-api-key"}},
+        query_config={"body": {"items": [{"client-secret": "real-client-secret"}]}},
+        groups=[1],
+        created_by="s",
+        updated_by="s",
+    )
+
+    output = DataSourceAPIModelSerializer(datasource, context={"request": _serializer_request(authenticated_user)}).data
+    assert output["connection_config"]["headers"]["X-API-Key"] == "******"
+    assert output["query_config"]["body"]["items"][0]["client-secret"] == "******"
+
+    serializer = DataSourceAPIModelSerializer(
+        datasource,
+        context={"request": _serializer_request(authenticated_user)},
+        data={**output, "namespaces": [], "tag": []},
+    )
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_data["connection_config"]["headers"]["X-API-Key"] == "real-api-key"
+    assert serializer.validated_data["query_config"]["body"]["items"][0]["client-secret"] == "real-client-secret"
+
+
+def test_transform_config_for_source_type_strips_python_transform_for_database():
+    from apps.operation_analysis.serializers.datasource_serializers import DISABLED_TRANSFORM_CONFIG, transform_config_for_source_type
+
+    leftover = {
+        "enabled": True,
+        "language": "python",
+        "script": "def transform(rows, params): return rows",
+    }
+    assert transform_config_for_source_type("postgresql", leftover) == DISABLED_TRANSFORM_CONFIG
+    assert transform_config_for_source_type("mysql", leftover) == DISABLED_TRANSFORM_CONFIG
+    assert transform_config_for_source_type("prometheus", leftover) == DISABLED_TRANSFORM_CONFIG
+    assert transform_config_for_source_type("nats", leftover) == DISABLED_TRANSFORM_CONFIG
+    assert transform_config_for_source_type("rest_api", leftover) == leftover
+    assert transform_config_for_source_type("excel", leftover) == leftover
+
+
+@pytest.mark.django_db
+def test_datasource_serializer_strips_transform_when_switching_rest_to_postgresql(authenticated_user):
+    from apps.operation_analysis.serializers.datasource_serializers import DataSourceAPIModelSerializer
+
+    datasource = DataSourceAPIModel.objects.create(
+        name="rest1",
+        rest_api="",
+        source_type="rest_api",
+        connection_config={"url": "https://example.com/orders", "method": "GET", "timeout": 10},
+        query_config={"response_path": "data.items"},
+        transform_config={
+            "enabled": True,
+            "language": "python",
+            "script": "def transform(rows, params): return rows",
+        },
+        params=[],
+        chart_type=["table"],
+        field_schema=[],
+        groups=[1],
+        created_by="s",
+        updated_by="s",
+    )
+
+    serializer = DataSourceAPIModelSerializer(
+        datasource,
+        context={"request": _serializer_request(authenticated_user)},
+        data={
+            "name": "rest1",
+            "rest_api": "",
+            "source_type": "postgresql",
+            "connection": None,
+            "connection_config": {
+                "host": "127.0.0.1",
+                "port": 5432,
+                "database": "bklite",
+                "username": "bklite",
+                "password": "secret",
+            },
+            "query_config": {"sql": "SELECT 1", "table": ""},
+            "params": [],
+            "chart_type": ["table"],
+            "field_schema": [],
+            "groups": [1],
+            "namespaces": [],
+            "tag": [],
+        },
+    )
+
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_data["transform_config"]["enabled"] is False
+    updated = serializer.save()
+    assert updated.source_type == "postgresql"
+    assert (updated.transform_config or {}).get("enabled") is False
+
+
+@pytest.mark.django_db
+def test_datasource_serializer_keeps_rest_transform_when_type_unchanged(authenticated_user):
+    from apps.operation_analysis.serializers.datasource_serializers import DataSourceAPIModelSerializer
+
+    transform_config = {
+        "enabled": True,
+        "language": "python",
+        "script": "def transform(rows, params): return rows",
+    }
+    datasource = DataSourceAPIModel.objects.create(
+        name="rest-keep",
+        rest_api="",
+        source_type="rest_api",
+        connection_config={"url": "https://example.com/orders", "method": "GET", "timeout": 10},
+        query_config={"response_path": "data.items"},
+        transform_config=transform_config,
+        params=[],
+        chart_type=["table"],
+        field_schema=[],
+        groups=[1],
+        created_by="s",
+        updated_by="s",
+    )
+
+    serializer = DataSourceAPIModelSerializer(
+        datasource,
+        context={"request": _serializer_request(authenticated_user)},
+        data={
+            "name": "rest-keep",
+            "rest_api": "",
+            "source_type": "rest_api",
+            "connection_config": {"url": "https://example.com/orders", "method": "GET", "timeout": 10},
+            "query_config": {"response_path": "data.items"},
+            "params": [],
+            "chart_type": ["table"],
+            "field_schema": [],
+            "groups": [1],
+            "namespaces": [],
+            "tag": [],
+        },
+    )
+
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_data["transform_config"]["enabled"] is True
+
+
+@pytest.mark.django_db
+def test_datasource_serializer_clears_connection_when_switching_rest_to_excel(authenticated_user):
+    from apps.operation_analysis.models.datasource_models import DataConnection
+    from apps.operation_analysis.serializers.datasource_serializers import DataSourceAPIModelSerializer
+    from apps.operation_analysis.services.data_connection.config_crypto import encrypt_connection_config
+
+    connection = DataConnection.objects.create(
+        name="rest-shared",
+        connection_type=DataConnection.TYPE_REST_API,
+        groups=[1],
+        config=encrypt_connection_config({"base_url": "https://api.example.com", "headers": {}}),
+    )
+    datasource = DataSourceAPIModel.objects.create(
+        name="rest-bound",
+        rest_api="",
+        source_type="rest_api",
+        connection=connection,
+        connection_overrides={"path": "orders", "method": "GET", "timeout": 10},
+        connection_config={"method": "GET", "timeout": 10},
+        query_config={"response_path": "data.items"},
+        transform_config={"enabled": True, "language": "python", "script": "def transform(rows, params): return rows"},
+        params=[],
+        chart_type=["table"],
+        field_schema=[],
+        groups=[1],
+        created_by="s",
+        updated_by="s",
+    )
+
+    serializer = DataSourceAPIModelSerializer(
+        datasource,
+        context={"request": _serializer_request(authenticated_user)},
+        data={
+            "name": "rest-bound",
+            "rest_api": "",
+            "source_type": "excel",
+            "connection_config": {"filename": "demo.xlsx"},
+            "query_config": {},
+            "params": [],
+            "chart_type": ["table"],
+            "field_schema": [],
+            "groups": [1],
+            "namespaces": [],
+            "tag": [],
+        },
+    )
+
+    assert serializer.is_valid(), serializer.errors
+    updated = serializer.save()
+    assert updated.source_type == "excel"
+    assert updated.connection_id is None
+    assert updated.connection_overrides == {}
+
+
 # --------------------------------------------------------------------------
 # schema 校验工具函数
 # --------------------------------------------------------------------------
@@ -227,6 +666,55 @@ def test_detect_db_id_references_flags_numeric_ids():
     assert "namespace_ids" in fields
     # organization_id 被豁免
     assert "organization_id" not in fields
+
+
+def test_detect_db_id_references_allows_network_topology_external_ids():
+    from apps.operation_analysis.schemas.import_export_schema import detect_db_id_references
+
+    data = {
+        "network_topologies": [
+            {
+                "key": "networkTopology::demo",
+                "name": "demo",
+                "base_url": "https://weops.example",
+                "token": "******",
+                "view_sets": {
+                    "nodes": [
+                        {
+                            "id": "node-1",
+                            "bk_obj_id": "bk_firewall",
+                            "bk_inst_uuid": "383679a0-0000-4000-8000-000000000001",
+                            "plugin_template_id": 2170,
+                            "network_collect_task_id": 197,
+                            "network_collect_instance_id": 1994,
+                        }
+                    ],
+                    "links": [
+                        {
+                            "id": "link-1",
+                            "source_node_id": "node-1",
+                            "target_node_id": "node-2",
+                            "port_pairs": [
+                                {
+                                    "source_interface": {
+                                        "bk_obj_id": "bk_interface",
+                                        "bk_inst_uuid": "383676a0-0000-4000-8000-000000000001",
+                                    },
+                                    "target_interface": {
+                                        "bk_obj_id": "bk_interface",
+                                        "bk_inst_uuid": "36563a00-0000-4000-8000-000000000001",
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                },
+                "refs": {"datasource_keys": [], "namespace_keys": []},
+            }
+        ]
+    }
+
+    assert detect_db_id_references(data) == []
 
 
 def test_count_objects():

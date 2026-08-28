@@ -1,8 +1,4 @@
 from typing import Any, cast
-from rest_framework import mixins
-from rest_framework.decorators import action
-from rest_framework.viewsets import GenericViewSet
-from django.db.models import Count, Q
 
 from apps.core.decorators.api_permission import HasPermission
 from apps.core.utils.loader import LanguageLoader
@@ -12,17 +8,20 @@ from apps.node_mgmt.constants.collector import CollectorConstants
 from apps.node_mgmt.constants.controller import ControllerConstants
 from apps.node_mgmt.constants.language import LanguageConstants
 from apps.node_mgmt.constants.node import NodeConstants
+from apps.node_mgmt.models.action import CollectorActionTaskNode
 from apps.node_mgmt.models.sidecar import Node, NodeOrganization
-from config.drf.pagination import CustomPageNumberPagination
 from apps.node_mgmt.serializers.node import (
-    NodeSerializer,
     BatchBindingNodeConfigurationSerializer,
     BatchOperateNodeCollectorSerializer,
+    BatchUpdateNodeOrganizationsSerializer,
+    ModulePushSerializer,
+    NodeSerializer,
     TaskNodesQuerySerializer,
 )
+from apps.node_mgmt.services.module_push import ModulePushService, build_module_push_actor_scope, parse_retire_linked_flag
 from apps.node_mgmt.services.node import NodeService
-from apps.node_mgmt.tasks.sidecar_config import sync_node_properties_to_sidecar
-from apps.node_mgmt.models.action import CollectorActionTaskNode, CollectorActionTask
+from apps.node_mgmt.services.sidecar_cache import invalidate_node_configuration_etags
+from apps.node_mgmt.tasks.sidecar_config import sync_node_properties_to_sidecar, sync_nodes_organizations_to_sidecar
 from apps.node_mgmt.utils.permission import (
     add_node_permissions,
     authorize_mutable_collector_configuration_ids,
@@ -31,7 +30,13 @@ from apps.node_mgmt.utils.permission import (
     get_authorized_node_queryset,
     get_node_permission,
 )
-from apps.node_mgmt.utils.task_result_schema import normalize_task_result_for_read
+from apps.node_mgmt.utils.task_result_schema import normalize_task_result_for_read, project_task_status_from_summary
+from config.drf.pagination import CustomPageNumberPagination
+from django.db import transaction
+from django.db.models import Count, Q
+from rest_framework import mixins
+from rest_framework.decorators import action
+from rest_framework.viewsets import GenericViewSet
 
 
 class NodeFilterHandler:
@@ -292,6 +297,12 @@ class NodeViewSet(mixins.DestroyModelMixin, GenericViewSet):
         if error_response:
             return error_response
         instance = nodes[0]
+        # 删除节点必须清 CMDB 上悬挂的 node_id（实例保留）。
+        # retire_linked 另退役监控等已关联对象；失败都不阻断删除。
+        actor_scope = build_module_push_actor_scope(request)
+        ModulePushService.best_effort_unlink_cmdb(instance, actor_scope=actor_scope)
+        if parse_retire_linked_flag(request):
+            ModulePushService.best_effort_retire_linked(instance, actor_scope=actor_scope)
         self.perform_destroy(instance)
         return WebUtils.response_success()
 
@@ -309,9 +320,12 @@ class NodeViewSet(mixins.DestroyModelMixin, GenericViewSet):
         if error_response:
             return error_response
 
+        name_changed = name is not None and name != node.name
         if name is not None:
             node.name = name
             node.save()
+            if name_changed:
+                invalidate_node_configuration_etags([node.id])
 
         if organizations is not None:
             NodeOrganization.objects.filter(node=node).delete()
@@ -322,6 +336,73 @@ class NodeViewSet(mixins.DestroyModelMixin, GenericViewSet):
             sync_node_properties_to_sidecar.delay(node_id=node.id, name=name, organizations=organizations)
 
         return WebUtils.response_success()
+
+    @action(methods=["post"], detail=False, url_path="batch_update_organizations")
+    @HasPermission("cloud_region_node-Edit")
+    def batch_update_organizations(self, request):
+        serializer = BatchUpdateNodeOrganizationsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        node_ids = serializer.validated_data["node_ids"]
+        organizations = serializer.validated_data["organizations"]
+
+        with transaction.atomic():
+            list(Node.objects.select_for_update().filter(id__in=node_ids))
+            nodes, error_response = authorize_node_ids(request, node_ids)
+            if error_response:
+                return error_response
+
+            error_response = authorize_target_organizations(request, nodes[0], organizations)
+            if error_response:
+                return error_response
+
+            NodeOrganization.objects.filter(node_id__in=node_ids).delete()
+            NodeOrganization.objects.bulk_create(
+                [NodeOrganization(node=node, organization=organization_id) for node in nodes for organization_id in organizations]
+            )
+
+            def enqueue_sidecar_sync():
+                sync_nodes_organizations_to_sidecar.delay(
+                    node_ids=list(node_ids),
+                    organizations=list(organizations),
+                )
+
+            transaction.on_commit(
+                enqueue_sidecar_sync,
+                robust=True,
+            )
+
+        return WebUtils.response_success({"updated_count": len(nodes)})
+
+    @action(methods=["post"], detail=True, url_path="module_push")
+    @HasPermission("cloud_region_node-Edit")
+    def module_push(self, request, pk=None):
+        """详情补推/重同步：仅推送请求中列出的 targets，无级联。"""
+        nodes, error_response = authorize_node_ids(request, [pk])
+        if error_response:
+            return error_response
+        serializer = ModulePushSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        targets = serializer.validated_data["targets"]
+        actor_scope = build_module_push_actor_scope(request)
+        results = ModulePushService.best_effort_push_node(
+            nodes[0].id,
+            targets=targets,
+            actor_scope=actor_scope,
+        )
+        return WebUtils.response_success(
+            {
+                "node_id": nodes[0].id,
+                "targets": list(targets),
+                "results": {
+                    target: {
+                        "state": status.state,
+                        "error": status.error,
+                        "attempts": status.attempts,
+                    }
+                    for target, status in (results or {}).items()
+                },
+            }
+        )
 
     @action(methods=["get"], detail=False, url_path=r"enum", filter_backends=[])
     def enum(self, request, *args, **kwargs):
@@ -448,9 +529,7 @@ class NodeViewSet(mixins.DestroyModelMixin, GenericViewSet):
             for obj in items
         ]
 
-        agg = CollectorActionTaskNode.objects.filter(
-            task_id=task_id, node_id__in=authorized_node_ids
-        ).aggregate(
+        agg = CollectorActionTaskNode.objects.filter(task_id=task_id, node_id__in=authorized_node_ids).aggregate(
             total=Count("id"),
             waiting=Count("id", filter=Q(status="waiting")),
             running=Count("id", filter=Q(status="running")),
@@ -469,13 +548,10 @@ class NodeViewSet(mixins.DestroyModelMixin, GenericViewSet):
             "cancelled": agg["cancelled"],
         }
 
-        task_obj = CollectorActionTask.objects.filter(id=task_id).first()
-        task_status = task_obj.status if task_obj else "waiting"
-
         return WebUtils.response_success(
             {
                 "task_id": task_id,
-                "status": task_status,
+                "status": project_task_status_from_summary(summary),
                 "summary": summary,
                 "items": data,
                 "count": total,
@@ -489,11 +565,7 @@ class NodeViewSet(mixins.DestroyModelMixin, GenericViewSet):
         cloud_region_id = request.data.get("cloud_region_id")
         if not cloud_region_id:
             return WebUtils.response_error(error_message="cloud_region_id is required")
-        nodes = (
-            get_authorized_node_queryset(request)
-            .prefetch_related("collectorconfiguration_set")
-            .filter(cloud_region_id=cloud_region_id)
-        )
+        nodes = get_authorized_node_queryset(request).prefetch_related("collectorconfiguration_set").filter(cloud_region_id=cloud_region_id)
         if request.data.get("ids"):
             nodes = nodes.filter(id__in=request.data["ids"])
 

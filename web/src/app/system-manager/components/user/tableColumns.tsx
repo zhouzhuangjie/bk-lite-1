@@ -6,6 +6,7 @@ import Icon from '@/components/icon';
 import type { Key } from 'react';
 import type { ChangeUserStatusAction, UserDataType } from '@/app/system-manager/types/user';
 import { getRandomColor } from '@/app/system-manager/utils';
+import { canDirectlyDeleteUser } from '@/app/system-manager/utils/userDeleteGuards';
 
 interface TableColumnsProps {
   t: (key: string) => string;
@@ -14,6 +15,7 @@ interface TableColumnsProps {
   onOpenPasswordModal: (userId: Key) => void;
   onDeleteUser: (userId: Key) => void;
   onChangeUserStatus: (userId: Key, action: ChangeUserStatusAction) => void;
+  otpEnabled?: boolean;
   convertToLocalizedTime: (isoString: string, format?: string) => string;
 }
 
@@ -24,6 +26,7 @@ export const createUserTableColumns = ({
   onOpenPasswordModal,
   onDeleteUser,
   onChangeUserStatus,
+  otpEnabled = false,
   convertToLocalizedTime,
 }: TableColumnsProps): ColumnsType<UserDataType> => {
   return [
@@ -262,14 +265,24 @@ export const createUserTableColumns = ({
                 </Popconfirm>
               </PermissionWrapper>
             )}
+            {otpEnabled && record.has_otp && (
+              <PermissionWrapper requiredPermissions={['Edit User']}>
+                <Popconfirm title={t('system.user.status.unbindOtpConfirm') || t('common.operateConfirm')} okText={t('common.confirm')} cancelText={t('common.cancel')} onConfirm={() => onChangeUserStatus(key, 'unbind_otp')}>
+                  <Button type="link" className="mr-[8px] p-0">{t('system.user.status.unbindOtp')}</Button>
+                </Popconfirm>
+              </PermissionWrapper>
+            )}
             <PermissionWrapper requiredPermissions={['Delete User']}>
               <Popconfirm
                 title={t('common.delConfirm')}
                 okText={t('common.confirm')}
                 cancelText={t('common.cancel')}
+                disabled={!canDirectlyDeleteUser(record)}
                 onConfirm={() => onDeleteUser(key)}
               >
-                <Button type="link" className="p-0">{t('common.delete')}</Button>
+                <Button type="link" className="p-0" disabled={!canDirectlyDeleteUser(record)}>
+                  {t('common.delete')}
+                </Button>
               </Popconfirm>
             </PermissionWrapper>
           </>

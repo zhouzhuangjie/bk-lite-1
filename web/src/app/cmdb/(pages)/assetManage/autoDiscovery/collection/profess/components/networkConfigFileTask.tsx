@@ -1,10 +1,10 @@
 'use client';
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Checkbox, Form, Input, Spin, Tooltip } from 'antd';
+import { Alert, Form, Input, Spin, Tooltip } from 'antd';
 import { InfoCircleOutlined } from '@ant-design/icons';
-import { useLocale } from '@/context/locale';
 import { useUserInfoContext } from '@/context/userInfo';
+import { useTranslation } from '@/utils/i18n';
 import BaseTaskForm, { BaseTaskRef } from './baseTask';
 import CredentialPoolEditor from './credentialPoolEditor';
 import { useTaskForm, getCleanupFormValues, getCycleFormValues } from '../hooks/useTaskForm';
@@ -23,6 +23,8 @@ import {
 } from '../hooks/formatTaskValues';
 import useAssetManageStore from '@/app/cmdb/store/useAssetManage';
 import { useCollectApi } from '@/app/cmdb/api';
+import { useCollectionFormLayout } from '../hooks/useCollectionFormLayout';
+import { resolveCredentialHelp } from './credentialHelp';
 
 interface NetworkConfigFileTaskProps {
   onClose: () => void;
@@ -41,7 +43,8 @@ const NetworkConfigFileTask: React.FC<NetworkConfigFileTaskProps> = ({
   modelItem,
   editId,
 }) => {
-  const localeContext = useLocale();
+  const { t } = useTranslation();
+  const collectionFormLayout = useCollectionFormLayout();
   const { selectedGroup } = useUserInfoContext();
   const baseRef = useRef<BaseTaskRef>(null as any);
   const copyTaskData = useAssetManageStore((state) => state.copyTaskData);
@@ -73,6 +76,10 @@ const NetworkConfigFileTask: React.FC<NetworkConfigFileTaskProps> = ({
           formatCycleValue,
         });
         const selectedData = baseRef.current?.selectedData || [];
+        const needEnable = (values.credentialPool || []).some((item: any) => {
+          const enablePassword = trimFormString(item?.enable_password);
+          return Boolean(enablePassword);
+        });
 
         return {
           ...baseData,
@@ -92,7 +99,7 @@ const NetworkConfigFileTask: React.FC<NetworkConfigFileTaskProps> = ({
             if (password && password !== PASSWORD_PLACEHOLDER) {
               credential.password = password;
             }
-            if (values.needEnable && enablePassword && enablePassword !== PASSWORD_PLACEHOLDER) {
+            if (enablePassword && enablePassword !== PASSWORD_PLACEHOLDER) {
               credential.enable_password = enablePassword;
             }
             if (item.port !== undefined && item.port !== null && item.port !== '') {
@@ -101,9 +108,10 @@ const NetworkConfigFileTask: React.FC<NetworkConfigFileTaskProps> = ({
             return credential;
           }),
           params: {
+            ...baseData.params,
             config_name: values.configName?.trim(),
             commands: values.commands,
-            need_enable: Boolean(values.needEnable),
+            need_enable: needEnable,
           },
         };
       },
@@ -131,9 +139,9 @@ const NetworkConfigFileTask: React.FC<NetworkConfigFileTaskProps> = ({
     taskName: isCopy ? '' : values.name,
     organization: values.team || [],
     accessPointId: values.access_point?.[0]?.id,
+    ip_precheck: Boolean(values.params?.ip_precheck),
     configName: values.params?.config_name || '',
     commands: values.params?.commands || '',
-    needEnable: Boolean(values.params?.need_enable),
   });
 
   useEffect(() => {
@@ -161,9 +169,8 @@ const NetworkConfigFileTask: React.FC<NetworkConfigFileTaskProps> = ({
   return (
     <Spin spinning={loading}>
       <Form
+        {...collectionFormLayout}
         form={form}
-        layout="horizontal"
-        labelCol={{ span: localeContext.locale === 'en' ? 6 : 5 }}
         onFinish={onFinish}
         initialValues={initialFormValues}
       >
@@ -224,29 +231,12 @@ const NetworkConfigFileTask: React.FC<NetworkConfigFileTaskProps> = ({
             />
           </Form.Item>
 
-          <Form.Item name="needEnable" valuePropName="checked">
-            <Checkbox>需要特权模式</Checkbox>
-          </Form.Item>
-
-          <Form.Item
-            name="credentialPool"
-            rules={[
-              {
-                validator: async (_, value) => {
-                  if (!form.getFieldValue('needEnable')) {
-                    return;
-                  }
-                  const hasEnablePassword = (value || []).some(
-                    (item: any) => item?.enable_password && item.enable_password !== PASSWORD_PLACEHOLDER
-                  );
-                  if (!hasEnablePassword) {
-                    throw new Error('启用特权模式时必须配置特权密码');
-                  }
-                },
-              },
-            ]}
-          >
-            <CredentialPoolEditor credentialShape="network_config_file" editMode={Boolean(editId)} />
+          <Form.Item name="credentialPool">
+            <CredentialPoolEditor
+              credentialShape="network_config_file"
+              credentialHelp={resolveCredentialHelp(modelItem, t)}
+              editMode={Boolean(editId)}
+            />
           </Form.Item>
         </BaseTaskForm>
       </Form>

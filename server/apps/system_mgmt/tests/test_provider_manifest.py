@@ -1,0 +1,358 @@
+import pytest
+
+from apps.system_mgmt.providers.schemas import ProviderManifest
+
+
+def test_provider_manifest_public_dict_includes_connection_template():
+    manifest = ProviderManifest.model_validate(
+        {
+            "key": "demo",
+            "name": "Demo",
+            "description": "demo provider",
+            "instance_templates": {
+                "base_connection": {
+                    "title": "Base",
+                    "groups": [
+                        {
+                            "key": "base",
+                            "title": "Base Fields",
+                            "fields": [{"key": "app_id", "label": "App ID", "required": True}],
+                        }
+                    ],
+                }
+            },
+            "capabilities": [
+                {
+                    "key": "user_sync",
+                    "name": "User Sync",
+                    "adapter_key": "demo.user_sync",
+                    "adapter_path": "apps.system_mgmt.providers.base.BaseUserSyncAdapter",
+                    "connection_template": [
+                        {"key": "user_sync_api_url", "label": "User Sync API URL", "required": True},
+                    ],
+                    "business_template": "",
+                }
+            ],
+        }
+    )
+
+    public_dict = manifest.to_public_dict()
+
+    assert public_dict["instance_template"] == [
+        {
+            "key": "app_id",
+            "label": "App ID",
+            "field_type": "string",
+            "required": True,
+            "secret": False,
+            "write_only": False,
+            "mask_strategy": "full",
+            "default": None,
+            "placeholder": "",
+            "help_text": "",
+            "options": [],
+            "reset_capabilities": [],
+            "input_mode": None,
+        }
+    ]
+    assert public_dict["capabilities"][0]["connection_template"] == [
+        {
+            "key": "user_sync_api_url",
+            "label": "User Sync API URL",
+            "field_type": "string",
+            "required": True,
+            "secret": False,
+            "write_only": False,
+            "mask_strategy": "full",
+            "default": None,
+            "placeholder": "",
+            "help_text": "",
+            "options": [],
+            "reset_capabilities": [],
+            "input_mode": None,
+        }
+    ]
+
+
+def test_provider_manifest_rejects_duplicate_connection_field_keys():
+    with pytest.raises(ValueError, match="Duplicate config field keys"):
+        ProviderManifest.model_validate(
+            {
+                "key": "demo",
+                "name": "Demo",
+                "instance_templates": {
+                    "base_connection": {
+                        "title": "Base",
+                        "groups": [
+                            {
+                                "key": "base",
+                                "title": "Base Fields",
+                                "fields": [{"key": "shared_url", "label": "Shared URL"}],
+                            }
+                        ],
+                    }
+                },
+                "capabilities": [
+                    {
+                        "key": "user_sync",
+                        "name": "User Sync",
+                        "adapter_key": "demo.user_sync",
+                        "adapter_path": "apps.system_mgmt.providers.base.BaseUserSyncAdapter",
+                        "connection_template": [
+                            {"key": "shared_url", "label": "User Sync URL"},
+                        ],
+                    }
+                ],
+            }
+        )
+
+
+def test_provider_manifest_public_dict_includes_business_templates():
+    manifest = ProviderManifest.model_validate(
+        {
+            "key": "demo",
+            "name": "Demo",
+            "instance_templates": {"base_connection": {"title": "Base", "groups": []}},
+            "business_templates": {
+                "user_sync_form": {
+                    "title": "User Sync",
+                    "groups": [
+                        {
+                            "key": "pull",
+                            "title": "拉取配置",
+                            "fields": [{"key": "root_department_id", "label": "根部门 ID", "required": True}],
+                        }
+                    ],
+                    "available_external_fields": ["user_id", "name"],
+                }
+            },
+            "capabilities": [
+                {
+                    "key": "user_sync",
+                    "name": "User Sync",
+                    "adapter_key": "demo.user_sync",
+                    "adapter_path": "apps.system_mgmt.providers.base.BaseUserSyncAdapter",
+                    "business_template": "user_sync_form",
+                }
+            ],
+        }
+    )
+
+    public_dict = manifest.to_public_dict()
+    assert public_dict["business_templates"]["user_sync_form"]["available_external_fields"] == ["user_id", "name"]
+    assert public_dict["capabilities"][0]["business_template"] == "user_sync_form"
+
+
+def test_provider_manifest_rejects_dangling_business_template():
+    with pytest.raises(ValueError, match="references unknown business_template"):
+        ProviderManifest.model_validate(
+            {
+                "key": "demo",
+                "name": "Demo",
+                "business_templates": {},
+                "capabilities": [
+                    {
+                        "key": "user_sync",
+                        "name": "User Sync",
+                        "adapter_key": "demo.user_sync",
+                        "adapter_path": "apps.system_mgmt.providers.base.BaseUserSyncAdapter",
+                        "business_template": "nonexistent_key",
+                    }
+                ],
+            }
+        )
+
+
+def test_business_template_rejects_duplicate_field_keys_across_groups():
+    with pytest.raises(ValueError, match="Duplicate field key"):
+        ProviderManifest.model_validate(
+            {
+                "key": "demo",
+                "name": "Demo",
+                "business_templates": {
+                    "form": {
+                        "title": "Form",
+                        "groups": [
+                            {
+                                "key": "group_a",
+                                "title": "Group A",
+                                "fields": [{"key": "shared_key", "label": "Field A"}],
+                            },
+                            {
+                                "key": "group_b",
+                                "title": "Group B",
+                                "fields": [{"key": "shared_key", "label": "Field B"}],
+                            },
+                        ],
+                    }
+                },
+                "capabilities": [],
+            }
+        )
+
+
+def test_template_field_manifest_supports_input_mode():
+    manifest = ProviderManifest.model_validate(
+        {
+            "key": "demo",
+            "name": "Demo",
+            "business_templates": {
+                "user_sync_form": {
+                    "title": "User Sync",
+                    "groups": [
+                        {
+                            "key": "pull",
+                            "title": "拉取配置",
+                            "fields": [
+                                {
+                                    "key": "root_department_id",
+                                    "label": "同步范围",
+                                    "required": True,
+                                    "input_mode": "manual_input",
+                                }
+                            ],
+                        }
+                    ],
+                    "available_external_fields": ["user_id"],
+                }
+            },
+            "capabilities": [
+                {
+                    "key": "user_sync",
+                    "name": "User Sync",
+                    "adapter_key": "demo.user_sync",
+                    "adapter_path": "apps.system_mgmt.providers.base.BaseUserSyncAdapter",
+                    "business_template": "user_sync_form",
+                }
+            ],
+        }
+    )
+
+    public_dict = manifest.to_public_dict()
+    root_field = public_dict["business_templates"]["user_sync_form"]["groups"][0]["fields"][0]
+    assert root_field["input_mode"] == "manual_input"
+
+
+def test_ad_manifest_declares_login_auth_and_user_sync():
+    from apps.system_mgmt.providers.builtin.ad import PROVIDER_MANIFEST
+
+    assert PROVIDER_MANIFEST.key == "ad"
+    assert [cap.key for cap in PROVIDER_MANIFEST.capabilities] == ["login_auth", "user_sync"]
+
+
+def test_ad_user_sync_root_dn_is_manual_input():
+    from apps.system_mgmt.providers.builtin.ad import PROVIDER_MANIFEST
+
+    template = PROVIDER_MANIFEST.business_templates["user_sync_form"]
+    root_field = next(field for group in template.groups for field in group.fields if field.key == "root_dns")
+
+    assert root_field.input_mode == "manual_input"
+    assert root_field.field_type == "textarea"
+
+
+def test_ad_user_sync_manifest_exposes_directory_query_parameters():
+    from apps.system_mgmt.providers.builtin.ad import PROVIDER_MANIFEST
+
+    template = PROVIDER_MANIFEST.business_templates["user_sync_form"]
+    field_map = {field.key: field for group in template.groups for field in group.fields}
+
+    assert list(field_map) == ["root_dns", "user_object_class", "user_filter", "organization_object_class"]
+    assert "base_dn" not in field_map
+    assert field_map["user_object_class"].default == "user"
+    assert field_map["user_filter"].default == "(&(objectCategory=Person)(sAMAccountName=*))"
+    assert field_map["organization_object_class"].default == "organizationalUnit"
+
+
+def test_feishu_user_sync_manifest_does_not_expose_fetch_child_toggle():
+    from apps.system_mgmt.providers.builtin.feishu import PROVIDER_MANIFEST
+
+    template = PROVIDER_MANIFEST.business_templates["user_sync_form"]
+    field_keys = [field.key for group in template.groups for field in group.fields]
+
+    assert "fetch_child" not in field_keys
+
+
+def test_capability_contract_only_validates_root_dn_for_ad_user_sync():
+    """AD user-sync contract must accept business_config with only root_dns."""
+    from apps.system_mgmt.providers.builtin.ad import PROVIDER_MANIFEST
+    from apps.system_mgmt.services.capability_contract_service import (
+        validate_user_sync_contract,
+    )
+
+    template = PROVIDER_MANIFEST.business_templates["user_sync_form"]
+    template_fields = {field.key for group in template.groups for field in group.fields}
+    assert "base_dn" not in template_fields
+
+    validate_user_sync_contract(
+        PROVIDER_MANIFEST,
+        business_config={"root_dns": ["OU=A,DC=x,DC=y"]},
+        field_mapping=None,
+        schedule_config=None,
+    )
+
+
+def test_ad_user_sync_contract_allows_custom_ldap_attribute_mapping():
+    from apps.system_mgmt.providers.builtin.ad import PROVIDER_MANIFEST
+    from apps.system_mgmt.services.capability_contract_service import (
+        validate_user_sync_contract,
+    )
+
+    validate_user_sync_contract(
+        PROVIDER_MANIFEST,
+        business_config={"root_dns": ["OU=A,DC=x,DC=y"]},
+        field_mapping={"username": "customEmployeeId"},
+        schedule_config=None,
+    )
+
+
+def test_user_sync_contract_does_not_treat_available_fields_as_a_field_existence_check():
+    from apps.system_mgmt.providers.builtin.feishu import PROVIDER_MANIFEST
+    from apps.system_mgmt.services.capability_contract_service import (
+        validate_user_sync_contract,
+    )
+
+    validate_user_sync_contract(
+        PROVIDER_MANIFEST,
+        field_mapping={"username": "customEmployeeId"},
+        schedule_config=None,
+    )
+
+
+def test_capability_contract_still_rejects_empty_root_dn_for_ad_user_sync():
+    """root_dns 必填规则由 serializer 保证；manifest 字段仍标记 required。"""
+    from apps.system_mgmt.providers.builtin.ad import PROVIDER_MANIFEST
+
+    template = PROVIDER_MANIFEST.business_templates["user_sync_form"]
+    root_field = next(
+        field for group in template.groups for field in group.fields if field.key == "root_dns"
+    )
+    assert root_field.required is True
+
+
+def test_ad_login_auth_connection_template_includes_base_dn_required():
+    """AD login_auth.connection_template 必须含 base_dn 必填字段。
+
+    回归锁：2026-07-02 spec 误删此字段，导致 AD 登录报 'AD user not found'。
+    base_dn 是 LDAP search 操作必需的 search_base（RFC 4511 §4.5.1.2），
+    不是应用层冗余字段。本测试保证未来不再被一并删除。
+    """
+    from apps.system_mgmt.providers.builtin.ad import PROVIDER_MANIFEST
+
+    login_auth_capability = next(
+        capability for capability in PROVIDER_MANIFEST.capabilities if capability.key == "login_auth"
+    )
+    base_dn_field = next(
+        (field for field in login_auth_capability.connection_template if field.key == "base_dn"),
+        None,
+    )
+
+    assert base_dn_field is not None, "login_auth.connection_template must contain base_dn field"
+    assert base_dn_field.required is True
+    assert base_dn_field.default is None
+    assert base_dn_field.placeholder == "DC=example,DC=com"
+    assert base_dn_field.field_type == "string"
+    # login_auth_identity_field must come AFTER base_dn in connection_template
+    field_keys = [field.key for field in login_auth_capability.connection_template]
+    assert field_keys.index("base_dn") < field_keys.index("login_auth_identity_field"), (
+        "base_dn must precede login_auth_identity_field in connection_template"
+    )

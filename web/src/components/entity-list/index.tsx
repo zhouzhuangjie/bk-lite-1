@@ -112,7 +112,11 @@ const EntityList = <T,>({
       >
         {menuActions && (
           <div className="absolute right-2 z-1 top-6" onClick={(e) => e.stopPropagation()}>
-            <Dropdown overlay={menuActions(item) as React.ReactElement} trigger={['click']} placement="bottomRight">
+            <Dropdown
+              popupRender={() => menuActions(item) as React.ReactElement}
+              trigger={['click']}
+              placement="bottomRight"
+            >
               <div className="cursor-pointer">
                 <Icon type="sangedian-copy" className="text-xl" />
               </div>
@@ -225,22 +229,22 @@ const EntityList = <T,>({
           <Spin spinning={loading}></Spin>
         </div>
       ) : (
-        <>
+        <div className="@container">
           {filteredItems.length === 0 ? (
             openModal ? (
-              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 2xl:grid-cols-5 gap-6">
+              <div className="grid grid-cols-1 @sm:grid-cols-2 @md:grid-cols-3 @lg:grid-cols-4 @7xl:grid-cols-5 gap-6">
                 {renderAddButton()}
               </div>
             ) : (
               <Empty description={t('common.noData')} />
             )
           ) : (
-            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 2xl:grid-cols-5 gap-6">
+            <div className="grid grid-cols-1 @sm:grid-cols-2 @md:grid-cols-3 @lg:grid-cols-4 @7xl:grid-cols-5 gap-6">
               {openModal && renderAddButton()}
               {filteredItems.map((item) => renderCard(item))}
             </div>
           )}
-        </>
+        </div>
       )}
     </div>
   );

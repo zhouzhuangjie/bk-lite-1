@@ -1,4 +1,4 @@
-import React, {
+import {
   useState,
   useEffect,
   useMemo,
@@ -10,13 +10,16 @@ import React, {
 import { v4 as uuidv4 } from 'uuid';
 import ViewSelector from '@/app/ops-analysis/components/widgetSelector';
 import ViewConfig from '@/app/ops-analysis/components/widgetConfig';
+import { mergeSanitizedWidgetValueConfig, omitForeignChartTypeFields } from '@/app/ops-analysis/components/widgetConfig/utils/submitConfig';
 import DashboardCanvas from './components/dashboardCanvas';
 import DashboardToolbar from './components/dashboardToolbar';
+import DashboardSubscriptionModal from '@/app/ops-analysis/components/dashboardSubscriptionModal';
 import ViewWorkspace from '../components/viewWorkspace';
 import { Input, Modal, message, Select } from 'antd';
 import { useTranslation } from '@/utils/i18n';
 import { useOpsAnalysis } from '@/app/ops-analysis/context/common';
 import { useCanvasResources } from '@/app/ops-analysis/hooks/useCanvasResources';
+import { useCanvasShareAction } from '@/app/ops-analysis/hooks/useCanvasShareAction';
 import {
   DashboardLayoutItem,
   DashboardWidgetLayoutItem,
@@ -31,6 +34,11 @@ import { DirItem } from '@/app/ops-analysis/types';
 import { useDataSourceManager } from '@/app/ops-analysis/hooks/useDataSource';
 import { useUnifiedFilter } from '@/app/ops-analysis/hooks/useUnifiedFilter';
 import { useDashBoardApi } from '@/app/ops-analysis/api/dashBoard';
+import { useDirectoryApi } from '@/app/ops-analysis/api';
+import useBtnPermissions from '@/hooks/usePermissions';
+import { useCanvasPeriodicRefresh } from '@/app/ops-analysis/hooks/useCanvasPeriodicRefresh';
+import { canPersistCanvasRefreshInterval, normalizeCanvasRefreshInterval } from '@/app/ops-analysis/utils/canvasRefreshInterval';
+import type { CanvasRuntimeRefreshCause } from '@/app/ops-analysis/utils/canvasRefreshTimer';
 import {
   UnifiedFilterBar,
   UnifiedFilterConfigModal,
@@ -66,9 +74,35 @@ import {
   removeDashboardGroupHeader,
   sanitizeCollapsedGroups,
 } from '@/app/ops-analysis/utils/dashboardGroups';
+import {
+  buildDashboardRenderSignal,
+  emitDashboardRenderSignal,
+  type DashboardWidgetRenderResult,
+  type DashboardRenderSignal,
+} from '@/app/ops-analysis/renderContract';
+import { prepareDashboardPrintLayout } from '@/app/ops-analysis/utils/prepareDashboardPrintLayout';
+import { useCanvasDraft } from '@/app/ops-analysis/hooks/useCanvasDraft';
+import {
+  restoreDraftRefreshInterval,
+  toCanvasDraftResourceId,
+  type CanvasDraftPayload,
+} from '@/app/ops-analysis/api/canvasDraft';
+import { bindCanvasDraftControls } from '@/app/ops-analysis/components/canvasDraftControls';
+import { normalizeStoredFilterState, buildFilterConfigConfirmSnapshot } from '@/app/ops-analysis/utils/unifiedFilterState';
+import {
+  migrateFilterBindings,
+  migrateParamItemsFromStringList,
+  logStringParamMigrationWarnings,
+} from '@/app/ops-analysis/utils/stringParamMultipleMigrate';
 
 interface DashboardProps {
   selectedDashboard?: DirItem | null;
+  shareMode?: boolean;
+  shareSessionId?: string;
+  getDashboardDetailOverride?: (id: string | number) => Promise<any>;
+  renderMode?: boolean;
+  renderFilterValues?: Record<string, FilterValue>;
+  renderDataSourceIds?: number[];
 }
 
 export interface DashboardRef {
@@ -76,13 +110,22 @@ export interface DashboardRef {
 }
 
 const Dashboard = forwardRef<DashboardRef, DashboardProps>(
-  ({ selectedDashboard }, ref) => {
+  ({
+    selectedDashboard,
+    shareMode = false,
+    getDashboardDetailOverride,
+    renderMode = false,
+    renderFilterValues,
+    renderDataSourceIds,
+  }, ref) => {
     const { t } = useTranslation();
     const { data: session } = useSession();
-    const themeName = resolveOpsChartThemeName();
+    const themeName = renderMode ? 'light' : resolveOpsChartThemeName();
     const chartTheme = getOpsChartTheme(themeName);
     const isDarkTheme = themeName === 'dark';
     const { getDashboardDetail, saveDashboard } = useDashBoardApi();
+    const { updateItem } = useDirectoryApi();
+    const { hasPermission } = useBtnPermissions();
     const dataSourceManager = useDataSourceManager();
     const { namespaceList, loadCanvasNamespaces } = useOpsAnalysis();
     const { syncCanvasResources } = useCanvasResources();
@@ -106,6 +149,9 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
     const [currentConfigItem, setCurrentConfigItem] = useState<LayoutItem>();
     const [isNewComponentConfig, setIsNewComponentConfig] = useState(false);
     const [dashboardReloadVersion, setDashboardReloadVersion] = useState(0);
+    const [refreshCause, setRefreshCause] =
+      useState<CanvasRuntimeRefreshCause>('initial');
+    const [savedRefreshInterval, setSavedRefreshInterval] = useState(0);
     const [widgetReloadVersions, setWidgetReloadVersions] = useState<
       Record<string, number>
     >({});
@@ -116,6 +162,8 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
       {},
     );
     const [filterConfigModalVisible, setFilterConfigModalVisible] =
+      useState(false);
+    const [subscriptionModalVisible, setSubscriptionModalVisible] =
       useState(false);
     const [namespaceDraftId, setNamespaceDraftId] = useState<
       number | undefined
@@ -132,19 +180,25 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
     const [filterSearchVersion, setFilterSearchVersion] = useState(0);
     const [namespaceSearchVersion, setNamespaceSearchVersion] = useState(0);
     const exportRef = useRef<HTMLDivElement>(null);
-    const getDashboardDetailRef = useRef(getDashboardDetail);
+    const canvasScrollRef = useRef<HTMLDivElement>(null);
+    const getDashboardDetailRef = useRef(getDashboardDetailOverride ?? getDashboardDetail);
     const collapsedGroupsHydratedKeyRef = useRef<string | null>(null);
     const skipCollapsedGroupsPersistRef = useRef(false);
     const [collapsedGroupsLayoutReadyId, setCollapsedGroupsLayoutReadyId] =
       useState<number | string | null>(null);
+    const { shareLoading, openShare } = useCanvasShareAction('dashboard');
     const [exporting, setExporting] = useState(false);
+    const renderResultsRef = useRef(
+      new Map<string, DashboardWidgetRenderResult>(),
+    );
+    const emittedRenderSignalRef = useRef(false);
     const resumeEditModeAfterFullscreenRef = useRef(false);
     const { isFullscreen, enterFullscreen, exitFullscreen } =
       useAppViewFullscreen();
 
     useEffect(() => {
-      getDashboardDetailRef.current = getDashboardDetail;
-    }, [getDashboardDetail]);
+      getDashboardDetailRef.current = getDashboardDetailOverride ?? getDashboardDetail;
+    }, [getDashboardDetail, getDashboardDetailOverride]);
 
     const {
       definitions,
@@ -176,11 +230,14 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
 
         return syncCanvasResources({
           source: nextWidgetLayout,
-          getDataSourceIds: collectDashboardDataSourceIds,
+          getDataSourceIds: (layout) => Array.from(new Set([
+            ...collectDashboardDataSourceIds(layout),
+            ...(renderDataSourceIds || []),
+          ])),
           getNamespaceIds: collectDashboardNamespaceIds,
         });
       },
-      [syncCanvasResources],
+      [renderDataSourceIds, syncCanvasResources],
     );
 
     const {
@@ -198,9 +255,118 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
       setFilterValues,
     });
 
+    const dashboardDraftResourceId = toCanvasDraftResourceId(
+      selectedDashboard?.data_id,
+    );
+    const getDashboardDraftPayload = useCallback(
+      (): CanvasDraftPayload => ({
+        name: selectedDashboard?.name,
+        desc: selectedDashboard?.desc || '',
+        view_sets: serializeDashboardGridStackLayout(layout),
+        filters: definitions,
+        other: otherConfig,
+        refresh_interval: savedRefreshInterval,
+      }),
+      [
+        definitions,
+        layout,
+        otherConfig,
+        savedRefreshInterval,
+        selectedDashboard?.desc,
+        selectedDashboard?.name,
+      ],
+    );
+    const applyDashboardDraftPayload = useCallback(
+      (payload: CanvasDraftPayload) => {
+        const nextLayout = deserializeDashboardGridStackLayout(payload.view_sets);
+        const loadedDefinitions: UnifiedFilterDefinition[] = Array.isArray(
+          payload.filters,
+        )
+          ? payload.filters
+          : [];
+        const nextValues = syncFilterValuesWithDefinitions(loadedDefinitions, {});
+
+        restoreDraftRefreshInterval(payload, setSavedRefreshInterval);
+        setLayout(nextLayout);
+        setOtherConfig((payload.other as OtherConfig) || {});
+        setDefinitions(loadedDefinitions);
+        setFilterValues(nextValues);
+        applyQueryState(loadedDefinitions, nextValues, appliedNamespaceId);
+        void syncDashboardCanvasResources(nextLayout);
+      },
+      [
+        appliedNamespaceId,
+        applyQueryState,
+        setDefinitions,
+        setFilterValues,
+        setSavedRefreshInterval,
+        syncDashboardCanvasResources,
+        syncFilterValuesWithDefinitions,
+      ],
+    );
+    const dashboardDraft = useCanvasDraft({
+      resourceType: 'dashboard',
+      resourceId: dashboardDraftResourceId,
+      enabled: Boolean(
+        isEditMode &&
+          !shareMode &&
+          !renderMode &&
+          dashboardDraftResourceId &&
+          !selectedDashboard?.is_build_in,
+      ),
+      getPayload: getDashboardDraftPayload,
+      applyPayload: applyDashboardDraftPayload,
+    });
+
     const widgetLayoutItems = useMemo(
       () => layout.filter(isDashboardWidgetItem),
       [layout],
+    );
+
+    const emitPreparedRenderSignal = useCallback(
+      async (signal: DashboardRenderSignal) => {
+        if (emittedRenderSignalRef.current) return;
+        emittedRenderSignalRef.current = true;
+        if (signal.type === 'report-ready') {
+          try {
+            await prepareDashboardPrintLayout();
+          } catch (error) {
+            emitDashboardRenderSignal({
+              type: 'report-failed',
+              dashboardId: signal.dashboardId,
+              widgets: signal.widgets,
+              error:
+                error instanceof Error
+                  ? error.message
+                  : 'Dashboard print preparation failed',
+            });
+            return;
+          }
+        }
+        emitDashboardRenderSignal(signal);
+      },
+      [],
+    );
+
+    const handleWidgetRenderStatus = useCallback(
+      (result: DashboardWidgetRenderResult) => {
+        if (!renderMode || emittedRenderSignalRef.current) return;
+        renderResultsRef.current.set(result.widgetId, result);
+        const signal = buildDashboardRenderSignal(
+          selectedDashboard?.data_id || 'unknown',
+          widgetLayoutItems.map((item) => item.i),
+          renderResultsRef.current,
+        );
+        if (signal) {
+          void emitPreparedRenderSignal(signal);
+        }
+      },
+      [
+        emitPreparedRenderSignal,
+        renderMode,
+        selectedDashboard?.data_id,
+        widgetLayoutItems,
+      ],
     );
 
     const groupIds = useMemo(
@@ -289,7 +455,36 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
           );
           const nextLayout = deserializeDashboardGridStackLayout(
             dashboardData.view_sets,
-          );
+          ).map((item) => {
+            if (!isDashboardWidgetItem(item) || !item.valueConfig) {
+              return item;
+            }
+            const valueConfig = item.valueConfig;
+            return {
+              ...item,
+              valueConfig: {
+                ...valueConfig,
+                ...(valueConfig.filterBindings
+                  ? {
+                    filterBindings: migrateFilterBindings(
+                      valueConfig.filterBindings,
+                    ),
+                  }
+                  : {}),
+                ...(valueConfig.dataSourceParams
+                  ? (() => {
+                    const migratedParams = migrateParamItemsFromStringList(
+                      valueConfig.dataSourceParams,
+                    );
+                    logStringParamMigrationWarnings(migratedParams.warnings, {
+                      canvasId: selectedDashboard.data_id,
+                    });
+                    return { dataSourceParams: migratedParams.params };
+                  })()
+                  : {}),
+              },
+            };
+          });
           await syncDashboardCanvasResources(nextLayout);
           if (nextLayout.length) {
             setLayout(nextLayout);
@@ -305,18 +500,22 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
           const savedOtherConfig = dashboardData.other || {};
           setOtherConfig(savedOtherConfig);
           setOriginalOtherConfig({ ...savedOtherConfig });
+          setSavedRefreshInterval(
+            normalizeCanvasRefreshInterval(dashboardData.refresh_interval),
+          );
 
           // Handle both legacy (unifiedFilters) and new (direct array) format
           const rawFilters = dashboardData.filters;
-          const loadedDefinitions: UnifiedFilterDefinition[] = Array.isArray(
-            rawFilters,
-          )
-            ? rawFilters
-            : rawFilters?.definitions || rawFilters?.unifiedFilters || [];
+          const { definitions: loadedDefinitions, values: migratedValues } =
+            normalizeStoredFilterState(
+              rawFilters,
+              renderMode ? (renderFilterValues ?? {}) : {},
+              { canvasId: selectedDashboard.data_id },
+            );
 
           const initialValues = syncFilterValuesWithDefinitions(
             loadedDefinitions,
-            {},
+            migratedValues,
           );
 
           setDefinitions(loadedDefinitions);
@@ -336,6 +535,18 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
           setAppliedFilterDefinitions([]);
           setAppliedFilterValues({});
           setOriginalDefinitions([]);
+          if (renderMode && !emittedRenderSignalRef.current) {
+            emittedRenderSignalRef.current = true;
+            emitDashboardRenderSignal({
+              type: 'report-failed',
+              dashboardId: String(selectedDashboard.data_id),
+              widgets: [],
+              error:
+                error instanceof Error
+                  ? error.message
+                  : 'Dashboard layout load failed',
+            });
+          }
         } finally {
           setLoading(false);
         }
@@ -345,6 +556,8 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
       selectedDashboard?.data_id,
       loadCanvasNamespaces,
       syncDashboardCanvasResources,
+      renderMode,
+      renderFilterValues,
     ]);
 
     // 监听 selectedDashboard 的变化，重置状态
@@ -363,6 +576,8 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
       setIsCreatingGroupName(false);
       setSaving(false);
       setDashboardReloadVersion(0);
+      setRefreshCause('initial');
+      setSavedRefreshInterval(0);
       setFilterSearchVersion(0);
       setNamespaceSearchVersion(0);
       setWidgetReloadVersions({});
@@ -518,8 +733,41 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
 
     const handleRefresh = () => {
       applyQueryState(definitions, filterValues, namespaceDraftId);
+      setRefreshCause('manual');
       setDashboardReloadVersion((prev) => prev + 1);
     };
+
+    const handlePeriodicRefresh = useCallback(
+      (cause: CanvasRuntimeRefreshCause = 'periodic') => {
+        setRefreshCause(cause);
+        setDashboardReloadVersion((prev) => prev + 1);
+      },
+      [],
+    );
+
+    const canPersistRefreshInterval = canPersistCanvasRefreshInterval({
+      shareMode,
+      isBuiltIn: Boolean(selectedDashboard?.is_build_in),
+      hasEditPermission: hasPermission(['EditChart']),
+    });
+
+    const { effectiveRefreshInterval, handleFrequencyChange } =
+      useCanvasPeriodicRefresh({
+        canvasId: selectedDashboard?.data_id,
+        savedInterval: savedRefreshInterval,
+        canPersist: canPersistRefreshInterval,
+        enabled: !renderMode && !isEditMode,
+        patchRefreshInterval: async (interval) => {
+          if (!selectedDashboard?.data_id) {
+            return;
+          }
+          await updateItem('dashboard', selectedDashboard.data_id, {
+            refresh_interval: interval,
+          });
+        },
+        onPeriodicRefresh: handlePeriodicRefresh,
+        onSavedIntervalChange: setSavedRefreshInterval,
+      });
 
     const handleExportPdf = useCallback(async () => {
       if (!exportRef.current) return;
@@ -555,6 +803,32 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
       [isEditMode],
     );
 
+    const handleTopologyLayoutChange = useCallback(
+      (
+        widgetId: string,
+        nextTopology: NonNullable<
+          NonNullable<DashboardWidgetLayoutItem['valueConfig']>['networkStatusTopology']
+        >,
+      ) => {
+        if (!isEditMode || shareMode) return;
+        setLayout((prevLayout) =>
+          prevLayout.map((item) => {
+            if (item.i !== widgetId || !isDashboardWidgetItem(item)) {
+              return item;
+            }
+            return {
+              ...item,
+              valueConfig: {
+                ...item.valueConfig,
+                networkStatusTopology: nextTopology,
+              },
+            };
+          }),
+        );
+      },
+      [isEditMode, shareMode],
+    );
+
     const handleAddComponent = (config: WidgetConfig, draftItem: LayoutItem) => {
       const nextUngroupedY = layout.reduce(
         (maxY, item) => Math.max(maxY, item.y + item.h),
@@ -570,27 +844,36 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
         groupId: null,
         name: config.name,
         description: config.description,
-        valueConfig: {
-          dataSource: config.dataSource,
-          chartType: config.chartType,
-          sceneWidgetType: config.sceneWidgetType,
-          networkStatusTopology: config.networkStatusTopology,
-          dataSourceParams: config.dataSourceParams || [],
-          tableConfig: config.tableConfig,
-          filterBindings: config.filterBindings,
-          selectedFields: config.selectedFields,
-          topNLabelField: config.topNLabelField,
-          topNValueField: config.topNValueField,
-          unit: config.unit,
-          conversionFactor: config.conversionFactor,
-          decimalPlaces: config.decimalPlaces,
-          thresholdColors: config.thresholdColors,
-          gaugeMin: config.gaugeMin,
-          gaugeMax: config.gaugeMax,
-          gaugeShape: config.gaugeShape,
-          compare: config.compare,
-          actions: config.actions,
-        },
+        valueConfig: omitForeignChartTypeFields(
+          {
+            dataSource: config.dataSource,
+            chartType: config.chartType,
+            sceneWidgetType: config.sceneWidgetType,
+            networkStatusTopology: config.networkStatusTopology,
+            dataSourceParams: config.dataSourceParams || [],
+            tableConfig: config.tableConfig,
+            filterBindings: config.filterBindings,
+            selectedFields: config.selectedFields,
+            descriptionField: config.descriptionField,
+            topNLabelField: config.topNLabelField,
+            topNValueField: config.topNValueField,
+            unit: config.unit,
+            unitId: config.unitId,
+            valueMappings: config.valueMappings,
+            chartThemeMode: config.chartThemeMode,
+            appearance: config.appearance,
+            conversionFactor: config.conversionFactor,
+            decimalPlaces: config.decimalPlaces,
+            thresholdColors: config.thresholdColors,
+            gaugeMin: config.gaugeMin,
+            gaugeMax: config.gaugeMax,
+            gaugeShape: config.gaugeShape,
+            cardList: config.cardList,
+            compare: config.compare,
+            actions: config.actions,
+          },
+          config.chartType || '',
+        ),
       };
       const nextLayout = pendingNewWidgetGroupId
         ? insertDashboardWidgetIntoGroup(
@@ -686,6 +969,15 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
       setIsEditMode(true);
     }, [isFullscreen]);
 
+    // 全屏切换只改 chrome 可见性，不 remount canvas；通知 GridStack/图表按新容器尺寸重算
+    useEffect(() => {
+      if (renderMode) return;
+      const frameId = window.requestAnimationFrame(() => {
+        window.dispatchEvent(new Event('resize'));
+      });
+      return () => window.cancelAnimationFrame(frameId);
+    }, [isFullscreen, renderMode]);
+
     const handleFullscreenToggle = useCallback(() => {
       if (isFullscreen) {
         exitFullscreen();
@@ -706,7 +998,6 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
       );
 
       setLayout([...originalLayout]);
-      void syncDashboardCanvasResources([...originalLayout]);
       setOtherConfig({ ...originalOtherConfig });
       setDefinitions([...originalDefinitions]);
       setFilterValues(revertedFilterValues);
@@ -716,7 +1007,6 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
         appliedNamespaceId,
       );
       setIsEditMode(false);
-      setDashboardReloadVersion((prev) => prev + 1);
       closeGroupNameModal();
     };
 
@@ -932,32 +1222,44 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
         const editedWidgetId = currentConfigItem?.i;
         const nextLayout = layout.map((item) => {
           if (item.i === editedWidgetId && isDashboardWidgetItem(item)) {
+            const nextChartType =
+              values.chartType || item.valueConfig?.chartType || '';
             return {
               ...item,
               name: values.name,
               description: values.description,
-              valueConfig: {
-                ...item.valueConfig,
-                dataSource: values.dataSource,
-                chartType: values.chartType,
-                sceneWidgetType: values.sceneWidgetType,
-                networkStatusTopology: values.networkStatusTopology,
-                dataSourceParams: values.dataSourceParams,
-                tableConfig: values.tableConfig,
-                filterBindings: values.filterBindings,
-                selectedFields: values.selectedFields,
-                topNLabelField: values.topNLabelField,
-                topNValueField: values.topNValueField,
-                unit: values.unit,
-                conversionFactor: values.conversionFactor,
-                decimalPlaces: values.decimalPlaces,
-                thresholdColors: values.thresholdColors,
-                gaugeMin: values.gaugeMin,
-                gaugeMax: values.gaugeMax,
-                gaugeShape: values.gaugeShape,
-                compare: values.compare,
-                actions: values.actions,
-              },
+              valueConfig: mergeSanitizedWidgetValueConfig(
+                item.valueConfig,
+                {
+                  dataSource: values.dataSource,
+                  chartType: values.chartType,
+                  sceneWidgetType: values.sceneWidgetType,
+                  networkStatusTopology: values.networkStatusTopology,
+                  dataSourceParams: values.dataSourceParams,
+                  tableConfig: values.tableConfig,
+                  filterBindings: values.filterBindings,
+                  selectedFields: values.selectedFields,
+                  descriptionField: values.descriptionField,
+                  topNLabelField: values.topNLabelField,
+                  topNValueField: values.topNValueField,
+                  unit: values.unit,
+                  unitId: values.unitId,
+                  valueMappings: values.valueMappings,
+                  chartThemeMode: values.chartThemeMode,
+                  appearance: values.appearance,
+                  conversionFactor: values.conversionFactor,
+                  decimalPlaces: values.decimalPlaces,
+                  thresholdColors: values.thresholdColors,
+                  gaugeMin: values.gaugeMin,
+                  gaugeMax: values.gaugeMax,
+                  gaugeShape: values.gaugeShape,
+                  cardList: values.cardList,
+                  compare: values.compare,
+                  compareMode: values.compareMode,
+                  actions: values.actions,
+                },
+                nextChartType,
+              ),
             };
           }
           return item;
@@ -1025,12 +1327,15 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
     const handleFilterConfigConfirm = (
       newDefinitions: UnifiedFilterDefinition[],
     ) => {
-      updateDefinitions(newDefinitions);
-      const updatedValues = syncFilterValuesWithDefinitions(
+      const snapshot = buildFilterConfigConfirmSnapshot(
         newDefinitions,
         filterValues,
+        appliedFilterValues,
       );
-      setFilterValues(updatedValues);
+      updateDefinitions(snapshot.definitions);
+      setAppliedFilterDefinitions(snapshot.definitions);
+      setFilterValues(snapshot.filterValues);
+      setAppliedFilterValues(snapshot.appliedFilterValues);
     };
 
     const handleDelete = (id: string) => {
@@ -1051,7 +1356,11 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
       });
     };
 
-    const dashboardToolbar = (
+    const handleShare = () => {
+      void openShare(selectedDashboard?.data_id);
+    };
+
+    const dashboardToolbar = renderMode ? null : (
       <DashboardToolbar
         selectedDashboard={selectedDashboard}
         chartTheme={chartTheme}
@@ -1060,6 +1369,8 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
         isEditMode={isEditMode}
         saving={saving}
         onRefresh={handleRefresh}
+        frequenceValue={effectiveRefreshInterval}
+        onFrequencyChange={handleFrequencyChange}
         onToggleFullscreen={handleFullscreenToggle}
         onExportPdf={handleExportPdf}
         onOpenFilterConfig={() => setFilterConfigModalVisible(true)}
@@ -1068,6 +1379,15 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
         onToggleEditMode={toggleEditMode}
         onCancelEdit={handleCancelEdit}
         onSave={handleSave}
+        editExtra={bindCanvasDraftControls(dashboardDraft)}
+        shareMode={shareMode}
+        shareLoading={shareLoading}
+        onOpenShare={!shareMode && selectedDashboard?.data_id ? handleShare : undefined}
+        onOpenSubscriptions={
+          !shareMode && selectedDashboard?.data_id
+            ? () => setSubscriptionModalVisible(true)
+            : undefined
+        }
       />
     );
 
@@ -1084,7 +1404,13 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
     );
 
     const dashboardCanvas = (
-      <div className="h-full overflow-auto" data-export-expand="true">
+      <div
+        ref={canvasScrollRef}
+        className={
+          renderMode ? 'w-full overflow-visible' : 'h-full overflow-auto'
+        }
+        data-export-expand="true"
+      >
         <DashboardCanvas
           dashboardId={selectedDashboard?.data_id}
           loading={loading}
@@ -1097,6 +1423,7 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
           filterSearchVersion={filterSearchVersion}
           namespaceSearchVersion={namespaceSearchVersion}
           dashboardReloadVersion={dashboardReloadVersion}
+          refreshCause={refreshCause}
           widgetReloadVersions={widgetReloadVersions}
           dataSourceResolver={dataSourceManager.findDataSource}
           appliedFilterValues={appliedFilterValues}
@@ -1111,6 +1438,12 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
           onDeleteEntireGroup={handleDeleteEntireGroup}
           onEditWidget={handleEdit}
           onDeleteWidget={handleDelete}
+          onTopologyLayoutChange={
+            isEditMode && !shareMode ? handleTopologyLayoutChange : undefined
+          }
+          renderMode={renderMode}
+          scrollRootRef={canvasScrollRef}
+          onWidgetRenderStatus={handleWidgetRenderStatus}
         />
       </div>
     );
@@ -1120,31 +1453,22 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
         className={`flex flex-col ${
           isFullscreen
             ? 'fixed inset-0 h-screen w-screen overflow-hidden'
-            : 'h-full flex-1 overflow-auto'
+            : renderMode
+              ? 'w-full min-h-screen overflow-visible'
+              : 'h-full flex-1 overflow-auto'
         }`}
         style={{
-          backgroundColor: isDarkTheme ? 'var(--color-fill-1)' : '#f7f8fa',
+          backgroundColor: isDarkTheme ? 'var(--color-bg-2)' : '#f7f8fa',
           zIndex: isFullscreen ? 1100 : undefined,
         }}
       >
         <AppViewFullscreenExit visible={isFullscreen} onExit={exitFullscreen} />
-        {isFullscreen ? (
+        {renderMode ? (
           <div
-            ref={exportRef}
-            className="flex-1 min-h-0 flex flex-col"
-            data-export-expand="true"
+            className="z-[9999] w-full min-h-screen overflow-visible bg-[#f7f8fa] p-4"
+            data-dashboard-render-root="true"
           >
-            {dashboardFilterBar && (
-              <div className="shrink-0 bg-[var(--color-bg-1)] px-2.5 pb-2 pt-1">
-                {dashboardFilterBar}
-              </div>
-            )}
-            <div
-              className="min-h-0 flex-1 overflow-hidden pt-1"
-              data-export-expand="true"
-            >
-              {dashboardCanvas}
-            </div>
+            {dashboardCanvas}
           </div>
         ) : (
           <ViewWorkspace
@@ -1152,9 +1476,14 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
             loading={loading}
             titleFallback="仪表盘"
             emptyDescription={t('dashboard.selectDashboardFirst')}
+            headerVisible={!isFullscreen}
+            filterBarVisible
             toolbar={dashboardToolbar}
             filterBar={dashboardFilterBar}
             contentRef={exportRef}
+            contentClassName={
+              isDarkTheme ? 'bg-[var(--color-bg-2)]' : 'bg-[#f7f8fa]'
+            }
           >
             {dashboardCanvas}
           </ViewWorkspace>
@@ -1167,7 +1496,7 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
         />
         <ViewConfig
           open={configDrawerVisible}
-          item={currentConfigItem as LayoutItem}
+          item={currentConfigItem}
           onConfirm={handleConfigConfirm}
           onClose={handleConfigClose}
           builtinNamespaceId={namespaceDraftId}
@@ -1183,6 +1512,14 @@ const Dashboard = forwardRef<DashboardRef, DashboardProps>(
           layoutItems={widgetLayoutItems}
           dataSources={dataSourceManager.dataSources}
         />
+        {selectedDashboard?.data_id && (
+          <DashboardSubscriptionModal
+            open={subscriptionModalVisible}
+            dashboardId={Number(selectedDashboard.data_id)}
+            appliedFilterValues={appliedFilterValues}
+            onClose={() => setSubscriptionModalVisible(false)}
+          />
+        )}
         <Modal
           title={
             isCreatingGroupName

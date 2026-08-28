@@ -1,10 +1,19 @@
 import { OBJECT_DEFAULT_ICON } from '@/app/monitor/constants';
+import { withDashboardReturnContext } from '@/app/monitor/dashboards/shared/utils';
+import { encodeInstanceIdValuesParam } from '@/app/monitor/dashboards/shared/utils/instance';
+
+import { resolveDashboardUrl } from '@/app/monitor/dashboards/registry';
 
 type DashboardUrlResolver = (
   objectName?: string | null,
   objectDisplayName?: string | null,
   queryString?: string
 ) => string;
+
+interface FlowDashboardPlugin {
+  collect_type?: string;
+  name?: string;
+}
 
 interface AssetViewMonitorItem {
   name?: string | null;
@@ -17,6 +26,7 @@ interface AssetViewRow {
   instance_id?: unknown;
   instance_name?: unknown;
   instance_id_values?: unknown;
+  plugins?: FlowDashboardPlugin[];
 }
 
 interface BuildAssetViewUrlOptions {
@@ -27,7 +37,7 @@ interface BuildAssetViewUrlOptions {
 }
 
 const toParamValue = (value: unknown) => {
-  if (Array.isArray(value)) return value.join(',');
+  if (Array.isArray(value)) return encodeInstanceIdValuesParam(value);
   if (value === null || value === undefined) return '';
   return String(value);
 };
@@ -56,13 +66,24 @@ export const buildAssetViewUrl = ({
     instance_id_values: toParamValue(row.instance_id_values),
     instance_id_keys: resolveInstanceIdKeys(monitorItem?.instance_id_keys)
   });
-  const queryString = params.toString();
+  const dashboardParams = withDashboardReturnContext(params, {
+    objectId: toParamValue(objectId),
+    objectName: toParamValue(monitorItem?.display_name || monitorItem?.name),
+    source: 'integration'
+  });
+  const queryString = dashboardParams.toString();
   const professionalDashboardUrl =
     resolveProfessionalDashboardUrl?.(
       monitorItem?.name,
       monitorItem?.display_name,
       queryString
-    ) || '';
+    ) ||
+    resolveDashboardUrl({
+      monitorObjectName: monitorItem?.name,
+      monitorObjectDisplayName: monitorItem?.display_name,
+      instancePlugins: row.plugins,
+      queryString,
+    });
 
   return professionalDashboardUrl || `/monitor/view/detail?${queryString}`;
 };

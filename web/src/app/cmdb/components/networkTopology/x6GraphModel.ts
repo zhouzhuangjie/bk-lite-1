@@ -4,7 +4,10 @@ import type {
   NetworkTopologyPositionedLink,
   NetworkTopologyPositionedNode,
 } from './types';
-import { NETWORK_TOPO_VISUAL, buildNetworkTopoPortLabel } from './x6Visual';
+import {
+  NETWORK_TOPO_CARD_VISUAL,
+  buildNetworkTopoPortLabel,
+} from './x6Visual';
 
 export interface BuildX6GraphDataOptions {
   nodes: NetworkTopologyPositionedNode[];
@@ -17,9 +20,10 @@ export interface BuildX6GraphDataOptions {
   showStatusDot?: boolean;
 }
 
-const NODE_WIDTH = NETWORK_TOPO_VISUAL.node.width;
-const NODE_HEIGHT = NETWORK_TOPO_VISUAL.node.height;
-const DEVICE_NODE_SHAPE = 'topo-network-device';
+/** Application overview still consumes the legacy card shape. */
+const NODE_WIDTH = NETWORK_TOPO_CARD_VISUAL.node.width;
+const NODE_HEIGHT = NETWORK_TOPO_CARD_VISUAL.node.height;
+const DEVICE_NODE_SHAPE = NETWORK_TOPO_CARD_VISUAL.shape;
 const STATUS_COLOR_MAP: Record<string, string> = {
   normal: '#39c78f',
   warning: '#f5b544',
@@ -27,9 +31,10 @@ const STATUS_COLOR_MAP: Record<string, string> = {
   critical: '#ff4d4f',
 };
 
-const toOpacityAttrs = (dimmed: boolean) => ({
-  opacity: dimmed ? 0.22 : 1,
-});
+// 缓存固定对象,避免 setAttrs 每次生成新引用(否则 x6 会重新创建 <image> 元素,触发 SVG 重请求)
+const OPACITY_ATTR_DIMMED = Object.freeze({ opacity: 0.22 });
+const OPACITY_ATTR_NORMAL = Object.freeze({ opacity: 1 });
+const toOpacityAttrs = (dimmed: boolean) => (dimmed ? OPACITY_ATTR_DIMMED : OPACITY_ATTR_NORMAL);
 
 const stripDevicePrefix = (value?: string, deviceName?: string) => {
   if (!value) return '';
@@ -74,8 +79,8 @@ export const buildNetworkTopologyX6GraphData = ({
       },
       attrs: {
         body: {
-          ...NETWORK_TOPO_VISUAL.node.defaultBody,
-          ...(selected ? NETWORK_TOPO_VISUAL.node.activeBody : {}),
+          ...NETWORK_TOPO_CARD_VISUAL.node.defaultBody,
+          ...(selected ? NETWORK_TOPO_CARD_VISUAL.node.activeBody : {}),
           ...(active ? { stroke: '#ff4d4f', strokeWidth: 2.4 } : {}),
           ...toOpacityAttrs(dimmed),
         },
@@ -177,8 +182,8 @@ export const buildNetworkTopologyX6GraphData = ({
       connector: { name: 'smooth' },
       attrs: {
         line: {
-          stroke: active ? '#ff4d4f' : NETWORK_TOPO_VISUAL.edge.stroke,
-          strokeWidth: active ? 3 : NETWORK_TOPO_VISUAL.edge.strokeWidth,
+          stroke: active ? '#ff4d4f' : NETWORK_TOPO_CARD_VISUAL.edge.stroke,
+          strokeWidth: active ? 3 : NETWORK_TOPO_CARD_VISUAL.edge.strokeWidth,
           strokeLinecap: 'round',
           strokeLinejoin: 'round',
           targetMarker: null,
@@ -188,11 +193,11 @@ export const buildNetworkTopologyX6GraphData = ({
       },
       labels: [
         portLabel(
-          NETWORK_TOPO_VISUAL.portLabelPosition.source,
+          NETWORK_TOPO_CARD_VISUAL.portLabelPosition.source,
           stripDevicePrefix(link.sourcePort, sourceName)
         ),
         portLabel(
-          NETWORK_TOPO_VISUAL.portLabelPosition.target,
+          NETWORK_TOPO_CARD_VISUAL.portLabelPosition.target,
           stripDevicePrefix(link.targetPort, targetName)
         ),
       ],

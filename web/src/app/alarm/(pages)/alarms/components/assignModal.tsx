@@ -6,6 +6,7 @@ import { UserItem } from '@/app/alarm/types/types';
 import { useTranslation } from '@/utils/i18n';
 import { ActionType } from '@/app/alarm/types/alarms';
 import { useAlarmApi } from '@/app/alarm/api/alarms';
+import { showOperatorFailureMessages } from '@/app/alarm/utils/operatorResult';
 
 interface AlarmAssignModalProps {
   actionType?: ActionType;
@@ -39,22 +40,21 @@ const AlarmAssignModal: React.FC<AlarmAssignModalProps> = ({
       return;
     }
     setConfirmLoading(true);
+    const fallback = `${t(`alarms.${actionType}`)}${t(`alarms.alert`)}${t('alarmCommon.partialFailure')}`;
     try {
       const data = await alertActionOperate(actionType, {
         alert_id: alertIds || [],
         assignee: selectedIds,
       });
       if (Object.values(data).some((res: any) => !res.result)) {
-        message.error(
-          `${t(`alarms.${actionType}`)}${t(`alarms.alert`)}${t('alarmCommon.partialFailure')}`
-        );
+        showOperatorFailureMessages(data, fallback);
       } else {
         message.success(t(`alarms.${actionType}`) + t('alarmCommon.success'));
         onSuccess(selectedIds);
       }
-
     } catch (err) {
       console.error(err);
+      showOperatorFailureMessages(null, fallback, err);
     } finally {
       setConfirmLoading(false);
       setSelectedIds([]);
@@ -74,8 +74,8 @@ const AlarmAssignModal: React.FC<AlarmAssignModalProps> = ({
         onCancel();
       }}
     >
-      <div className="flex justify-between items-center mt-2 mb-4">
-        <label className="block mr-2">
+      <div className="mt-2 mb-4">
+        <label className="block mb-2">
           {t('common.select')}
           {t('alarms.user')}
         </label>
@@ -84,7 +84,7 @@ const AlarmAssignModal: React.FC<AlarmAssignModalProps> = ({
           showSearch
           mode="multiple"
           optionFilterProp="label"
-          style={{ width: '100%', flex: 1 }}
+          style={{ width: '100%' }}
           placeholder={t('common.selectTip')}
           options={options}
           value={selectedIds}

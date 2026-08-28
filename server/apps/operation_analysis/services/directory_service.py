@@ -2,6 +2,8 @@
 # @File: directory_service.py
 # @Time: 2025/11/3 16:22
 # @Author: windyzhao
+from rest_framework.exceptions import ValidationError
+
 from apps.core.utils.team_utils import get_current_team
 from apps.operation_analysis.constants.constants import PERMISSION_DATASOURCE, PERMISSION_DIRECTORY
 from apps.operation_analysis.filters.base_filters import GroupPermissionMixin
@@ -11,22 +13,10 @@ from apps.operation_analysis.services.canvas.registry import CANVAS_TYPE_REGISTR
 from apps.operation_analysis.services.node_tree import TreeNodeBuilder
 
 
-def _get_visible_canvas_queryset(meta, directories, current_team, request, group_ids):
+def _get_visible_canvas_queryset(meta, directories, current_team, group_ids):
+    """画布可见性与目录一致：仅按组织归属过滤。"""
     base = meta.model.objects.filter(directory__in=directories)
-    return (
-        (
-            GroupPermissionMixin.apply_group_filter(
-                base.filter(is_build_in=False),
-                current_team,
-                request.user,
-                meta.permission_key,
-                group_ids=group_ids,
-            )
-            | GroupPermissionMixin.apply_group_filter(base.filter(is_build_in=True), current_team, group_ids=group_ids)
-        )
-        .distinct()
-        .order_by("id")
-    )
+    return GroupPermissionMixin.apply_group_filter(base, current_team, group_ids=group_ids).order_by("id")
 
 
 class DictDirectoryService:
@@ -38,7 +28,10 @@ class DictDirectoryService:
         获取目录树形结构,目录和仪表盘统一作为树节点
         """
         # 验证用户组织权限，构建组织ID列表（支持 include_children）
-        current_team = int(get_current_team(request))
+        try:
+            current_team = int(get_current_team(request))
+        except (TypeError, ValueError):
+            raise ValidationError({"detail": "current_team cookie 缺失或格式错误，请重新登录或刷新页面"})
         group_ids = [current_team]
         if request.COOKIES.get("include_children", "0") == "1":
             from apps.core.utils.viewset_utils import GenericViewSetFun
@@ -52,10 +45,9 @@ class DictDirectoryService:
         base_queryset = Directory.objects.filter(is_active=True)
         directories = GroupPermissionMixin.apply_group_filter(base_queryset, current_team, group_ids=group_ids).order_by("id")
 
-        # 构建各类画布的查询集
-        # 内置画布只需通过组织过滤（第一层），跳过实例级权限过滤（第二层）
+        # 构建各类画布的查询集（与目录相同，仅组织过滤）
         canvas_queryset_map = {
-            object_type: _get_visible_canvas_queryset(meta, directories, current_team, request, group_ids)
+            object_type: _get_visible_canvas_queryset(meta, directories, current_team, group_ids)
             for object_type, meta in CANVAS_TYPE_REGISTRY.items()
         }
 
@@ -122,7 +114,7 @@ class DictDirectoryService:
             return {"count": 0, "items": []}
 
         result = []
-        queryset = model_class.objects.all()
+        queryset = model_class.objects.select_related("directory")
         filter_queryset = GroupPermissionMixin.apply_group_filter(queryset, group_id)
         queryset_count = filter_queryset.count()
         instances = filter_queryset[(page - 1) * page_size : page * page_size]

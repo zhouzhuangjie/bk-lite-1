@@ -9,6 +9,7 @@ import {
   getOpsChartThemeByMode,
 } from '@/app/ops-analysis/utils/chartTheme';
 import WidgetRenderer from '@/app/ops-analysis/components/widgetRenderer';
+import ScreenWidgetThemeProvider from '@/app/ops-analysis/components/screenWidgetThemeProvider';
 import WidgetErrorState from '@/app/ops-analysis/components/widgetErrorState';
 
 interface ChartNodeProps {
@@ -177,17 +178,20 @@ const ChartNodeContent: React.FC<ChartNodeProps> = ({ node }) => {
             }}
           >
             <ConfigProvider getPopupContainer={() => document.body}>
-              <WidgetRenderer
-                chartType={chartType}
-                {...widgetProps}
-                fallback={
-                  <div className="h-full flex flex-col items-center justify-center">
-                    <div className="text-xs text-gray-500">
-                      Unknown chart type: {chartType}
+              <ScreenWidgetThemeProvider mode={valueConfig?.chartThemeMode}>
+                <WidgetRenderer
+                  surface="dashboard"
+                  chartType={chartType}
+                  {...widgetProps}
+                  fallback={
+                    <div className="h-full flex flex-col items-center justify-center">
+                      <div className="text-xs text-gray-500">
+                        Unknown chart type: {chartType}
+                      </div>
                     </div>
-                  </div>
-                }
-              />
+                  }
+                />
+              </ScreenWidgetThemeProvider>
             </ConfigProvider>
           </div>
         )}
@@ -199,7 +203,6 @@ const ChartNodeContent: React.FC<ChartNodeProps> = ({ node }) => {
 const ChartNode: React.FC<ChartNodeProps> = ({ node }) => {
   const { locale, messages } = getLocaleData();
   return (
-    // @ts-expect-error react-intl type incompatibility with React 19
     <IntlProvider locale={locale} messages={messages}>
       <ChartNodeContent node={node} />
     </IntlProvider>

@@ -3,10 +3,12 @@
 仅 mock cache 与 converge celery.delay 边界。断言真实返回值与 DB 副作用。
 """
 import json
+import logging
 import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from apps.node_mgmt.constants.controller import ControllerConstants
 from apps.node_mgmt.constants.node import NodeConstants
 from apps.node_mgmt.models import Collector, Node
 from apps.node_mgmt.models.cloud_region import CloudRegion
@@ -94,6 +96,13 @@ def test_get_node_or_404_missing():
 # --------------------------------------------------------------------------- #
 # configuration_bound_to_node / get_bound_*
 # --------------------------------------------------------------------------- #
+def test_config_section_headers_separate_base_and_instance_templates():
+    template = Sidecar.add_config_section_headers("\n[[inputs.netflow]]", has_child_configs=True)
+
+    assert template.index(Sidecar.BASE_CONFIG_HEADER.strip()) < template.index("[[inputs.netflow]]")
+    assert template.index(Sidecar.INSTANCE_CONFIG_HEADER.strip()) > template.index("[[inputs.netflow]]")
+
+
 @pytest.mark.django_db
 def test_configuration_bound_to_node(node):
     collector = Collector.objects.create(
@@ -194,6 +203,114 @@ def test_get_collectors_returns_304_when_etag_matches(node):
         cache_mock.get.return_value = "cached-etag"
         resp = Sidecar.get_collectors(req)
     assert resp.status_code == 304
+
+
+@pytest.mark.django_db
+def test_update_node_client_304_refreshes_reported_node_metadata(node):
+    node.cpu_architecture = ""
+    node.install_method = ControllerConstants.AUTO
+    node.node_type = ControllerConstants.NODE_TYPE_HOST
+    node.save(update_fields=["cpu_architecture", "install_method", "node_type", "updated_at"])
+
+    request = SimpleNamespace(
+        headers={"If-None-Match": '"cached-etag"'},
+        META={},
+        data={
+            "node_name": node.name,
+            "node_details": {
+                "ip": node.ip,
+                "operating_system": "Linux",
+                "cpu_architecture": "amd64",
+                "status": {"status": 0},
+                "tags": [
+                    "zone:1",
+                    "group:1",
+                    "install_method:manual",
+                    "node_type:container",
+                ],
+            },
+        },
+    )
+
+    with (
+        patch("apps.node_mgmt.services.sidecar.cache") as cache_mock,
+        patch.object(Sidecar, "trigger_converge_tasks_if_needed"),
+    ):
+        cache_mock.get.return_value = "cached-etag"
+        response = Sidecar.update_node_client(request, node.id)
+
+    node.refresh_from_db()
+    assert response.status_code == 304
+    assert node.cpu_architecture == NodeConstants.X86_64_ARCH
+    assert node.install_method == ControllerConstants.AUTO
+    assert node.node_type == ControllerConstants.NODE_TYPE_HOST
+
+
+@pytest.mark.django_db
+def test_update_node_client_304_does_not_log_existing_architecture_fallback(node, caplog):
+    task = ControllerTask.objects.create(
+        cloud_region=node.cloud_region, type="install", status="success", package_version_id=1
+    )
+    ControllerTaskNode.objects.create(
+        task=task, ip=node.ip, os="linux", cpu_architecture="arm64",
+        port=22, username="root", password="x", status="success",
+    )
+    request = SimpleNamespace(
+        headers={"If-None-Match": '"cached-etag"'},
+        META={},
+        data={
+            "node_name": node.name,
+            "node_details": {
+                "ip": node.ip,
+                "operating_system": "Linux",
+                "status": {"status": 0},
+            },
+        },
+    )
+
+    caplog.set_level(logging.INFO, logger="node")
+    with (
+        patch("apps.node_mgmt.services.sidecar.cache") as cache_mock,
+        patch.object(Sidecar, "trigger_converge_tasks_if_needed"),
+    ):
+        cache_mock.get.return_value = "cached-etag"
+        response = Sidecar.update_node_client(request, node.id)
+
+    node.refresh_from_db()
+    assert response.status_code == 304
+    assert node.cpu_architecture == NodeConstants.X86_64_ARCH
+    assert "Falling back to install task CPU architecture" not in caplog.text
+
+
+@pytest.mark.django_db
+def test_update_node_client_304_does_not_guess_missing_container_architecture(node):
+    node.cpu_architecture = ""
+    node.save(update_fields=["cpu_architecture", "updated_at"])
+
+    request = SimpleNamespace(
+        headers={"If-None-Match": '"cached-etag"'},
+        META={},
+        data={
+            "node_name": node.name,
+            "node_details": {
+                "ip": node.ip,
+                "operating_system": "Linux",
+                "status": {"status": 0},
+                "tags": ["node_type:container"],
+            },
+        },
+    )
+
+    with (
+        patch("apps.node_mgmt.services.sidecar.cache") as cache_mock,
+        patch.object(Sidecar, "trigger_converge_tasks_if_needed"),
+    ):
+        cache_mock.get.return_value = "cached-etag"
+        response = Sidecar.update_node_client(request, node.id)
+
+    node.refresh_from_db()
+    assert response.status_code == 304
+    assert node.cpu_architecture == ""
 
 
 # --------------------------------------------------------------------------- #
@@ -300,7 +417,7 @@ def test_fallback_cpu_arch_from_architecture_field():
 
 
 @pytest.mark.django_db
-def test_fallback_cpu_arch_from_install_task():
+def test_fallback_cpu_arch_from_install_task(caplog):
     region = CloudRegion.objects.create(name="cr-fallback")
     task = ControllerTask.objects.create(
         cloud_region=region, type="install", status="waiting", package_version_id=1
@@ -309,10 +426,66 @@ def test_fallback_cpu_arch_from_install_task():
         task=task, ip="10.9.9.9", os="linux", cpu_architecture="arm64",
         port=22, username="root", password="x", status="running",
     )
+    caplog.set_level(logging.INFO, logger="node")
     arch = Sidecar._fallback_cpu_architecture(
         "nid", {"ip": "10.9.9.9", "operating_system": "Linux"}
     )
     assert arch == NodeConstants.ARM64_ARCH
+    assert "Falling back to install task CPU architecture for node nid" in caplog.text
+
+
+@pytest.mark.django_db
+def test_fallback_cpu_arch_keeps_existing_and_skips_install_task(caplog):
+    region = CloudRegion.objects.create(name="cr-fallback-existing")
+    task = ControllerTask.objects.create(
+        cloud_region=region, type="install", status="waiting", package_version_id=1
+    )
+    ControllerTaskNode.objects.create(
+        task=task, ip="10.9.9.9", os="linux", cpu_architecture="arm64",
+        port=22, username="root", password="x", status="running",
+    )
+    caplog.set_level(logging.INFO, logger="node")
+    arch = Sidecar._fallback_cpu_architecture(
+        "nid",
+        {"ip": "10.9.9.9", "operating_system": "Linux"},
+        existing_cpu_architecture=NodeConstants.X86_64_ARCH,
+    )
+    assert arch == NodeConstants.X86_64_ARCH
+    assert "Falling back to install task CPU architecture" not in caplog.text
+
+
+@pytest.mark.django_db
+def test_cached_heartbeat_updates_does_not_rewrite_existing_cpu_architecture(node):
+    task = ControllerTask.objects.create(
+        cloud_region=node.cloud_region, type="install", status="success", package_version_id=1
+    )
+    ControllerTaskNode.objects.create(
+        task=task, ip=node.ip, os="linux", cpu_architecture="arm64",
+        port=22, username="root", password="x", status="success",
+    )
+    updates, _, _ = Sidecar._cached_heartbeat_updates(
+        node.id,
+        {"ip": node.ip, "operating_system": "Linux", "status": {"status": 0}},
+    )
+    assert "cpu_architecture" not in updates
+
+
+@pytest.mark.django_db
+def test_cached_heartbeat_updates_fills_missing_cpu_architecture_from_install_task(node):
+    node.cpu_architecture = ""
+    node.save(update_fields=["cpu_architecture", "updated_at"])
+    task = ControllerTask.objects.create(
+        cloud_region=node.cloud_region, type="install", status="success", package_version_id=1
+    )
+    ControllerTaskNode.objects.create(
+        task=task, ip=node.ip, os="linux", cpu_architecture="x86_64",
+        port=22, username="root", password="x", status="success",
+    )
+    updates, _, _ = Sidecar._cached_heartbeat_updates(
+        node.id,
+        {"ip": node.ip, "operating_system": "Linux", "status": {"status": 0}},
+    )
+    assert updates["cpu_architecture"] == NodeConstants.X86_64_ARCH
 
 
 @pytest.mark.django_db

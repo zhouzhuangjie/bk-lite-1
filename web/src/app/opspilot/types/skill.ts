@@ -5,6 +5,7 @@ export interface Skill {
   created_by: string;
   team: string[];
   team_name: string;
+  usage_team?: number[] | string[];
   is_pinned?: boolean;
   permissions?: string[];
   skill_type?: number;
@@ -19,29 +20,11 @@ export interface ModifySkillModalProps {
   initialValues?: Skill | null;
 }
 
-export interface RagScoreThresholdItem {
-  knowledge_base: number;
-  score: number;
-}
-
-export interface KnowledgeBase {
-  id: number;
-  name: string;
-  introduction?: string;
-}
-
 export interface SelectorOption {
   id: number;
   name: string;
   icon?: string;
   description?: string;
-}
-
-export interface KnowledgeBaseRagSource {
-  id: number,
-  name: string,
-  introduction: string,
-  score?: number
 }
 
 export interface InvocationLogParams {
@@ -84,38 +67,43 @@ export interface SkillParam {
   type: 'text' | 'password';
 }
 
+export interface SkillPackageParam {
+  key: string;
+  value: string;
+  type: 'text' | 'password' | 'textarea';
+  multiline?: boolean;
+}
+
+export interface SkillPackageVariableDecl {
+  name: string;
+  required?: boolean;
+  secret?: boolean;
+  description?: string;
+  /** 声明类型：text 单行明文、password 加密、textarea 多行明文。 */
+  type?: 'text' | 'password' | 'textarea';
+  /** 兼容旧声明；优先认 type。 */
+  input?: 'text' | 'textarea';
+  multiline?: boolean;
+}
+
 export interface SkillDetail extends Skill {
   llm_model?: number;
-  knowledge_base?: number[];
-  knowledge_base_ids?: number[];
   tool_ids?: number[];
   prompt_template?: string;
-  rag_config?: RagConfig;
   temperature?: number;
   skill_prompt?: string;
   skill_params?: SkillParam[];
+  skill_package_params?: Record<string, SkillPackageParam[]>;
   guide?: string;
   show_think?: boolean;
   enable_suggest?: boolean;
   enable_query_rewrite?: boolean;
   enable_conversation_history?: boolean;
-  enable_rag?: boolean;
-  enable_rag_strict_mode?: boolean;
-  enable_rag_knowledge_source?: boolean;
-  rag_score_threshold?: RagScoreThresholdItem[];
   conversation_window_size?: number;
   tools?: unknown[];
-  enable_km_route?: boolean;
-  km_llm_model?: number;
+  wiki_knowledge_bases?: number[];
   desc?: string;
   skill_packages?: SkillPackage[];
-}
-
-export interface RagConfig {
-  enabled: boolean;
-  top_k?: number;
-  score_threshold?: number;
-  rag_score_thresholds?: RagScoreThresholdItem[];
 }
 
 export interface Rule {
@@ -147,7 +135,6 @@ export interface RuleConditionItem {
 
 export interface RuleActionSet {
   skill_prompt?: string;
-  knowledge_base_list?: number[];
 }
 
 export interface RuleParams {
@@ -189,10 +176,8 @@ export interface SkillDetailPayload {
   introduction?: string;
   team?: string[];
   llm_model?: number;
-  knowledge_base_ids?: number[];
   tool_ids?: number[];
   prompt_template?: string;
-  rag_config?: RagConfig;
   skill_packages?: Partial<SkillPackage>[];
   [key: string]: unknown;
 }
@@ -236,6 +221,7 @@ export interface CreateSkillPayload {
   name: string;
   introduction: string;
   team: string[];
+  usage_team?: number[] | string[];
   skill_type: number;
 }
 
@@ -258,6 +244,7 @@ export interface SkillPackage {
   permissions?: string[];
   created_at?: string;
   updated_at?: string;
+  variables?: SkillPackageVariableDecl[];
 }
 
 export interface SkillPackageListResponse {

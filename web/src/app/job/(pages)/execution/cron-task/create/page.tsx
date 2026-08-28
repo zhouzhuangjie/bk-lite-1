@@ -22,8 +22,9 @@ import useJobApi from '@/app/job/api';
 import { JobType, ScheduleType, ScheduledTaskFormData, Script, Playbook } from '@/app/job/types';
 import { useRouter } from 'next/navigation';
 import dayjs from 'dayjs';
-import HostSelectionModal, { HostItem, TargetSourceType } from '@/app/job/components/host-selection-modal';
+import HostSelectionModal, { HostItem, TargetSourceType } from '@/app/job/components/jobHostSelectionModalRuntime';
 import { AddTargetHostButton, TargetSourceSelector } from '@/app/job/components/target-selection-controls';
+import { createDefaultExecutionName } from '@/app/job/utils/execution-name';
 import { useUserInfoContext } from '@/context/userInfo';
 
 const CreateCronTaskPage = () => {
@@ -39,6 +40,7 @@ const CreateCronTaskPage = () => {
   const { selectedGroup } = useUserInfoContext();
 
   const [form] = Form.useForm();
+  const [defaultTaskName] = useState(() => createDefaultExecutionName(t('job.scheduledTask')));
   const [submitting, setSubmitting] = useState(false);
   const [jobType, setJobType] = useState<JobType>('script');
   const [templateType, setTemplateType] = useState<'script' | 'playbook'>('script');
@@ -273,32 +275,25 @@ const CreateCronTaskPage = () => {
   return (
     <div className="w-full h-full overflow-auto pb-6">
       <div
-        className="rounded-lg px-6 py-4 mb-4"
-        style={{
-          background: 'var(--color-bg-1)',
-          border: '1px solid var(--color-border-1)',
-        }}
+        className="rounded-lg px-6 py-4 mb-4 bg-[var(--color-bg-1)] border border-[var(--color-border-1)]"
       >
-        <h2 className="text-base font-medium m-0 mb-1" style={{ color: 'var(--color-text-1)' }}>
+        <h2 className="text-base font-medium m-0 mb-1 text-[var(--color-text-1)]">
           {t('job.createTask')}
         </h2>
-        <p className="text-sm m-0" style={{ color: 'var(--color-text-3)' }}>
+        <p className="text-sm m-0 text-[var(--color-text-3)]">
           {t('job.createTaskDesc')}
         </p>
       </div>
 
       <div
-        className="rounded-lg px-6 py-6"
-        style={{
-          background: 'var(--color-bg-1)',
-          border: '1px solid var(--color-border-1)',
-        }}
+        className="rounded-lg px-6 py-6 bg-[var(--color-bg-1)] border border-[var(--color-border-1)]"
       >
         <Form
           form={form}
           layout="vertical"
           className="w-full"
           initialValues={{
+            name: defaultTaskName,
             timeout: 300,
             dailyTime: dayjs().hour(2).minute(0),
             hourlyInterval: 1,
@@ -498,15 +493,14 @@ const CreateCronTaskPage = () => {
                       value={field.value}
                       onChange={(e) => field.setter(e.target.value)}
                       onBlur={(e) => { if (!e.target.value.trim()) field.setter('*'); }}
-                      className="w-12 text-center font-mono"
-                      style={{ borderColor: 'var(--color-primary)' }}
+                      className="w-12 border-[var(--color-primary)] text-center font-mono"
                     />
                   ))}
                 </div>
-                <div className="text-(--color-text-2) text-center text-sm" style={{ width: '296px' }}>
+                <div className="w-[296px] text-center text-sm text-(--color-text-2)">
                   {describeCron()}
                 </div>
-                <div className="text-sm text-center" style={{ width: '296px' }}>
+                <div className="w-[296px] text-center text-sm">
                   {previewLoading ? (
                     <>
                       <span className="text-(--color-text-3) text-xs">{t('job.cronNextRun')}</span>
@@ -563,6 +557,7 @@ const CreateCronTaskPage = () => {
       <HostSelectionModal
         open={hostModalOpen}
         selectedKeys={selectedHostKeys}
+        selectedHosts={selectedHosts}
         source={targetSource}
         onConfirm={handleHostConfirm}
         onCancel={() => setHostModalOpen(false)}

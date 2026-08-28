@@ -17,6 +17,7 @@ export interface ListItem {
   display_name?: string;
   id?: string | number;
   value?: string | number;
+  color?: string;
 }
 
 export interface ModalConfig {
@@ -145,6 +146,7 @@ export interface GapInterval {
   start: number;
   end: number;
   duration?: number;
+  align?: 'exact';
   series?: Array<{
     metric?: Record<string, string>;
     missing_points?: number;
@@ -153,7 +155,7 @@ export interface GapInterval {
 
 export interface SegmentedItem {
   label: string;
-  value: string;
+  value: string | number;
 }
 
 export interface Pagination {
@@ -203,6 +205,8 @@ export interface InstanceParam {
   add_metrics?: boolean;
   monitor_plugin_id?: React.Key;
   name?: string;
+  /** 精确匹配存储键；用于回填已选实例展示名 */
+  instance_id?: string;
   vm_params?: any;
 }
 
@@ -218,9 +222,17 @@ export interface ObjectItem {
   template_id?: string;
   template_type?: string;
   is_custom?: boolean;
+  is_visible?: boolean;
+  parent?: number | null;
+  level?: 'base' | 'derivative';
   type: string;
   plugin_name?: string;
   plugin_id?: number;
+  parent_monitor_object?: number | string | null;
+  parent_monitor_object_name?: string;
+  parent_monitor_object_display_name?: string;
+  parent_monitor_object_icon?: string;
+  parent_object_display_name?: string;
   display_description?: string;
   description: string;
   display_name?: string;
@@ -230,10 +242,18 @@ export interface ObjectItem {
   icon?: string;
   instance_count?: number;
   display_fields?: {
+    column_key?: string;
     name: string;
     type?: 'metric' | 'field';
+    role?: 'resource_ip';
     sort_order: number;
+    variable_id?: string;
     metrics: { plugin: string; metric: string; field?: string }[];
+  }[];
+  instance_summary_columns?: {
+    fact: string;
+    title: string;
+    order?: number;
   }[];
   options?: ObjectItem[];
   label?: string;
@@ -271,17 +291,29 @@ export interface MetricItem {
   metric_group: number;
   metric_object: number;
   name: string;
+  monitor_plugin_name?: string;
   type: string;
   display_name?: string;
   display_description?: string;
   instance_id_keys?: string[];
   dimensions: Dimension[];
   query?: string;
+  view_query?: string;
+  view_config?: {
+    mode: 'top' | 'bottom' | 'limited';
+    limit?: number;
+  };
   unit?: string;
   displayType?: string;
   description?: string;
+  is_ifmib?: boolean;
   viewData?: ChartData[] | InterfaceTableItem[];
   displayUnit?: string;
+  seriesBudget?: {
+    truncated: boolean;
+    limit: number;
+    applied?: boolean;
+  };
   style?: {
     width: string;
     height: string;
@@ -304,6 +336,7 @@ export interface ThresholdField {
 }
 
 export interface FilterItem {
+  logic?: 'and' | 'or' | null;
   name: string | null;
   method: string | null;
   value: string;

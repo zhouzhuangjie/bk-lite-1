@@ -19,7 +19,6 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from rest_framework.response import Response
 
 from apps.core.utils.ssrf_validator import SSRFError
 from apps.opspilot.serializers.llm_serializer import LLMSerializer
@@ -85,7 +84,8 @@ def test_apply_skill_packages_records_visible_match_summary(mocker):
 
     viewset._apply_skill_packages_to_params(params, skill)
 
-    assert "已命中技能包：Kubernetes Specialist" in params["skill_prompt"]
+    assert "已启用的技能包" in params["skill_prompt"]
+    assert "### Kubernetes Specialist" in params["skill_prompt"]
     assert params["matched_skill_packages"] == [
         {
             "id": "kubernetes-specialist",
@@ -101,6 +101,175 @@ def test_apply_skill_packages_records_visible_match_summary(mocker):
     assert params["skill_package_capabilities"] == ["config_analysis_report", "repair_diff_report"]
     assert params["skill_package_reports"] == {"config_analysis": {"source_tool": "analyze_deployment_configurations"}}
     assert params["skill_package_workflows"] == {"after_config_analysis": [{"type": "choice"}]}
+
+
+def test_apply_skill_packages_keeps_report_capabilities_scoped_to_matched(mocker):
+    """报告门禁只看 matched：寒暄未命中 trigger 时 capabilities 为空；物化仍带 enabled 全集。"""
+    mocker.patch("apps.opspilot.viewsets.llm_view.hydrate_skill_packages", side_effect=lambda packages: packages)
+
+    viewset = LLMViewSet()
+    skill = SimpleNamespace(
+        skill_prompt="你是运维助手。",
+        skill_packages=[
+            {
+                "id": "kubernetes-specialist",
+                "name": "Kubernetes Specialist",
+                "description": "Kubernetes workload troubleshooting",
+                "required_tools": ["kubernetes"],
+                "triggers": ["异常工作负载"],
+                "capabilities": ["config_analysis_report", "repair_diff_report"],
+                "reports": {"config_analysis": {"source_tool": "analyze_deployment_configurations"}},
+                "workflows": {"after_config_analysis": [{"type": "choice"}]},
+                "skill_markdown": "Use workload troubleshooting workflow.",
+            }
+        ],
+    )
+    params = {
+        "skill_prompt": skill.skill_prompt,
+        "user_message": "你好",
+        "tools": [{"name": "kubernetes"}],
+    }
+
+    viewset._apply_skill_packages_to_params(params, skill)
+
+    assert params["matched_skill_packages"] == []
+    assert params["skill_package_capabilities"] == []
+    assert [pkg["id"] for pkg in params["enabled_skill_packages"]] == ["kubernetes-specialist"]
+    assert params["enabled_skill_packages"][0]["missing_params"] == []
+
+
+def _execution_skill():
+    return SimpleNamespace(
+        id=7,
+        name="runtime-skill",
+        skill_type=1,
+        tools=[],
+        team=[999],
+        enable_suggest=False,
+        enable_query_rewrite=False,
+        show_think=False,
+        skill_params=[],
+        skill_packages=[],
+        skill_prompt="",
+        wiki_knowledge_bases=SimpleNamespace(values_list=lambda *args, **kwargs: []),
+    )
+
+
+def _execution_request(*, current_team=None, group_list=None, is_superuser=False):
+    cookies = {"include_children": "1"}
+    if current_team is not None:
+        cookies["current_team"] = current_team
+    return SimpleNamespace(
+        user=SimpleNamespace(
+            id=11,
+            username="alice",
+            domain="example.com",
+            locale="zh-Hans",
+            group_list=[] if group_list is None else group_list,
+            is_superuser=is_superuser,
+            is_authenticated=True,
+        ),
+        data={
+            "skill_id": 7,
+            "user_message": "hello",
+            "group": 123,
+            "caller_identity": {
+                "username": "mallory",
+                "domain": "evil.example",
+                "team_id": 123,
+                "include_children": False,
+                "token": "forged-secret",
+            },
+        },
+        COOKIES=cookies,
+        META={"REMOTE_ADDR": "127.0.0.1"},
+    )
+
+
+@pytest.mark.parametrize(
+    ("action_name", "downstream_name"),
+    [
+        ("execute", "stream_chat"),
+        ("execute_agui", "stream_agui_chat"),
+    ],
+)
+def test_skill_execution_overwrites_forged_caller_identity(action_name, downstream_name, mocker):
+    viewset = LLMViewSet()
+    viewset.loader = None
+    request = _execution_request(current_team="7", group_list=[{"id": 7}])
+    skill = _execution_skill()
+    mocker.patch.object(LLMViewSet, "get_has_permission", return_value=True)
+    mocker.patch.object(LLMViewSet, "_apply_skill_packages_to_params")
+    mocker.patch("apps.opspilot.viewsets.llm_view.merge_skill_params", return_value=[])
+    mocker.patch("apps.opspilot.viewsets.llm_view.LLMSkill.objects.get", return_value=skill)
+    sentinel = object()
+    downstream = mocker.patch(
+        f"apps.opspilot.viewsets.llm_view.{downstream_name}",
+        return_value=sentinel,
+    )
+
+    response = getattr(LLMViewSet, action_name).__wrapped__(viewset, request)
+
+    assert response is sentinel
+    forwarded_params = downstream.call_args.args[0]
+    assert forwarded_params["caller_identity"] == {
+        "username": "alice",
+        "domain": "example.com",
+        "team_id": 7,
+        "include_children": True,
+    }
+    assert "forged-secret" not in json.dumps(forwarded_params)
+
+
+@pytest.mark.parametrize(
+    ("current_team", "group_list", "is_superuser", "message_part"),
+    [
+        (None, [7], False, "current team"),
+        ("not-a-team", [7], False, "positive integer"),
+        ("7", [8], True, "not a member"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("action_name", "downstream_name"),
+    [
+        ("execute", "stream_chat"),
+        ("execute_agui", "stream_agui_chat"),
+    ],
+)
+def test_skill_execution_rejects_invalid_current_team_before_downstream(
+    action_name,
+    downstream_name,
+    current_team,
+    group_list,
+    is_superuser,
+    message_part,
+    mocker,
+):
+    viewset = LLMViewSet()
+    viewset.loader = None
+    request = _execution_request(
+        current_team=current_team,
+        group_list=group_list,
+        is_superuser=is_superuser,
+    )
+    skill_get = mocker.patch(
+        "apps.opspilot.viewsets.llm_view.LLMSkill.objects.get",
+        return_value=_execution_skill(),
+    )
+    downstream = mocker.patch(f"apps.opspilot.viewsets.llm_view.{downstream_name}")
+    sentinel = object()
+    error_response = mocker.patch.object(
+        LLMViewSet,
+        "create_error_stream_response",
+        return_value=sentinel,
+    )
+
+    response = getattr(LLMViewSet, action_name).__wrapped__(viewset, request)
+
+    assert response is sentinel
+    assert message_part in error_response.call_args.args[0]
+    skill_get.assert_not_called()
+    downstream.assert_not_called()
 
 
 class _FakeSkill:
@@ -284,7 +453,7 @@ def test_test_mysql_connection_rejects_private_host(mocker):
     body = _json_body(response)
     assert response.status_code == 400
     assert body["result"] is False
-    assert "private host blocked" in body["message"]
+    assert body["message"] == "Connection target is not allowed"
     guard.assert_called_once_with("10.0.0.5", 3306)
     # 拦截后不得 normalize / 真实测试连接
     normalize.assert_not_called()
@@ -311,7 +480,7 @@ def test_test_redis_connection_rejects_private_url(mocker):
     body = _json_body(response)
     assert response.status_code == 400
     assert body["result"] is False
-    assert "loopback url blocked" in body["message"]
+    assert body["message"] == "Connection target is not allowed"
     normalize.assert_not_called()
     tester.assert_not_called()
 
@@ -372,3 +541,68 @@ def test_get_skill_params_handles_none():
     instance = SimpleNamespace(skill_params=None)
 
     assert LLMSerializer.get_skill_params(instance) == []
+
+
+def test_skill_package_cleanup_storage_path_removes_directory(tmp_path, mocker):
+    """_cleanup_storage_path:storage_path 落在 root 之下时,rmtree 掉。"""
+    from apps.opspilot.viewsets.llm_view import SkillPackageViewSet
+
+    storage_dir = tmp_path / "1" / "my-skill" / "0.1.0"
+    storage_dir.mkdir(parents=True)
+    (storage_dir / "SKILL.md").write_text("# hi")
+
+    mocker.patch(
+        "apps.opspilot.viewsets.llm_view.DEFAULT_SKILL_PACKAGE_ROOT",
+        tmp_path,
+    )
+
+    result = SkillPackageViewSet._cleanup_storage_path(str(storage_dir))
+
+    assert result is True
+    assert not storage_dir.exists()
+    # 上层 /1 目录还在(我们只删 skill_id/version 那一层)
+    assert (tmp_path / "1").exists()
+
+
+def test_skill_package_cleanup_storage_path_refuses_path_outside_root(tmp_path, mocker):
+    """Safety:_cleanup_storage_path 拒绝删 storage_root 之外的目录。"""
+    from apps.opspilot.viewsets.llm_view import SkillPackageViewSet
+
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    (outside_dir / "important.txt").write_text("data")
+
+    mocker.patch(
+        "apps.opspilot.viewsets.llm_view.DEFAULT_SKILL_PACKAGE_ROOT",
+        tmp_path / "totally_unrelated_root",
+    )
+
+    result = SkillPackageViewSet._cleanup_storage_path(str(outside_dir))
+
+    assert result is False
+    # 目录不能被删
+    assert outside_dir.exists()
+    assert (outside_dir / "important.txt").read_text() == "data"
+
+
+def test_skill_package_cleanup_storage_path_empty_string_is_noop(tmp_path, mocker):
+    """空 storage_path(老数据 / 没解压过)不报错,直接返回 False。"""
+    from apps.opspilot.viewsets.llm_view import SkillPackageViewSet
+
+    result = SkillPackageViewSet._cleanup_storage_path("")
+    assert result is False
+
+
+def test_prepare_skill_package_params_copies_stored_when_request_omits_field():
+    stored = {"ad-domain-ops": [{"key": "AD_HOST", "value": "enc", "type": "text"}]}
+    skill = SimpleNamespace(skill_package_params=stored)
+    params = {}
+    assert LLMViewSet._prepare_skill_package_params(params, skill) is None
+    assert params["skill_package_params_overlay"] is stored
+
+
+def test_prepare_skill_package_params_skips_overlay_when_stored_empty():
+    skill = SimpleNamespace(skill_package_params={})
+    params = {}
+    assert LLMViewSet._prepare_skill_package_params(params, skill) is None
+    assert "skill_package_params_overlay" not in params

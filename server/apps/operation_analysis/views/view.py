@@ -9,6 +9,7 @@ from rest_framework.response import Response
 from apps.core.decorators.api_permission import HasPermission
 from apps.core.utils.viewset_utils import AuthViewSet
 from apps.operation_analysis.common.audit_log import get_response_name, log_ops_analysis_success
+from apps.operation_analysis.common.visibility_update import partial_update_groups_with_auth
 from apps.operation_analysis.filters.filters import (
     ArchitectureModelFilter,
     DashboardModelFilter,
@@ -27,6 +28,7 @@ from apps.operation_analysis.serializers.directory_serializers import (
     TopologyModelSerializer,
 )
 from apps.operation_analysis.services.directory_service import DictDirectoryService
+from apps.operation_analysis.services.share_service import SharePermissionDenied, create_or_get_share
 from config.drf.pagination import CustomPageNumberPagination
 
 
@@ -38,11 +40,87 @@ def _raise_if_builtin(instance, action_name="修改"):
         raise PermissionDenied(f"内置对象不允许{action_name}")
 
 
+def _raise_if_builtin_content_update(instance, request):
+    """内置对象仅开放组织可见性配置，内容字段仍保持只读。"""
+    if getattr(instance, "is_build_in", False) and set(request.data.keys()) != {"groups"}:
+        _raise_if_builtin(instance, "编辑")
+
+
+def _destroy_subscribable_canvas(viewset, request, *, resource_type: str, log_action: str):
+    """删除画布前终止关联订阅（Dashboard / Screen / Report 共用）。"""
+    from django.db import transaction
+
+    from apps.operation_analysis.services.canvas_report.registry import get_canvas_report_adapter
+
+    instance = viewset.get_object()
+    _raise_if_builtin(instance, "删除")
+    name = instance.name
+    with transaction.atomic():
+        adapter = get_canvas_report_adapter(resource_type)
+        adapter.terminate_subscriptions_on_delete(
+            instance,
+            actor=getattr(request.user, "username", "") or "",
+            actor_domain=getattr(request.user, "domain", "") or "",
+        )
+        viewset.perform_destroy(instance)
+    response = Response(status=204)
+    log_ops_analysis_success(request, response, "delete", log_action.format(name=name))
+    return response
+
+
+def _create_canvas_share_response(viewset, request, *, resource_type, resource_label):
+    from rest_framework.exceptions import PermissionDenied
+
+    from apps.operation_analysis.services.share_audit import log_share_access
+
+    space_id = viewset._parse_current_team_cookie(request)
+    resource = viewset.get_object()
+    try:
+        result = create_or_get_share(
+            resource_type=resource_type,
+            resource=resource,
+            sharer=request.user,
+            tenant_domain=resource.domain,
+            space_id=space_id,
+        )
+    except SharePermissionDenied as exc:
+        log_share_access(
+            request,
+            action="create",
+            dashboard=resource if resource_type == "dashboard" else None,
+            visitor=request.user,
+            result="reject",
+            reason="permission_denied",
+        )
+        raise PermissionDenied(f"无权分享该{resource_label}") from exc
+    response = Response(
+        {
+            "id": result.link.id,
+            "url": f"/ops-analysis/share/{result.token}",
+            "status": result.link.status,
+            "sharer_username": result.link.sharer_username,
+            "resource_type": result.link.resource_type,
+        }
+    )
+    log_share_access(
+        request,
+        action="create",
+        link=result.link,
+        dashboard=resource if resource_type == "dashboard" else None,
+        visitor=request.user,
+        result="ok",
+    )
+    return response
+
+
 def _partial_update_with_auth(viewset, request, *args, **kwargs):
     """在 ops-analysis 本地保留 PATCH 语义，避免修改公共 AuthViewSet。"""
+    instance = viewset.get_object()
+    if getattr(instance, "is_build_in", False):
+        return partial_update_groups_with_auth(viewset, request, instance)
+
     user = getattr(request, "user", None)
     data = request.data
-    instance = viewset.get_object()
     org_field = viewset.ORGANIZATION_FIELD
     instance_org_value = getattr(instance, org_field, [])
     if not isinstance(instance_org_value, list):
@@ -87,20 +165,37 @@ def _execute_with_clean_validation_error(handler):
 
 class BuiltinVisibleMixin:
     """
-    内置对象跳过实例级权限过滤（但仍受组织过滤约束）。
-    通过 get_queryset_by_permission 将内置对象从权限过滤中排除后合并；
-    在 retrieve 中内置对象跳过实例级校验。
+    运营分析目录/画布：可见性仅按组织归属过滤。
+
+    功能动作（查看/编辑/删除）仍由 HasPermission 功能权限控制；
+    不依赖系统管理实例数据权限或 created_by。
+    内置对象 retrieve 仍可直接返回序列化结果。
     """
 
     def get_queryset_by_permission(self, request, queryset, permission_key=None):
-        builtin_qs = queryset.filter(is_build_in=True)
-        normal_qs = queryset.filter(is_build_in=False)
-        # 内置对象：复用 filter_by_group 做组织过滤（支持 include_children），跳过实例级权限
-        _ct, _ic, _of, org_query = self.filter_by_group(builtin_qs, request, request.user)
-        builtin_filtered = builtin_qs.filter(org_query)
-        # 普通对象：走完整权限过滤
-        normal_filtered = super().get_queryset_by_permission(request, normal_qs, permission_key)
-        return (normal_filtered | builtin_filtered).distinct()
+        _ct, _ic, _of, org_query = self.filter_by_group(queryset, request, request.user)
+        return queryset.filter(org_query)
+
+    def get_has_permission(self, user, instance, current_team, is_list=False, is_check=False, include_children=False):
+        from apps.core.utils.user_group import normalize_user_group_ids
+
+        user_groups = normalize_user_group_ids(getattr(user, "group_list", []))
+        if include_children:
+            group_tree = getattr(user, "group_tree", [])
+            child_groups = self.extract_child_group_ids(group_tree, current_team)
+            if child_groups:
+                user_groups = child_groups
+
+        org_field = getattr(self, "ORGANIZATION_FIELD", "groups")
+        if is_list:
+            for item in instance:
+                org_value = getattr(item, org_field, []) or []
+                if not set(org_value).intersection(set(user_groups)):
+                    return False
+            return True
+
+        org_value = getattr(instance, org_field, []) or []
+        return bool(set(org_value).intersection(set(user_groups)))
 
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -151,7 +246,7 @@ class DirectoryModelViewSet(BuiltinVisibleMixin, AuthViewSet):
     @HasPermission("view-EditCatalogue")
     def partial_update(self, request, *args, **kwargs):
         instance = self.get_object()
-        _raise_if_builtin(instance, "编辑")
+        _raise_if_builtin_content_update(instance, request)
         response = _partial_update_with_auth(self, request, *args, **kwargs)
         name = get_response_name(response, request.data.get("name", instance.name))
         log_ops_analysis_success(request, response, "update", f"编辑目录: {name}")
@@ -214,7 +309,7 @@ class DashboardModelViewSet(BuiltinVisibleMixin, AuthViewSet):
     @HasPermission("view-EditChart")
     def partial_update(self, request, *args, **kwargs):
         instance = self.get_object()
-        _raise_if_builtin(instance, "编辑")
+        _raise_if_builtin_content_update(instance, request)
         response = _execute_with_clean_validation_error(lambda: _partial_update_with_auth(self, request, *args, **kwargs))
         name = get_response_name(response, request.data.get("name", instance.name))
         log_ops_analysis_success(request, response, "update", f"编辑仪表盘: {name}")
@@ -222,12 +317,24 @@ class DashboardModelViewSet(BuiltinVisibleMixin, AuthViewSet):
 
     @HasPermission("view-DeleteChart")
     def destroy(self, request, *args, **kwargs):
-        instance = self.get_object()
-        _raise_if_builtin(instance, "删除")
-        name = instance.name
-        response = super(DashboardModelViewSet, self).destroy(request, *args, **kwargs)
-        log_ops_analysis_success(request, response, "delete", f"删除仪表盘: {name}")
-        return response
+        from apps.operation_analysis.services.canvas_report.types import RESOURCE_TYPE_DASHBOARD
+
+        return _destroy_subscribable_canvas(
+            self,
+            request,
+            resource_type=RESOURCE_TYPE_DASHBOARD,
+            log_action="删除仪表盘: {name}",
+        )
+
+    @HasPermission("view-View")
+    @action(detail=True, methods=["post"], url_path="share")
+    def share(self, request, *args, **kwargs):
+        return _create_canvas_share_response(
+            self,
+            request,
+            resource_type="dashboard",
+            resource_label="仪表盘",
+        )
 
 
 class TopologyModelViewSet(BuiltinVisibleMixin, AuthViewSet):
@@ -271,7 +378,7 @@ class TopologyModelViewSet(BuiltinVisibleMixin, AuthViewSet):
     @HasPermission("view-EditChart")
     def partial_update(self, request, *args, **kwargs):
         instance = self.get_object()
-        _raise_if_builtin(instance, "编辑")
+        _raise_if_builtin_content_update(instance, request)
         response = _execute_with_clean_validation_error(lambda: _partial_update_with_auth(self, request, *args, **kwargs))
         name = get_response_name(response, request.data.get("name", instance.name))
         log_ops_analysis_success(request, response, "update", f"编辑拓扑图: {name}")
@@ -285,6 +392,16 @@ class TopologyModelViewSet(BuiltinVisibleMixin, AuthViewSet):
         response = super(TopologyModelViewSet, self).destroy(request, *args, **kwargs)
         log_ops_analysis_success(request, response, "delete", f"删除拓扑图: {name}")
         return response
+
+    @HasPermission("view-View")
+    @action(detail=True, methods=["post"], url_path="share")
+    def share(self, request, *args, **kwargs):
+        return _create_canvas_share_response(
+            self,
+            request,
+            resource_type="topology",
+            resource_label="拓扑图",
+        )
 
 
 class ArchitectureModelViewSet(BuiltinVisibleMixin, AuthViewSet):
@@ -328,7 +445,7 @@ class ArchitectureModelViewSet(BuiltinVisibleMixin, AuthViewSet):
     @HasPermission("view-EditChart")
     def partial_update(self, request, *args, **kwargs):
         instance = self.get_object()
-        _raise_if_builtin(instance, "编辑")
+        _raise_if_builtin_content_update(instance, request)
         response = _execute_with_clean_validation_error(lambda: _partial_update_with_auth(self, request, *args, **kwargs))
         name = get_response_name(response, request.data.get("name", instance.name))
         log_ops_analysis_success(request, response, "update", f"编辑架构图: {name}")
@@ -342,6 +459,16 @@ class ArchitectureModelViewSet(BuiltinVisibleMixin, AuthViewSet):
         response = super(ArchitectureModelViewSet, self).destroy(request, *args, **kwargs)
         log_ops_analysis_success(request, response, "delete", f"删除架构图: {name}")
         return response
+
+    @HasPermission("view-View")
+    @action(detail=True, methods=["post"], url_path="share")
+    def share(self, request, *args, **kwargs):
+        return _create_canvas_share_response(
+            self,
+            request,
+            resource_type="architecture",
+            resource_label="架构图",
+        )
 
 
 class CanvasModelViewSet(BuiltinVisibleMixin, AuthViewSet):
@@ -383,7 +510,7 @@ class CanvasModelViewSet(BuiltinVisibleMixin, AuthViewSet):
     @HasPermission("view-EditChart")
     def partial_update(self, request, *args, **kwargs):
         instance = self.get_object()
-        _raise_if_builtin(instance, "编辑")
+        _raise_if_builtin_content_update(instance, request)
         response = _execute_with_clean_validation_error(lambda: _partial_update_with_auth(self, request, *args, **kwargs))
         name = get_response_name(response, request.data.get("name", instance.name))
         log_ops_analysis_success(request, response, "update", f"编辑{self.canvas_label}: {name}")
@@ -398,6 +525,20 @@ class CanvasModelViewSet(BuiltinVisibleMixin, AuthViewSet):
         log_ops_analysis_success(request, response, "delete", f"删除{self.canvas_label}: {name}")
         return response
 
+    @HasPermission("view-View")
+    @action(detail=True, methods=["post"], url_path="share")
+    def share(self, request, *args, **kwargs):
+        if not getattr(self, "share_resource_type", None):
+            from rest_framework.exceptions import MethodNotAllowed
+
+            raise MethodNotAllowed("POST")
+        return _create_canvas_share_response(
+            self,
+            request,
+            resource_type=self.share_resource_type,
+            resource_label=self.canvas_label,
+        )
+
 
 class ScreenModelViewSet(CanvasModelViewSet):
     """
@@ -409,6 +550,18 @@ class ScreenModelViewSet(CanvasModelViewSet):
     filterset_class = ScreenModelFilter
     permission_key = "directory.screen"
     canvas_label = "大屏"
+    share_resource_type = "screen"
+
+    @HasPermission("view-DeleteChart")
+    def destroy(self, request, *args, **kwargs):
+        from apps.operation_analysis.services.canvas_report.types import RESOURCE_TYPE_SCREEN
+
+        return _destroy_subscribable_canvas(
+            self,
+            request,
+            resource_type=RESOURCE_TYPE_SCREEN,
+            log_action="删除大屏: {name}",
+        )
 
 
 class ReportModelViewSet(CanvasModelViewSet):
@@ -421,3 +574,15 @@ class ReportModelViewSet(CanvasModelViewSet):
     filterset_class = ReportModelFilter
     permission_key = "directory.report"
     canvas_label = "报表"
+    share_resource_type = "report"
+
+    @HasPermission("view-DeleteChart")
+    def destroy(self, request, *args, **kwargs):
+        from apps.operation_analysis.services.canvas_report.types import RESOURCE_TYPE_REPORT
+
+        return _destroy_subscribable_canvas(
+            self,
+            request,
+            resource_type=RESOURCE_TYPE_REPORT,
+            log_action="删除报表: {name}",
+        )

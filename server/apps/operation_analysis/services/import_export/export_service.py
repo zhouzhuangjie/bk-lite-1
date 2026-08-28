@@ -11,23 +11,28 @@ from typing import Any
 
 import yaml
 
+from apps.operation_analysis.constants.canvas_refresh import CANVAS_REFRESH_OBJECT_TYPES, normalize_canvas_refresh_interval
 from apps.operation_analysis.constants.import_export import (
     BUSINESS_KEY_SEPARATOR,
     CANVAS_TYPES,
     OBJECT_TYPE_TO_SECTION,
-    SENSITIVE_FIELDS,
     SENSITIVE_PLACEHOLDER,
     YAML_SCHEMA_VERSION,
     ObjectType,
     ScopeType,
+    is_sensitive_field_name,
 )
 from apps.operation_analysis.models.datasource_models import DataSourceAPIModel, NameSpace
-from apps.operation_analysis.models.models import Architecture, Dashboard, Report, Screen, Topology
+from apps.operation_analysis.models.models import Architecture, Dashboard, NetworkTopology, Report, Screen, Topology
+from apps.operation_analysis.schemas.import_export_schema import normalize_date_range_param_values
 from apps.operation_analysis.services.import_export.view_sets import (
     normalize_canvas_view_sets_for_storage,
     normalize_canvas_view_sets_for_yaml,
     rewrite_canvas_view_sets_refs_for_yaml,
 )
+from apps.operation_analysis.services.named_option_datasources import collect_named_option_datasource_ids_from_filters
+from apps.operation_analysis.services.network_status_topology_overlay import overlay_datasource_ids_for_view_sets
+from apps.operation_analysis.services.string_param_multiple_migrate import migrate_filters_payload, migrate_param_items
 
 
 class ExportService:
@@ -51,6 +56,7 @@ class ExportService:
         ObjectType.ARCHITECTURE: Architecture,
         ObjectType.SCREEN: Screen,
         ObjectType.REPORT: Report,
+        ObjectType.NETWORK_TOPOLOGY: NetworkTopology,
         ObjectType.DATASOURCE: DataSourceAPIModel,
         ObjectType.NAMESPACE: NameSpace,
     }
@@ -73,22 +79,29 @@ class ExportService:
             return f"{object_type.value}{BUSINESS_KEY_SEPARATOR}{obj.name}"
 
     @staticmethod
-    def mask_sensitive_fields(data: dict) -> dict:
+    def mask_sensitive_fields(data: Any) -> Any:
         """
         对敏感字段进行脱敏处理
 
-        遍历字典，将SENSITIVE_FIELDS中定义的字段值替换为占位符。
+        遍历字典，将敏感字段值替换为占位符。
+        REST headers 的所有值一律脱敏（Header 名可见）。
         """
+        if isinstance(data, list):
+            return [ExportService.mask_sensitive_fields(item) for item in data]
+        if not isinstance(data, dict):
+            return data
+
         result = {}
         for key, value in data.items():
-            if key in SENSITIVE_FIELDS and value:
+            if key == "headers" and isinstance(value, dict):
+                result[key] = {
+                    header_key: (SENSITIVE_PLACEHOLDER if header_value not in (None, "") else header_value)
+                    for header_key, header_value in value.items()
+                }
+            elif is_sensitive_field_name(key) and value:
                 result[key] = SENSITIVE_PLACEHOLDER
-            elif isinstance(value, dict):
-                result[key] = ExportService.mask_sensitive_fields(value)
-            elif isinstance(value, list):
-                result[key] = [ExportService.mask_sensitive_fields(item) if isinstance(item, dict) else item for item in value]
             else:
-                result[key] = value
+                result[key] = ExportService.mask_sensitive_fields(value)
         return result
 
     @staticmethod
@@ -108,20 +121,55 @@ class ExportService:
         )
 
     @staticmethod
-    def convert_datasource_to_yaml(ds: DataSourceAPIModel) -> dict:
-        """将数据源对象转换为YAML结构"""
-        namespace_keys = [ns.name for ns in ds.namespaces.all()]
+    def convert_datasource_to_yaml(ds: DataSourceAPIModel, *, namespace_keys: list[str] | None = None) -> dict:
+        """将数据源对象转换为YAML结构。
+
+        - 公共连接不作为一级对象；引用连接时展开为脱敏内联配置。
+        - 新 Excel 不导出原文件/物化行；旧 imported_items 仅在仍存在时导出以保持兼容。
+        """
+        if namespace_keys is None:
+            namespace_keys = [ns.name for ns in ds.namespaces.all()]
         tag_names = [tag.name for tag in ds.tag.all()]
+
+        # 共享连接展开为可导入的脱敏内联配置，不导出 connection_id。
+        if ds.connection_id:
+            from apps.operation_analysis.services.data_connection.resolver import ConnectionResolveError, resolve_datasource_connection
+
+            try:
+                connection_config = resolve_datasource_connection(ds)
+            except ConnectionResolveError:
+                connection_config = dict(ds.connection_config or {})
+        else:
+            connection_config = dict(ds.connection_config or {})
+
+        query_config = dict(ds.query_config or {})
+        if ds.source_type == DataSourceAPIModel.SOURCE_TYPE_EXCEL:
+            entered_new_model = bool(
+                getattr(ds, "excel_materialization_generation", 0)
+                or getattr(ds, "excel_success_slot_id", None)
+                or getattr(ds, "excel_candidate_slot_id", None)
+            )
+            if entered_new_model:
+                query_config.pop("imported_items", None)
+                query_config.pop("imported_fields", None)
+                query_config.pop("imported_count", None)
+            connection_config.pop("file", None)
+
+        transform_config = ds.transform_config if isinstance(ds.transform_config, dict) else {}
 
         return ExportService.mask_sensitive_fields(
             {
                 "key": ExportService.generate_business_key(ds, ObjectType.DATASOURCE),
                 "name": ds.name,
                 "rest_api": ds.rest_api,
+                "source_type": ds.source_type,
+                "connection_config": connection_config,
+                "query_config": query_config,
+                "transform_config": transform_config,
                 "desc": ds.desc or "",
                 # [内部预留] is_active 字段仅内部使用，无产品功能依赖
                 "is_active": ds.is_active,
-                "params": ds.params or [],
+                "params": normalize_date_range_param_values(migrate_param_items(ds.params or [])[0]),
                 "tags": tag_names,
                 "chart_type": ds.chart_type or [],
                 "field_schema": ds.field_schema or [],
@@ -130,20 +178,25 @@ class ExportService:
         )
 
     @staticmethod
-    def extract_canvas_dependencies(view_sets: list | dict, object_type: ObjectType) -> tuple[set, set]:
+    def extract_canvas_dependencies(
+        view_sets: list | dict,
+        object_type: ObjectType,
+        filters=None,
+    ) -> tuple[set, set]:
         """
         从画布的view_sets中提取依赖的数据源和命名空间
 
         依赖收敛规则：遍历view_sets中的组件配置，提取实际引用的数据源ID和命名空间ID。
+        画布筛选项上的动态选项源也纳入依赖，否则分享/导入会缺下拉选项。
         返回：(datasource_ids, namespace_ids)
         """
         datasource_ids = set()
         namespace_ids = set()
 
-        if not view_sets:
+        if not view_sets and not filters:
             return datasource_ids, namespace_ids
 
-        normalized = normalize_canvas_view_sets_for_storage(view_sets, object_type)
+        normalized = normalize_canvas_view_sets_for_storage(view_sets, object_type) if view_sets else view_sets
 
         def collect_datasource_ids(value: Any):
             if isinstance(value, list):
@@ -163,8 +216,12 @@ class ExportService:
             for nested in value.values():
                 collect_datasource_ids(nested)
 
-        if object_type in CANVAS_TYPES:
+        if object_type in CANVAS_TYPES and normalized:
             collect_datasource_ids(normalized)
+            datasource_ids |= overlay_datasource_ids_for_view_sets(normalized)
+        if isinstance(normalized, dict):
+            datasource_ids |= collect_named_option_datasource_ids_from_filters(normalized.get("filters"))
+        datasource_ids |= collect_named_option_datasource_ids_from_filters(filters)
 
         return datasource_ids, namespace_ids
 
@@ -177,7 +234,10 @@ class ExportService:
         ns_key_map: {namespace_id: namespace_key} 映射
         """
         raw_view_sets = canvas.view_sets if canvas.view_sets is not None else []
-        ds_ids, ns_ids = ExportService.extract_canvas_dependencies(raw_view_sets, object_type)
+        filters = getattr(canvas, "filters", None) if object_type == ObjectType.DASHBOARD else None
+        if filters is None and isinstance(raw_view_sets, dict):
+            filters = raw_view_sets.get("filters")
+        ds_ids, ns_ids = ExportService.extract_canvas_dependencies(raw_view_sets, object_type, filters=filters)
         view_sets = rewrite_canvas_view_sets_refs_for_yaml(
             normalize_canvas_view_sets_for_yaml(raw_view_sets, object_type),
             object_type,
@@ -191,7 +251,6 @@ class ExportService:
             "key": ExportService.generate_business_key(canvas, object_type),
             "name": canvas.name,
             "desc": canvas.desc or "",
-            "other": canvas.other or {},
             "view_sets": view_sets,
             "refs": {
                 "datasource_keys": datasource_keys,
@@ -199,14 +258,24 @@ class ExportService:
             },
         }
 
+        if hasattr(canvas, "other"):
+            base_data["other"] = canvas.other or {}
+
         # Dashboard有额外的filters字段
         if object_type == ObjectType.DASHBOARD and hasattr(canvas, "filters"):
-            base_data["filters"] = canvas.filters or []
+            base_data["filters"] = migrate_filters_payload(canvas.filters or [])[0]
 
-        return base_data
+        if object_type == ObjectType.NETWORK_TOPOLOGY:
+            base_data["base_url"] = canvas.base_url
+            base_data["token"] = canvas.token
+
+        if object_type in CANVAS_REFRESH_OBJECT_TYPES:
+            base_data["refresh_interval"] = normalize_canvas_refresh_interval(getattr(canvas, "refresh_interval", 0))
+
+        return ExportService.mask_sensitive_fields(base_data)
 
     @classmethod
-    def _collect_canvas_dependencies(cls, object_type: str, object_ids: list[int]) -> tuple[set, set]:
+    def _collect_canvas_dependencies(cls, object_type: str, object_ids: list[int], *, lock: bool = False) -> tuple[set, set]:
         collected_datasource_ids = set()
         collected_namespace_ids = set()
 
@@ -216,8 +285,15 @@ class ExportService:
         ot = ObjectType(object_type)
         model = cls.MODEL_MAP[ot]
 
-        for canvas in model.objects.filter(id__in=object_ids):
-            ds_ids, ns_ids = cls.extract_canvas_dependencies(canvas.view_sets or [], ot)
+        canvases = model.objects.filter(id__in=object_ids)
+        if lock:
+            canvases = canvases.select_for_update()
+        for canvas in canvases:
+            filters = getattr(canvas, "filters", None) if ot == ObjectType.DASHBOARD else None
+            view_sets = canvas.view_sets or []
+            if filters is None and isinstance(view_sets, dict):
+                filters = view_sets.get("filters")
+            ds_ids, ns_ids = cls.extract_canvas_dependencies(view_sets, ot, filters=filters)
             collected_datasource_ids.update(ds_ids)
             collected_namespace_ids.update(ns_ids)
 
@@ -232,6 +308,35 @@ class ExportService:
             existing = set(NameSpace.objects.filter(id__in=object_ids).values_list("id", flat=True))
             return set(), existing
         return set(), set()
+
+    @classmethod
+    def collect_export_dependencies(
+        cls,
+        scope_type: str,
+        object_type: str,
+        object_ids: list[int],
+        *,
+        lock: bool = False,
+    ) -> tuple[set[int], set[int], dict[int, set[int]]]:
+        """返回导出依赖闭包及数据源到命名空间的同一时点关系快照。"""
+        if scope_type == ScopeType.CANVAS.value:
+            datasource_ids, namespace_ids = cls._collect_canvas_dependencies(object_type, object_ids, lock=lock)
+        else:
+            datasource_ids, namespace_ids = cls._collect_config_objects(object_type, object_ids)
+
+        datasource_namespace_ids: dict[int, set[int]] = {datasource_id: set() for datasource_id in datasource_ids}
+        if datasource_ids:
+            if lock:
+                list(DataSourceAPIModel.objects.select_for_update().filter(id__in=datasource_ids).only("id"))
+            related_namespaces = DataSourceAPIModel.objects.filter(id__in=datasource_ids).values_list("id", "namespaces__id")
+            for datasource_id, namespace_id in related_namespaces:
+                if namespace_id is None:
+                    continue
+                datasource_namespace_ids[datasource_id].add(namespace_id)
+                namespace_ids.add(namespace_id)
+        if lock and namespace_ids:
+            list(NameSpace.objects.select_for_update().filter(id__in=namespace_ids).only("id"))
+        return datasource_ids, namespace_ids, datasource_namespace_ids
 
     @classmethod
     def _convert_canvases_to_yaml(
@@ -252,7 +357,14 @@ class ExportService:
             export_data[section_name].append(yaml_obj)
 
     @classmethod
-    def export_objects(cls, scope_type: str, object_type: str, object_ids: list[int], organization_id: int = 0) -> dict:
+    def export_objects(
+        cls,
+        scope_type: str,
+        object_type: str,
+        object_ids: list[int],
+        organization_id: int = 0,
+        authorized_dependencies: tuple[set[int], set[int], dict[int, set[int]]] | None = None,
+    ) -> dict:
         """
         导出对象为YAML
 
@@ -261,6 +373,7 @@ class ExportService:
         - object_type: 要导出的对象类型
         - object_ids: 经过组织过滤的合法对象 ID 列表
         - organization_id: 组织ID
+        - authorized_dependencies: 已在同一事务内锁定并通过鉴权的依赖 ID 集
 
         返回：
         {
@@ -280,10 +393,14 @@ class ExportService:
         for section in section_names:
             export_data[section] = []
 
-        if scope_type == ScopeType.CANVAS.value:
-            collected_datasource_ids, collected_namespace_ids = cls._collect_canvas_dependencies(object_type, object_ids)
+        if authorized_dependencies is None:
+            collected_datasource_ids, collected_namespace_ids, datasource_namespace_ids = cls.collect_export_dependencies(
+                scope_type,
+                object_type,
+                object_ids,
+            )
         else:
-            collected_datasource_ids, collected_namespace_ids = cls._collect_config_objects(object_type, object_ids)
+            collected_datasource_ids, collected_namespace_ids, datasource_namespace_ids = authorized_dependencies
 
         ns_key_map = {}
         if collected_namespace_ids:
@@ -294,16 +411,16 @@ class ExportService:
 
         ds_key_map = {}
         if collected_datasource_ids:
-            datasources = DataSourceAPIModel.objects.filter(id__in=collected_datasource_ids).prefetch_related("namespaces", "tag")
+            datasources = DataSourceAPIModel.objects.filter(id__in=collected_datasource_ids).prefetch_related("tag")
             for ds in datasources:
                 ds_key = cls.generate_business_key(ds, ObjectType.DATASOURCE)
                 ds_key_map[ds.id] = ds_key
-                export_data["datasources"].append(cls.convert_datasource_to_yaml(ds))
-
-                for ns in ds.namespaces.all():
-                    if ns.id not in ns_key_map:
-                        ns_key_map[ns.id] = ns.name
-                        export_data["namespaces"].append(cls.convert_namespace_to_yaml(ns))
+                namespace_keys = sorted(
+                    ns_key_map[namespace_id]
+                    for namespace_id in datasource_namespace_ids.get(ds.id, set())
+                    if namespace_id in ns_key_map
+                )
+                export_data["datasources"].append(cls.convert_datasource_to_yaml(ds, namespace_keys=namespace_keys))
 
         cls._convert_canvases_to_yaml(scope_type, object_type, object_ids, ds_key_map, ns_key_map, export_data)
 

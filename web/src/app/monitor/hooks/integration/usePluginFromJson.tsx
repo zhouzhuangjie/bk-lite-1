@@ -1,11 +1,106 @@
 import { useState, useCallback, useMemo } from 'react';
+import { Collapse, Form } from 'antd';
 import { useConfigRenderer } from './useConfigRenderer';
 import { DataMapper } from './useDataMapper';
+import {
+  buildWebsiteRequestUrl,
+  splitWebsiteRequestUrl,
+  validateWebsiteRequestHeaders
+} from './http-request-config';
+import { applyMinioEditConfig, getMinioEditCompatibilityValues } from './minio-config';
+import { resolveSnmpInterfaceFilterMode } from './snmpInterfaceFilterMode';
 import useIntegrationApi from '@/app/monitor/api/integration';
 import useApiClient from '@/utils/request';
+import { useTranslation } from '@/utils/i18n';
+import { normalizePasswordFields } from '@/components/password/normalizePasswordWhitespace';
+
+/**
+ * 兜底：把 formFields 中非必填且用户未填的字段补齐。
+ * 原因：前端表单只回填用户实际改过的字段，未改的 key 不会出现在 formData 里。
+ * 但后端 Jinja2 模板（child.toml.j2）用 `{{ 字段名 }}` 渲染时，未定义的 key 会抛
+ * UndefinedError,触发 "渲染采集模板失败"。
+ *
+ * 文本类可选字段补空串，配合模板 `{% if send %}{% endif %}` 跳过该行。
+ * 布尔开关（或带 default_value 的字段）绝不能补空串：Jinja
+ * `{{ x | default(false) }}` 对已定义的空串不会兜底，会渲出
+ * `insecure_skip_verify = ` 这类非法 TOML，拖垮同机 Telegraf。
+ *
+ * 导出供单元测试使用。
+ */
+export const fillOptionalFormFields = (
+  formData: Record<string, any>,
+  formFields: any[] | undefined
+): Record<string, any> => {
+  if (!formFields?.length) return formData;
+  const result = { ...formData };
+  formFields.forEach((field: any) => {
+    if (field.required === true) return;
+    if (result[field.name] !== undefined) return;
+    if (Object.prototype.hasOwnProperty.call(field, 'default_value')) {
+      result[field.name] = field.default_value;
+      return;
+    }
+    if (field.type === 'switch') {
+      result[field.name] = false;
+      return;
+    }
+    result[field.name] = '';
+  });
+  return result;
+};
+
+const INTERFACE_FILTER_FIELD_NAMES = new Set([
+  'interface_filter_mode',
+  'iftype_exclude',
+  'iftype_include',
+  'ifdescr_exclude',
+  'ifdescr_include'
+]);
+
+interface FieldDependency {
+  field?: string | string[];
+  value?: unknown;
+  conditions?: Array<Array<{ equals?: unknown }>>;
+}
+
+interface AdvancedFormField {
+  name: string;
+  section?: string;
+  dependency?: FieldDependency;
+}
+
+/**
+ * IF-MIB 的接口过滤只在接口表启用时才有意义。此处识别这一类独占高级面板，
+ * 供外层直接随 enable_ifmib 隐藏整个折叠区，避免留下没有字段的空面板。
+ */
+export const isIfmibFilterAdvancedPanel = (advancedFields: AdvancedFormField[]) =>
+  advancedFields.length > 0 &&
+  advancedFields.every(
+    (field) => {
+      const dependency = field.dependency;
+      const enableIfmibIndex = Array.isArray(dependency?.field)
+        ? dependency.field.indexOf('enable_ifmib')
+        : -1;
+      const dependsOnEnabledIfmib =
+        (dependency?.field === 'enable_ifmib' && dependency?.value === true) ||
+        (enableIfmibIndex >= 0 && dependency?.conditions?.[enableIfmibIndex]?.some(
+          (condition) => condition?.equals === true
+        ));
+      return (
+        (field.section === 'interface_filter' || INTERFACE_FILTER_FIELD_NAMES.has(field.name)) &&
+        dependsOnEnabledIfmib
+      );
+    }
+  );
+
+export const shouldRenderAdvancedFieldsPanel = (
+  isIfmibFilterPanel: boolean,
+  enableIfmib: unknown
+) => !isIfmibFilterPanel || enableIfmib !== false;
 
 export const usePluginFromJson = () => {
   const { isLoading } = useApiClient();
+  const { t } = useTranslation();
   const [config, setConfig] = useState<any>(null);
   const [currentPluginId, setCurrentPluginId] = useState<
     string | number | null
@@ -116,7 +211,10 @@ export const usePluginFromJson = () => {
               if (field.visible_in === 'auto' && mode === 'edit') return null;
               if (field.visible_in === 'edit' && mode === 'auto') return null;
             }
-            if (mode === 'edit' && field.editable === false) {
+            if (
+              mode === 'edit'
+              && (field.editable === false || field.name === 'enable_ifmib')
+            ) {
               fieldCopy.widget_props = {
                 ...field.widget_props,
                 disabled: true
@@ -128,6 +226,121 @@ export const usePluginFromJson = () => {
       };
 
       const formFields = getFieldsForMode(config.form_fields || [], extra.mode);
+      const advancedFields = formFields?.filter((field: any) => field.advanced) || [];
+      const basicFields = formFields?.filter((field: any) => !field.advanced) || [];
+      const ADVANCED_SECTION_ORDER = ['request', 'auth', 'response', 'tls', 'interface_filter'];
+      const advancedPanel = config.advanced_panel || {};
+      const isInterfaceFilterAdvanced = isIfmibFilterAdvancedPanel(advancedFields);
+      const advancedTitle =
+        advancedPanel.title ||
+        (isInterfaceFilterAdvanced
+          ? t('monitor.integrations.advancedFilterConfiguration')
+          : t('monitor.integrations.advancedConfiguration'));
+      // 接口过滤只展示功能说明；互斥提示放在字段旁，避免顶部残留旧文案
+      const advancedHint = isInterfaceFilterAdvanced
+        ? t('monitor.integrations.advancedFilterConfigurationHint')
+        : (advancedPanel.hint || t('monitor.integrations.advancedConfigurationHint'));
+
+      const renderAdvancedFieldGroups = (fields: any[]) => {
+        const hasSections = fields.some((field) => field.section);
+        if (!hasSections) {
+          return fields.map((fieldConfig: any) => renderFormField(fieldConfig, extra.mode));
+        }
+
+        const sectionMap = new Map<string, any[]>();
+        fields.forEach((field) => {
+          const section = field.section || 'other';
+          if (!sectionMap.has(section)) sectionMap.set(section, []);
+          sectionMap.get(section)!.push(field);
+        });
+
+        const orderedSections = [
+          ...ADVANCED_SECTION_ORDER.filter((section) => sectionMap.has(section)),
+          ...Array.from(sectionMap.keys()).filter(
+            (section) => !ADVANCED_SECTION_ORDER.includes(section)
+          ),
+        ];
+
+        return (
+          <div className="space-y-5">
+            {orderedSections.map((section) => (
+              <section key={section} className="space-y-3">
+                {/* 仅网站等多分组高级区展示小节标题；单一接口过滤组不再重复标题 */}
+                {orderedSections.length > 1 && (
+                  <div className="border-b border-[var(--color-border-1)] pb-2">
+                    <h4 className="m-0 text-[13px] font-medium leading-5 text-[var(--color-text-1)]">
+                      {t(`monitor.integrations.advancedSections.${section}`)}
+                    </h4>
+                  </div>
+                )}
+                <div className="space-y-1">
+                  {(sectionMap.get(section) || []).map((fieldConfig: any) =>
+                    renderFormField(fieldConfig, extra.mode)
+                  )}
+                </div>
+              </section>
+            ))}
+          </div>
+        );
+      };
+
+      const formItems = (
+        <>
+          {basicFields.map((fieldConfig: any) =>
+            renderFormField(fieldConfig, extra.mode)
+          )}
+          {advancedFields.length > 0 && (() => {
+            // Ant Design：函数子节点的 Form.Item 必须带 truthy 的 shouldUpdate/dependencies，
+            // 否则子节点不会渲染。网站拨测等非 IF-MIB 面板不能写 shouldUpdate={false}。
+            const advancedCollapse = (
+              <Collapse
+                bordered={false}
+                ghost
+                className="mb-4 max-w-[720px] bg-transparent [&_.ant-collapse-header]:!items-center [&_.ant-collapse-header]:!px-0 [&_.ant-collapse-expand-icon]:!me-2 [&_.ant-collapse-content-box]:!px-0 [&_.ant-collapse-content-box]:!pb-1 [&_.ant-collapse-content-box]:!pt-3"
+                expandIconPosition="start"
+                items={[{
+                  key: 'advanced-options',
+                  label: (
+                    <div>
+                      <div className="text-[13px] font-medium leading-5 text-[var(--color-text-1)]">
+                        {advancedTitle}
+                      </div>
+                      {advancedHint ? (
+                        <div className="mt-0.5 text-[12px] font-normal leading-[18px] text-[var(--color-text-3)]">
+                          {advancedHint}
+                        </div>
+                      ) : null}
+                    </div>
+                  ),
+                  forceRender: true,
+                  children: renderAdvancedFieldGroups(advancedFields),
+                }]}
+              />
+            );
+            if (!isInterfaceFilterAdvanced) {
+              return advancedCollapse;
+            }
+            return (
+              <Form.Item
+                noStyle
+                shouldUpdate={(previousValues, currentValues) =>
+                  previousValues.enable_ifmib !== currentValues.enable_ifmib
+                }
+              >
+                {({ getFieldValue }) =>
+                  // 未初始化时沿用 enable_ifmib 默认 true；只有明确关闭才隐藏整个区域。
+                  !shouldRenderAdvancedFieldsPanel(
+                    isInterfaceFilterAdvanced,
+                    getFieldValue('enable_ifmib')
+                  )
+                    ? null
+                    : advancedCollapse
+                }
+              </Form.Item>
+            );
+          })()}
+        </>
+      );
 
       if (extra.mode === 'auto') {
         return {
@@ -136,13 +349,7 @@ export const usePluginFromJson = () => {
           collector: config.collector,
           instance_type: config.instance_type,
           object_name: config.object_name,
-          formItems: (
-            <>
-              {formFields?.map((fieldConfig: any) =>
-                renderFormField(fieldConfig, extra.mode)
-              )}
-            </>
-          ),
+          formItems,
           columns:
             config.table_columns?.map((columnConfig: any) =>
               renderTableColumn(
@@ -165,9 +372,21 @@ export const usePluginFromJson = () => {
               return acc;
             }, {}) || {},
           getParams: (row: any, tableConfig: any) => {
-            return DataMapper.transformAutoRequest(
+            const normalizedRow = normalizePasswordFields(
               row,
-              tableConfig.dataSource || [],
+              formFields,
+              { includeReadOnly: true }
+            ).values;
+            const normalizedDataSource = (tableConfig.dataSource || []).map(
+              (item: Record<string, unknown>) =>
+                normalizePasswordFields(item, config.table_columns, {
+                  includeReadOnly: true
+                }).values
+            );
+            const filledRow = fillOptionalFormFields(normalizedRow, formFields);
+            return DataMapper.transformAutoRequest(
+              filledRow,
+              normalizedDataSource,
               {
                 config_type: config.config_type,
                 collect_type: config.collect_type,
@@ -192,13 +411,7 @@ export const usePluginFromJson = () => {
           collector: config.collector,
           instance_type: config.instance_type,
           object_name: config.object_name,
-          formItems: (
-            <>
-              {formFields?.map((fieldConfig: any) =>
-                renderFormField(fieldConfig, extra.mode)
-              )}
-            </>
-          ),
+          formItems,
           getDefaultForm: (apiData: any) => {
             const formValues: any = {};
             formFields?.forEach((field: any) => {
@@ -212,6 +425,32 @@ export const usePluginFromJson = () => {
                 );
               }
             });
+            // interface_filter_mode 不落库，需从 tagpass/tagdrop 反推，避免编辑回显恒为 exclude。
+            if (formFields?.some((field: any) => field?.name === 'interface_filter_mode')) {
+              formValues.interface_filter_mode = resolveSnmpInterfaceFilterMode(formValues);
+            }
+            if (config.instance_type === 'minio') {
+              Object.assign(formValues, getMinioEditCompatibilityValues(apiData));
+            }
+            if (config.instance_type === 'web') {
+              const requestUrl = apiData?.child?.content?.config?.urls?.[0];
+              if (requestUrl) {
+                const { baseUrl, entries } = splitWebsiteRequestUrl(requestUrl);
+                formValues.monitor_url = baseUrl;
+                formValues.request_params = entries;
+              }
+              const childConfig = apiData?.child?.content?.config || {};
+              const authorization = childConfig.headers?.Authorization || childConfig.headers?.authorization;
+              formValues.request_method = childConfig.method || 'GET';
+              formValues.request_headers = Object.entries(childConfig.headers || {})
+                .filter(([key]) => key.toLowerCase() !== 'authorization')
+                .map(([key, value]) => ({ key, value: String(value ?? '') }));
+              formValues.auth_type = authorization
+                ? 'bearer'
+                : childConfig.username
+                  ? 'basic'
+                  : 'none';
+            }
             return formValues;
           },
           getParams: (formData: any, configForm: any) => {
@@ -235,9 +474,12 @@ export const usePluginFromJson = () => {
                 env_config: { ...configForm.base.env_config }
               };
             }
+            // 把非必填字段未填的补成空串,避免后端 Jinja2 模板 {{ 字段名 }} 抛
+            // UndefinedError；后端 child.toml.j2 用 {% if 字段 %}{% endif %} 跳过空串
+            const filledFormData = { ...formData };
             formFields?.forEach((field: any) => {
               const { name, transform_on_edit, editable } = field;
-              const formValue = formData[name];
+              const formValue = filledFormData[name];
               // 跳过不可编辑的字段（只用于回显，不应写入）
               if (editable === false) {
                 return;
@@ -251,7 +493,7 @@ export const usePluginFromJson = () => {
                   transform_on_edit,
                   'toApi',
                   undefined,
-                  formData
+                  filledFormData
                 );
                 // 如果转换后的值是 undefined，跳过（表示该字段不需要写入）
                 if (transformedValue === undefined) {
@@ -283,6 +525,89 @@ export const usePluginFromJson = () => {
                 }
               }
             });
+            // SNMP 接口黑白名单：空数组/空串不得写成 []（会误杀全部接口），改为删除对应键
+            if (
+              String(config.collect_type || '').startsWith('snmp') &&
+              result?.child?.content?.config
+            ) {
+              const snmpFilterNames = new Set(
+                (formFields || [])
+                  .map((field: any) => field?.name)
+                  .filter((name: string) =>
+                    [
+                      'iftype_include',
+                      'iftype_exclude',
+                      'ifdescr_include',
+                      'ifdescr_exclude'
+                    ].includes(name)
+                  )
+              );
+              if (snmpFilterNames.size) {
+                const snmpConfig = result.child.content.config;
+                const pruneFilterKey = (
+                  tableName: 'tagpass' | 'tagdrop',
+                  key: string,
+                  value: any
+                ) => {
+                  const empty =
+                    value == null ||
+                    value === '' ||
+                    (Array.isArray(value) && value.length === 0);
+                  if (!snmpConfig[tableName]) {
+                    return;
+                  }
+                  if (empty) {
+                    delete snmpConfig[tableName][key];
+                    if (Object.keys(snmpConfig[tableName]).length === 0) {
+                      delete snmpConfig[tableName];
+                    }
+                  }
+                };
+                if (snmpFilterNames.has('iftype_include')) {
+                  pruneFilterKey(
+                    'tagpass',
+                    'ifType',
+                    filledFormData.iftype_include
+                  );
+                }
+                if (snmpFilterNames.has('iftype_exclude')) {
+                  pruneFilterKey(
+                    'tagdrop',
+                    'ifType',
+                    filledFormData.iftype_exclude
+                  );
+                }
+                if (snmpFilterNames.has('ifdescr_include')) {
+                  const descrInclude = DataMapper.transformValue(
+                    filledFormData.ifdescr_include,
+                    {
+                      origin_path: 'child.content.config.tagpass.ifDescr',
+                      to_api: { split: ',' }
+                    },
+                    'toApi',
+                    undefined,
+                    filledFormData
+                  );
+                  pruneFilterKey('tagpass', 'ifDescr', descrInclude);
+                }
+                if (snmpFilterNames.has('ifdescr_exclude')) {
+                  const descrExclude = DataMapper.transformValue(
+                    filledFormData.ifdescr_exclude,
+                    {
+                      origin_path: 'child.content.config.tagdrop.ifDescr',
+                      to_api: { split: ',' }
+                    },
+                    'toApi',
+                    undefined,
+                    filledFormData
+                  );
+                  pruneFilterKey('tagdrop', 'ifDescr', descrExclude);
+                }
+                if (!snmpConfig.tagexclude) {
+                  snmpConfig.tagexclude = ['ifType'];
+                }
+              }
+            }
             // 处理额外字段（extra_edit_fields）
             if (config.extra_edit_fields) {
               Object.entries(config.extra_edit_fields).forEach(
@@ -295,7 +620,7 @@ export const usePluginFromJson = () => {
                       transformConfig,
                       'toApi',
                       undefined,
-                      formData
+                      filledFormData
                     );
                     const targetPath = transformConfig.origin_path;
                     if (targetPath && transformedValue !== undefined) {
@@ -308,6 +633,88 @@ export const usePluginFromJson = () => {
                   }
                 }
               );
+            }
+            if (config.instance_type === 'web') {
+              const childConfig = result.child.content.config;
+              const childEnvConfig = result.child.env_config || {};
+              result.child.env_config = childEnvConfig;
+              const childConfigId = String(result.child.id || '').toUpperCase();
+              const passwordEnvKey = `PASSWORD__${childConfigId}`;
+              const bearerEnvKey = `BEARER_TOKEN__${childConfigId}`;
+              const setOptionalConfig = (key: string, value: any) => {
+                if (value === undefined) return;
+                if (value === null || value === '') {
+                  delete childConfig[key];
+                  return;
+                }
+                childConfig[key] = value;
+              };
+              result.child.content.config.urls = [
+                buildWebsiteRequestUrl(
+                  String(filledFormData.monitor_url || ''),
+                  filledFormData.request_params || []
+                )
+              ];
+              result.child.content.config.headers = Object.fromEntries(
+                validateWebsiteRequestHeaders(filledFormData.request_headers || []).map(
+                  ({ key, value }) => [key, value]
+                )
+              );
+              childConfig.method = filledFormData.request_method || 'GET';
+              if (childConfig.method !== 'POST') {
+                delete childConfig.body;
+              } else {
+                setOptionalConfig('body', filledFormData.request_body);
+              }
+              setOptionalConfig('response_status_code', filledFormData.response_status_code);
+              setOptionalConfig('response_string_match', filledFormData.response_string_match);
+              setOptionalConfig(
+                'response_timeout',
+                filledFormData.response_timeout === undefined
+                  ? undefined
+                  : filledFormData.response_timeout === null || filledFormData.response_timeout === ''
+                    ? ''
+                    : `${filledFormData.response_timeout}s`
+              );
+              if (filledFormData.follow_redirects === undefined || filledFormData.follow_redirects === '') {
+                delete childConfig.follow_redirects;
+              } else {
+                childConfig.follow_redirects = filledFormData.follow_redirects;
+              }
+              // 布尔开关：空串/缺省一律写成 false，避免 toml.dumps 产出
+              // insecure_skip_verify = "" 拖垮同机 Telegraf。
+              childConfig.insecure_skip_verify =
+                filledFormData.insecure_skip_verify === true ||
+                filledFormData.insecure_skip_verify === 'true';
+              if (filledFormData.auth_type === 'basic') {
+                delete result.child.content.config.bearer_token;
+                delete result.child.content.config.headers.Authorization;
+                delete result.child.content.config.headers.authorization;
+                delete childEnvConfig[bearerEnvKey];
+                result.child.content.config.password = `\${${passwordEnvKey}}`;
+                if (filledFormData.ENV_PASSWORD !== undefined) {
+                  childEnvConfig[passwordEnvKey] = filledFormData.ENV_PASSWORD;
+                }
+              } else if (filledFormData.auth_type === 'bearer') {
+                delete result.child.content.config.username;
+                delete result.child.content.config.password;
+                result.child.content.config.headers.Authorization = `Bearer \${${bearerEnvKey}}`;
+                delete childEnvConfig[passwordEnvKey];
+                if (filledFormData.ENV_BEARER_TOKEN !== undefined) {
+                  childEnvConfig[bearerEnvKey] = filledFormData.ENV_BEARER_TOKEN;
+                }
+              } else {
+                delete result.child.content.config.username;
+                delete result.child.content.config.password;
+                delete result.child.content.config.bearer_token;
+                delete result.child.content.config.headers.Authorization;
+                delete result.child.content.config.headers.authorization;
+                delete childEnvConfig[passwordEnvKey];
+                delete childEnvConfig[bearerEnvKey];
+              }
+            }
+            if (config.instance_type === 'minio') {
+              applyMinioEditConfig(result, configForm, filledFormData);
             }
             // 如果有 base，统一同步 child.env_config 到 base.env_config
             if (result.base && result.child?.env_config) {
@@ -338,7 +745,7 @@ export const usePluginFromJson = () => {
         getDefaultForm: () => ({})
       };
     },
-    [config, currentPluginId, renderFormField, renderTableColumn]
+    [config, currentPluginId, renderFormField, renderTableColumn, t]
   );
 
   return useMemo(

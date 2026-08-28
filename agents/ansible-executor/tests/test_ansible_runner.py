@@ -1,3 +1,4 @@
+import json
 import sys
 import zipfile
 
@@ -5,16 +6,46 @@ import pytest
 from core.config import ServiceConfig
 from service import ansible_runner
 from service.ansible_runner import (
+    AdhocRequest,
     PlaybookRequest,
     _build_host_credentials_inventory,
     _quote_inventory_value,
+    _redact_cli_command,
     _safe_extract_zip,
     _safe_workspace_path,
     parse_ansible_output_per_host,
     parse_playbook_recap,
+    prepare_adhoc_execution,
     prepare_playbook_execution,
     run_command,
+    to_adhoc_request,
 )
+
+
+def test_redact_cli_command_hides_extra_vars_values():
+    command = ["ansible-playbook", "playbook.yml", "--extra-vars", '{"bklite_session_url":"secret"}']
+
+    assert _redact_cli_command(command) == ["ansible-playbook", "playbook.yml", "--extra-vars", "***"]
+    assert command[-1] != "***"
+
+
+def test_to_adhoc_request_accepts_windows_stream_type():
+    request = to_adhoc_request(
+        {
+            "inventory": "localhost,",
+            "module": "win_shell",
+            "stream_remote_output": True,
+            "stream_remote_type": "PowerShell",
+        }
+    )
+
+    assert request.stream_remote_output is True
+    assert request.stream_remote_type == "powershell"
+
+
+def test_to_adhoc_request_rejects_unknown_windows_stream_type():
+    with pytest.raises(ValueError, match="stream_remote_type must be bat or powershell"):
+        to_adhoc_request({"inventory": "localhost,", "stream_remote_type": "python"})
 
 
 def test_safe_workspace_path_rejects_parent_escape(tmp_path):
@@ -183,6 +214,27 @@ async def test_prepare_playbook_execution_rejects_missing_explicit_zip_playbook_
 
 
 @pytest.mark.asyncio
+async def test_prepare_playbook_execution_keeps_extra_vars_out_of_process_arguments(tmp_path, monkeypatch):
+    monkeypatch.setattr(ansible_runner, "BASE_TASK_DIR", tmp_path / "work")
+    config = ServiceConfig(nats_servers=["nats://127.0.0.1:4222"], nats_instance_id="default")
+    request = PlaybookRequest(
+        playbook_content="- hosts: all\n  gather_facts: false\n  tasks: []\n",
+        inventory_content="[all]\n127.0.0.1 ansible_connection=local\n",
+        extra_vars={"bklite_session_url": "https://server.example/session/secret"},
+        task_id="secret-extra-vars",
+    )
+
+    command, workspace, _ = await prepare_playbook_execution(config, request)
+
+    assert not any("session/secret" in argument for argument in command)
+    extra_vars_reference = command[command.index("--extra-vars") + 1]
+    assert extra_vars_reference.startswith("@")
+    extra_vars_path = workspace / extra_vars_reference.removeprefix("@")
+    assert json.loads(extra_vars_path.read_text(encoding="utf-8"))["bklite_session_url"].endswith("/secret")
+    assert extra_vars_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
 async def test_run_command_returns_untruncated_output_for_small_payload():
     code, output, output_meta = await run_command(
         [sys.executable, "-c", "print('hello world')"],
@@ -298,3 +350,156 @@ def test_host_credentials_inventory_password_with_hash_survives_shlex_parsing(tm
     assert "ansible_password=CW@roger1117!@#" in tokens
     # 行内 '#' 之后的连接参数不能被注释吃掉
     assert "ansible_connection=ssh" in tokens
+
+
+def test_host_credentials_inventory_uses_configured_known_hosts_for_password_ssh(tmp_path, monkeypatch):
+    known_hosts_file = tmp_path / "known_hosts"
+    known_hosts_file.write_text("", encoding="utf-8")
+    monkeypatch.setenv("SSH_KNOWN_HOSTS_FILE", str(known_hosts_file))
+
+    inventory = _build_host_credentials_inventory(
+        tmp_path,
+        [
+            {
+                "host": "10.0.0.8",
+                "user": "root",
+                "password": "credential",
+                "connection": "ssh",
+                "port": 22,
+            }
+        ],
+    )
+
+    assert "StrictHostKeyChecking=yes" in inventory
+    assert f"UserKnownHostsFile={known_hosts_file}" in inventory
+    assert "StrictHostKeyChecking=no" not in inventory
+    assert "UserKnownHostsFile=/dev/null" not in inventory
+
+
+def test_host_credentials_inventory_rejects_missing_configured_known_hosts(tmp_path, monkeypatch):
+    monkeypatch.setenv("SSH_KNOWN_HOSTS_FILE", str(tmp_path / "missing-known-hosts"))
+
+    with pytest.raises(ValueError, match=r"SSH_KNOWN_HOSTS_FILE.*FileNotFoundError"):
+        _build_host_credentials_inventory(
+            tmp_path,
+            [{"host": "10.0.0.8", "user": "root", "password": "credential", "connection": "ssh"}],
+        )
+
+
+def test_host_credentials_inventory_rejects_unreadable_configured_known_hosts(tmp_path, monkeypatch):
+    known_hosts_file = tmp_path / "known_hosts"
+    known_hosts_file.write_text("", encoding="utf-8")
+    original_open = type(known_hosts_file).open
+
+    def denied_open(path, *args, **kwargs):
+        if path == known_hosts_file:
+            raise PermissionError("denied by test")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setenv("SSH_KNOWN_HOSTS_FILE", str(known_hosts_file))
+    monkeypatch.setattr(type(known_hosts_file), "open", denied_open)
+
+    with pytest.raises(ValueError, match=r"SSH_KNOWN_HOSTS_FILE.*PermissionError"):
+        _build_host_credentials_inventory(
+            tmp_path,
+            [{"host": "10.0.0.8", "user": "root", "password": "credential", "connection": "ssh"}],
+        )
+
+
+def test_host_credentials_inventory_explicit_ssh_args_override_configured_known_hosts(tmp_path, monkeypatch):
+    monkeypatch.setenv("SSH_KNOWN_HOSTS_FILE", "/etc/ansible-executor/known_hosts")
+    explicit_args = "-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/custom/known_hosts"
+
+    inventory = _build_host_credentials_inventory(
+        tmp_path,
+        [
+            {
+                "host": "10.0.0.8",
+                "user": "root",
+                "password": "credential",
+                "connection": "ssh",
+                "ssh_common_args": explicit_args,
+            }
+        ],
+    )
+
+    assert "StrictHostKeyChecking=accept-new" in inventory
+    assert "UserKnownHostsFile=/custom/known_hosts" in inventory
+    assert "UserKnownHostsFile=/etc/ansible-executor/known_hosts" not in inventory
+
+
+def test_host_credentials_inventory_warns_when_password_ssh_keeps_legacy_host_key_policy(tmp_path, monkeypatch, caplog):
+    monkeypatch.delenv("SSH_KNOWN_HOSTS_FILE", raising=False)
+
+    inventory = _build_host_credentials_inventory(
+        tmp_path,
+        [
+            {
+                "host": "10.0.0.8\nforged-audit-entry",
+                "user": "root",
+                "password": "credential",
+                "connection": "ssh",
+            },
+            {
+                "host": "10.0.0.9",
+                "user": "root",
+                "password": "credential",
+                "connection": "ssh",
+            },
+        ],
+    )
+
+    assert "StrictHostKeyChecking=no" in inventory
+    assert "UserKnownHostsFile=/dev/null" in inventory
+    assert caplog.text.count("password SSH host key verification is disabled") == 1
+    assert "host_count=2" in caplog.text
+    assert "forged-audit-entry" not in caplog.text
+    assert "credential" not in caplog.text
+
+
+def test_host_credentials_inventory_can_disable_winrm_certificate_validation(tmp_path):
+    inventory = _build_host_credentials_inventory(
+        tmp_path,
+        [
+            {
+                "host": "10.0.0.8",
+                "user": "Administrator",
+                "password": "credential",
+                "connection": "winrm",
+                "port": 5986,
+                "winrm_scheme": "https",
+                "winrm_transport": "ntlm",
+                "winrm_cert_validation": False,
+            }
+        ],
+    )
+
+    assert "ansible_winrm_server_cert_validation=ignore" in inventory
+
+
+def test_prepare_adhoc_execution_restricts_credential_inventory_permissions(tmp_path, monkeypatch):
+    monkeypatch.setattr(ansible_runner, "BASE_TASK_DIR", tmp_path / "work")
+    _, workspace = prepare_adhoc_execution(
+        AdhocRequest(
+            host_credentials=[{"host": "10.0.0.8", "user": "Administrator", "password": "secret"}],
+            module="ping",
+            task_id="restricted-adhoc-inventory",
+        )
+    )
+
+    assert (workspace / "inventory.ini").stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+async def test_prepare_playbook_execution_restricts_credential_inventory_permissions(tmp_path, monkeypatch):
+    monkeypatch.setattr(ansible_runner, "BASE_TASK_DIR", tmp_path / "work")
+    config = ServiceConfig(nats_servers=["nats://127.0.0.1:4222"], nats_instance_id="default")
+    request = PlaybookRequest(
+        playbook_content="- hosts: all\n  gather_facts: false\n  tasks: []\n",
+        host_credentials=[{"host": "10.0.0.8", "user": "Administrator", "password": "secret"}],
+        task_id="restricted-playbook-inventory",
+    )
+
+    _, workspace, _ = await prepare_playbook_execution(config, request)
+
+    assert (workspace / "inventory.ini").stat().st_mode & 0o777 == 0o600

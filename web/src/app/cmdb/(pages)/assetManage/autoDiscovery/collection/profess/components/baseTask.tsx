@@ -13,6 +13,12 @@ import { useInstanceApi, useCollectApi, useModelApi } from '@/app/cmdb/api';
 import styles from '../index.module.scss';
 import CustomTable from '@/components/custom-table';
 import IpRangeInput from '@/app/cmdb/components/ipInput';
+import {
+  IP_RANGE_CYCLE_HINT_THRESHOLD,
+  ipRangeSize,
+  isIpRangeOrderValid,
+  isIpRangeWithinLimit,
+} from '@/app/cmdb/components/ipInput/ipRangeLimits';
 import { useCommon } from '@/app/cmdb/context/common';
 import { FieldModalRef } from '@/app/cmdb/types/assetManage';
 import { useTranslation } from '@/utils/i18n';
@@ -21,6 +27,10 @@ import { ModelItem } from '@/app/cmdb/types/autoDiscovery';
 import GroupTreeSelector from '@/components/group-tree-select';
 import { useAssetManageStore } from '@/app/cmdb/store';
 import { useUserInfoContext } from '@/context/userInfo';
+import {
+  CmdbInstanceOption,
+  toCmdbInstanceOptions,
+} from '@/app/cmdb/utils/instanceOption';
 
 import {
   CYCLE_OPTIONS,
@@ -63,6 +73,9 @@ const ACCESS_POINT_TASK_TYPES = [
   'ipmi',
   'ip', // IP 发现：由接入点直连目标网段执行探测（规格 §13.1）
 ];
+const LONG_TOOLTIP_OVERLAY_STYLE = {
+  maxWidth: 'min(520px, calc(100vw - 48px))',
+};
 
 import {
   CaretRightOutlined,
@@ -83,10 +96,12 @@ import {
   Select,
   Dropdown,
   Drawer,
+  Alert,
+  Switch,
 } from 'antd';
 
 interface TableItem {
-  _id?: string;
+  inst_uuid?: string;
   model_id?: string;
   model_name?: string;
 }
@@ -95,22 +110,26 @@ interface BaseTaskFormProps {
   children?: React.ReactNode;
   nodeId?: string;
   showAdvanced?: boolean;
+  showTimeout?: boolean;
+  showIpPrecheck?: boolean;
   modelItem: ModelItem;
   submitLoading?: boolean;
   instPlaceholder?: string;
   assetOptionLabel?: string;
   timeoutProps?: {
     min?: number;
+    max?: number;
     defaultValue?: number;
     addonAfter?: string;
   };
   onClose: () => void;
   onTest?: () => void;
   submitText?: string;
+  singleInstanceOnly?: boolean;
 }
 
 export interface BaseTaskRef {
-  instOptions: { label: string; value: string;[key: string]: any }[];
+  instOptions: CmdbInstanceOption[];
   accessPoints: { label: string; value: string;[key: string]: any }[];
   selectedData: TableItem[];
   ipRange: string[];
@@ -124,11 +143,14 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
     {
       children,
       showAdvanced = true,
+      showTimeout = true,
+      showIpPrecheck = true,
       nodeId,
       submitLoading,
       modelItem,
       timeoutProps = {
-        min: 0,
+        min: 1,
+        max: 86400,
         defaultValue: 600,
         addonAfter: '',
       },
@@ -137,6 +159,7 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
       onClose,
       onTest,
       submitText,
+      singleInstanceOnly = false,
     },
     ref
   ) => {
@@ -145,6 +168,7 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
     const { model_id: modelId, task_type: taskType, target_model_id: targetModelId } = modelItem;
     const isNetworkConfigFileTask = modelId === 'network_config_file';
     const instanceModelId = targetModelId || modelId;
+    const previousInstanceModelIdRef = useRef(instanceModelId);
     const normalizedTaskType = taskType || nodeId || '';
     const { t } = useTranslation();
     const guardClose = useUnsavedConfirm();
@@ -158,9 +182,7 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
     const users = useRef(commonContext?.userList || []);
     const userList = users.current;
     const [instOptLoading, setOptLoading] = useState(false);
-    const [instOptions, setOptions] = useState<
-      { label: string; value: string }[]
-    >([]);
+    const [instOptions, setOptions] = useState<CmdbInstanceOption[]>([]);
     const [ipRange, setIpRange] = useState<string[]>([]);
     const [collectionType, setCollectionType] = useState('ip');
     const [selectedData, setSelectedData] = useState<TableItem[]>([]);
@@ -178,7 +200,7 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
     const [instData, setInstData] = useState<any[]>([]);
     const [instLoading, setInstLoading] = useState(false);
     const [ipRangeOrg, setIpRangeOrg] = useState<number[]>([]);
-    const [selectedInstIds, setSelectedInstIds] = useState<number[]>([]);
+    const [selectedInstUuids, setSelectedInstUuids] = useState<string[]>([]);
     const cleanupStrategyValue = Form.useWatch('cleanupStrategy', form);
     const accessPointId = Form.useWatch('accessPointId', form);
     const organizationValue = Form.useWatch('organization', form);
@@ -205,16 +227,15 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
       return current.every((item, index) => item === next[index]);
     };
 
-    const supportsIpSelection = IP_SELECTION_TASK_TYPES.includes(
+    const supportsIpSelection = !singleInstanceOnly && IP_SELECTION_TASK_TYPES.includes(
       normalizedTaskType
     );
     const supportsAssetOnlySelection = ASSET_ONLY_SELECTION_TASK_TYPES.includes(
       normalizedTaskType
     );
 
-    const requiresSingleInstanceSelect = SINGLE_INSTANCE_SELECT_TASK_TYPES.includes(
-      normalizedTaskType
-    );
+    const requiresSingleInstanceSelect = singleInstanceOnly
+      || SINGLE_INSTANCE_SELECT_TASK_TYPES.includes(normalizedTaskType);
     const requiresAccessPointSelect = ACCESS_POINT_TASK_TYPES.includes(
       normalizedTaskType
     );
@@ -338,10 +359,10 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
     useEffect(() => {
       if (selectedData.length && instData.length) {
         const selectedInsts = instData.filter((item) =>
-          selectedData.some((d) => d._id === item._id)
+          selectedData.some((d) => d.inst_uuid === item.inst_uuid)
         );
         setSelectedRows(selectedInsts);
-        setSelectedKeys(selectedInsts.map((item) => item._id));
+        setSelectedKeys(selectedInsts.map((item) => item.inst_uuid));
       }
     }, [selectedData, instData]);
 
@@ -459,7 +480,7 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
 
     const handleDeleteRow = (record: TableItem) => {
       const newSelectedData = selectedData.filter(
-        (item: any) => item._id !== record._id
+        (item) => item.inst_uuid !== record.inst_uuid
       );
       setSelectedData(newSelectedData);
       form.setFieldValue('assetInst', newSelectedData);
@@ -470,7 +491,7 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
         return;
       }
       const newSelectedData = selectedData.filter(
-        (item: any) => !displaySelectedKeys.includes(item._id)
+        (item) => !displaySelectedKeys.includes(item.inst_uuid)
       );
       setSelectedData(newSelectedData);
       form.setFieldValue('assetInst', newSelectedData);
@@ -507,10 +528,20 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
     );
 
     useEffect(() => {
+      if (previousInstanceModelIdRef.current === instanceModelId) {
+        return;
+      }
+      previousInstanceModelIdRef.current = instanceModelId;
+      form.setFieldValue('instUuid', undefined);
+      setOptions([]);
+      setSelectedInstUuids([]);
+    }, [form, instanceModelId]);
+
+    useEffect(() => {
       const init = async () => {
         if (requiresSingleInstanceSelect) {
           const selectedIds = (await fetchSelectedInstances()) || [];
-          setSelectedInstIds(selectedIds);
+          setSelectedInstUuids(selectedIds);
           fetchOptions(selectedIds);
         }
 
@@ -537,7 +568,7 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
       }
     };
 
-    const fetchOptions = async (instIds: number[] = []) => {
+    const fetchOptions = async (instUuids: string[] = []) => {
       try {
         setOptLoading(true);
         const data = await instanceApi.searchInstances({
@@ -545,15 +576,13 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
           page: 1,
           page_size: 10000,
         });
-        const currentInstId = form.getFieldValue('instId');
+        const currentInstUuid = form.getFieldValue('instUuid');
         setOptions(
-          data.insts.map((item: any) => ({
-            label: item.inst_name,
-            value: item._id,
-            origin: item,
-            disabled: (instIds.length ? instIds : selectedInstIds)
-              .filter((id) => id !== currentInstId)
-              .includes(item._id),
+          toCmdbInstanceOptions(data.insts || []).map((option) => ({
+            ...option,
+            disabled: (instUuids.length ? instUuids : selectedInstUuids)
+              .filter((instUuid) => instUuid !== currentInstUuid)
+              .includes(option.value),
           }))
         );
       } catch (error) {
@@ -589,7 +618,7 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
 
     const showFieldModal = async () => {
       try {
-        const attrList = await modelApi.getModelAttrList(modelId);
+        const attrList = await modelApi.getModelAttrList(instanceModelId);
         // API 返回扁平数组，需要转换为分组结构
         const groupMap = new Map<string, any[]>();
         (attrList || []).forEach((attr: any) => {
@@ -711,7 +740,7 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
                         >
                           <InputNumber
                             className="w-20"
-                            min={5}
+                            min={1}
                             placeholder={t('common.inputTip')}
                           />
                         </Form.Item>
@@ -763,22 +792,31 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
             {/* 接入点 */}
             {requiresAccessPointSelect && (
               <Form.Item
-                label={t('Collection.accessPoint')}
+                label={
+                  <span>
+                    {t('Collection.accessPoint')}
+                    <Tooltip
+                      overlayStyle={LONG_TOOLTIP_OVERLAY_STYLE}
+                      title={
+                        <span>
+                          {t('Collection.accessPointHelp')}
+                          <a
+                            className="ml-2 text-blue-500 hover:text-blue-600"
+                            href="/node-manager/cloudregion"
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            {t('Collection.accessPointLink')}
+                          </a>
+                        </span>
+                      }
+                    >
+                      <QuestionCircleOutlined className="ml-1 cursor-help text-gray-400" />
+                    </Tooltip>
+                  </span>
+                }
                 name="accessPointId"
                 required
-                extra={
-                  <div className="text-xs leading-5">
-                    <span>{t('Collection.accessPointHelp')}</span>
-                    <a
-                      className="ml-2 text-blue-500 hover:text-blue-600"
-                      href="/node-manager/cloudregion"
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      {t('Collection.accessPointLink')}
-                    </a>
-                  </div>
-                }
                 rules={[
                   {
                     required: true,
@@ -799,7 +837,7 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
             {requiresSingleInstanceSelect && (
               <Form.Item label={instPlaceholder} required>
                 <Space>
-                  <Form.Item name="instId" rules={rules.instId} noStyle>
+                  <Form.Item name="instUuid" rules={rules.instUuid} noStyle>
                     <Select
                       style={{ width: '400px' }}
                       placeholder={t('common.selectTip')}
@@ -864,17 +902,15 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
                               );
                             }
 
-                            const ipToNumber = (ip: string) =>
-                              ip
-                                .split('.')
-                                .reduce(
-                                  (acc, curr) => acc * 256 + Number(curr),
-                                  0,
-                                );
-
-                            if (ipToNumber(value[0]) > ipToNumber(value[1])) {
+                            if (!isIpRangeOrderValid(value[0], value[1])) {
                               return Promise.reject(
                                 new Error(t('Collection.ipRangeOrderInvalid')),
+                              );
+                            }
+
+                            if (!isIpRangeWithinLimit(value[0], value[1])) {
+                              return Promise.reject(
+                                new Error(t('Collection.ipRangeTooLarge')),
                               );
                             }
 
@@ -885,6 +921,21 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
                     >
                       <IpRangeInput value={ipRange} onChange={onIpChange} />
                     </Form.Item>
+                    {ipRangeSize(ipRange?.[0], ipRange?.[1]) >
+                      IP_RANGE_CYCLE_HINT_THRESHOLD && (
+                      <Form.Item
+                        labelCol={{ span: 0 }}
+                        wrapperCol={{ span: 24 }}
+                        className={styles.ipRangeCycleHintItem}
+                      >
+                        <Alert
+                          type="warning"
+                          showIcon
+                          className={styles.formFieldHint}
+                          message={t('Collection.ipRangeCycleHint')}
+                        />
+                      </Form.Item>
+                    )}
                   </>
                 ) : (
                   /* 选择资产 */
@@ -898,7 +949,10 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
                     <div>
                       <Space>
                         {isCommonSelectInstTask ? (
-                          <Tooltip title={hostAssetSelectTooltip}>
+                          <Tooltip
+                            overlayStyle={LONG_TOOLTIP_OVERLAY_STYLE}
+                            title={hostAssetSelectTooltip}
+                          >
                             <span>
                               <Button
                                 type="primary"
@@ -936,7 +990,7 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
                         pagination={false}
                         className="mt-4"
                         size="middle"
-                        rowKey="_id"
+                        rowKey="inst_uuid"
                         rowSelection={{
                           selectedRowKeys: displaySelectedKeys,
                           onChange: (selectedRowKeys) => {
@@ -971,6 +1025,7 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
                 }
                 key="advanced"
               >
+                {showTimeout && (
                 <Form.Item
                   label={
                     <span>
@@ -985,10 +1040,29 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
                 >
                   <InputNumber
                     className="w-40"
-                    min={timeoutProps.min}
+                    min={timeoutProps.min ?? 1}
+                    max={timeoutProps.max ?? 86400}
                     addonAfter={timeoutProps.addonAfter}
                   />
                 </Form.Item>
+                )}
+                {showIpPrecheck && (
+                <Form.Item
+                  label={
+                    <span>
+                      {t('Collection.ipPrecheck')}
+                      <Tooltip title={t('Collection.ipPrecheckTooltip')}>
+                        <QuestionCircleOutlined className="ml-1 text-gray-400" />
+                      </Tooltip>
+                    </span>
+                  }
+                  name="ip_precheck"
+                  valuePropName="checked"
+                  initialValue={false}
+                >
+                  <Switch />
+                </Form.Item>
+                )}
                 <Form.Item
                   label={t('Collection.cleanupStrategy')}
                   name="cleanupStrategy"
@@ -1118,7 +1192,7 @@ const BaseTaskForm = forwardRef<BaseTaskRef, BaseTaskFormProps>(
             dataSource={instData}
             size="middle"
             loading={instLoading}
-            rowKey="_id"
+            rowKey="inst_uuid"
             scroll={{ y: 'calc(100vh - 280px)' }}
             pagination={{
               ...instPagination,

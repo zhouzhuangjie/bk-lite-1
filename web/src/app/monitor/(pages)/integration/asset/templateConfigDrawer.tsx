@@ -14,7 +14,7 @@ import {
   ToolOutlined,
   ApiOutlined,
 } from '@ant-design/icons';
-import OperateDrawer from '@/app/node-manager/components/operate-drawer';
+import OperateDrawer from '@/components/operate-drawer';
 import CustomTable from '@/components/custom-table';
 import EditConfig from './updateConfig';
 import { useTranslation } from '@/utils/i18n';
@@ -327,7 +327,7 @@ const TemplateConfigDrawer = forwardRef<TemplateDrawerRef, ModalSuccess>(
           title={instanceName || '--'}
           open={visible}
           width={showLeftPanel ? 800 : 600}
-          destroyOnClose
+          destroyOnHidden
           onClose={handleCancel}
         >
           <div className="flex h-full">

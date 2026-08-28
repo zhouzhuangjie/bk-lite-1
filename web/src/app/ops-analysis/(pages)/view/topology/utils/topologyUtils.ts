@@ -12,28 +12,8 @@ import {
   getTopologyEdgeVisual,
 } from './topologyVisualStyles';
 
-// 通用工具函数
-export const getValueByPath = (obj: unknown, path: string): unknown => {
-  if (!obj || !path) return undefined;
-
-  return path.split('.').reduce((current, key) => {
-    if (current === null || current === undefined) return undefined;
-
-    // 处理数组索引
-    if (Array.isArray(current)) {
-      const index = parseInt(key, 10);
-      if (!isNaN(index) && index >= 0 && index < current.length) {
-        return current[index];
-      }
-      // 如果key不是数字，尝试在数组的每个元素中查找
-      return current.length > 0 && current[0] && typeof current[0] === 'object'
-        ? (current[0] as Record<string, unknown>)[key]
-        : undefined;
-    }
-
-    return (current as Record<string, unknown>)[key];
-  }, obj);
-};
+const isFiniteNumber = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value);
 
 export const formatDisplayValue = (
   value: unknown,
@@ -50,12 +30,10 @@ export const formatDisplayValue = (
   const numValue = typeof value === 'string' ? parseFloat(value) : value;
 
   if (typeof numValue === 'number' && !isNaN(numValue)) {
-    // 应用换算系数
-    const factor = conversionFactor !== undefined ? conversionFactor : 1;
+    const factor = isFiniteNumber(conversionFactor) ? conversionFactor : 1;
     const convertedValue = numValue * factor;
 
-    // 格式化小数位
-    let formattedValue = decimalPlaces !== undefined
+    let formattedValue = isFiniteNumber(decimalPlaces)
       ? convertedValue.toFixed(decimalPlaces)
       : String(convertedValue);
 

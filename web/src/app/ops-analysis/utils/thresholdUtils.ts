@@ -10,6 +10,25 @@ export interface ThresholdColorConfig {
   color: string;
 }
 
+/** 写盘时保留用户显式给出的列表（含空数组）；缺省或非数组则省略。 */
+export const persistThresholdColorConfig = (
+  colors: unknown,
+): ThresholdColorConfig[] | undefined => {
+  if (!Array.isArray(colors)) return undefined;
+  return colors.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const row = item as Record<string, unknown>;
+    const value = String(row.value ?? '').trim();
+    const color = String(row.color ?? '').trim();
+    if (!value && !color) return [];
+    return [{ value, color }];
+  });
+};
+
+/** InputNumber 清空后是 null；只有有限数字才视为用户显式配置。 */
+export const isFiniteNumber = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value);
+
 /**
  * 初始化阈值颜色：如果传入有效数组则按值降序排列，否则返回默认值
  */
@@ -73,35 +92,6 @@ export const getColorByThreshold = (
 };
 
 /**
- * 验证阈值配置的有效性
- * @param thresholds 阈值配置数组
- * @returns 验证结果
- */
-export const validateThresholds = (thresholds: ThresholdColorConfig[]) => {
-  const errors: string[] = [];
-
-  for (let i = 0; i < thresholds.length; i++) {
-    const threshold = thresholds[i];
-
-    // 检查颜色格式
-    if (!threshold.color || !threshold.color.match(/^#[0-9A-Fa-f]{6}$/)) {
-      errors.push(`第${i + 1}个阈值的颜色格式无效`);
-    }
-
-    // 检查数值格式
-    const value = parseFloat(threshold.value);
-    if (isNaN(value)) {
-      errors.push(`第${i + 1}个阈值的数值无效`);
-    }
-  }
-
-  return {
-    isValid: errors.length === 0,
-    errors
-  };
-};
-
-/**
  * 格式化显示值（添加单位、小数位等）
  * @param value 原始值
  * @param unit 单位（自由文本后缀，兼容旧逻辑）
@@ -118,11 +108,18 @@ export const formatDisplayValue = (
   conversionFactor?: number,
   unitId?: string
 ): string => {
+  const resolvedDecimalPlaces = isFiniteNumber(decimalPlaces)
+    ? decimalPlaces
+    : undefined;
+  const resolvedConversionFactor = isFiniteNumber(conversionFactor)
+    ? conversionFactor
+    : undefined;
+
   // 结构化单位：委托单位库（opt-in，旧调用不受影响）
   if (unitId && unitId.trim()) {
     return formatUnit(value, unitId, {
-      decimals: decimalPlaces,
-      conversionFactor,
+      decimals: resolvedDecimalPlaces,
+      conversionFactor: resolvedConversionFactor,
     }).text;
   }
 
@@ -136,13 +133,13 @@ export const formatDisplayValue = (
     return String(value);
   }
 
-  // 应用换算系数
-  const factor = conversionFactor !== undefined ? conversionFactor : 1;
+  // 应用换算系数；清空后的 null 回退为 1，避免 `value * null === 0`
+  const factor = resolvedConversionFactor ?? 1;
   const convertedValue = numValue * factor;
 
-  // 格式化小数位
-  let formattedValue = decimalPlaces !== undefined
-    ? convertedValue.toFixed(decimalPlaces)
+  // 格式化小数位；清空后的 null 回退默认展示，避免 `toFixed(null)` 变成 0 位
+  let formattedValue = resolvedDecimalPlaces !== undefined
+    ? convertedValue.toFixed(resolvedDecimalPlaces)
     : String(convertedValue);
 
   // 添加单位
@@ -151,37 +148,4 @@ export const formatDisplayValue = (
   }
 
   return formattedValue;
-};
-
-/**
- * 从嵌套对象中根据路径提取值
- * @param obj 数据对象
- * @param path 路径，支持 "." 分隔的嵌套路径和数组索引 "[0]"
- * @returns 提取的值
- */
-export const getValueByPath = (
-  obj: unknown,
-  path: string | undefined
-): unknown => {
-  if (!path || obj === null || obj === undefined) {
-    return undefined;
-  }
-
-  // 处理路径，将 "[0]" 转换为 ".0"
-  const normalizedPath = path.replace(/\[(\d+)\]/g, '.$1');
-  const keys = normalizedPath.split('.');
-
-  let current: unknown = obj;
-  for (const key of keys) {
-    if (current === null || current === undefined) {
-      return undefined;
-    }
-    if (typeof current === 'object') {
-      current = (current as Record<string, unknown>)[key];
-    } else {
-      return undefined;
-    }
-  }
-
-  return current;
 };

@@ -2,7 +2,7 @@ import type { TableProps } from 'antd';
 import type { Key } from 'react';
 
 type UserStatus = 'normal' | 'disabled' | 'locked' | 'password_expired';
-type ChangeUserStatusAction = 'enable' | 'disable' | 'unlock';
+type ChangeUserStatusAction = 'enable' | 'disable' | 'unlock' | 'unbind_otp';
 
 // 定义接口
 interface UserDataType {
@@ -20,6 +20,8 @@ interface UserDataType {
   groups: Array<any>;
   last_login?: string;
   status?: UserStatus;
+  sync_source?: number | null;
+  has_otp?: boolean;
 }
 
 interface ChangeUserStatusParams {
@@ -37,6 +39,19 @@ interface ChangeUserStatusResponse {
   total: number;
   success_ids: number[];
   skipped: ChangeUserStatusSkippedItem[];
+}
+
+interface UserImportFailure {
+  row_number: number;
+  username: string;
+  message: string;
+}
+
+interface UserImportResult {
+  total_count: number;
+  success_count: number;
+  failed_count: number;
+  failures: UserImportFailure[];
 }
 
 interface Access {
@@ -82,6 +97,8 @@ export type {
   ChangeUserStatusResponse,
   ChangeUserStatusSkippedItem,
   TableRowSelection,
+  UserImportFailure,
+  UserImportResult,
   TransmitUserData,
   UserDataType,
   UserStatus,

@@ -10,7 +10,31 @@ export interface ExtendedTreeDataNode extends TreeDataNode {
   hasAuth?: boolean;
   isVirtual?: boolean;
   roleIds?: number[];
+  syncSource?: number | null;
+  parentId?: number;
   children?: ExtendedTreeDataNode[];
+}
+
+/**
+ * Convert API group response to tree data nodes
+ */
+/**
+ * Convert page organization tree nodes for GroupTreeSelect.
+ */
+export function toGroupTreeSelectNodes(nodes: ExtendedTreeDataNode[]): Array<{
+  key: number;
+  value: number;
+  title: string;
+  disabled: boolean;
+  children?: ReturnType<typeof toGroupTreeSelectNodes>;
+}> {
+  return nodes.map((node) => ({
+    key: Number(node.key),
+    value: Number(node.key),
+    title: String(node.title ?? ''),
+    disabled: node.hasAuth === false,
+    children: node.children?.length ? toGroupTreeSelectNodes(node.children) : undefined,
+  }));
 }
 
 /**
@@ -25,6 +49,8 @@ export function convertGroupsToTreeData(groups: OriginalGroup[]): ExtendedTreeDa
       hasAuth: group.hasAuth,
       isVirtual: currentIsVirtual,
       roleIds: group.role_ids || [],
+      syncSource: group.sync_source ?? null,
+      parentId: (group as OriginalGroup & { parentId?: number }).parentId,
       children: group.subGroups ? convertGroupsToTreeData(group.subGroups) : [],
     };
   });

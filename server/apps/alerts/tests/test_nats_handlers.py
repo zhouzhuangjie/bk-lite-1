@@ -1,16 +1,27 @@
 """告警中心 NATS RPC 统计处理器与辅助函数覆盖测试。
 
-对照 spec/prd/告警中心：运营统计（趋势/分布/TOP）按组织与权限范围聚合。
+对照 specs/capabilities/legacy-prd-告警中心-告警.md：运营统计（趋势/分布/TOP）按组织与权限范围聚合。
 """
 
 import datetime
 
 import pytest
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from apps.alerts.constants.constants import AlertStatus, LevelType
-from apps.alerts.models.models import Alert, Level
+from apps.alerts.models.models import Alert, Event, Incident, Level
 from apps.alerts.nats import nats as N
+from apps.core.utils.internal_event_auth import sign_internal_event
+
+
+def _receive_internal(**payload):
+    return N.receive_alert_events(
+        **payload,
+        internal_auth=sign_internal_event("alerts.receive_alert_events", payload, caller=payload["pusher"]),
+    )
+
 
 # --------------------------------------------------------------------------
 # 纯辅助函数
@@ -44,21 +55,17 @@ def test_group_dy_date_format_variants():
 
 
 def test_group_dy_date_format_all_branches():
-    from django.db.models.functions import TruncMinute, TruncMonth, TruncWeek
+    from django.db.models.functions import TruncMinute, TruncMonth
 
     assert N.group_dy_date_format("minute")[0] is TruncMinute
-    assert N.group_dy_date_format("week")[0] is TruncWeek
     assert N.group_dy_date_format("month")[0] is TruncMonth
 
 
-def test_generate_time_periods_minute_week_month():
+def test_generate_time_periods_minute_and_month():
     tz = timezone.get_current_timezone()
     start = timezone.make_aware(datetime.datetime(2026, 1, 1, 0, 0), tz)
     end = timezone.make_aware(datetime.datetime(2026, 1, 1, 0, 3), tz)
     assert len(N._generate_time_periods("minute", start, end)) == 3
-
-    wk_end = timezone.make_aware(datetime.datetime(2026, 1, 20), tz)
-    assert len(N._generate_time_periods("week", start, wk_end)) >= 2
 
     mo_end = timezone.make_aware(datetime.datetime(2026, 4, 1), tz)
     assert len(N._generate_time_periods("month", start, mo_end)) >= 3
@@ -88,10 +95,21 @@ def test_parse_client_datetime_iso():
     assert isinstance(dt, datetime.datetime)
 
 
-def test_parse_client_datetime_plain():
+def test_parse_client_datetime_explicit_offset():
     tz = timezone.get_current_timezone()
-    dt = N._parse_client_datetime("2026-01-01 10:00:00", tz)
+    dt = N._parse_client_datetime("2026-01-01T10:00:00+08:00", tz)
     assert isinstance(dt, datetime.datetime)
+
+
+@pytest.mark.parametrize("raw_value", ["", "not-a-number", "0", "-1"])
+def test_positive_int_env_invalid_value_falls_back(monkeypatch, raw_value):
+    monkeypatch.setenv("ALERT_TREND_TEST_SPAN", raw_value)
+    assert N._positive_int_env("ALERT_TREND_TEST_SPAN", 60) == 60
+
+
+def test_positive_int_env_accepts_override(monkeypatch):
+    monkeypatch.setenv("ALERT_TREND_TEST_SPAN", "120")
+    assert N._positive_int_env("ALERT_TREND_TEST_SPAN", 60) == 120
 
 
 def test_generate_time_periods_day():
@@ -99,7 +117,46 @@ def test_generate_time_periods_day():
     start = timezone.make_aware(datetime.datetime(2026, 1, 1), tz)
     end = timezone.make_aware(datetime.datetime(2026, 1, 3), tz)
     periods = N._generate_time_periods("day", start, end)
-    assert len(periods) == 3
+    assert periods == [datetime.date(2026, 1, 1), datetime.date(2026, 1, 2)]
+
+
+@pytest.mark.unit
+def test_generate_time_periods_day_excludes_end_midnight():
+    tz = timezone.get_current_timezone()
+    start = timezone.make_aware(datetime.datetime(2026, 7, 29), tz)
+    end = timezone.make_aware(datetime.datetime(2026, 8, 5), tz)
+
+    periods = N._generate_time_periods("day", start, end)
+
+    assert periods == [
+        datetime.date(2026, 7, 29),
+        datetime.date(2026, 7, 30),
+        datetime.date(2026, 7, 31),
+        datetime.date(2026, 8, 1),
+        datetime.date(2026, 8, 2),
+        datetime.date(2026, 8, 3),
+        datetime.date(2026, 8, 4),
+    ]
+
+
+@pytest.mark.unit
+def test_generate_time_periods_rolling_seven_days_can_span_eight_calendar_days():
+    tz = timezone.get_current_timezone()
+    start = timezone.make_aware(datetime.datetime(2026, 7, 28, 17, 44, 47), tz)
+    end = start + datetime.timedelta(days=7)
+
+    periods = N._generate_time_periods("day", start, end)
+
+    assert periods == [
+        datetime.date(2026, 7, 28),
+        datetime.date(2026, 7, 29),
+        datetime.date(2026, 7, 30),
+        datetime.date(2026, 7, 31),
+        datetime.date(2026, 8, 1),
+        datetime.date(2026, 8, 2),
+        datetime.date(2026, 8, 3),
+        datetime.date(2026, 8, 4),
+    ]
 
 
 def test_generate_time_periods_hour():
@@ -142,6 +199,119 @@ def test_authorized_queryset_superuser_scoped():
     assert set(qs.values_list("alert_id", flat=True)) == {"A1"}
 
 
+@pytest.mark.django_db
+def test_authorized_queryset_uses_alert_permission_rules(monkeypatch):
+    team_alert = Alert.objects.create(
+        alert_id="A1",
+        level="0",
+        title="t",
+        content="c",
+        fingerprint="fp1",
+        team=[1],
+    )
+    instance_alert = Alert.objects.create(
+        alert_id="A2",
+        level="0",
+        title="t",
+        content="c",
+        fingerprint="fp2",
+        team=[2],
+    )
+    hidden_alert = Alert.objects.create(
+        alert_id="A3",
+        level="0",
+        title="t",
+        content="c",
+        fingerprint="fp3",
+        team=[3],
+    )
+    calls = []
+
+    def fake_get_permission_rules(user, current_team, app_name, permission_key, include_children=False):
+        calls.append((user.username, user.domain, current_team, app_name, permission_key, include_children))
+        return {
+            "team": [1],
+            "instance": [{"id": instance_alert.id, "permission": ["View"]}],
+        }
+
+    monkeypatch.setattr(N, "get_permission_rules", fake_get_permission_rules)
+
+    qs, err = N._get_authorized_alert_queryset(
+        {
+            "team": 1,
+            "user": "alice",
+            "domain": "tenant.example",
+            "is_superuser": False,
+            "include_children": True,
+            "permission": {"alarm": ["Alarms-View"]},
+        }
+    )
+
+    assert err is None
+    assert set(qs.values_list("id", flat=True)) == {team_alert.id, instance_alert.id}
+    assert hidden_alert.id not in set(qs.values_list("id", flat=True))
+    assert calls == [("alice", "tenant.example", 1, "alerts", "alert", True)]
+
+
+@pytest.mark.django_db
+def test_authorized_queryset_instance_only_does_not_grant_current_team(monkeypatch):
+    current_team_alert = Alert.objects.create(
+        alert_id="A-current-team",
+        level="0",
+        title="current team alert",
+        content="c",
+        fingerprint="fp-current",
+        team=[1],
+    )
+    instance_alert = Alert.objects.create(
+        alert_id="A-instance",
+        level="0",
+        title="instance grant",
+        content="c",
+        fingerprint="fp-instance",
+        team=[2],
+    )
+
+    monkeypatch.setattr(
+        N,
+        "get_permission_rules",
+        lambda *args, **kwargs: {
+            "team": [],
+            "instance": [{"id": instance_alert.id, "permission": ["View"]}],
+        },
+    )
+
+    queryset, error = N._get_authorized_alert_queryset(
+        {
+            "team": 1,
+            "user": "alice",
+            "domain": "tenant.example",
+            "is_superuser": False,
+            "permission": {"alarm": ["Alarms-View"]},
+        }
+    )
+
+    assert error is None
+    assert set(queryset.values_list("id", flat=True)) == {instance_alert.id}
+    assert current_team_alert.id not in queryset.values_list("id", flat=True)
+
+
+@pytest.mark.django_db
+def test_authorized_queryset_requires_permission_identity_for_non_superuser():
+    qs, err = N._get_authorized_alert_queryset(
+        {
+            "team": 1,
+            "user": "alice",
+            "is_superuser": False,
+            "permission": {"alarm": ["Alarms-View"]},
+        }
+    )
+
+    assert qs is None
+    assert err["result"] is False
+    assert "用户信息" in err["message"]
+
+
 # --------------------------------------------------------------------------
 # RPC 统计处理器
 # --------------------------------------------------------------------------
@@ -167,6 +337,126 @@ def test_get_alert_statistics(user_info):
 def test_get_alert_statistics_permission_error():
     result = N.get_alert_statistics(user_info={"team": 1, "is_superuser": False, "permission": {}})
     assert result["result"] is False
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_get_alert_period_statistics_uses_each_domain_time_and_half_open_window(user_info):
+    from apps.alerts.models.alert_source import AlertSource
+
+    source = AlertSource.objects.create(name="source", source_id="period-source", source_type="restful", secret="x")
+    start = timezone.now().replace(microsecond=0) - datetime.timedelta(days=30)
+    end = timezone.now().replace(microsecond=0) + datetime.timedelta(minutes=1)
+    old_alert = Alert.objects.create(
+        alert_id="OLD-PERIOD",
+        level="0",
+        title="old",
+        content="c",
+        fingerprint="old-period",
+        team=[1],
+    )
+    new_alert = Alert.objects.create(
+        alert_id="NEW-PERIOD",
+        level="0",
+        title="new",
+        content="c",
+        fingerprint="new-period",
+        team=[1],
+        is_session_alert=True,
+    )
+    Alert.objects.filter(pk=old_alert.pk).update(created_at=start - datetime.timedelta(days=1))
+    Alert.objects.filter(pk=new_alert.pk).update(created_at=start)
+
+    for index, alert in enumerate([old_alert, old_alert, old_alert, new_alert]):
+        event = Event.objects.create(
+            source=source,
+            raw_data={},
+            title=f"event-{index}",
+            level="0",
+            start_time=start,
+            event_id=f"PERIOD-EVENT-{index}",
+        )
+        Event.objects.filter(pk=event.pk).update(received_at=start + datetime.timedelta(hours=index + 1))
+        alert.events.add(event)
+    boundary_event = Event.objects.create(
+        source=source,
+        raw_data={},
+        title="boundary",
+        level="0",
+        start_time=end,
+        event_id="PERIOD-EVENT-END",
+    )
+    Event.objects.filter(pk=boundary_event.pk).update(received_at=end)
+    new_alert.events.add(boundary_event)
+
+    old_incident = Incident.objects.create(incident_id="OLD-INCIDENT", level="0", title="old", team=[1])
+    new_incident = Incident.objects.create(incident_id="NEW-INCIDENT", level="0", title="new", team=[1])
+    old_incident.alert.add(old_alert)
+    new_incident.alert.add(new_alert)
+    Incident.objects.filter(pk=old_incident.pk).update(created_at=start - datetime.timedelta(days=1))
+    Incident.objects.filter(pk=new_incident.pk).update(created_at=start)
+
+    result = N.get_alert_period_statistics(user_info=user_info, time=[start.isoformat(), end.isoformat()])
+
+    assert result == {
+        "result": True,
+        "data": {
+            "new_alert_count": 1,
+            "linked_event_count": 4,
+            "affected_alert_count": 2,
+            "new_incident_count": 1,
+            "session_alert_count": 1,
+            "session_alert_rate": 100.0,
+            "aggregation_ratio": 2.0,
+        },
+        "message": "",
+    }
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_get_alert_period_statistics_requires_time(user_info):
+    result = N.get_alert_period_statistics(user_info=user_info)
+
+    assert result == {"result": False, "data": {}, "message": "time range is required."}
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_get_alert_snapshot_statistics_keeps_old_active_alerts_and_ignores_time(user_info):
+    old_time = timezone.now() - datetime.timedelta(days=60)
+    statuses = [
+        AlertStatus.UNASSIGNED,
+        AlertStatus.PENDING,
+        AlertStatus.PROCESSING,
+        AlertStatus.AUTO_RECOVERY,
+    ]
+    for index, status in enumerate(statuses):
+        alert = Alert.objects.create(
+            alert_id=f"SNAPSHOT-{index}",
+            level="0",
+            title="snapshot",
+            content="c",
+            fingerprint=f"snapshot-{index}",
+            team=[1],
+            status=status,
+        )
+        Alert.objects.filter(pk=alert.pk).update(created_at=old_time)
+
+    result = N.get_alert_snapshot_statistics(
+        user_info=user_info,
+        time=[timezone.now().isoformat(), (timezone.now() + datetime.timedelta(days=1)).isoformat()],
+    )
+
+    assert result["result"] is True
+    assert result["data"] == {
+        "active_count": 3,
+        "unassigned_count": 1,
+        "pending_count": 1,
+        "processing_count": 1,
+        "auto_recovery_count": 1,
+        "auto_recovery_rate": 25.0,
+    }
 
 
 @pytest.mark.django_db
@@ -228,33 +518,28 @@ def test_get_alert_today_status_summary_counts_created_closed_and_processing(use
 
 @pytest.mark.django_db
 def test_get_alert_status_distribution_returns_active_status_labels(user_info):
-    Alert.objects.create(
-        alert_id="A1",
-        level="0",
-        title="t",
-        content="c",
-        fingerprint="fp1",
-        team=[1],
-        status=AlertStatus.UNASSIGNED,
-    )
-    Alert.objects.create(
-        alert_id="A2",
-        level="0",
-        title="t",
-        content="c",
-        fingerprint="fp2",
-        team=[1],
-        status=AlertStatus.PENDING,
-    )
-    Alert.objects.create(
-        alert_id="A3",
-        level="0",
-        title="t",
-        content="c",
-        fingerprint="fp3",
-        team=[1],
-        status=AlertStatus.PROCESSING,
-    )
+    expected_counts = {
+        AlertStatus.UNASSIGNED: 8,
+        AlertStatus.PENDING: 8,
+        AlertStatus.PROCESSING: 4,
+    }
+    alerts = []
+    for status, count in expected_counts.items():
+        for index in range(count):
+            alerts.append(
+                Alert.objects.create(
+                    alert_id=f"{status}-{index}",
+                    level="0",
+                    title="t",
+                    content="c",
+                    fingerprint=f"{status}-fp-{index}",
+                    team=[1],
+                    status=status,
+                )
+            )
+    now = timezone.now()
+    for index, alert in enumerate(alerts):
+        Alert.objects.filter(pk=alert.pk).update(updated_at=now - datetime.timedelta(minutes=index))
     Alert.objects.create(
         alert_id="A4",
         level="0",
@@ -269,8 +554,48 @@ def test_get_alert_status_distribution_returns_active_status_labels(user_info):
 
     assert result["result"] is True
     assert result["data"] == [
-        {"name": "未分派", "value": 1},
-        {"name": "待响应", "value": 1},
+        {"name": "未分派", "value": 8},
+        {"name": "待响应", "value": 8},
+        {"name": "处理中", "value": 4},
+    ]
+
+
+@pytest.mark.django_db
+def test_get_alert_status_distribution_aggregates_multiple_alerts_per_status(user_info):
+    """同状态下多条告警必须正确聚合。
+
+    Alert.Meta.ordering 含 updated_at；若不在聚合前 order_by()，部分数据库会把排序列
+    加入 GROUP BY，导致每个状态被拆成多条 count=1，dict 覆盖后恒为 1（issue #4478）。
+    """
+    now = timezone.now()
+    for i, status in enumerate(
+        [
+            AlertStatus.UNASSIGNED,
+            AlertStatus.UNASSIGNED,
+            AlertStatus.UNASSIGNED,
+            AlertStatus.PENDING,
+            AlertStatus.PENDING,
+            AlertStatus.PROCESSING,
+        ]
+    ):
+        alert = Alert.objects.create(
+            alert_id=f"S{i}",
+            level="0",
+            title="t",
+            content="c",
+            fingerprint=f"fp-status-{i}",
+            team=[1],
+            status=status,
+        )
+        # 错开 updated_at，放大默认排序对 GROUP BY 的干扰
+        Alert.objects.filter(pk=alert.pk).update(updated_at=now - datetime.timedelta(minutes=i))
+
+    result = N.get_alert_status_distribution(user_info=user_info)
+
+    assert result["result"] is True
+    assert result["data"] == [
+        {"name": "未分派", "value": 3},
+        {"name": "待响应", "value": 2},
         {"name": "处理中", "value": 1},
     ]
 
@@ -308,15 +633,135 @@ def test_get_alert_level_trend_returns_multiseries_by_level(user_info):
     )
     Alert.objects.filter(pk=fatal_alert.pk).update(created_at=now)
     Alert.objects.filter(pk=warning_alert.pk).update(created_at=now)
-    start = (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
-    end = (now + datetime.timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+    start = (now - datetime.timedelta(days=1)).isoformat()
+    end = (now + datetime.timedelta(days=1)).isoformat()
 
-    result = N.get_alert_level_trend(user_info=user_info, time=[start, end], group_by="day")
+    result = N.get_alert_level_trend(user_info=user_info, time=[start, end])
 
     assert result["result"] is True
     assert set(result["data"]) == {"致命", "预警"}
     assert sum(point[1] for point in result["data"]["致命"]) == 1
     assert sum(point[1] for point in result["data"]["预警"]) == 1
+
+
+@pytest.mark.django_db
+def test_get_alert_level_trend_span_over_limit_rejected_before_period_generation(monkeypatch, user_info):
+    """超限区间必须在生成完整时间序列前被拒绝。"""
+    # 1 天窗会推导为 hour；压低 hour 上限以触发跨度拒绝。
+    monkeypatch.setitem(N._MAX_SPAN_SECONDS, "hour", 3600)
+    start = datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc)
+    end = start + datetime.timedelta(days=1)
+    monkeypatch.setattr(
+        N,
+        "_generate_time_periods",
+        lambda *_args, **_kwargs: pytest.fail("超限请求不应生成时间序列"),
+    )
+
+    result = N.get_alert_level_trend(
+        user_info=user_info,
+        time=[start.isoformat(), end.isoformat()],
+        group_by="day",
+    )
+
+    assert result["result"] is False
+    assert result["data"] == {}
+    assert "hour" in result["message"]
+
+
+@pytest.mark.django_db
+def test_get_alert_level_trend_exact_span_limit_is_accepted(monkeypatch, user_info):
+    start = datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc)
+    end = start + datetime.timedelta(hours=6)
+    monkeypatch.setattr(N, "_generate_time_periods", lambda *_args, **_kwargs: [])
+
+    result = N.get_alert_level_trend(
+        user_info=user_info,
+        time=[start.isoformat(), end.isoformat()],
+    )
+
+    assert result["result"] is True
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("handler", "empty_data"),
+    [
+        (N.get_alert_trend_data, []),
+        (N.get_alert_level_trend, {}),
+    ],
+)
+@pytest.mark.parametrize(
+    "time_values",
+    [
+        "2025-01-01",
+        ["not-a-datetime", "2025-01-02 00:00:00"],
+        [None, "2025-01-02 00:00:00"],
+    ],
+)
+def test_alert_trend_rejects_malformed_time(user_info, handler, empty_data, time_values):
+    result = handler(user_info=user_info, time=time_values)
+
+    assert result["result"] is False
+    assert result["data"] == empty_data
+    assert result["message"]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("handler", "empty_data"),
+    [
+        (N.get_alert_trend_data, []),
+        (N.get_alert_level_trend, {}),
+    ],
+)
+def test_alert_trend_rejects_timezone_less_time(user_info, handler, empty_data):
+    result = handler(
+        user_info=user_info,
+        time=["2025-01-01 00:00:00", "2025-01-02 00:00:00"],
+    )
+
+    assert result["result"] is False
+    assert result["data"] == empty_data
+    assert "datetime" in result["message"]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("handler", "empty_data"),
+    [
+        (N.get_alert_trend_data, []),
+        (N.get_alert_level_trend, {}),
+    ],
+)
+def test_alert_trend_rejects_reversed_time(user_info, handler, empty_data):
+    result = handler(
+        user_info=user_info,
+        time=["2025-01-02T00:00:00Z", "2025-01-01T00:00:00Z"],
+    )
+
+    assert result["result"] is False
+    assert result["data"] == empty_data
+    assert "later" in result["message"]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("handler", "empty_data"),
+    [
+        (N.get_alert_trend_data, []),
+        (N.get_alert_level_trend, {}),
+    ],
+)
+@pytest.mark.parametrize("group_by", ["level", ["day"], "minute"])
+def test_alert_trend_ignores_client_group_by(user_info, handler, empty_data, group_by):
+    result = handler(
+        user_info=user_info,
+        time=["2025-01-01T00:00:00Z", "2025-01-01T02:00:00Z"],
+        group_by=group_by,
+    )
+
+    assert result["result"] is True
+    assert "group_by" not in result.get("message", "")
 
 
 @pytest.mark.django_db
@@ -359,43 +804,51 @@ def test_get_alert_trend_data_requires_time(user_info):
 
 
 @pytest.mark.django_db
-def test_get_alert_trend_data_minute_span_over_limit_rejected(user_info):
-    """minute 粒度时间跨度超过 7 天上限时，应返回 result=False（拒绝生成超大时间序列）。
-    若移除 get_alert_trend_data 中的跨度校验代码，本测试将失败。
-    """
+def test_get_alert_trend_data_short_window_uses_minute(user_info):
     result = N.get_alert_trend_data(
         user_info=user_info,
-        time=["2026-01-01 00:00:00", "2026-01-09 00:00:00"],  # 8 天，超过 minute 粒度 7 天上限
-        group_by="minute",
-    )
-    assert result["result"] is False, "超出 minute 粒度上限的请求必须被拒绝，防止 OOM"
-    assert "minute" in result["message"]
-
-
-@pytest.mark.django_db
-def test_get_alert_trend_data_minute_span_within_limit_ok(user_info):
-    """minute 粒度时间跨度在 7 天以内，应正常返回数据。"""
-    result = N.get_alert_trend_data(
-        user_info=user_info,
-        time=["2026-01-01 00:00:00", "2026-01-06 00:00:00"],  # 5 天，在上限内
-        group_by="minute",
+        time=["2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z"],
+        group_by="day",
     )
     assert result["result"] is True
     assert "告警数" in result["data"]
+    # 1 小时窗按 minute 补齐，应远多于按天的 1 个点
+    assert len(result["data"]["告警数"]) >= 60
 
 
 @pytest.mark.django_db
-def test_get_alert_trend_data_hour_span_over_limit_rejected(user_info):
-    """hour 粒度时间跨度超过 90 天上限时，应返回 result=False。
-    若移除跨度校验代码，本测试将失败。
-    """
+def test_get_alert_trend_data_hour_span_over_limit_rejected(monkeypatch, user_info):
+    """推导为 hour 后若超过 hour 上限，应拒绝。"""
+    monkeypatch.setitem(N._MAX_SPAN_SECONDS, "hour", 6 * 3600)
     result = N.get_alert_trend_data(
         user_info=user_info,
-        time=["2026-01-01 00:00:00", "2026-04-15 00:00:00"],  # ~104 天，超过 hour 粒度 90 天上限
-        group_by="hour",
+        time=["2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"],
     )
     assert result["result"] is False, "超出 hour 粒度上限的请求必须被拒绝，防止 OOM"
     assert "hour" in result["message"]
+
+
+@pytest.mark.django_db
+def test_get_alert_trend_data_seven_day_window_uses_hour(user_info):
+    result = N.get_alert_trend_data(
+        user_info=user_info,
+        time=["2026-01-01T00:00:00Z", "2026-01-08T00:00:00Z"],
+    )
+    assert result["result"] is True
+    assert "告警数" in result["data"]
+    # 7 天按 hour，约 168 点，不应再是日粒度的 ~7 点
+    assert len(result["data"]["告警数"]) >= 160
+
+
+@pytest.mark.django_db
+def test_get_alert_trend_data_day_span_over_limit_rejected(monkeypatch, user_info):
+    monkeypatch.setitem(N._MAX_SPAN_SECONDS, "day", 30 * 24 * 3600)
+    result = N.get_alert_trend_data(
+        user_info=user_info,
+        time=["2026-01-01T00:00:00Z", "2026-03-01T00:00:00Z"],  # ~59 天 → day
+    )
+    assert result["result"] is False
+    assert "day" in result["message"]
 
 
 @pytest.mark.django_db
@@ -403,12 +856,12 @@ def test_get_alert_trend_data_returns_series(user_info):
     Alert.objects.create(alert_id="A1", level="0", title="t", content="c", fingerprint="fp", team=[1])
     result = N.get_alert_trend_data(
         user_info=user_info,
-        time=["2026-01-01 00:00:00", "2026-01-03 00:00:00"],
+        time=["2026-01-01T00:00:00Z", "2026-01-03T00:00:00Z"],
         group_by="day",
     )
     assert result["result"] is True
     assert "告警数" in result["data"]
-    assert "事件数" in result["data"]
+    assert "告警关联事件数" in result["data"]
 
 
 @pytest.mark.django_db
@@ -417,8 +870,8 @@ def test_get_alert_trend_data_with_events_in_window(user_info):
     now = timezone.now()
     alert = Alert.objects.create(alert_id="A1", level="0", title="t", content="c", fingerprint="fp", team=[1])
     Alert.objects.filter(pk=alert.pk).update(created_at=now)
-    start = (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
-    end = (now + datetime.timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+    start = (now - datetime.timedelta(days=1)).isoformat()
+    end = (now + datetime.timedelta(days=1)).isoformat()
     result = N.get_alert_trend_data(user_info=user_info, time=[start, end], group_by="day")
     assert result["result"] is True
     # 告警数序列非空且为 [时间, 数量] 形式
@@ -430,30 +883,172 @@ def test_get_alert_trend_data_with_events_in_window(user_info):
 
 @pytest.mark.django_db
 def test_get_alert_source_event_top(user_info):
-    from django.utils import timezone
-
     from apps.alerts.models.alert_source import AlertSource
-    from apps.alerts.models.models import Event
 
     src = AlertSource.objects.create(name="Zabbix", source_id="s1", source_type="zabbix", secret="x")
     alert = Alert.objects.create(alert_id="A1", level="0", title="t", content="c", fingerprint="fp", team=[1])
+    start = timezone.now().replace(microsecond=0) - datetime.timedelta(days=1)
+    end = timezone.now().replace(microsecond=0) + datetime.timedelta(minutes=1)
     event = Event.objects.create(source=src, raw_data={}, title="e", level="0", start_time=timezone.now(), event_id="E1")
+    Event.objects.filter(pk=event.pk).update(received_at=start)
     alert.events.add(event)
-    result = N.get_alert_source_event_top(user_info=user_info, limit=5)
+    old_event = Event.objects.create(source=src, raw_data={}, title="old", level="0", start_time=start, event_id="E2")
+    Event.objects.filter(pk=old_event.pk).update(received_at=start - datetime.timedelta(seconds=1))
+    alert.events.add(old_event)
+
+    result = N.get_alert_source_event_top(user_info=user_info, limit=5, time=[start.isoformat(), end.isoformat()])
     assert result["result"] is True
     assert result["data"][0] == {"source_name": "Zabbix", "count": 1}
 
 
 @pytest.mark.django_db
+@pytest.mark.integration
+def test_get_alert_source_event_top_requires_time(user_info):
+    result = N.get_alert_source_event_top(user_info=user_info, limit=5)
+
+    assert result["result"] is False
+    assert result["data"] == []
+
+
+@pytest.mark.django_db
+def test_get_alert_source_distribution_returns_full_distribution_and_unknown():
+    for index in range(12):
+        Alert.objects.create(
+            alert_id=f"DIST-{index}",
+            level="0",
+            title="t",
+            content="c",
+            fingerprint=f"dist-{index}",
+            source_name="zabbix" if index < 3 else (None if index == 11 else f"source-{index}"),
+            team=[1],
+        )
+    for index, source_name in enumerate([" zabbix ", "", "   "], start=12):
+        Alert.objects.create(
+            alert_id=f"DIST-{index}",
+            level="0",
+            title="t",
+            content="c",
+            fingerprint=f"dist-{index}",
+            source_name=source_name,
+            team=[1],
+        )
+
+    with CaptureQueriesContext(connection) as queries:
+        result = N.get_alert_source_distribution(user_info={"team": 1, "is_superuser": True})
+
+    assert result["result"] is True
+    assert result["data"] == [
+        {"name": "zabbix", "value": 4},
+        {"name": "source-10", "value": 1},
+        *[{"name": f"source-{index}", "value": 1} for index in range(3, 10)],
+        {"name": "未知来源", "value": 3},
+    ]
+    assert len(queries) == 1
+    assert "GROUP BY" in queries[0]["sql"].upper()
+
+
+@pytest.mark.django_db
+def test_get_alert_source_distribution_requires_alert_permission():
+    result = N.get_alert_source_distribution(user_info={"team": 1, "permission": {}})
+    assert result["result"] is False
+
+
+@pytest.mark.django_db
 def test_get_alert_source_statistics(user_info):
     from apps.alerts.models.alert_source import AlertSource
+    from apps.alerts.models.models import Event
 
     AlertSource.objects.create(name="s1", source_id="s1", source_type="restful", secret="x", is_active=True)
-    AlertSource.objects.create(name="s2", source_id="s2", source_type="restful", secret="x", is_active=False)
+    src2 = AlertSource.objects.create(name="s2", source_id="s2", source_type="restful", secret="x", is_active=False)
+    alert = Alert.objects.create(alert_id="A1", level="0", title="t", content="c", fingerprint="fp", team=[1])
+    event = Event.objects.create(
+        source=src2,
+        raw_data={},
+        title="e",
+        level="0",
+        start_time=timezone.now(),
+        event_id="E1",
+    )
+    alert.events.add(event)
+
     result = N.get_alert_source_statistics(user_info=user_info)
+
     assert result["result"] is True
     assert result["data"]["total_count"] == 2
     assert result["data"]["enabled_count"] == 1
+    assert result["data"]["enabled_rate"] == 50.0
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_get_alert_source_statistics_counts_all_configured_sources_and_scopes_activity(user_info):
+    from apps.alerts.models.alert_source import AlertSource
+    from apps.alerts.models.models import Event
+
+    visible_source = AlertSource.objects.create(
+        name="visible",
+        source_id="visible",
+        source_type="restful",
+        secret="x",
+        is_active=True,
+    )
+    hidden_source = AlertSource.objects.create(
+        name="hidden",
+        source_id="hidden",
+        source_type="restful",
+        secret="x",
+        is_active=True,
+    )
+    unused_source = AlertSource.objects.create(
+        name="unused",
+        source_id="unused",
+        source_type="restful",
+        secret="x",
+        is_active=True,
+    )
+
+    visible_alert = Alert.objects.create(
+        alert_id="A1",
+        level="0",
+        title="t",
+        content="c",
+        fingerprint="fp1",
+        team=[1],
+    )
+    hidden_alert = Alert.objects.create(
+        alert_id="A2",
+        level="0",
+        title="t",
+        content="c",
+        fingerprint="fp2",
+        team=[2],
+    )
+    visible_event = Event.objects.create(
+        source=visible_source,
+        raw_data={},
+        title="e1",
+        level="0",
+        start_time=timezone.now(),
+        event_id="E1",
+    )
+    hidden_event = Event.objects.create(
+        source=hidden_source,
+        raw_data={},
+        title="e2",
+        level="0",
+        start_time=timezone.now(),
+        event_id="E2",
+    )
+    visible_alert.events.add(visible_event)
+    hidden_alert.events.add(hidden_event)
+
+    result = N.get_alert_source_statistics(user_info=user_info)
+
+    assert result["result"] is True
+    assert result["data"]["total_count"] == 3
+    assert result["data"]["enabled_count"] == 3
+    assert result["data"]["active_count"] == 1
+    assert AlertSource.objects.filter(pk=unused_source.pk).exists()
 
 
 @pytest.mark.django_db
@@ -462,13 +1057,54 @@ def test_get_alert_source_statistics_permission_error():
     assert result["result"] is False
 
 
+@pytest.mark.integration
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("handler", "empty_data"),
+    [
+        (N.get_alert_source_statistics, {}),
+        (N.get_notification_statistics, {}),
+        (N.get_notification_channel_stats, []),
+        (N.get_alert_data_quality, {}),
+    ],
+)
+@pytest.mark.parametrize(
+    "time_range",
+    [
+        ["2026-01-01 00:00:00", "2026-01-02T00:00:00Z"],
+        ["2026-01-01T00:00:00Z"],
+    ],
+)
+def test_alert_statistics_reject_invalid_time_range(
+    user_info,
+    handler,
+    empty_data,
+    time_range,
+):
+    result = handler(user_info=user_info, time=time_range)
+
+    assert result["result"] is False
+    assert result["data"] == empty_data
+    assert "time range" in result["message"]
+
+
 @pytest.mark.django_db
 def test_get_notification_statistics(user_info):
     from apps.alerts.constants.constants import NotifyResultStatus
     from apps.alerts.models import NotifyResult
 
-    NotifyResult.objects.create(notify_type="alert", notify_object="A1", notify_result=NotifyResultStatus.SUCCESS)
-    NotifyResult.objects.create(notify_type="alert", notify_object="A2", notify_result=NotifyResultStatus.FAILED)
+    Alert.objects.create(alert_id="A1", level="0", title="t", content="c", fingerprint="fp1", team=[1])
+    Alert.objects.create(alert_id="A2", level="0", title="t", content="c", fingerprint="fp2", team=[1])
+    NotifyResult.objects.create(
+        notify_type="alert",
+        notify_object="A1",
+        notify_result=NotifyResultStatus.SUCCESS,
+    )
+    NotifyResult.objects.create(
+        notify_type="alert",
+        notify_object="A2",
+        notify_result=NotifyResultStatus.FAILED,
+    )
     result = N.get_notification_statistics(user_info=user_info)
     assert result["result"] is True
     assert result["data"]["total_count"] == 2
@@ -477,20 +1113,125 @@ def test_get_notification_statistics(user_info):
 
 
 @pytest.mark.django_db
+@pytest.mark.integration
+def test_get_notification_statistics_empty_sample_has_no_rate(user_info):
+    result = N.get_notification_statistics(user_info=user_info)
+
+    assert result["result"] is True
+    assert result["data"] == {
+        "total_count": 0,
+        "success_count": 0,
+        "failed_count": 0,
+        "success_rate": None,
+        "failed_rate": None,
+    }
+
+
+@pytest.mark.django_db
+def test_get_notification_statistics_counts_only_authorized_alerts(user_info):
+    from apps.alerts.constants.constants import NotifyResultStatus
+    from apps.alerts.models import NotifyResult
+
+    Alert.objects.create(alert_id="A1", level="0", title="t", content="c", fingerprint="fp1", team=[1])
+    Alert.objects.create(alert_id="A2", level="0", title="t", content="c", fingerprint="fp2", team=[2])
+    NotifyResult.objects.create(
+        notify_type="alert",
+        notify_object="A1",
+        notify_result=NotifyResultStatus.SUCCESS,
+    )
+    NotifyResult.objects.create(
+        notify_type="alert",
+        notify_object="A2",
+        notify_result=NotifyResultStatus.FAILED,
+    )
+
+    result = N.get_notification_statistics(user_info=user_info)
+
+    assert result["result"] is True
+    assert result["data"]["total_count"] == 1
+    assert result["data"]["success_count"] == 1
+    assert result["data"]["failed_count"] == 0
+
+
+@pytest.mark.django_db
 def test_get_alert_data_quality_empty(user_info):
     result = N.get_alert_data_quality(user_info=user_info)
     assert result["result"] is True
-    assert result["data"]["total_count"] == 0
+    assert result["data"] == {
+        "alert_quality": {
+            "total_count": 0,
+            "missing_resource_id_count": 0,
+            "missing_resource_id_rate": None,
+            "missing_rule_id_count": 0,
+            "missing_rule_id_rate": None,
+        },
+        "event_quality": {
+            "total_count": 0,
+            "missing_service_count": 0,
+            "missing_service_rate": None,
+            "missing_item_count": 0,
+            "missing_item_rate": None,
+            "missing_external_id_count": 0,
+            "missing_external_id_rate": None,
+        },
+    }
 
 
 @pytest.mark.django_db
 def test_get_alert_data_quality_with_data(user_info):
-    Alert.objects.create(alert_id="A1", level="0", title="t", content="c", fingerprint="fp", team=[1], resource_id="", rule_id="")
-    result = N.get_alert_data_quality(user_info=user_info)
+    from apps.alerts.models.alert_source import AlertSource
+
+    start = timezone.now().replace(microsecond=0) - datetime.timedelta(days=1)
+    end = timezone.now().replace(microsecond=0) + datetime.timedelta(minutes=1)
+    alert = Alert.objects.create(alert_id="A1", level="0", title="t", content="c", fingerprint="fp", team=[1], resource_id="", rule_id="")
+    source = AlertSource.objects.create(name="quality", source_id="quality", source_type="restful", secret="x")
+    period_event = Event.objects.create(
+        source=source,
+        raw_data={},
+        title="period",
+        level="0",
+        start_time=start,
+        event_id="QUALITY-PERIOD",
+        service="",
+        item="cpu",
+        external_id="",
+    )
+    old_event = Event.objects.create(
+        source=source,
+        raw_data={},
+        title="old",
+        level="0",
+        start_time=start,
+        event_id="QUALITY-OLD",
+        service="service",
+        item="",
+        external_id="external",
+    )
+    Event.objects.filter(pk=period_event.pk).update(received_at=start)
+    Event.objects.filter(pk=old_event.pk).update(received_at=start - datetime.timedelta(seconds=1))
+    alert.events.add(period_event, old_event)
+
+    result = N.get_alert_data_quality(user_info=user_info, time=[start.isoformat(), end.isoformat()])
+
     assert result["result"] is True
-    assert result["data"]["total_count"] == 1
-    # 缺失 resource_id → 100%
-    assert result["data"]["missing_resource_id_rate"] == 100.0
+    assert result["data"] == {
+        "alert_quality": {
+            "total_count": 1,
+            "missing_resource_id_count": 1,
+            "missing_resource_id_rate": 100.0,
+            "missing_rule_id_count": 1,
+            "missing_rule_id_rate": 100.0,
+        },
+        "event_quality": {
+            "total_count": 1,
+            "missing_service_count": 1,
+            "missing_service_rate": 100.0,
+            "missing_item_count": 0,
+            "missing_item_rate": 0.0,
+            "missing_external_id_count": 1,
+            "missing_external_id_rate": 100.0,
+        },
+    }
 
 
 # --------------------------------------------------------------------------
@@ -501,6 +1242,17 @@ def test_get_alert_data_quality_with_data(user_info):
 def test_alert_test():
     result = N.alert_test()
     assert result["result"] is True
+
+
+@pytest.mark.django_db
+def test_receive_alert_events_health_probe_has_no_event_side_effects():
+    from apps.alerts.models.models import Event
+
+    before = Event.objects.count()
+    result = N.receive_alert_events(health_probe=True)
+
+    assert result == {"result": True, "data": {"status": "ok"}, "message": ""}
+    assert Event.objects.count() == before
 
 
 @pytest.mark.django_db
@@ -555,6 +1307,500 @@ def test_receive_alert_events_success():
     assert Event.objects.filter(title="事件A").exists()
 
 
+@pytest.mark.integration
+@pytest.mark.django_db
+def test_receive_alert_events_rejects_forged_internal_pusher_without_auth(monkeypatch):
+    from apps.alerts.models.alert_source import AlertSource
+
+    for lid in (0, 1, 2, 3):
+        Level.objects.create(level_id=lid, level_name=f"L{lid}", level_display_name=f"等级{lid}", level_type=LevelType.EVENT)
+    AlertSource.objects.create(
+        name="nats伪造来源",
+        source_id="nats-forged",
+        source_type="nats",
+        secret="x",
+        team_secrets={},
+        is_active=True,
+        is_effective=True,
+        config={"event_fields_mapping": {"title": "title", "level": "level", "item": "item", "start_time": "start_time"}},
+    )
+    monkeypatch.setenv("ALERTS_ALLOW_LEGACY_INTERNAL_EVENT_AUTH", "false")
+
+    result = N.receive_alert_events(
+        source_id="nats-forged",
+        pusher="lite-monitor",
+        events=[
+            {
+                "title": "forged",
+                "level": "0",
+                "item": "cpu",
+                "start_time": "1700000000",
+                "organizations": [99],
+            }
+        ],
+    )
+
+    assert result["result"] is False
+    assert result["code"] == "internal_auth_required"
+    assert Event.objects.filter(title="forged").exists() is False
+
+
+@pytest.mark.integration
+@pytest.mark.django_db
+def test_receive_alert_events_rejects_invalid_signature_during_rolling_upgrade(monkeypatch):
+    from apps.alerts.models.alert_source import AlertSource
+
+    for lid in (0, 1, 2, 3):
+        Level.objects.create(level_id=lid, level_name=f"L{lid}", level_display_name=f"等级{lid}", level_type=LevelType.EVENT)
+    AlertSource.objects.create(
+        name="nats 篡改来源",
+        source_id="nats-tampered",
+        source_type="nats",
+        secret="x",
+        team_secrets={},
+        is_active=True,
+        is_effective=True,
+        config={"event_fields_mapping": {"title": "title", "level": "level", "item": "item", "start_time": "start_time"}},
+    )
+    monkeypatch.delenv("ALERTS_ALLOW_LEGACY_INTERNAL_EVENT_AUTH", raising=False)
+    payload = {
+        "source_id": "nats-tampered",
+        "pusher": "lite-monitor",
+        "events": [
+            {
+                "title": "tampered",
+                "level": "0",
+                "item": "cpu",
+                "start_time": "1700000000",
+                "organizations": [3],
+            }
+        ],
+    }
+    internal_auth = sign_internal_event("alerts.receive_alert_events", payload, caller="lite-monitor")
+    internal_auth["signature"] = "0" * 64
+
+    result = N.receive_alert_events(**payload, internal_auth=internal_auth)
+
+    assert result["result"] is False
+    assert result["code"] == "internal_auth_required"
+    assert Event.objects.filter(title="tampered").exists() is False
+
+
+@pytest.mark.integration
+@pytest.mark.django_db
+def test_receive_alert_events_legacy_sender_remains_available_for_rolling_upgrade(monkeypatch):
+    from apps.alerts.models.alert_source import AlertSource
+
+    for lid in (0, 1, 2, 3):
+        Level.objects.create(level_id=lid, level_name=f"L{lid}", level_display_name=f"等级{lid}", level_type=LevelType.EVENT)
+    AlertSource.objects.create(
+        name="nats legacy 来源",
+        source_id="nats-legacy-rolling",
+        source_type="nats",
+        secret="x",
+        team_secrets={},
+        is_active=True,
+        is_effective=True,
+        config={"event_fields_mapping": {"title": "title", "level": "level", "item": "item", "start_time": "start_time"}},
+    )
+    monkeypatch.delenv("ALERTS_ALLOW_LEGACY_INTERNAL_EVENT_AUTH", raising=False)
+
+    result = N.receive_alert_events(
+        source_id="nats-legacy-rolling",
+        pusher="lite-monitor",
+        events=[
+            {
+                "title": "legacy",
+                "level": "0",
+                "item": "cpu",
+                "start_time": "1700000000",
+                "organizations": [3],
+            }
+        ],
+    )
+
+    assert result["result"] is True
+    assert Event.objects.filter(title="legacy").exists() is True
+
+
+@pytest.mark.parametrize("pusher", ["lite-monitor", "lite-log", "lite-apm"])
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_receive_alert_events_allows_whitelisted_internal_organizations_without_source_registration(pusher):
+    """内部白名单来源直推不依赖 NATS 告警源预先登记组织。"""
+    from apps.alerts.constants.constants import LevelType
+    from apps.alerts.models.alert_source import AlertSource
+    from apps.alerts.models.models import Event
+
+    for lid in (0, 1, 2, 3):
+        Level.objects.create(
+            level_id=lid,
+            level_name=f"L{lid}",
+            level_display_name=f"等级{lid}",
+            level_type=LevelType.EVENT,
+        )
+    AlertSource.objects.create(
+        name="监控中心 NATS 源",
+        source_id="nats",
+        source_type="nats",
+        secret="x",
+        team_secrets={},
+        is_active=True,
+        is_effective=True,
+        config={"event_fields_mapping": {"title": "title", "level": "level", "item": "item", "start_time": "start_time"}},
+    )
+    events = [
+        {
+            "title": "CPU 超阈值",
+            "level": "0",
+            "item": "cpu",
+            "start_time": "1700000000",
+            "organizations": [3],
+        }
+    ]
+
+    result = _receive_internal(
+        source_id="nats",
+        events=events,
+        pusher=pusher,
+    )
+
+    assert result["result"] is True
+    assert Event.objects.get(title="CPU 超阈值").team == [3]
+
+
+@pytest.mark.django_db
+def test_receive_alert_events_reports_partial_ingestion(monkeypatch):
+    from apps.alerts.models.alert_source import AlertSource
+
+    AlertSource.objects.create(
+        name="nats部分接入",
+        source_id="nats-partial",
+        source_type="nats",
+        secret="x",
+        is_active=True,
+        is_effective=True,
+    )
+
+    class FakeAdapter:
+        def __init__(self, **kwargs):
+            pass
+
+        def main(self):
+            return {"received": 2, "accepted": 1, "skipped": 1, "errored": 0}
+
+    monkeypatch.setattr(
+        N.AlertSourceAdapterFactory,
+        "get_adapter",
+        staticmethod(lambda source: FakeAdapter),
+    )
+
+    result = N.receive_alert_events(source_id="nats-partial", events=[{"title": "ok"}, {}], pusher="lite-monitor")
+
+    assert result["result"] is False
+    assert result["data"]["processed_events"] == 1
+    assert result["data"]["ingestion"]["skipped"] == 1
+
+
+@pytest.mark.parametrize("pusher", ["lite-monitor", "lite-log", "lite-apm"])
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_receive_alert_events_real_adapter_preserves_partial_contract_and_safe_log(pusher, caplog):
+    from apps.alerts.models.alert_source import AlertSource
+
+    for level_id in (0, 1, 2, 3):
+        Level.objects.create(
+            level_id=level_id,
+            level_name=f"L{level_id}",
+            level_display_name=f"等级{level_id}",
+            level_type=LevelType.EVENT,
+        )
+    AlertSource.objects.create(
+        name="NATS 兼容源",
+        source_id="nats-real-partial",
+        source_type="nats",
+        secret="source-secret",
+        team_secrets={},
+        is_active=True,
+        is_effective=True,
+        config={"event_fields_mapping": {"title": "title", "level": "level"}},
+    )
+    marker = f"SECRET-NATS-{pusher}-4671"
+    events = [
+        {"title": f"{pusher} 正常事件", "level": "0", "organizations": [3]},
+        {"description": marker, "secret": marker, "organizations": [3]},
+    ]
+
+    result = _receive_internal(
+        source_id="nats-real-partial",
+        events=events,
+        pusher=pusher,
+    )
+
+    assert result["result"] is False
+    assert result["data"]["processed_events"] == 1
+    assert result["data"]["ingestion"] == {
+        "received": 2,
+        "accepted": 1,
+        "skipped": 1,
+        "errored": 0,
+        "duplicates": 0,
+        "rejected": 1,
+    }
+    assert Event.objects.get(title=f"{pusher} 正常事件").team == [3]
+    assert marker not in caplog.text
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_receive_alert_events_per_event_ack_is_opt_in_and_identity_preserving(monkeypatch):
+    from apps.alerts.models.alert_source import AlertSource
+
+    AlertSource.objects.create(
+        name="nats逐事件ACK",
+        source_id="nats-ack",
+        source_type="nats",
+        secret="x",
+        is_active=True,
+        is_effective=True,
+    )
+
+    adapter_events = []
+
+    class FakeAdapter:
+        def __init__(self, events, **kwargs):
+            self.events = events
+            adapter_events.extend(events)
+
+        def main(self):
+            status = self.events[0]["test_status"]
+            return {
+                "received": 1,
+                "accepted": int(status == "accepted"),
+                "skipped": int(status in {"duplicate", "rejected"}),
+                "errored": int(status == "errored"),
+                "duplicates": int(status == "duplicate"),
+                "rejected": int(status == "rejected"),
+            }
+
+    monkeypatch.setattr(
+        N.AlertSourceAdapterFactory,
+        "get_adapter",
+        staticmethod(lambda source: FakeAdapter),
+    )
+    monkeypatch.setattr(N, "PER_EVENT_ACK_TOKEN", "receiver-secret")
+    monkeypatch.setenv("ALERTS_ALLOW_LEGACY_INTERNAL_EVENT_AUTH", "false")
+    events = [
+        {
+            "delivery_id": "d1",
+            "test_status": "accepted",
+            "lifecycle_action": "created",
+            "lifecycle_generation": "generation-1",
+        },
+        {"delivery_id": "d2", "test_status": "duplicate"},
+        {"delivery_id": "d3", "test_status": "rejected"},
+    ]
+
+    result = N.receive_alert_events(
+        source_id="nats-ack",
+        events=events,
+        pusher="lite-monitor",
+        ack_mode=N.PER_EVENT_ACK_MODE,
+        ack_token="receiver-secret",
+    )
+
+    assert result["result"] is False
+    assert result["data"]["event_results"] == [
+        {"delivery_id": "d1", "status": "accepted", "retryable": False},
+        {"delivery_id": "d2", "status": "duplicate", "retryable": False},
+        {"delivery_id": "d3", "status": "rejected", "retryable": True},
+    ]
+    assert adapter_events[0]["lifecycle_action"] == "created"
+    assert adapter_events[0]["lifecycle_generation"] == "generation-1"
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_receive_alert_events_legacy_pusher_cannot_set_lifecycle_identity(monkeypatch):
+    """旧批量协议保留普通字段兼容，但不能仅凭 pusher 提升生命周期身份。"""
+    from apps.alerts.models.alert_source import AlertSource
+
+    AlertSource.objects.create(
+        name="nats旧协议",
+        source_id="nats-legacy",
+        source_type="nats",
+        secret="x",
+        is_active=True,
+        is_effective=True,
+    )
+    captured = {}
+
+    class FakeAdapter:
+        def __init__(self, events, trusted_internal, **kwargs):
+            captured["events"] = events
+            captured["trusted_internal"] = trusted_internal
+
+        def main(self):
+            return {"received": 1, "accepted": 1, "skipped": 0, "errored": 0}
+
+    monkeypatch.setattr(N.AlertSourceAdapterFactory, "get_adapter", staticmethod(lambda source: FakeAdapter))
+
+    result = _receive_internal(
+        source_id="nats-legacy",
+        events=[
+            {
+                "title": "legacy-event",
+                "organizations": [3],
+                "lifecycle_action": "closed",
+                "lifecycle_generation": "forged-generation",
+            }
+        ],
+        pusher="lite-monitor",
+    )
+
+    assert result["result"] is True
+    assert captured["trusted_internal"] is True
+    assert captured["events"] == [
+        {
+            "title": "legacy-event",
+            "organizations": [3],
+            "push_source_id": "lite-monitor",
+        }
+    ]
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_receive_alert_events_per_event_ack_rejects_untrusted_and_bounds_batches(monkeypatch):
+    from apps.alerts.models.alert_source import AlertSource
+
+    AlertSource.objects.create(
+        name="nats逐事件ACK上界",
+        source_id="nats-ack-bound",
+        source_type="nats",
+        secret="x",
+        is_active=True,
+        is_effective=True,
+    )
+
+    class FakeAdapter:
+        def __init__(self, events, trusted_internal, **kwargs):
+            pass
+
+        def main(self):
+            return {"received": 1, "accepted": 1, "skipped": 0, "errored": 0, "duplicates": 0, "rejected": 0}
+
+    monkeypatch.setattr(N.AlertSourceAdapterFactory, "get_adapter", staticmethod(lambda source: FakeAdapter))
+    monkeypatch.setattr(N, "PER_EVENT_ACK_TOKEN", "receiver-secret")
+
+    untrusted = N.receive_alert_events(
+        source_id="nats-ack-bound",
+        events=[{"delivery_id": "d"}],
+        pusher="unknown",
+        ack_mode=N.PER_EVENT_ACK_MODE,
+        ack_token="receiver-secret",
+    )
+    wrong_token = N.receive_alert_events(
+        source_id="nats-ack-bound",
+        events=[{"delivery_id": "d"}],
+        pusher="lite-monitor",
+        ack_mode=N.PER_EVENT_ACK_MODE,
+        ack_token="wrong",
+    )
+    oversized = N.receive_alert_events(
+        source_id="nats-ack-bound",
+        events=[{"delivery_id": str(index)} for index in range(N.PER_EVENT_ACK_MAX_EVENTS + 1)],
+        pusher="lite-monitor",
+        ack_mode=N.PER_EVENT_ACK_MODE,
+        ack_token="receiver-secret",
+    )
+    monkeypatch.setenv("ALERTS_ALLOW_LEGACY_INTERNAL_EVENT_AUTH", "false")
+    unsigned_organization = N.receive_alert_events(
+        source_id="nats-ack-bound",
+        events=[{"delivery_id": "d", "organizations": [3]}],
+        pusher="lite-monitor",
+        ack_mode=N.PER_EVENT_ACK_MODE,
+        ack_token="receiver-secret",
+    )
+
+    assert untrusted["result"] is False
+    assert "restricted" in untrusted["message"]
+    assert wrong_token["result"] is False
+    assert oversized["result"] is False
+    assert oversized["data"]["max_events"] == N.PER_EVENT_ACK_MAX_EVENTS
+    assert unsigned_organization["code"] == "internal_auth_required"
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_receive_alert_events_marks_lite_log_as_trusted_internal(mocker):
+    from apps.alerts.models.alert_source import AlertSource
+
+    source = AlertSource.objects.create(
+        name="日志中心 NATS 源",
+        source_id="nats",
+        source_type="nats",
+        secret="source-secret",
+        team_secrets={"3": "team-secret"},
+        is_active=True,
+        is_effective=True,
+        config={},
+    )
+    adapter = mocker.Mock()
+    adapter.main.return_value = {"received": 1, "accepted": 1, "skipped": 0, "errored": 0}
+    adapter_class = mocker.Mock(return_value=adapter)
+    mocker.patch.object(N.AlertSourceAdapterFactory, "get_adapter", return_value=adapter_class)
+
+    result = _receive_internal(
+        source_id="nats",
+        pusher="lite-log",
+        events=[{"title": "日志错误", "organizations": [3]}],
+    )
+
+    assert result["result"] is True
+    adapter_class.assert_called_once_with(
+        alert_source=source,
+        secret="",
+        events=[{"title": "日志错误", "organizations": [3], "push_source_id": "lite-log"}],
+        trusted_internal=True,
+    )
+    adapter.main.assert_called_once_with()
+
+
+@pytest.mark.django_db
+@pytest.mark.integration
+def test_receive_alert_events_does_not_log_event_payload_or_secret(mocker):
+    from apps.alerts.models.alert_source import AlertSource
+
+    AlertSource.objects.create(
+        name="日志中心 NATS 源",
+        source_id="nats",
+        source_type="nats",
+        secret="source-secret",
+        team_secrets={"3": "team-secret"},
+        is_active=True,
+        is_effective=True,
+        config={},
+    )
+    adapter = mocker.Mock()
+    adapter_class = mocker.Mock(return_value=adapter)
+    mocker.patch.object(N.AlertSourceAdapterFactory, "get_adapter", return_value=adapter_class)
+    info = mocker.patch.object(N.logger, "info")
+
+    _receive_internal(
+        source_id="nats",
+        pusher="lite-log",
+        events=[{"title": "sensitive-log-content", "organizations": [3], "secret": "event-secret"}],
+    )
+
+    logged = " ".join(str(call) for call in info.call_args_list)
+    assert "sensitive-log-content" not in logged
+    assert "event-secret" not in logged
+    assert "source_id=%s" in logged
+    assert "pusher=%s" in logged
+    assert "event_count=%s" in logged
+
+
 # --------------------------------------------------------------------------
 # get_notification_channel_stats
 # --------------------------------------------------------------------------
@@ -571,3 +1817,31 @@ def test_get_notification_channel_stats_ok(user_info):
     result = N.get_notification_channel_stats(user_info=user_info)
     assert result["result"] is True
     assert isinstance(result["data"], list)
+
+
+@pytest.mark.django_db
+def test_get_notification_channel_stats_counts_only_authorized_alerts(user_info):
+    from apps.alerts.constants.constants import NotifyResultStatus
+    from apps.alerts.models import NotifyResult
+
+    Alert.objects.create(alert_id="A1", level="0", title="t", content="c", fingerprint="fp1", team=[1])
+    Alert.objects.create(alert_id="A2", level="0", title="t", content="c", fingerprint="fp2", team=[2])
+    NotifyResult.objects.create(
+        notify_type="alert",
+        notify_object="A1",
+        notify_channel="email",
+        notify_channel_name="邮件",
+        notify_result=NotifyResultStatus.SUCCESS,
+    )
+    NotifyResult.objects.create(
+        notify_type="alert",
+        notify_object="A2",
+        notify_channel="sms",
+        notify_channel_name="短信",
+        notify_result=NotifyResultStatus.SUCCESS,
+    )
+
+    result = N.get_notification_channel_stats(user_info=user_info)
+
+    assert result["result"] is True
+    assert result["data"] == [{"name": "邮件", "value": 100.0}]

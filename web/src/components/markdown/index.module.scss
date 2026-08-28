@@ -6,10 +6,19 @@
   }
   h1, h2, h3, h4, h5, h6 {
     border-bottom: 1px solid var(--color-border-1) !important;
+    scroll-margin-top: 64px;
+    &:target,
+    &.is-highlight {
+      background: linear-gradient(90deg, rgba(2, 132, 199, 0.16), transparent 75%);
+      border-radius: 6px;
+      transition: background 800ms ease-out;
+    }
   }
+  // 宽表按内容展开；由外层 overflow-x 横向滚动，避免 width:100% 把单元格压成竖排字
   table {
     border-collapse: collapse;
-    width: 100%;
+    width: max-content;
+    max-width: none;
     margin-bottom: 16px;
     tr {
       background-color: transparent !important;
@@ -18,6 +27,7 @@
       border: 1px solid var(--color-border-1);
       padding: 8px 16px;
       background-color: transparent;
+      white-space: nowrap;
     }
     th {
       background-color: var(--color-fill-2);
@@ -25,6 +35,67 @@
     }
     tbody {
       background-color: inherit;
+    }
+  }
+
+  img {
+    max-width: 100%;
+    height: auto;
+    display: block;
+    margin: 12px 0;
+    border-radius: 6px;
+    border: 1px solid var(--color-border-1);
+    background: var(--color-fill-1);
+  }
+
+  :global(.md-code-block) {
+    position: relative;
+  }
+
+  :global(.md-code-block > pre) {
+    padding-right: 44px;
+  }
+
+  :global(.md-code-copy) {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    z-index: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 1px solid var(--color-border-1);
+    border-radius: 6px;
+    background: var(--color-bg);
+    color: var(--color-text-3);
+    cursor: pointer;
+    opacity: 0.85;
+    transition: color 150ms ease, background 150ms ease, border-color 150ms ease,
+      opacity 150ms ease;
+
+    &:hover {
+      opacity: 1;
+      color: var(--color-primary);
+      border-color: var(--color-primary);
+      background: var(--color-fill-1);
+    }
+
+    &:focus-visible {
+      outline: 2px solid var(--color-primary);
+      outline-offset: 1px;
+    }
+
+    &.is-copied {
+      color: var(--color-success, #52c41a);
+      border-color: var(--color-success, #52c41a);
+    }
+
+    svg {
+      width: 14px;
+      height: 14px;
     }
   }
 }

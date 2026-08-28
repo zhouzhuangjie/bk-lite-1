@@ -1,0 +1,122 @@
+'use client';
+
+import React, { useEffect, useRef } from 'react';
+import { Radio, Select, Spin } from 'antd';
+import type { InputControlConfig, InputOption } from '@/app/ops-analysis/types/dataSource';
+import { useParamInputOptions } from '@/app/ops-analysis/hooks/useParamInputOptions';
+import { createParamInputOptionsNotifier } from '@/app/ops-analysis/utils/paramInputOptionsLoader';
+import { normalizeParamInputChangeValue } from '@/app/ops-analysis/components/normalizeParamInputChangeValue';
+import ParamInputTableSelect from '@/app/ops-analysis/components/paramInputTableSelect';
+
+interface ParamInputControlProps {
+  inputConfig?: InputControlConfig;
+  fallback: React.ReactNode;
+  value?: string | number | Array<string | number>;
+  onChange?: (value: string | number | Array<string | number> | null) => void;
+  disabled?: boolean;
+  placeholder?: string;
+  allowClear?: boolean;
+  style?: React.CSSProperties;
+  onOptionsResolved?: (options: InputOption[]) => void;
+}
+
+export const ParamInputControl: React.FC<ParamInputControlProps> = ({
+  inputConfig,
+  fallback,
+  value,
+  onChange,
+  disabled,
+  placeholder,
+  allowClear = true,
+  style,
+  onOptionsResolved,
+}) => {
+  const state = useParamInputOptions(inputConfig);
+  const onOptionsResolvedRef = useRef(onOptionsResolved);
+  const notifierRef = useRef(createParamInputOptionsNotifier());
+  onOptionsResolvedRef.current = onOptionsResolved;
+
+  const renderFallback = () => {
+    if (!React.isValidElement(fallback)) return fallback;
+    return React.cloneElement(fallback as React.ReactElement<any>, {
+      value,
+      onChange: (valueOrEvent: unknown) =>
+        onChange?.(normalizeParamInputChangeValue(valueOrEvent)),
+      disabled,
+    });
+  };
+
+  useEffect(() => {
+    if (state.status !== 'success' || !onOptionsResolvedRef.current) return;
+    if (!state.resultKey) return;
+    notifierRef.current.notify(
+      state.resultKey,
+      state.options,
+      onOptionsResolvedRef.current,
+    );
+  }, [state]);
+
+  if (!inputConfig || inputConfig.control === 'input') return <>{renderFallback()}</>;
+  if (state.status === 'loading') return <Spin size="small" />;
+
+  const options = state.status === 'success' ? state.options : [];
+
+  if (inputConfig.control === 'radio') {
+    return (
+      <Radio.Group
+        value={value}
+        disabled={disabled}
+        options={options}
+        optionType="button"
+        buttonStyle="outline"
+        onChange={(event) => onChange?.(event.target.value ?? null)}
+      />
+    );
+  }
+
+  if (inputConfig.control === 'select') {
+    const isMultiple = Boolean(inputConfig.multiple);
+    if (inputConfig.picker === 'table') {
+      return (
+        <ParamInputTableSelect
+          options={options}
+          value={value}
+          onChange={onChange}
+          disabled={disabled}
+          placeholder={placeholder}
+          allowClear={allowClear}
+          multiple={isMultiple}
+          maxCount={isMultiple ? inputConfig.maxCount : undefined}
+          style={style}
+        />
+      );
+    }
+    return (
+      <Select
+        value={value}
+        disabled={disabled}
+        placeholder={placeholder}
+        allowClear={allowClear}
+        mode={inputConfig.multiple ? 'multiple' : undefined}
+        maxCount={isMultiple ? inputConfig.maxCount : undefined}
+        maxTagCount={isMultiple ? 'responsive' : undefined}
+        maxTagTextLength={isMultiple ? 16 : undefined}
+        style={{ width: '100%', ...style }}
+        options={options}
+        onChange={(nextValue) => onChange?.(nextValue ?? null)}
+      />
+    );
+  }
+
+  return (
+    <Select
+      value={value}
+      disabled={disabled}
+      placeholder={placeholder}
+      allowClear={allowClear}
+      style={{ width: '100%', ...style }}
+      options={options}
+      onChange={(nextValue) => onChange?.(nextValue ?? null)}
+    />
+  );
+};

@@ -2,19 +2,51 @@
 """IP 视图数据组装：容量/利用率/各状态计数/落库 IP 列表。规格 §5/§7.2。"""
 from apps.cmdb.constants.constants import INSTANCE
 from apps.cmdb.graph.drivers.graph_client import GraphClient
-from apps.cmdb.utils.ipam_cidr import parse_subnet, subnet_capacity, compute_utilization
+from apps.cmdb.services.instance import InstanceManage
+from apps.cmdb.utils.ipam_cidr import compute_utilization, parse_subnet, subnet_capacity
 
 IP_STATUS_KEYS = ["online", "offline", "conflict", "unknown"]
 
 
-def _query_subnet_ips(subnet_inst_id) -> list:
+def _dedupe_ip_rows(rows: list) -> list:
+    result = []
+    seen = set()
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        identity = row.get("_id") or (row.get("subnet_id"), row.get("ip_addr"))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(row)
+    return result
+
+
+def _query_subnet_ips_by_field(subnet_inst_id) -> list:
     with GraphClient() as ag:
         rows, _ = ag.query_entity(
             INSTANCE,
-            [{"field": "model_id", "type": "str=", "value": "ip"},
-             {"field": "subnet_id", "type": "str=", "value": str(subnet_inst_id)}],
+            [{"field": "model_id", "type": "str=", "value": "ip"}, {"field": "subnet_id", "type": "str=", "value": str(subnet_inst_id)}],
         )
     return rows or []
+
+
+def _query_subnet_ips_by_association(subnet) -> list:
+    subnet_uuid = subnet.get("inst_uuid")
+    if not subnet_uuid:
+        return []
+    associations = InstanceManage.instance_association_instance_list_by_uuid("subnet", subnet_uuid) or []
+    rows = []
+    for item in associations:
+        if item.get("model_asst_id") != "subnet_group_ip":
+            continue
+        rows.extend(item.get("inst_list") or [])
+    return rows
+
+
+def _query_subnet_ips(subnet: dict) -> list:
+    """IP 视图按实例关联查询；旧数据用 subnet_id 字段兜底。"""
+    return _dedupe_ip_rows(_query_subnet_ips_by_association(subnet) + _query_subnet_ips_by_field(subnet.get("_id")))
 
 
 def _first(value):
@@ -27,7 +59,7 @@ def _first(value):
 def build_ipam_view(subnet: dict) -> dict:
     net = parse_subnet(subnet.get("subnet_address"), subnet.get("subnet_mask"))
     capacity = subnet_capacity(net)
-    ips = _query_subnet_ips(subnet.get("_id"))
+    ips = _query_subnet_ips(subnet)
     counts = {k: 0 for k in IP_STATUS_KEYS}
     for ip in ips:
         st = _first(ip.get("ip_status")) or "unknown"

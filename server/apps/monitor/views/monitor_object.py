@@ -1,8 +1,11 @@
-from django.db.models import Count
+from django.db import transaction
+from django.db.models import Count, Q
 from rest_framework import viewsets
 from rest_framework.decorators import action
 
+from apps.core.exceptions.base_app_exception import ValidationAppException
 from apps.core.logger import monitor_logger as logger
+from apps.core.user_habit import column_preference_habit_key
 from apps.core.utils.loader import LanguageLoader
 from apps.core.utils.permission_utils import (
     get_permissions_rules,
@@ -12,14 +15,139 @@ from apps.core.utils.web_utils import WebUtils
 from apps.monitor.constants.language import LanguageConstants
 from apps.monitor.constants.permission import PermissionConstants
 from apps.monitor.filters.monitor_object import MonitorObjectFilter
-from apps.monitor.models import MonitorInstance, MonitorPolicy
+from apps.monitor.models import (
+    MonitorInstance,
+    MonitorInstanceOrganization,
+    MonitorPolicy,
+    PolicyOrganization,
+)
 from apps.monitor.models.monitor_object import MonitorObject, MonitorObjectType
+from apps.monitor.models.user_habit import UserHabit
 from apps.monitor.serializers.monitor_object import MonitorObjectSerializer, MonitorObjectTypeSerializer
+from apps.monitor.serializers.view_column_preference import MonitorViewColumnPreferenceSerializer
 from apps.monitor.services.monitor_object import MonitorObjectService
-from apps.monitor.utils.display_fields import validate_display_fields
+from apps.monitor.services.monitor_object_cleanup import MonitorObjectCleanupPolicyService
+from apps.monitor.utils.display_fields import build_display_column_key, validate_display_fields
 from apps.monitor.utils.instance_id_keys import resolve_monitor_object_instance_id_keys
 from config.drf.pagination import CustomPageNumberPagination
 from apps.core.utils.team_utils import get_current_team
+
+MAX_CANDIDATE_TEAM_ID = 2_147_483_647
+MAX_CANDIDATE_TEAM_ID_TEXT = str(MAX_CANDIDATE_TEAM_ID)
+
+
+def _normalize_candidate_values(values):
+    if not isinstance(values, (list, tuple, set)):
+        return set()
+
+    normalized = set()
+    for value in values:
+        if isinstance(value, dict):
+            value = value.get("id")
+        if value is None:
+            continue
+        try:
+            normalized.add(value)
+        except TypeError:
+            continue
+    return normalized
+
+
+def _normalize_candidate_team_ids(values):
+    normalized = set()
+    for value in _normalize_candidate_values(values):
+        if type(value) is int:
+            team_id = value
+        elif isinstance(value, str) and value.isascii() and value.isdigit() and not value.startswith("0"):
+            if len(value) > len(MAX_CANDIDATE_TEAM_ID_TEXT) or (len(value) == len(MAX_CANDIDATE_TEAM_ID_TEXT) and value > MAX_CANDIDATE_TEAM_ID_TEXT):
+                continue
+            team_id = int(value)
+        else:
+            continue
+        if 0 < team_id <= MAX_CANDIDATE_TEAM_ID:
+            normalized.add(team_id)
+    return normalized
+
+
+def _build_instance_count_queryset(instance_permissions, cur_team):
+    candidate_teams = _normalize_candidate_team_ids(cur_team)
+    candidate_instance_ids = set()
+
+    if isinstance(instance_permissions, dict):
+        for permission in instance_permissions.values():
+            if not isinstance(permission, dict):
+                continue
+            candidate_teams.update(_normalize_candidate_team_ids(permission.get("team", [])))
+            candidate_instance_ids.update(_normalize_candidate_values(permission.get("instance", [])))
+
+    queryset = MonitorInstance.objects.filter(
+        is_deleted=False,
+        is_active=True,
+    ).prefetch_related("monitorinstanceorganization_set")
+    if not candidate_teams and not candidate_instance_ids:
+        return queryset.none()
+
+    candidate_filter = Q()
+    if candidate_teams:
+        candidate_filter |= Q(monitorinstanceorganization__organization__in=candidate_teams)
+    if candidate_instance_ids:
+        candidate_filter |= Q(id__in=candidate_instance_ids)
+    return queryset.filter(candidate_filter).distinct()
+
+
+def _build_org_map_for_ids(model, id_field: str, ids: list) -> dict:
+    """分块加载 id→组织集合，避免一次性巨大 IN 查询。"""
+    org_map: dict = {}
+    chunk_size = 2000
+    for start in range(0, len(ids), chunk_size):
+        chunk = ids[start : start + chunk_size]
+        for entity_id, organization in model.objects.filter(
+            **{f"{id_field}__in": chunk}
+        ).values_list(id_field, "organization"):
+            org_map.setdefault(entity_id, set()).add(organization)
+    return org_map
+
+
+def _count_by_object_with_permissions(rows, org_map, permissions, cur_team):
+    """对 (id, monitor_object_id) 行按权限累计每个对象的可见数量。"""
+    counts = {}
+    for entity_id, monitor_object_id in rows:
+        teams = org_map.get(entity_id, set())
+        if not check_instance_permission(
+            monitor_object_id,
+            entity_id,
+            teams,
+            permissions,
+            cur_team,
+        ):
+            continue
+        counts[monitor_object_id] = counts.get(monitor_object_id, 0) + 1
+    return counts
+
+
+def _build_instance_count_map(instance_permissions, cur_team):
+    """按权限统计各对象实例数，避免把完整 ORM 实例装入内存。"""
+    rows = list(
+        _build_instance_count_queryset(instance_permissions, cur_team).values_list(
+            "id", "monitor_object_id"
+        )
+    )
+    if not rows:
+        return {}
+    org_map = _build_org_map_for_ids(
+        MonitorInstanceOrganization, "monitor_instance_id", [row[0] for row in rows]
+    )
+    return _count_by_object_with_permissions(rows, org_map, instance_permissions, cur_team)
+
+
+def _build_policy_count_map(policy_permissions, cur_team):
+    """按权限统计各对象策略数，只取 id / object_id / 组织关系。"""
+    # 权限规则仍要求逐策略判定；此处只拉 id 三元组，避免装载完整 Policy ORM。
+    rows = list(MonitorPolicy.objects.all().values_list("id", "monitor_object_id"))
+    if not rows:
+        return {}
+    org_map = _build_org_map_for_ids(PolicyOrganization, "policy_id", [row[0] for row in rows])
+    return _count_by_object_with_permissions(rows, org_map, policy_permissions, cur_team)
 
 
 class MonitorObjectViewSet(viewsets.ModelViewSet):
@@ -30,7 +158,7 @@ class MonitorObjectViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """默认返回所有对象（父+子），传 parent_only=true 时只返回父对象"""
-        queryset = super().get_queryset()
+        queryset = super().get_queryset().select_related("type")
         if "parent" in self.request.query_params:
             return queryset
         if self.request.query_params.get("parent_only") in ["true", "True"]:
@@ -43,21 +171,27 @@ class MonitorObjectViewSet(viewsets.ModelViewSet):
 
         未自定义的默认列取绑定指标在当前账号语言下的译名；用户通过弹窗自定义过展示列后，
         display_fields[].name 是明确的列头配置，必须原样返回，不能再被指标译名覆盖。
+        带 role 的语义列（如云平台子对象 IP）只借指标定位 label，列头由前端按 role 渲染，
+        同样不能被指标译名覆盖。
         不就地修改入参，返回新副本。
         """
         if not display_fields:
             return display_fields
-        if customized:
-            return [{**col} for col in display_fields]
         translated = []
         for col in display_fields:
             metrics = col.get("metrics") or []
             metric_name = metrics[0].get("metric") if metrics else None
             new_name = col.get("name")
-            if metric_name:
+            if metric_name and not customized and not col.get("role"):
                 key = f"{LanguageConstants.MONITOR_OBJECT_METRIC}.{object_name}.{metric_name}.name"
                 new_name = lan.get(key) or new_name
-            translated.append({**col, "name": new_name})
+            translated.append(
+                {
+                    **col,
+                    "name": new_name,
+                    "column_key": build_display_column_key(col),
+                }
+            )
         return translated
 
     def list(self, request, *args, **kwargs):
@@ -71,19 +205,19 @@ class MonitorObjectViewSet(viewsets.ModelViewSet):
         children_counts = MonitorObject.objects.filter(parent__isnull=False).values("parent_id").annotate(children_count=Count("id"))
         children_count_map = {item["parent_id"]: item["children_count"] for item in children_counts}
 
-        # 构建类型 id -> name 的映射，用于自定义类型的 fallback 显示
-        type_name_map = {t.id: t.name for t in MonitorObjectType.objects.all()}
-
         for result in results:
             _type_key = f"{LanguageConstants.MONITOR_OBJECT_TYPE}.{result['type']}"
             _name_key = f"{LanguageConstants.MONITOR_OBJECT}.{result['name']}"
-            # display_type 优先级：国际化 > 类型名称 > 类型ID
-            result["display_type"] = lan.get(_type_key) or type_name_map.get(result["type"]) or result["type"]
-            # display_name 优先级：国际化 > 模型字段 display_name > name
+            # display_type 优先级：国际化 > 类型名称 > 类型ID(英文 slug)
+            i18n_type = lan.get(_type_key)
+            result["display_type"] = (
+                i18n_type
+                or (result.get("type_info") or {}).get("name")
+                or result["type"]
+            )
+            # display_name 优先级：国际化 > 模型字段 display_name > name(英文 slug)
             i18n_name = lan.get(_name_key)
             result["display_name"] = i18n_name or result.get("display_name") or result["name"]
-            # 添加是否内置标识：有国际化配置 或 没有 display_name 字段 表示内置
-            result["is_builtin"] = bool(i18n_name) or not result.get("display_name")
             # 添加子对象数量
             result["children_count"] = children_count_map.get(result["id"], 0)
             # 展示列名国际化：默认列跟随语言，自定义列保留用户输入。
@@ -111,24 +245,7 @@ class MonitorObjectViewSet(viewsets.ModelViewSet):
                 inst_res.get("team", []),
             )
 
-            inst_objs = MonitorInstance.objects.filter(is_deleted=False).prefetch_related("monitorinstanceorganization_set")
-            inst_map = {}
-            for inst_obj in inst_objs:
-                monitor_object_id = inst_obj.monitor_object_id
-                instance_id = inst_obj.id
-                teams = {i.organization for i in inst_obj.monitorinstanceorganization_set.all()}
-                _check = check_instance_permission(
-                    monitor_object_id,
-                    instance_id,
-                    teams,
-                    instance_permissions,
-                    cur_team,
-                )
-                if not _check:
-                    continue
-                if monitor_object_id not in inst_map:
-                    inst_map[monitor_object_id] = 0
-                inst_map[monitor_object_id] += 1
+            inst_map = _build_instance_count_map(instance_permissions, cur_team)
 
             for result in results:
                 result["instance_count"] = inst_map.get(result["id"], 0)
@@ -148,18 +265,7 @@ class MonitorObjectViewSet(viewsets.ModelViewSet):
                 policy_res.get("team", []),
             )
 
-            policy_objs = MonitorPolicy.objects.all().prefetch_related("policyorganization_set")
-            policy_map = {}
-            for policy_obj in policy_objs:
-                monitor_object_id = policy_obj.monitor_object_id
-                instance_id = policy_obj.id
-                teams = {i.organization for i in policy_obj.policyorganization_set.all()}
-                _check = check_instance_permission(monitor_object_id, instance_id, teams, policy_permissions, cur_team)
-                if not _check:
-                    continue
-                if monitor_object_id not in policy_map:
-                    policy_map[monitor_object_id] = 0
-                policy_map[monitor_object_id] += 1
+            policy_map = _build_policy_count_map(policy_permissions, cur_team)
 
             for result in results:
                 result["policy_count"] = policy_map.get(result["id"], 0)
@@ -173,13 +279,12 @@ class MonitorObjectViewSet(viewsets.ModelViewSet):
 
     @action(methods=["post"], detail=True, url_path="visibility")
     def visibility(self, request, pk=None):
-        """切换对象可见性"""
+        """切换对象可见性，同时级联到子对象。"""
         obj = self.get_object()
         is_visible = request.data.get("is_visible")
         if is_visible is None:
             return WebUtils.response_error("is_visible is required")
-        obj.is_visible = is_visible
-        obj.save(update_fields=["is_visible"])
+        MonitorObjectService.set_object_visibility(obj, bool(is_visible))
         return WebUtils.response_success()
 
     @action(methods=["post"], detail=True, url_path="display_fields")
@@ -194,6 +299,50 @@ class MonitorObjectViewSet(viewsets.ModelViewSet):
         obj.display_fields_customized = True
         obj.save(update_fields=["display_fields", "display_fields_customized"])
         return WebUtils.response_success(normalized)
+
+    def destroy(self, request, *args, **kwargs):
+        """内置对象的定义与生命周期受保护，运行配置使用独立 action 管理。"""
+        instance = self.get_object()
+        if instance.is_builtin:
+            raise ValidationAppException("内置监控对象不能删除")
+        return super().destroy(request, *args, **kwargs)
+
+    @action(methods=["get", "put"], detail=True, url_path="view_column_preference")
+    def view_column_preference(self, request, pk=None):
+        """读取或保存当前用户在当前监控对象下的列表列配置。"""
+        monitor_object = self.get_object()
+        habit_key = column_preference_habit_key(monitor_object.id)
+        if request.method == "GET":
+            habit = UserHabit.objects.filter(user=request.user, habit_key=habit_key).first()
+            return WebUtils.response_success(self._column_preference_from_habit(habit))
+
+        serializer = MonitorViewColumnPreferenceSerializer(data=request.data)
+        if not serializer.is_valid():
+            return WebUtils.response_error(
+                response_data=serializer.errors,
+                error_message="列配置格式无效",
+            )
+        field_keys = serializer.validated_data["field_keys"]
+        fixed_field_keys = serializer.validated_data.get("fixed_field_keys") or []
+        payload = {"field_keys": field_keys, "fixed_field_keys": fixed_field_keys}
+        UserHabit.objects.update_or_create(
+            user=request.user,
+            habit_key=habit_key,
+            defaults={"habit_value": payload},
+        )
+        return WebUtils.response_success(payload)
+
+    @staticmethod
+    def _column_preference_from_habit(habit):
+        if habit is None or type(habit.habit_value) is not dict:
+            return None
+        field_keys = habit.habit_value.get("field_keys")
+        if type(field_keys) is not list:
+            return None
+        fixed_field_keys = habit.habit_value.get("fixed_field_keys") or []
+        if type(fixed_field_keys) is not list:
+            fixed_field_keys = []
+        return {"field_keys": field_keys, "fixed_field_keys": fixed_field_keys}
 
     def create(self, request, *args, **kwargs):
         """创建监控对象，支持同时创建子对象"""
@@ -215,6 +364,13 @@ class MonitorObjectViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(data=data)
         serializer.is_valid(raise_exception=True)
         parent_obj = serializer.save()
+        if {"cleanup_policy", "cleanup_timeout_days", "cleanup_timeout_value", "cleanup_timeout_unit"} & set(data):
+            parent_obj = MonitorObjectCleanupPolicyService.configure(
+                parent_obj,
+                policy=parent_obj.cleanup_policy,
+                timeout_value=parent_obj.cleanup_timeout_days,
+                timeout_unit=parent_obj.cleanup_timeout_unit,
+            )
 
         # 批量创建子对象
         if children:
@@ -250,6 +406,38 @@ class MonitorObjectViewSet(viewsets.ModelViewSet):
         instance = self.get_object()
         data = request.data.copy()
         children = data.pop("children", None)
+        cleanup_keys = {
+            "cleanup_policy",
+            "cleanup_timeout_days",
+            "cleanup_timeout_value",
+            "cleanup_timeout_unit",
+        }
+        requested_cleanup = cleanup_keys & set(data.keys())
+
+        if instance.is_builtin:
+            disallowed_keys = set(data.keys()) - cleanup_keys
+            if children is not None or disallowed_keys:
+                raise ValidationAppException("内置监控对象定义不可修改")
+            policy = data.get("cleanup_policy", instance.cleanup_policy)
+            timeout_value = data.get(
+                "cleanup_timeout_value",
+                data.get("cleanup_timeout_days", instance.cleanup_timeout_days),
+            )
+            timeout_unit = data.get("cleanup_timeout_unit", instance.cleanup_timeout_unit)
+            instance = MonitorObjectCleanupPolicyService.configure(
+                instance,
+                policy=policy,
+                timeout_value=timeout_value,
+                timeout_unit=timeout_unit,
+            )
+            return WebUtils.response_success(self.get_serializer(instance).data)
+
+        cleanup_policy = data.pop("cleanup_policy", instance.cleanup_policy)
+        cleanup_timeout_value = data.pop(
+            "cleanup_timeout_value",
+            data.pop("cleanup_timeout_days", instance.cleanup_timeout_days),
+        )
+        cleanup_timeout_unit = data.pop("cleanup_timeout_unit", instance.cleanup_timeout_unit)
 
         # 父对象自动补充 instance_id_keys
         data["instance_id_keys"] = resolve_monitor_object_instance_id_keys(
@@ -262,10 +450,18 @@ class MonitorObjectViewSet(viewsets.ModelViewSet):
         if not instance.default_metric and "default_metric" not in data:
             data["default_metric"] = f"any({{instance_type='{instance.name}'}}) by (instance_id)"
 
-        # 更新父对象
-        serializer = self.get_serializer(instance, data=data, partial=partial)
-        serializer.is_valid(raise_exception=True)
-        self.perform_update(serializer)
+        # 更新父对象；清理策略通过专用服务写入并重置累计周期。
+        with transaction.atomic():
+            serializer = self.get_serializer(instance, data=data, partial=partial or not data)
+            serializer.is_valid(raise_exception=True)
+            self.perform_update(serializer)
+            if requested_cleanup:
+                instance = MonitorObjectCleanupPolicyService.configure(
+                    instance,
+                    policy=cleanup_policy,
+                    timeout_value=cleanup_timeout_value,
+                    timeout_unit=cleanup_timeout_unit,
+                )
 
         # 处理子对象
         if children is not None:
@@ -309,7 +505,7 @@ class MonitorObjectViewSet(viewsets.ModelViewSet):
             if new_children:
                 MonitorObject.objects.bulk_create(new_children)
 
-        return WebUtils.response_success(serializer.data)
+        return WebUtils.response_success(self.get_serializer(instance).data)
 
 
 class MonitorObjectTypeViewSet(viewsets.ModelViewSet):

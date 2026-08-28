@@ -1,15 +1,19 @@
-import React from 'react';
-import { Input, Button, Tree, Dropdown, Menu, Skeleton } from 'antd';
-import { PlusOutlined, MoreOutlined } from '@ant-design/icons';
+import React, { useMemo } from 'react';
+import { Input, Button, Tree, Skeleton, Dropdown } from 'antd';
+import type { MenuProps } from 'antd';
+import { PlusOutlined } from '@ant-design/icons';
 import type { DataNode as TreeDataNode } from 'antd/lib/tree';
 import PermissionWrapper from '@/components/permission';
 import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
 import Icon from '@/components/icon';
+import MoreActionsDropdown from '@/components/more-actions-dropdown';
+import usePermissions from '@/hooks/usePermissions';
 
 interface ExtendedTreeDataNode extends TreeDataNode {
   hasAuth?: boolean;
   isVirtual?: boolean;
   parentIsVirtual?: boolean;
+  syncSource?: number | null;
   children?: ExtendedTreeDataNode[];
 }
 
@@ -18,6 +22,7 @@ interface GroupTreeProps {
   searchValue: string;
   onSearchChange: (value: string) => void;
   onAddRootGroup: () => void;
+  onOpenArchivedDrawer?: () => void;
   onTreeSelect: (selectedKeys: React.Key[]) => void;
   onGroupAction: (action: string, groupKey: number) => void;
   t: (key: string) => string;
@@ -29,23 +34,25 @@ const GroupTree: React.FC<GroupTreeProps> = ({
   searchValue,
   onSearchChange,
   onAddRootGroup,
+  onOpenArchivedDrawer,
   onTreeSelect,
   onGroupAction,
   t,
   loading = false,
 }) => {
-  // Helper function to check if a node's parent is virtual
+  const { hasPermission } = usePermissions();
+  const canAddGroup = hasPermission(['Add Group']);
+  const canDeleteGroup = hasPermission(['Delete Group']);
+  const showRootActions = canAddGroup || canDeleteGroup;
+
   const isNodeChildOfVirtual = (tree: ExtendedTreeDataNode[], targetKey: number): boolean => {
     for (const node of tree) {
-      // Check if any of the children is the target node
       if (node.children) {
         for (const child of node.children) {
           if (child.key === targetKey) {
-            // Found the target node, check if its parent (current node) is virtual
             return node.isVirtual === true;
           }
         }
-        // Continue searching in children
         const result = isNodeChildOfVirtual(node.children, targetKey);
         if (result) return result;
       }
@@ -71,64 +78,45 @@ const GroupTree: React.FC<GroupTreeProps> = ({
 
     const nodeName = node ? (typeof node.title === 'string' ? node.title : String(node.title)) : '';
     const isDefaultGroup = nodeName === 'Default';
-    
-    // 判断是否为顶层虚拟团队（自己是虚拟团队且父节点不是虚拟团队）
+
     const isVirtual = node?.isVirtual === true;
+    const isSyncedGroup = node?.syncSource != null;
     const hasVirtualParent = isNodeChildOfVirtual(treeData, groupKey);
     const isTopLevelVirtualGroup = isVirtual && !hasVirtualParent;
-    
-    // 虚拟团队的子级不能再添加子级
-    const canAddSubGroup = !hasVirtualParent;
+
+    const canAddSubGroup = !hasVirtualParent && !isSyncedGroup;
 
     const menuItems = [
       ...(canAddSubGroup ? [{
         key: 'addSubGroup',
-        label: (
-          <PermissionWrapper requiredPermissions={['Add Group']}>
-            {t('system.group.addSubGroups')}
-          </PermissionWrapper>
-        ),
+        label: t('system.group.addSubGroups'),
+        permission: 'Add Group',
       }] : []),
       {
         key: 'edit',
-        label: (
-          <PermissionWrapper requiredPermissions={['Edit Group']}>
-            {t('common.edit')}
-          </PermissionWrapper>
-        ),
+        label: t('common.edit'),
+        permission: 'Edit Group',
       },
-      {
+      ...(node?.syncSource == null ? [{
         key: 'delete',
         disabled: isDefaultGroup || isTopLevelVirtualGroup,
-        label: (
-          <PermissionWrapper requiredPermissions={['Delete Group']}>
-            {t('common.delete')}
-          </PermissionWrapper>
-        ),
-      },
+        label: t('system.group.archive'),
+        permission: 'Delete Group',
+      }] : []),
     ];
 
     return (
-      <Dropdown
-        overlay={
-          <Menu
-            onClick={({ key, domEvent }) => {
-              domEvent.stopPropagation();
-              onGroupAction(key, groupKey);
-            }}
-            items={menuItems}
-          />
-        }
-        trigger={['click']}
-      >
-        <MoreOutlined
-          className="cursor-pointer"
-          onClick={(e) => {
-            e.stopPropagation();
-            e.preventDefault();
-          }}
-        />
-      </Dropdown>
+      <MoreActionsDropdown
+        items={menuItems.map((item) => ({
+          key: String(item.key),
+          label: item.label,
+          permission: item.permission,
+          disabled: 'disabled' in item ? item.disabled : undefined,
+          onClick: () => onGroupAction(String(item.key), groupKey),
+        }))}
+        buttonClassName="cursor-pointer"
+        stopPropagation
+      />
     );
   };
 
@@ -137,7 +125,7 @@ const GroupTree: React.FC<GroupTreeProps> = ({
       const currentIsVirtual = node.isVirtual === true;
       const childParentIsVirtual = currentIsVirtual || parentIsVirtual;
       const iconType = currentIsVirtual ? 'xunituandui' : 'zuzhiqunzu';
-      
+
       return {
         ...node,
         parentIsVirtual,
@@ -146,7 +134,7 @@ const GroupTree: React.FC<GroupTreeProps> = ({
           <div className="flex justify-between items-center w-full pr-1">
             <div className="flex items-center gap-1 flex-1 min-w-0">
               <Icon type={iconType} className="flex-shrink-0 font-mini" />
-              <EllipsisWithTooltip 
+              <EllipsisWithTooltip
                 text={typeof node.title === 'function' ? String(node.title(node)) : String(node.title)}
                 className={`truncate max-w-[100px] flex-1 ${node.hasAuth === false ? 'opacity-50' : ''}`}
               />
@@ -160,6 +148,25 @@ const GroupTree: React.FC<GroupTreeProps> = ({
       };
     });
 
+  const rootMenuItems = useMemo((): MenuProps['items'] => {
+    const items: MenuProps['items'] = [];
+    if (canAddGroup) {
+      items.push({
+        key: 'addRoot',
+        label: t('system.group.addRootGroup'),
+        onClick: () => onAddRootGroup(),
+      });
+    }
+    if (canDeleteGroup && onOpenArchivedDrawer) {
+      items.push({
+        key: 'restoreArchived',
+        label: t('system.group.restoreArchivedGroup'),
+        onClick: () => onOpenArchivedDrawer(),
+      });
+    }
+    return items;
+  }, [canAddGroup, canDeleteGroup, onAddRootGroup, onOpenArchivedDrawer, t]);
+
   return (
     <div className="w-full h-full flex flex-col">
       <div className="flex items-center mb-4">
@@ -170,15 +177,16 @@ const GroupTree: React.FC<GroupTreeProps> = ({
           onChange={(e) => onSearchChange(e.target.value)}
           value={searchValue}
         />
-        <PermissionWrapper requiredPermissions={['Add Group']}>
-          <Button 
-            type="primary" 
-            size="small" 
-            icon={<PlusOutlined />} 
-            className="ml-2" 
-            onClick={onAddRootGroup}
-          />
-        </PermissionWrapper>
+        {showRootActions && (
+          <Dropdown menu={{ items: rootMenuItems }} trigger={['click']}>
+            <Button
+              type="primary"
+              size="small"
+              icon={<PlusOutlined />}
+              className="ml-2"
+            />
+          </Dropdown>
+        )}
       </div>
       {loading ? (
         <div className="w-full flex-1 overflow-auto p-4">
@@ -186,7 +194,7 @@ const GroupTree: React.FC<GroupTreeProps> = ({
         </div>
       ) : (
         <Tree
-          className="w-full flex-1 overflow-auto"
+          className="w-full flex-1 overflow-auto bg-transparent"
           showLine
           blockNode
           expandAction={false}

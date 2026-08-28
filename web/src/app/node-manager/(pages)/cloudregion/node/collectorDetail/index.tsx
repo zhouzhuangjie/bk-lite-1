@@ -4,17 +4,18 @@ import React, {
   useState,
   forwardRef,
   useImperativeHandle,
-  useRef
+  useRef,
+  useMemo
 } from 'react';
 import {
   Tag,
-  Empty,
   Button,
   Spin,
   Badge,
   Popconfirm,
   message,
-  Input
+  Input,
+  Space
 } from 'antd';
 import {
   RightOutlined,
@@ -23,7 +24,8 @@ import {
   ExclamationCircleOutlined
 } from '@ant-design/icons';
 import Icon from '@/components/icon';
-import OperateDrawer from '@/app/node-manager/components/operate-drawer';
+import CompactEmptyState from '@/components/compact-empty-state';
+import OperateDrawer from '@/components/operate-drawer';
 import { useTranslation } from '@/utils/i18n';
 import { useTelegrafMap } from '@/app/node-manager/hooks/node';
 import { useLocalizedTime } from '@/hooks/useLocalizedTime';
@@ -44,6 +46,17 @@ import CustomTable from '@/components/custom-table';
 import ConfigModal from './configModal';
 import PermissionWrapper from '@/components/permission';
 import { useUserInfoContext } from '@/context/userInfo';
+import { useClientData } from '@/context/client';
+import {
+  getSoldModulePushTargets,
+  hasSuccessfulModuleLink,
+  type ModulePushStatusMap,
+  type ModulePushTarget
+} from '@/app/node-manager/utils/modulePush';
+import {
+  asCollectorStatusList,
+  resolveMainConfig
+} from '@/app/node-manager/utils/collectorConfig';
 
 interface CollectorDetailDrawerProps extends ModalSuccess {
   nodeStateEnum?: any;
@@ -55,9 +68,14 @@ const CollectorDetailDrawer = forwardRef<ModalRef, CollectorDetailDrawerProps>(
     const { convertToLocalizedTime } = useLocalizedTime();
     const statusMap = useTelegrafMap();
     const cloudId = useCloudId();
-    const { getConfiglist, getChildConfig, deleteSubConfig } =
+    const { getConfiglist, getChildConfig, deleteSubConfig, modulePush, getNodeList } =
       useNodeManagerApi();
     const commonContext = useUserInfoContext();
+    const { clientData } = useClientData();
+    const soldPushTargets = useMemo(
+      () => getSoldModulePushTargets(clientData),
+      [clientData]
+    );
     const adminRef = useRef(commonContext?.roles || []);
     const isAdmin =
       adminRef.current.includes('admin') ||
@@ -67,6 +85,7 @@ const CollectorDetailDrawer = forwardRef<ModalRef, CollectorDetailDrawerProps>(
     const configRequestIdRef = useRef<number>(0);
     const subConfigAbortControllerRef = useRef<AbortController | null>(null);
     const subConfigRequestIdRef = useRef<number>(0);
+    const selectedCollectorRef = useRef<TableDataItem | null>(null);
     const [visible, setVisible] = useState<boolean>(false);
     const [selectedCollector, setSelectedCollector] =
       useState<TableDataItem | null>(null);
@@ -77,6 +96,9 @@ const CollectorDetailDrawer = forwardRef<ModalRef, CollectorDetailDrawerProps>(
     const [mainConfigLoading, setMainConfigLoading] = useState<boolean>(false);
     const [subConfigs, setSubConfigs] = useState<any[]>([]);
     const [subConfigLoading, setSubConfigLoading] = useState<boolean>(false);
+    const [modulePushLoading, setModulePushLoading] = useState<
+      ModulePushTarget | null
+    >(null);
     const [subConfigPagination, setSubConfigPagination] = useState<Pagination>({
       current: 1,
       total: 0,
@@ -89,9 +111,12 @@ const CollectorDetailDrawer = forwardRef<ModalRef, CollectorDetailDrawerProps>(
       showModal: ({ collectors, row }) => {
         setVisible(true);
         // 过滤采集器列表:如果同一个collector_id同时存在于collectors和collectors_install中,只保留collectors中的
-        const collectorsFromStatus = row.status?.collectors || [];
-        const collectorsInstallFromStatus =
-          row.status?.collectors_install || [];
+        const collectorsFromStatus = asCollectorStatusList(
+          row.status?.collectors
+        );
+        const collectorsInstallFromStatus = asCollectorStatusList(
+          row.status?.collectors_install
+        );
         const collectorIds = new Set(
           collectorsFromStatus.map((c: any) => c.collector_id)
         );
@@ -110,6 +135,9 @@ const CollectorDetailDrawer = forwardRef<ModalRef, CollectorDetailDrawerProps>(
         ].filter((c: any) => c.collector_id !== 'ansibleexecutor_linux'); // 过滤掉 Ansible-Executor
         setCollectors(filteredCollectors);
         setForm(row);
+        selectedCollectorRef.current = null;
+        setSelectedCollector(null);
+        setMainConfig(null);
         if (filteredCollectors.length > 0) {
           const sortedCollectors = [...filteredCollectors].sort((a, b) => {
             const priorityA = STATUS_CODE_PRIORITY[a.status] || 999;
@@ -125,29 +153,47 @@ const CollectorDetailDrawer = forwardRef<ModalRef, CollectorDetailDrawerProps>(
             firstCollector.message =
               firstCollector.message?.final_message || '';
           }
+          selectedCollectorRef.current = firstCollector;
           setSelectedCollector(firstCollector);
-          setMainConfig({
-            key: '',
-            collector_id: firstCollector.collector_id,
-            name: '',
-            operatingSystem: '',
-            configInfo: '',
-            nodeCount: 0,
-            collector_name: firstCollector.collector_name
-          } as ConfigData);
-          if (firstCollector.collector_id && row.id) {
-            // 加载所有配置数据
-            loadAllConfigs(
-              row.id as string,
-              firstCollector.collector_id as string
-            );
+          setMainConfig(null);
+          if (row.id) {
+            loadAllConfigs(row.id as string);
           }
         }
       }
     }));
 
+    const applyMainConfig = (
+      configs: ConfigData[],
+      collector: TableDataItem | null,
+      options?: { page?: number; configType?: string }
+    ) => {
+      let targetConfig = null;
+      if (collector) {
+        targetConfig = resolveMainConfig(configs, {
+          collector_id:
+            typeof collector.collector_id === 'string'
+              ? collector.collector_id
+              : undefined,
+          configuration_id: collector.configuration_id
+        });
+      }
+      if (targetConfig) {
+        setMainConfig(targetConfig);
+        loadSubConfigs({
+          configId: targetConfig.key,
+          page: options?.page,
+          configType: options?.configType
+        });
+        return;
+      }
+      setMainConfig(null);
+      setSubConfigs([]);
+      setSubConfigPagination({ current: 1, total: 0, pageSize: 10 });
+    };
+
     // 加载所有配置数据（只调用一次 config_node_asso 接口）
-    const loadAllConfigs = async (nodeId: string, firstCollectorId: string) => {
+    const loadAllConfigs = async (nodeId: string) => {
       configAbortControllerRef.current?.abort();
       const abortController = new AbortController();
       configAbortControllerRef.current = abortController;
@@ -173,36 +219,13 @@ const CollectorDetailDrawer = forwardRef<ModalRef, CollectorDetailDrawerProps>(
           })
         );
         setAllConfigs(configData);
-        const targetConfig = configData.find(
-          (config) => config.collector_id === firstCollectorId
-        );
-        if (targetConfig) {
-          setMainConfig(targetConfig);
-          loadSubConfigs({ configId: targetConfig.key });
-        } else {
-          setMainConfig(null);
-        }
+        applyMainConfig(configData, selectedCollectorRef.current);
       } catch (error) {
         console.error('Failed to load configs:', error);
       } finally {
         if (currentRequestId === configRequestIdRef.current) {
           setMainConfigLoading(false);
         }
-      }
-    };
-
-    // 前端过滤主配置（根据 collector_id）
-    const filterMainConfigByCollectorId = (collectorId: string) => {
-      const targetConfig = allConfigs.find(
-        (config) => config.collector_id === collectorId
-      );
-      if (targetConfig) {
-        setMainConfig(targetConfig);
-        loadSubConfigs({ configId: targetConfig.key, page: 1, configType: '' });
-      } else {
-        setMainConfig(null);
-        setSubConfigs([]);
-        setSubConfigPagination({ current: 1, total: 0, pageSize: 10 });
       }
     };
 
@@ -276,10 +299,12 @@ const CollectorDetailDrawer = forwardRef<ModalRef, CollectorDetailDrawerProps>(
     const handleCancel = () => {
       configAbortControllerRef.current?.abort();
       subConfigAbortControllerRef.current?.abort();
+      selectedCollectorRef.current = null;
       setVisible(false);
       setCollectors([]);
       setSelectedCollector(null);
       setForm({});
+      setAllConfigs([]);
       setMainConfig(null);
       setSubConfigs([]);
       setSubConfigPagination({ current: 1, total: 0, pageSize: 10 });
@@ -302,10 +327,9 @@ const CollectorDetailDrawer = forwardRef<ModalRef, CollectorDetailDrawerProps>(
       if (collector.message && typeof collector.message === 'object') {
         collector.message = collector.message?.final_message || '';
       }
+      selectedCollectorRef.current = collector;
       setSelectedCollector(collector);
-      if (collector.collector_id) {
-        filterMainConfigByCollectorId(collector.collector_id as string);
-      }
+      applyMainConfig(allConfigs, collector, { page: 1, configType: '' });
     };
 
     // 处理主配置编辑
@@ -334,11 +358,8 @@ const CollectorDetailDrawer = forwardRef<ModalRef, CollectorDetailDrawerProps>(
         }
         return;
       }
-      if (form.id && selectedCollector?.collector_id) {
-        await loadAllConfigs(
-          form.id as string,
-          selectedCollector.collector_id as string
-        );
+      if (form.id) {
+        await loadAllConfigs(form.id as string);
       }
       onSuccess?.();
     };
@@ -452,16 +473,9 @@ const CollectorDetailDrawer = forwardRef<ModalRef, CollectorDetailDrawerProps>(
           engText: 'Unknown',
           icon: (
             <div
-              className="w-6 h-6 rounded-lg flex items-center justify-center"
-              style={{ backgroundColor: 'rgba(0, 0, 0, 0.1)' }}
+              className="flex h-6 w-6 items-center justify-center rounded-lg bg-black/10"
             >
-              <ExclamationCircleOutlined
-                style={{
-                  color: '#000000',
-                  fontWeight: 'bold',
-                  fontSize: '12px'
-                }}
-              />
+              <ExclamationCircleOutlined className="text-xs font-bold text-black" />
             </div>
           )
         }
@@ -472,9 +486,8 @@ const CollectorDetailDrawer = forwardRef<ModalRef, CollectorDetailDrawerProps>(
       const osValue = form?.operating_system;
       return (
         <Icon
-          className="mr-[8px] center-align"
+          className="mr-[8px] center-align inline-block scale-[1.3]"
           type={osValue === 'linux' ? 'Linux' : 'Window-Windows'}
-          style={{ transform: 'scale(1.3)', display: 'inline-block' }}
         />
       );
     };
@@ -482,6 +495,56 @@ const CollectorDetailDrawer = forwardRef<ModalRef, CollectorDetailDrawerProps>(
     const getOSLabel = () => {
       const osValue = form?.operating_system;
       return nodeStateEnum?.os?.[osValue] || osValue;
+    };
+
+    const pushStatus = (form.push_status || {}) as ModulePushStatusMap;
+
+    const formatPushState = (target: ModulePushTarget) => {
+      const state = pushStatus?.[target]?.state;
+      if (!state) {
+        return t('node-manager.cloudregion.node.pushStateNone');
+      }
+      const key = `node-manager.cloudregion.node.pushState.${state}`;
+      const translated = t(key);
+      return translated === key ? state : translated;
+    };
+
+    const refreshNodeLinkage = async () => {
+      if (!form.id) return;
+      try {
+        const res = await getNodeList({
+          cloud_region_id: cloudId,
+          page: 1,
+          page_size: 1,
+          filters: {
+            id: [{ lookup_expr: 'exact', value: String(form.id) }]
+          }
+        });
+        const latest = res?.items?.[0];
+        if (latest) {
+          setForm((prev) => ({
+            ...prev,
+            cmdb_id: latest.cmdb_id,
+            monitor_id: latest.monitor_id,
+            push_status: latest.push_status
+          }));
+        }
+      } catch {
+        // 推送已成功时列表刷新失败不阻断；下次打开详情会拿到最新值
+      }
+      onSuccess();
+    };
+
+    const handleModulePush = async (target: ModulePushTarget) => {
+      if (!form.id) return;
+      setModulePushLoading(target);
+      try {
+        await modulePush(form.id as string, [target]);
+        message.success(t('common.operationSuccessful'));
+        await refreshNodeLinkage();
+      } finally {
+        setModulePushLoading(null);
+      }
     };
 
     return (
@@ -505,21 +568,90 @@ const CollectorDetailDrawer = forwardRef<ModalRef, CollectorDetailDrawerProps>(
             </>
           }
           headerExtra={
-            <div
-              style={{
-                color: 'var(--color-text-3)',
-                fontSize: '12px'
-              }}
-            >
+            <div className="text-xs text-[var(--color-text-3)]">
               {t('node-manager.cloudregion.node.lastReportTime')}：
               {form.updated_at ? convertToLocalizedTime(form.updated_at) : '--'}
             </div>
           }
           open={visible}
           width={800}
-          destroyOnClose
+          destroyOnHidden
           onClose={handleCancel}
         >
+          {soldPushTargets.length > 0 && (
+            <div className="mb-4 rounded border border-[var(--color-border-1)] bg-[var(--color-bg-1)] p-3">
+              <div className="mb-2 font-medium text-[14px]">
+                {t('node-manager.cloudregion.node.moduleLinkage')}
+              </div>
+              <div className="space-y-2 text-[12px] text-[var(--color-text-2)]">
+                {soldPushTargets.includes('cmdb') && (
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <Space size="middle" wrap>
+                      <span>
+                        {t('node-manager.cloudregion.node.cmdbId')}：
+                        {form.cmdb_id || '--'}
+                      </span>
+                      <span>
+                        {t('node-manager.cloudregion.node.pushStatus')}：
+                        {formatPushState('cmdb')}
+                      </span>
+                    </Space>
+                    <PermissionWrapper requiredPermissions={['Edit']}>
+                      <Button
+                        type="link"
+                        size="small"
+                        loading={modulePushLoading === 'cmdb'}
+                        disabled={!!modulePushLoading}
+                        onClick={() => void handleModulePush('cmdb')}
+                      >
+                        {hasSuccessfulModuleLink(
+                          form.cmdb_id,
+                          pushStatus,
+                          'cmdb'
+                        )
+                          ? t('node-manager.cloudregion.node.resyncModule')
+                          : t('node-manager.cloudregion.node.pushModule')}
+                      </Button>
+                    </PermissionWrapper>
+                  </div>
+                )}
+                {soldPushTargets.includes('monitor') && (
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <Space size="middle" wrap>
+                      <span>
+                        {t('node-manager.cloudregion.node.monitorId')}：
+                        {form.monitor_id || '--'}
+                      </span>
+                      <span>
+                        {t('node-manager.cloudregion.node.pushStatus')}：
+                        {formatPushState('monitor')}
+                      </span>
+                    </Space>
+                    <PermissionWrapper requiredPermissions={['Edit']}>
+                      <Button
+                        type="link"
+                        size="small"
+                        loading={modulePushLoading === 'monitor'}
+                        disabled={!!modulePushLoading}
+                        onClick={() => void handleModulePush('monitor')}
+                      >
+                        {hasSuccessfulModuleLink(
+                          form.monitor_id,
+                          pushStatus,
+                          'monitor'
+                        )
+                          ? t('node-manager.cloudregion.node.resyncModule')
+                          : t('node-manager.cloudregion.node.pushModule')}
+                      </Button>
+                    </PermissionWrapper>
+                  </div>
+                )}
+              </div>
+              <div className="mt-2 text-[12px] text-[var(--color-text-3)]">
+                {t('node-manager.cloudregion.node.modulePushNoCascade')}
+              </div>
+            </div>
+          )}
           <div className="flex h-full">
             <div className="w-1/3 pr-4 border-r border-gray-200">
               <div className="flex items-center mb-2">
@@ -531,11 +663,7 @@ const CollectorDetailDrawer = forwardRef<ModalRef, CollectorDetailDrawerProps>(
                   count={collectors.length}
                   showZero
                   color="var(--color-fill-1)"
-                  style={{
-                    backgroundColor: 'var(--color-fill-2)',
-                    color: 'var(--color-text-2)',
-                    boxShadow: 'none'
-                  }}
+                  className="bg-[var(--color-fill-2)] text-[var(--color-text-2)] shadow-none"
                 />
               </div>
               <div className="space-y-2">
@@ -550,15 +678,14 @@ const CollectorDetailDrawer = forwardRef<ModalRef, CollectorDetailDrawerProps>(
                           return (
                             <div
                               key={collector.collector_id}
-                              className={`p-3 rounded cursor-pointer transition-colors flex items-center justify-between border-l-4 ${
+                              className={`flex cursor-pointer items-center justify-between rounded border border-[var(--color-border-1)] border-l-4 p-3 transition-colors ${
                                 selectedCollector?.collector_id ===
                                 collector.collector_id
-                                  ? 'bg-[var(--color-bg-hover)] border-blue-200'
-                                  : 'bg-[var(--color-bg-1)] border-gray-200 hover:bg-[var(--color-bg-hover)]'
+                                  ? 'bg-[var(--color-bg-hover)]'
+                                  : 'bg-[var(--color-bg-1)] hover:bg-[var(--color-bg-hover)]'
                               }`}
                               style={{
-                                border: '1px solid var(--color-border-1)',
-                                borderLeft: `4px solid ${collectorStatusInfo.color}`
+                                borderLeftColor: collectorStatusInfo.color
                               }}
                               onClick={() => handleCollectorClick(collector)}
                             >
@@ -617,11 +744,10 @@ const CollectorDetailDrawer = forwardRef<ModalRef, CollectorDetailDrawerProps>(
                     >
                       <span className="flex items-center text-xs">
                         <span
+                          className="mr-1 text-base"
                           style={{
                             color: getStatusInfo(selectedCollector.status)
-                              .color,
-                            fontSize: '16px',
-                            marginRight: '4px'
+                              .color
                           }}
                         >
                           {React.cloneElement(
@@ -636,14 +762,11 @@ const CollectorDetailDrawer = forwardRef<ModalRef, CollectorDetailDrawerProps>(
                             }
                           )}
                         </span>
-                        <span style={{ whiteSpace: 'pre-line' }}>
+                        <span className="whitespace-pre-line">
                           {selectedCollector.message || '--'}
                         </span>
                       </span>
-                      <p
-                        className="mt-[4px]"
-                        style={{ whiteSpace: 'pre-line' }}
-                      >
+                      <p className="mt-[4px] whitespace-pre-line">
                         {selectedCollector.verbose_message || ''}
                       </p>
                     </div>
@@ -691,7 +814,7 @@ const CollectorDetailDrawer = forwardRef<ModalRef, CollectorDetailDrawerProps>(
                             onSearch={handleSearch}
                             onClear={handleClearSearch}
                             allowClear
-                            style={{ width: 250 }}
+                            className="w-[250px]"
                           />
                         </div>
                         <div className="flex-1">
@@ -716,7 +839,7 @@ const CollectorDetailDrawer = forwardRef<ModalRef, CollectorDetailDrawerProps>(
                   </Spin>
                 </div>
               ) : (
-                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} />
+                <CompactEmptyState description={t('common.noData')} />
               )}
             </div>
           </div>

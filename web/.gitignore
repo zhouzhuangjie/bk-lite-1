@@ -14,6 +14,8 @@ node_modules/
 
 # testing
 /coverage
+/playwright-report/
+/test-results/
 
 # next.js
 /.next/
@@ -41,9 +43,8 @@ yarn-error.log*
 *.tsbuildinfo
 tsconfig.lint.json
 
-# npm、pnpm 和 yarn lock
+# npm 和 yarn lock
 package-lock.json
-pnpm-lock.yaml
 yarn.lock
 
 .history
@@ -63,6 +64,12 @@ server.js
 server.key
 
 .env.local
-pnpm-workspace.yaml
 
 deploy/docker-compose/conf/nats/nats.conf
+
+# Next.js 本机自动生成的 agent 规则文件
+/AGENTS.md
+/CLAUDE.md
+
+# temporary hide nested app node_modules during type-check
+.typecheck-nm-hidden/

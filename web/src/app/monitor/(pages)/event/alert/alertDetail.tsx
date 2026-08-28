@@ -11,7 +11,7 @@ import React, {
 } from 'react';
 import { Button, Tag, Tabs, Spin } from 'antd';
 import VirtualList from 'rc-virtual-list';
-import OperateModal from '@/app/monitor/components/operate-drawer';
+import OperateModal from '@/components/operate-drawer';
 import { useTranslation } from '@/utils/i18n';
 import {
   ModalRef,
@@ -39,14 +39,20 @@ import { renderChart } from '@/app/monitor/utils/common';
 import { useUnitTransform } from '@/app/monitor/hooks/useUnitTransform';
 import { LEVEL_MAP } from '@/app/monitor/constants';
 import type { ListRef } from 'rc-virtual-list';
-import { buildAlertSnapshotChartValues } from './alertDetailUtils';
+import {
+  buildAlertDetailMetricQuery,
+  buildAlertSnapshotChartModel,
+  decorateAlertSnapshotChartData,
+  resolveAlertDetailChartUnit,
+  resolveAlertDetailMetric
+} from './alertDetailUtils';
 
 const TIMELINE_ITEM_HEIGHT = 48;
 
 type AlertEventItem = TableDataItem & HeatMapDataItem;
 
 const AlertDetail = forwardRef<ModalRef, ModalConfig>(
-  ({ objects, userList, onSuccess, objectId }, ref) => {
+  ({ objects, userList, onSuccess }, ref) => {
     const { t } = useTranslation();
     const { getMonitorMetrics } = useMonitorApi();
     const { getMonitorEventDetail, getEventRaw, getSnapshot } = useEventApi();
@@ -59,6 +65,10 @@ const AlertDetail = forwardRef<ModalRef, ModalConfig>(
     const [formData, setFormData] = useState<TableDataItem>({});
     const [title, setTitle] = useState<string>('');
     const [chartData, setChartData] = useState<ChartData[]>([]);
+    const [chartXAxisDomain, setChartXAxisDomain] = useState<
+      [number, number] | null
+    >(null);
+    const [chartUnit, setChartUnit] = useState<string>('');
     const [trapData, setTrapData] = useState<TableDataItem>({});
     const [activeTab, setActiveTab] = useState<string>('information');
     const [loading, setLoading] = useState<boolean>(false);
@@ -107,7 +117,7 @@ const AlertDetail = forwardRef<ModalRef, ModalConfig>(
       showModal: ({ title, form }) => {
         setGroupVisible(true);
         setTitle(title);
-        getMetrics(form, objectId as React.Key);
+        getMetrics(form);
       }
     }));
 
@@ -116,23 +126,25 @@ const AlertDetail = forwardRef<ModalRef, ModalConfig>(
       [activeTab]
     );
 
-    const getMetrics = async (row: TableDataItem, id: React.Key) => {
+    const getMetrics = async (row: TableDataItem) => {
       setPageLoading(true);
       try {
-        const data = await getMonitorMetrics({ monitor_object_id: id });
-        const metricInfo =
-          data.find(
-            (item: MetricItem) =>
-              item.id === row.policy?.query_condition?.metric_id
-          ) || {};
-        const displayUnit = row.policy?.calculation_unit || metricInfo.unit;
-        const metricWithUnit = { ...metricInfo, unit: displayUnit };
+        const query = buildAlertDetailMetricQuery(row);
+        let metricInfo: MetricItem | Record<string, never> = {};
+        if (query) {
+          const { items: data } = await getMonitorMetrics(query);
+          metricInfo =
+            data.find((item: MetricItem) => Number(item.id) === query.id) ||
+            {};
+        }
+        const metricWithUnit = resolveAlertDetailMetric(row, metricInfo);
         const form: TableDataItem = {
           ...row,
           metric: metricWithUnit,
           alertValue: getEnumValueUnit(metricWithUnit as MetricItem, row.value)
         };
         setFormData(form);
+        setChartUnit(resolveAlertDetailChartUnit(form, ''));
         if (form.policy?.query_condition?.type === 'pmq') {
           getRawData(form);
           return;
@@ -151,8 +163,14 @@ const AlertDetail = forwardRef<ModalRef, ModalConfig>(
           page_size: -1,
           page: 10
         });
-        const data = buildAlertSnapshotChartValues(
-          responseData?.snapshots || []
+        const snapshots = responseData?.snapshots || [];
+        const isNoDataAlert = form.alert_type === 'no_data';
+        const snapshotChart = buildAlertSnapshotChartModel(
+          snapshots,
+          isNoDataAlert ? { alertType: 'no_data' } : undefined
+        );
+        setChartUnit(
+          resolveAlertDetailChartUnit(form, responseData?.chart_unit)
         );
         const config = [
           {
@@ -164,11 +182,24 @@ const AlertDetail = forwardRef<ModalRef, ModalConfig>(
             title: form.metric?.display_name || '--'
           }
         ];
-        const _chartData = renderChart(
-          [{ values: data, metric: form.metric }],
+        const rendered = renderChart(
+          [{ values: snapshotChart.dataValues, metric: form.metric }],
           config
         );
-        setChartData(_chartData);
+        if (isNoDataAlert) {
+          setChartData(
+            decorateAlertSnapshotChartData(
+              rendered,
+              snapshotChart.gapIntervals,
+              snapshotChart.xAxisDomain,
+              snapshotChart.noDataTimes
+            )
+          );
+          setChartXAxisDomain(snapshotChart.xAxisDomain);
+        } else {
+          setChartData(rendered);
+          setChartXAxisDomain(null);
+        }
       } finally {
         setLoading(false);
       }
@@ -274,6 +305,8 @@ const AlertDetail = forwardRef<ModalRef, ModalConfig>(
       setGroupVisible(false);
       setActiveTab('information');
       setChartData([]);
+      setChartXAxisDomain(null);
+      setChartUnit('');
       setTrapData({});
       setEventData([]);
       timelineRef.current?.scrollTo(0);
@@ -400,6 +433,8 @@ const AlertDetail = forwardRef<ModalRef, ModalConfig>(
                       onClose={closeModal}
                       trapData={trapData}
                       chartData={chartData}
+                      chartXAxisDomain={chartXAxisDomain}
+                      chartUnit={chartUnit}
                     />
                   </Spin>
                 ) : (

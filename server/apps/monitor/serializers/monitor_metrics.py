@@ -1,7 +1,8 @@
 from rest_framework import serializers
 
-from apps.monitor.models.monitor_metrics import MetricGroup, Metric
+from apps.monitor.models.monitor_metrics import Metric, MetricGroup
 from apps.monitor.utils.instance_id_keys import resolve_metric_instance_id_keys
+from apps.monitor.utils.metric_query_labels import ensure_metric_labels_placeholder
 
 
 class MetricGroupSerializer(serializers.ModelSerializer):
@@ -10,7 +11,21 @@ class MetricGroupSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = MetricGroup
-        fields = "__all__"
+        fields = [
+            "id",
+            "monitor_object",
+            "monitor_plugin",
+            "name",
+            "description",
+            "is_pre",
+            "sort_order",
+            "created_at",
+            "updated_at",
+            "created_by",
+            "updated_by",
+            "domain",
+            "updated_by_domain",
+        ]
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
@@ -47,10 +62,37 @@ class MetricGroupSerializer(serializers.ModelSerializer):
 class MetricSerializer(serializers.ModelSerializer):
     # 这里定义 is_pre 但不给默认值，防止用户传递该字段
     is_pre = serializers.BooleanField(read_only=True)
+    is_ifmib = serializers.BooleanField(read_only=True)
+    monitor_plugin_name = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Metric
-        fields = "__all__"
+        fields = [
+            "id",
+            "monitor_object",
+            "monitor_plugin",
+            "monitor_plugin_name",
+            "metric_group",
+            "name",
+            "display_name",
+            "query",
+            "view_query",
+            "view_config",
+            "unit",
+            "data_type",
+            "description",
+            "dimensions",
+            "instance_id_keys",
+            "is_ifmib",
+            "is_pre",
+            "sort_order",
+            "created_at",
+            "updated_at",
+            "created_by",
+            "updated_by",
+            "domain",
+            "updated_by_domain",
+        ]
 
     def _resolve_instance_id_keys(self, attrs, default_metric_keys=None):
         monitor_object = attrs.get("monitor_object", getattr(self.instance, "monitor_object", None))
@@ -68,6 +110,9 @@ class MetricSerializer(serializers.ModelSerializer):
             getattr(monitor_object, "instance_id_keys", []),
         )
         return data
+
+    def get_monitor_plugin_name(self, instance):
+        return instance.monitor_plugin.name if instance.monitor_plugin else ""
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
@@ -90,9 +135,16 @@ class MetricSerializer(serializers.ModelSerializer):
         if self.instance is not None:
             queryset = queryset.exclude(id=self.instance.id)
         if queryset.exists():
-            raise serializers.ValidationError({"name": "同模板内指标名称不能重复"})
+            raise serializers.ValidationError({"name": "同模板内指标 ID 不能重复"})
+
+        if "query" in attrs and attrs.get("query") is not None:
+            attrs["query"] = ensure_metric_labels_placeholder(attrs.get("query"))
 
         return attrs
+
+    def get_unique_together_validators(self):
+        # 禁用 DRF 默认 unique_together 文案，改由 validate() 给出字段级错误
+        return []
 
     def create(self, validated_data):
         """

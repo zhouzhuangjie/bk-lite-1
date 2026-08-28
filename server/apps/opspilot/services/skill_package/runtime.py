@@ -1,8 +1,23 @@
 import json
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
 import yaml
+
+from apps.core.logger import opspilot_logger as logger
+from apps.opspilot.utils.db_cleanup import run_with_db_cleanup
+
+# SKILL.md frontmatter 提取正则(与 importer._split_frontmatter 保持一致)
+_SKILL_MD_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*(?:\n|$)", re.DOTALL)
+# 策略字段:由 SKILL.md frontmatter / skill.yaml 决定,覆盖 DB manifest
+_STRATEGY_FIELDS = ("capabilities", "reports", "workflows", "variables")
+_DOMAIN_MATCH_ALIASES = (
+    (
+        ("kubernetes", "k8s"),
+        ("kubernetes", "k8s", "集群", "工作负载", "pod", "pods", "deployment", "namespace", "命名空间"),
+    ),
+)
 
 
 def normalize_skill_packages(raw_packages: Any) -> list[dict[str, Any]]:
@@ -59,46 +74,72 @@ def build_skill_package_prompt(
     user_message: Any,
     available_tool_names: Iterable[str] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
-    selected = select_skill_packages_for_message(skill_packages, user_message)
-    if not selected:
+    """把已启用技能包以渐进披露目录写入 system prompt。
+
+    只注入名称 / 短说明 / 触发词 / 依赖工具，**不**塞入完整 ``skill_markdown``。
+    完整正文由 DeepAgent ``SkillsMiddleware`` 物化为 ``SKILL.md``，模型按需
+    ``read_file`` 读取，避免寒暄类问题也烧掉整包 token。
+    """
+    # 列出所有已启用的技能包(不靠 keyword 匹配筛,避免"今天天气"也强塞正文)。
+    # LLM 看到目录后按用户问题挑相关的 1+ 个用,而不是"显示的都用上"。
+    enabled = normalize_skill_packages(skill_packages)
+    if not enabled:
         return base_prompt or "", []
 
     available = {str(item) for item in (available_tool_names or [])}
-    blocks = ["\n\n---\n\n## 当前可用技能包\n"]
+    blocks = ["\n\n---\n\n## 已启用的技能包\n"]
+    matched = select_skill_packages_for_message(enabled, user_message)
+    matched_ids = {_package_match_key(package) for package in matched}
     matched_packages: list[dict[str, Any]] = []
-    for package in selected:
+    for package in enabled:
         package_name = _package_display_name(package)
         missing_tools = _missing_required_tools(package, available)
-        matched_packages.append(
-            {
-                "id": str(package.get("id") or package.get("package_id") or package_name),
-                "name": package_name,
-                "package_id": str(package.get("package_id") or package.get("id") or ""),
-                "description": str(package.get("description") or ""),
-                "missing_tools": missing_tools,
-                "capabilities": _as_list(package.get("capabilities")),
-                "reports": _as_dict(package.get("reports")),
-                "workflows": _as_dict(package.get("workflows")),
-            }
-        )
+        if _package_match_key(package) in matched_ids:
+            matched_packages.append(_package_summary(package, missing_tools))
         missing_notice = f"\n- 缺少依赖工具：{'、'.join(missing_tools)}" if missing_tools else ""
+        missing_params = _as_list(package.get("missing_params"))
+        if missing_params:
+            missing_notice += f"\n- 缺少必填变量：{'、'.join(missing_params)}，本包不可用"
+        description = _compact_package_description(package)
         blocks.append(
             "\n".join(
                 [
                     f"### {package_name}",
-                    f"- 命中标记：已命中技能包：{package_name}",
-                    f"- 说明：{package.get('description') or '无'}",
+                    f"- 说明：{description}",
                     f"- 触发词：{_join_list(package.get('triggers')) or '无'}",
                     f"- 依赖工具：{_join_list(package.get('required_tools')) or '无'}{missing_notice}",
-                    "",
-                    str(package.get("skill_markdown") or package.get("content") or "").strip(),
                 ]
             )
         )
     blocks.append(
-        "\n使用规则：仅在用户问题命中技能包能力边界时采用对应技能包；如果采用技能包方法，必须在思考区或最终答复开头写明 `已命中技能包：<技能包名称>`；技能包不是工具调用，不要把技能包写成已调用工具；技能包提供任务方法和输出约束，事实数据必须来自工具或上下文。"
+        "\n使用规则：以上是技能包**目录**(仅名称与短说明)。完整步骤在 DeepAgent 技能库的 "
+        "`/skills/<name>/SKILL.md` 中，需要时用 `read_file`（建议 `limit=1000`）按需读取，"
+        "**不要假设本列表已包含全文**。"
+        "以下技能包**已启用**(可被调用),但**仅当用户问题与某个技能包的能力边界相关时才采用**;"
+        "用户明说「使用xx」时,直接调用对应那个,其他技能包忽略;用户没明说时,根据问题"
+        "**挑 1 个或几个最相关的用**,不要「列出来的全用上」。"
+        "如采用技能包方法,必须在思考区或最终答复开头写明 `已采用技能包:<技能包名称>`。"
+        "技能包不是工具调用,不要把技能包写成已调用工具;技能包提供任务方法和输出约束,"
+        "事实数据必须来自工具或上下文。"
+        "\n运行规则：当用户要求你实际获取、访问、转换、读取、生成或处理外部内容时，"
+        "不要只输出安装步骤或示例代码；必须优先调用当前可用工具完成任务。"
+        "技能包若声明了 reports.source_tool，用该业务工具取数；不要用 `execute` 去探 "
+        "`~/.kube` 代替已声明的业务工具。其他无业务工具覆盖的技能脚本，仍可用沙箱 "
+        "`execute`/`read_file`/`write_file`。"
+        "只有工具不可用或执行失败时，才说明失败原因并给出人工执行步骤。"
     )
     return (base_prompt or "") + "\n".join(blocks), matched_packages
+
+
+_COMPACT_DESCRIPTION_LIMIT = 240
+
+
+def _compact_package_description(package: dict[str, Any]) -> str:
+    """目录用短说明；过长描述截断，避免变相塞入正文。"""
+    text = " ".join(str(package.get("description") or "无").split()).strip() or "无"
+    if len(text) <= _COMPACT_DESCRIPTION_LIMIT:
+        return text
+    return text[: _COMPACT_DESCRIPTION_LIMIT - 1].rstrip() + "…"
 
 
 def build_skill_package_strategy(matched_skill_packages: Any) -> dict[str, Any]:
@@ -134,12 +175,23 @@ def hydrate_skill_packages(skill_packages: Any) -> list[dict[str, Any]]:
         return packages
 
     try:
-        stored_packages = {item.id: item for item in SkillPackage.objects.filter(id__in=ids, is_enabled=True)}
-    except Exception:
+        # 同步 ORM 查询,调用方须在 sync 上下文(用 ThreadPoolExecutor 包一层)。
+        # 该线程可能是 asyncio/LangGraph 旁路线程，必须在本线程清理连接。
+        def _load_packages():
+            return list(SkillPackage.objects.filter(id__in=ids, is_enabled=True))
+
+        stored_list = run_with_db_cleanup(_load_packages)
+        # key 统一转 str:LangGraph configurable 跨节点序列化会把 int id 转 str,
+        # 后续 stored_packages.get(item.get("id")) 也用 str 查,保持一致。
+        stored_packages = {str(item.id): item for item in stored_list}
+    except Exception as e:
+        logger.debug("技能包查询失败: %r", e)
         return packages
     hydrated: list[dict[str, Any]] = []
     for item in packages:
-        stored = stored_packages.get(item.get("id"))
+        # 兼容 str/int id(参见上面 stored_packages 的 key 处理)。
+        item_id = item.get("id")
+        stored = stored_packages.get(item_id) or stored_packages.get(str(item_id) if item_id is not None else None)
         if not stored:
             hydrated.append(item)
             continue
@@ -158,39 +210,108 @@ def hydrate_skill_packages(skill_packages: Any) -> list[dict[str, Any]]:
                 "capabilities": manifest.get("capabilities", []),
                 "reports": manifest.get("reports", {}),
                 "workflows": manifest.get("workflows", {}),
+                "variables": manifest.get("variables", []),
                 "skill_markdown": stored.skill_markdown,
             }
         )
+        # 注入物化所需的 extracted_root + asset_roots(流式路径)。
+        # 真相源仍是磁盘上的 extracted_path;materalizer 用 Path.rglob 扫描读盘,
+        # 不在 snapshot 里复制文件内容,避免 mb 级包占用内存。
+        # 仅当 storage_path 非空时添加,空字符串保持后向兼容(走旧 dict 路径)。
+        storage_path_text = str(getattr(stored, "storage_path", "") or "")
+        if storage_path_text:
+            disk_markdown = _skill_markdown_from_storage(storage_path_text)
+            if disk_markdown:
+                snapshot["skill_markdown"] = disk_markdown
+            extracted_root = Path(storage_path_text) / "extracted"
+            snapshot["extracted_root"] = extracted_root
+            asset_roots: dict[str, Path | None] = {}
+            if extracted_root.is_dir():
+                for child in extracted_root.iterdir():
+                    if child.is_dir():
+                        asset_roots[child.name] = child
+            snapshot["asset_roots"] = asset_roots
         hydrated.append(snapshot)
     return hydrated
 
 
 def _manifest_with_storage_overlay(stored_package) -> dict[str, Any]:
+    """从 DB manifest 出发,叠加磁盘上 skill.yaml / SKILL.md frontmatter 的策略字段。
+
+    优先级(由低到高): DB manifest → skill.yaml → SKILL.md frontmatter。
+
+    设计原因:用户编辑磁盘上的 SKILL.md 后希望能立即热生效,而不用每次都重导 ZIP。
+    - DB manifest 是导入时落盘的快照,可能落后于磁盘文件。
+    - skill.yaml 与 SKILL.md frontmatter 同时存在时,SKILL.md frontmatter 优先
+      (用户改 SKILL.md 比改 skill.yaml 频繁,且 SKILL.md 是 deepagent 沙箱的真相源)。
+    - 磁盘文件不存在 / 不含某策略字段时,沿用 DB manifest 的值
+      (后向兼容历史数据,避免删 skill.yaml 后能力丢失)。
+    """
     manifest = dict(getattr(stored_package, "manifest", None) or {})
-    missing_strategy_fields = any(key not in manifest for key in ("capabilities", "reports", "workflows"))
     storage_path = getattr(stored_package, "storage_path", "")
-    if not missing_strategy_fields or not storage_path:
+    if not storage_path:
         return manifest
 
-    manifest_path = Path(storage_path) / "extracted" / "skill.yaml"
-    if not manifest_path.exists():
+    extracted_dir = Path(storage_path) / "extracted"
+    if not extracted_dir.is_dir():
         return manifest
-    try:
-        file_manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
-    except Exception:
-        return manifest
-    if not isinstance(file_manifest, dict):
-        return manifest
-    for key in ("capabilities", "reports", "workflows"):
-        if key not in manifest and key in file_manifest:
-            manifest[key] = file_manifest[key]
+
+    # 1) skill.yaml 中间层(比 DB 新,但比 SKILL.md 旧)
+    skill_yaml_path = extracted_dir / "skill.yaml"
+    if skill_yaml_path.is_file():
+        try:
+            file_manifest = yaml.safe_load(skill_yaml_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            file_manifest = None
+        if isinstance(file_manifest, dict):
+            for key in _STRATEGY_FIELDS:
+                if key in file_manifest:
+                    manifest[key] = file_manifest[key]
+
+    # 2) SKILL.md frontmatter 最高优先级(用户编辑磁盘文件 → 立即热生效)
+    skill_md_path = extracted_dir / "SKILL.md"
+    if skill_md_path.is_file():
+        try:
+            skill_md = skill_md_path.read_text(encoding="utf-8")
+        except Exception:
+            skill_md = ""
+        if skill_md:
+            match = _SKILL_MD_FRONTMATTER_RE.match(skill_md)
+            if match:
+                try:
+                    frontmatter = yaml.safe_load(match.group(1)) or {}
+                except Exception:
+                    frontmatter = None
+                if isinstance(frontmatter, dict):
+                    for key in _STRATEGY_FIELDS:
+                        if key in frontmatter:
+                            manifest[key] = frontmatter[key]
+
     return manifest
+
+
+def _skill_markdown_from_storage(storage_path: str) -> str:
+    """读 extracted/SKILL.md 正文,供物化热生效;失败或空文件返回空串走 DB。"""
+    skill_md_path = Path(storage_path) / "extracted" / "SKILL.md"
+    if not skill_md_path.is_file():
+        return ""
+    try:
+        skill_md = skill_md_path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    if not skill_md.strip():
+        return ""
+    match = re.match(r"^---\s*\n(.*?)\n---\s*(?:\n|$)(.*)$", skill_md, re.DOTALL)
+    if match:
+        return match.group(2).lstrip()
+    return skill_md
 
 
 def _match_score(package: dict[str, Any], message: str) -> int:
     if not message:
         return 0
     score = 0
+    package_text = _package_search_text(package)
     searchable_fields = [
         package.get("name"),
         package.get("description"),
@@ -205,7 +326,44 @@ def _match_score(package: dict[str, Any], message: str) -> int:
         text = str(trigger).casefold()
         if text and text in message:
             score += 5
+    for package_aliases, message_aliases in _DOMAIN_MATCH_ALIASES:
+        if any(alias in package_text for alias in package_aliases) and any(alias in message for alias in message_aliases):
+            score += 4
     return score
+
+
+def _package_search_text(package: dict[str, Any]) -> str:
+    parts = [
+        package.get("name"),
+        package.get("description"),
+        package.get("category"),
+        package.get("id"),
+        package.get("package_id"),
+        package.get("skill_markdown"),
+        package.get("content"),
+    ]
+    parts.extend(_as_list(package.get("triggers")))
+    parts.extend(_as_list(package.get("required_tools")))
+    parts.extend(_as_list(package.get("capabilities")))
+    return " ".join(str(part or "") for part in parts).casefold()
+
+
+def _package_match_key(package: dict[str, Any]) -> str:
+    return str(package.get("id") or package.get("package_id") or _package_display_name(package))
+
+
+def _package_summary(package: dict[str, Any], missing_tools: list[str]) -> dict[str, Any]:
+    package_name = _package_display_name(package)
+    return {
+        "id": str(package.get("id") or package.get("package_id") or package_name),
+        "name": package_name,
+        "package_id": str(package.get("package_id") or package.get("id") or ""),
+        "description": str(package.get("description") or ""),
+        "missing_tools": missing_tools,
+        "capabilities": _as_list(package.get("capabilities")),
+        "reports": _as_dict(package.get("reports")),
+        "workflows": _as_dict(package.get("workflows")),
+    }
 
 
 def _package_display_name(package: dict[str, Any]) -> str:

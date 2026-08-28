@@ -119,6 +119,12 @@ class AlertEscalationTask(models.Model):
     layers = JSONField(default=list, help_text="升级链层级快照")
     current_layer_index = models.IntegerField(default=0, help_text="当前层级索引")
     layer_started_at = models.DateTimeField(help_text="本层开始时间")
+    next_escalation_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="下次升级检查时间；空值为待回填旧记录",
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -181,6 +187,9 @@ class NotifyResult(models.Model):
     notify_time = models.DateTimeField(auto_now_add=True, help_text="通知时间")
     notify_result = models.CharField(
         max_length=30, choices=NotifyResultStatus.CHOICES, help_text="通知结果"
+    )
+    failure_reason = models.TextField(
+        null=True, blank=True, help_text="通知失败原因"
     )
     notify_object = models.CharField(
         max_length=100, null=True, blank=True, help_text="通知对象ID"

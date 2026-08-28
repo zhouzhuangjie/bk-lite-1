@@ -22,13 +22,21 @@ import { useTopologyLifecycle } from './hooks/useTopologyLifecycle';
 import { useNodeConfigFlow } from './hooks/useNodeConfigFlow';
 import { useDataSourceManager } from '@/app/ops-analysis/hooks/useDataSource';
 import { useUnifiedFilter } from '@/app/ops-analysis/hooks/useUnifiedFilter';
+import { useCanvasShareAction } from '@/app/ops-analysis/hooks/useCanvasShareAction';
+import { useDirectoryApi } from '@/app/ops-analysis/api';
+import useBtnPermissions from '@/hooks/usePermissions';
+import { useCanvasPeriodicRefresh } from '@/app/ops-analysis/hooks/useCanvasPeriodicRefresh';
+import { canPersistCanvasRefreshInterval, normalizeCanvasRefreshInterval } from '@/app/ops-analysis/utils/canvasRefreshInterval';
 import {
   TopologyProps,
   TopologyRef,
+  TopologyViewSets,
 } from '@/app/ops-analysis/types/topology';
 import type { FilterValue } from '@/app/ops-analysis/types/dashBoard';
 import TopologyToolbar from './components/toolbar';
 import TopologyCanvasShell from './components/canvasShell';
+import SingleValueFetchErrorTooltip from './components/singleValueFetchErrorTooltip';
+import type { SingleValueFetchErrorTooltipState } from './components/singleValueFetchErrorTooltip';
 import ViewWorkspace from '../components/viewWorkspace';
 import ContextMenu from './components/contextMenu';
 import EdgeConfigPanel from './components/edgeConfPanel';
@@ -50,12 +58,23 @@ import {
   AppViewFullscreenExit,
   useAppViewFullscreen,
 } from '@/app/ops-analysis/components/appFullscreen';
+import { useCanvasDraft } from '@/app/ops-analysis/hooks/useCanvasDraft';
+import {
+  restoreDraftRefreshInterval,
+  toCanvasDraftResourceId,
+  type CanvasDraftPayload,
+} from '@/app/ops-analysis/api/canvasDraft';
+import { syncFilterValuesWithDefinitions } from '@/app/ops-analysis/utils/unifiedFilterState';
+import { bindCanvasDraftControls } from '@/app/ops-analysis/components/canvasDraftControls';
 
 const Topology = forwardRef<TopologyRef, TopologyProps>(
-  ({ selectedTopology }, ref) => {
+  ({ selectedTopology, shareMode = false }, ref) => {
     const themeName = resolveOpsChartThemeName();
     const chartTheme = getOpsChartTheme(themeName);
     const isDarkTheme = themeName === 'dark';
+    const { shareLoading, openShare } = useCanvasShareAction('topology');
+    const { updateItem } = useDirectoryApi();
+    const { hasPermission } = useBtnPermissions();
     const containerRef = useRef<HTMLDivElement>(null);
     const canvasContainerRef = useRef<HTMLDivElement>(null);
     const canvasHostRef = useRef<HTMLDivElement>(null);
@@ -74,7 +93,10 @@ const Topology = forwardRef<TopologyRef, TopologyProps>(
     const [appliedFilterValues, setAppliedFilterValues] = useState<
       Record<string, FilterValue>
     >({});
+    const [savedRefreshInterval, setSavedRefreshInterval] = useState(0);
     const [nodeChangeKey, setNodeChangeKey] = useState(0);
+    const [singleValueFetchErrorTooltip, setSingleValueFetchErrorTooltip] =
+      useState<SingleValueFetchErrorTooltipState | null>(null);
     const rebuildFiltersRef = useRef<(() => void) | null>(null);
     const { isFullscreen, enterFullscreen, exitFullscreen } =
       useAppViewFullscreen();
@@ -119,6 +141,8 @@ const Topology = forwardRef<TopologyRef, TopologyProps>(
       handleAddChartNode,
       handleSaveTopology,
       handleLoadTopology,
+      loadTopologyData,
+      serializeTopologyData,
       resizeCanvas,
       loading,
       toggleEditMode,
@@ -139,6 +163,7 @@ const Topology = forwardRef<TopologyRef, TopologyProps>(
       minimapContainerRef,
       handleNodeRemovedCallback,
       isFullscreen,
+      setSingleValueFetchErrorTooltip,
     );
 
     const { handleEdgeConfigConfirm, closeEdgeConfig, handleMenuClick } =
@@ -177,7 +202,6 @@ const Topology = forwardRef<TopologyRef, TopologyProps>(
       clearRefreshTimer,
       handleFilterConfigConfirm,
       handleFilterSearch,
-      handleFrequencyChange,
       handleRefresh,
       rebuildFiltersFromNodes,
       refreshTopologyNodes,
@@ -204,6 +228,32 @@ const Topology = forwardRef<TopologyRef, TopologyProps>(
       refreshAllChartNodes,
       updateDefinitions,
     });
+
+    const canPersistRefreshInterval = canPersistCanvasRefreshInterval({
+      shareMode,
+      isBuiltIn: Boolean(selectedTopology?.is_build_in),
+      hasEditPermission: hasPermission(['EditChart']),
+    });
+
+    const { effectiveRefreshInterval, handleFrequencyChange } =
+      useCanvasPeriodicRefresh({
+        canvasId: selectedTopology?.data_id,
+        savedInterval: savedRefreshInterval,
+        canPersist: canPersistRefreshInterval,
+        enabled: !state.isEditMode,
+        patchRefreshInterval: async (interval) => {
+          if (!selectedTopology?.data_id) {
+            return;
+          }
+          await updateItem('topology', selectedTopology.data_id, {
+            refresh_interval: interval,
+          });
+        },
+        onPeriodicRefresh: (cause) => {
+          refreshTopologyNodes(cause);
+        },
+        onSavedIntervalChange: setSavedRefreshInterval,
+      });
 
     // 监听画布容器大小变化，自动调整画布大小
     const handleCanvasResize = useCallback(() => {
@@ -297,10 +347,80 @@ const Topology = forwardRef<TopologyRef, TopologyProps>(
       updateSingleNodeData,
     });
 
-    const handleSave = () => {
-      if (selectedTopology) {
-        handleSaveTopology(selectedTopology, definitions);
-      }
+    const topologyDraftResourceId = toCanvasDraftResourceId(
+      selectedTopology?.data_id,
+    );
+    const getTopologyDraftPayload = useCallback(
+      (): CanvasDraftPayload => {
+        const topologyData = serializeTopologyData();
+        return {
+          name: selectedTopology?.name,
+          desc: selectedTopology?.desc,
+          view_sets: {
+            nodes: topologyData.nodes,
+            edges: topologyData.edges,
+            filters: definitions,
+          },
+          refresh_interval: savedRefreshInterval,
+        };
+      },
+      [
+        definitions,
+        savedRefreshInterval,
+        selectedTopology?.desc,
+        selectedTopology?.name,
+        serializeTopologyData,
+      ],
+    );
+    const applyTopologyDraftPayload = useCallback(
+      (payload: CanvasDraftPayload) => {
+        const viewSets = (payload.view_sets || {}) as TopologyViewSets;
+        const loadedDefinitions = Array.isArray(viewSets.filters)
+          ? viewSets.filters
+          : [];
+        const nextValues = syncFilterValuesWithDefinitions(loadedDefinitions, {});
+
+        restoreDraftRefreshInterval(payload, setSavedRefreshInterval);
+        loadTopologyData(viewSets);
+        setDefinitions(loadedDefinitions);
+        setFilterValues(nextValues);
+        setAppliedFilterValues(nextValues);
+        void syncTopologyCanvasResources().then(() => {
+          refreshTopologyNodes(
+            'reload',
+            nextValues,
+            loadedDefinitions,
+            appliedNamespaceId,
+          );
+        });
+      },
+      [
+        appliedNamespaceId,
+        loadTopologyData,
+        refreshTopologyNodes,
+        setAppliedFilterValues,
+        setDefinitions,
+        setFilterValues,
+        setSavedRefreshInterval,
+        syncTopologyCanvasResources,
+      ],
+    );
+    const topologyDraft = useCanvasDraft({
+      resourceType: 'topology',
+      resourceId: topologyDraftResourceId,
+      enabled: Boolean(
+        state.isEditMode &&
+          !shareMode &&
+          topologyDraftResourceId &&
+          !selectedTopology?.is_build_in,
+      ),
+      getPayload: getTopologyDraftPayload,
+      applyPayload: applyTopologyDraftPayload,
+    });
+
+    const handleSave = async () => {
+      if (!selectedTopology) return;
+      await handleSaveTopology(selectedTopology, definitions);
     };
 
     useEffect(() => {
@@ -308,7 +428,7 @@ const Topology = forwardRef<TopologyRef, TopologyProps>(
     }, [rebuildFiltersFromNodes]);
 
     const hasUnsavedChanges = () => {
-      return state.isEditMode;
+      return state.isEditMode && canUndo;
     };
 
     useImperativeHandle(ref, () => ({
@@ -338,7 +458,14 @@ const Topology = forwardRef<TopologyRef, TopologyProps>(
       startInitialization,
       syncTopologyCanvasResources,
       toggleEditMode,
+      onLoadedRefreshInterval: (interval) => {
+        setSavedRefreshInterval(normalizeCanvasRefreshInterval(interval));
+      },
     });
+
+    const onCancelEdit = () => {
+      handleCancelEdit();
+    };
 
     const handleSelectMode = () => {
       state.setIsSelectMode(!state.isSelectMode);
@@ -381,9 +508,19 @@ const Topology = forwardRef<TopologyRef, TopologyProps>(
     const topologyToolbar = (
       <TopologyToolbar
         selectedTopology={selectedTopology}
+        shareMode={shareMode}
+        shareLoading={shareLoading}
+        onOpenShare={
+          !shareMode && selectedTopology?.data_id
+            ? () => {
+              void openShare(selectedTopology.data_id);
+            }
+            : undefined
+        }
         onEdit={handleEnterEditMode}
         onSave={handleSave}
-        onCancel={handleCancelEdit}
+        onCancel={onCancelEdit}
+        editExtra={bindCanvasDraftControls(topologyDraft)}
         onFilterConfig={() => setFilterConfigModalVisible(true)}
         onZoomIn={zoomIn}
         onZoomOut={zoomOut}
@@ -400,6 +537,7 @@ const Topology = forwardRef<TopologyRef, TopologyProps>(
         onFullscreenToggle={handleFullscreenToggle}
         onRefresh={handleRefresh}
         onFrequencyChange={handleFrequencyChange}
+        frequenceValue={effectiveRefreshInterval}
       />
     );
 
@@ -443,6 +581,7 @@ const Topology = forwardRef<TopologyRef, TopologyProps>(
           t={t}
           setMinimapVisible={setMinimapVisible}
         />
+        <SingleValueFetchErrorTooltip tooltip={singleValueFetchErrorTooltip} />
       </div>
     );
 
@@ -490,6 +629,7 @@ const Topology = forwardRef<TopologyRef, TopologyProps>(
           readonly={nodeReadonly}
           builtinNamespaceId={namespaceDraftId}
           editingNodeData={addNodeVisible ? null : state.editingNodeData}
+          filterDefinitions={definitions}
           onClose={handleNodeEditClose}
           onConfirm={handleNodeConfirm}
           onCancel={handleNodeEditClose}

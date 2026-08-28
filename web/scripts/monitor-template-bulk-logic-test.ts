@@ -1,14 +1,21 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 import {
   buildBulkApplyPayload,
   buildPolicyPreview,
+  changeBulkAssetPage,
   clearTemplateSelection,
+  canDeleteTemplates,
+  containsBuiltinTemplate,
   getAssetCollectionTemplateLabels,
   getAssetOrganizationText,
   getPrimaryNoticeType,
   groupPolicyTemplates,
   normalizeBulkConfig,
+  reconcileBulkAssetSelection,
+  resetBulkAssetPageForSearch,
   selectTemplateGroup,
   toggleTemplateSelection,
 } from '../src/app/monitor/(pages)/event/template/templateBulkUtils';
@@ -43,6 +50,29 @@ const templates = [
   },
 ];
 
+const templatePageSource = readFileSync(
+  new URL('../src/app/monitor/(pages)/event/template/page.tsx', import.meta.url),
+  'utf8'
+);
+const searchPosition = templatePageSource.indexOf('<Input');
+const importPosition = templatePageSource.indexOf('<Upload', searchPosition);
+const bulkPosition = templatePageSource.indexOf('<Dropdown', importPosition);
+assert.ok(searchPosition >= 0 && searchPosition < importPosition);
+assert.ok(importPosition < bulkPosition);
+assert.match(templatePageSource, /disabled: !selectedTemplateKeys\.length \|\| containsBuiltin/);
+assert.match(templatePageSource, /内置模版不可删除/);
+
+const strategyPageSource = readFileSync(
+  new URL('../src/app/monitor/(pages)/event/strategy/detail/page.tsx', import.meta.url),
+  'utf8'
+);
+const confirmPosition = strategyPageSource.indexOf("{t('common.confirm')}");
+const saveTemplatePosition = strategyPageSource.indexOf('保存模版', confirmPosition);
+const cancelPosition = strategyPageSource.indexOf("{t('common.cancel')}", saveTemplatePosition);
+assert.ok(confirmPosition >= 0 && confirmPosition < saveTemplatePosition);
+assert.ok(saveTemplatePosition < cancelPosition);
+assert.match(strategyPageSource, /validateFields\(templateFields\)/);
+
 const groups = groupPolicyTemplates(templates);
 assert.deepEqual(groups.map((group) => ({
   name: group.name,
@@ -59,6 +89,22 @@ assert.deepEqual(selectedOne, ['host-remote:0']);
 const selectedGroup = selectTemplateGroup(selectedOne, groups[0].templates, true);
 assert.deepEqual(selectedGroup, ['host-remote:0', 'host-remote:1']);
 assert.deepEqual(clearTemplateSelection(), []);
+assert.equal(canDeleteTemplates([]), false);
+assert.equal(canDeleteTemplates([{ template_type: 'custom', deletable: true }]), true);
+assert.equal(
+  containsBuiltinTemplate([
+    { template_type: 'custom', deletable: true },
+    { template_type: 'builtin', deletable: false },
+  ]),
+  true
+);
+assert.equal(
+  canDeleteTemplates([
+    { template_type: 'custom', deletable: true },
+    { template_type: 'builtin', deletable: false },
+  ]),
+  false
+);
 
 const selectedTemplates = templates.filter((item) => selectedGroup.includes(item.template_key));
 const assets = [
@@ -89,12 +135,11 @@ const config = {
 
 const preview = buildPolicyPreview(selectedTemplates, assets, config);
 assert.deepEqual(preview.map((item) => item.name), [
-  '批量策略-CPU 使用率过高-host-a',
-  '批量策略-CPU 使用率过高-host-b',
-  '批量策略-内存使用率过高-host-a',
-  '批量策略-内存使用率过高-host-b',
+  '批量策略-CPU 使用率过高',
+  '批量策略-内存使用率过高',
 ]);
 assert.equal(preview[0].metricLabel, 'Host Remote - cpu_usage_total');
+assert.equal(preview[0].assetScopeLabel, '覆盖 2 个实例：host-a、host-b');
 assert.equal(preview[0].statusLabel, '启用');
 
 const payload = buildBulkApplyPayload({
@@ -105,7 +150,7 @@ const payload = buildBulkApplyPayload({
 });
 assert.equal(payload.monitor_object, 3);
 assert.deepEqual(payload.asset_ids, ["('host-a',)", "('host-b',)"]);
-assert.deepEqual(payload.templates.map((item) => item.collect_type), [11, 11]);
+assert.deepEqual(payload.template_keys, ['host-remote:0', 'host-remote:1']);
 assert.deepEqual(payload.config.notice_type_ids, [1, 2]);
 assert.equal(payload.config.notice_type, 'email');
 assert.equal(payload.config.trigger_count, 2);
@@ -181,6 +226,90 @@ assert.deepEqual(
     ],
   }),
   ['Host Remote', 'Telegraf', '13']
+);
+
+const firstAssetPage = [
+  { instance_id: 'host-a', instance_name: 'host-a' },
+  { instance_id: 'host-b', instance_name: 'host-b' },
+];
+const secondAssetPage = [
+  { instance_id: 'host-c', instance_name: 'host-c' },
+  { instance_id: 'host-d', instance_name: 'host-d' },
+];
+
+const firstPageSelection = reconcileBulkAssetSelection(
+  [],
+  firstAssetPage,
+  ['host-a']
+);
+const crossPageSelection = reconcileBulkAssetSelection(
+  firstPageSelection.selectedAssets,
+  secondAssetPage,
+  ['host-a', 'host-c']
+);
+assert.deepEqual(crossPageSelection.selectedAssetIds, ['host-a', 'host-c']);
+assert.deepEqual(
+  crossPageSelection.selectedAssets.map((asset) => asset.instance_id),
+  ['host-a', 'host-c']
+);
+
+// 翻页或切换搜索结果本身不会触发选择变更，已选缓存仍包含完整记录。
+assert.deepEqual(
+  crossPageSelection.selectedAssets.map((asset) => asset.instance_id),
+  ['host-a', 'host-c']
+);
+const selectionAfterCancel = reconcileBulkAssetSelection(
+  crossPageSelection.selectedAssets,
+  firstAssetPage,
+  ['host-c']
+);
+assert.deepEqual(selectionAfterCancel.selectedAssetIds, ['host-c']);
+assert.deepEqual(
+  selectionAfterCancel.selectedAssets.map((asset) => asset.instance_id),
+  ['host-c']
+);
+
+const assetPagination = { current: 3, pageSize: 8, total: 64 };
+assert.deepEqual(changeBulkAssetPage(assetPagination, 4, 8), {
+  current: 4,
+  pageSize: 8,
+  total: 64,
+});
+assert.deepEqual(changeBulkAssetPage(assetPagination, 3, 20), {
+  current: 1,
+  pageSize: 20,
+  total: 64,
+});
+assert.deepEqual(resetBulkAssetPageForSearch(assetPagination), {
+  current: 1,
+  pageSize: 8,
+  total: 64,
+});
+
+const bulkApplyModalSource = readFileSync(
+  resolve('src/app/monitor/(pages)/event/template/bulkApplyModal.tsx'),
+  'utf8'
+);
+assert.match(bulkApplyModalSource, /name: assetNameQuery/, '资产搜索应传递 name 参数');
+assert.match(
+  bulkApplyModalSource,
+  /page_size: assetPagination\.pageSize/,
+  '资产请求应使用受控的每页数量'
+);
+assert.doesNotMatch(
+  bulkApplyModalSource,
+  /page_size:\s*1000/,
+  '资产列表不应再受 1000 条硬上限约束'
+);
+assert.match(
+  bulkApplyModalSource,
+  /preserveSelectedRowKeys: true/,
+  '资产表格应保留跨页选择状态'
+);
+assert.match(
+  bulkApplyModalSource,
+  /requestId !== assetRequestIdRef\.current/,
+  '旧资产请求响应不应覆盖新查询'
 );
 
 console.log('monitor-template-bulk logic validation passed');

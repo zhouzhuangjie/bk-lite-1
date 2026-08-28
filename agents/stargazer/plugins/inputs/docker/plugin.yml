@@ -1,24 +1,26 @@
 name: docker
-version: "1.0.0"
+version: 1.0.0
 category: container
-
 metadata:
-  display_name: "Docker 容器"
-  description: "通过脚本采集宿主机 Docker 实例的配置信息"
-  author: "WeOps"
-  tags: [docker, container]
+  display_name: Docker 容器
+  description: 通过脚本采集宿主机 Docker 实例的配置信息
+  author: WeOps
+  tags:
+  - docker
+  - container
   cloud_protocol: false
   model_id: docker
-
 executors:
   job:
     type: job
-    timeout: 60
+    execution_mode: remote
+    capacity_group: remote_job
     scripts:
       linux: plugins/inputs/docker/docker_default_discover.sh
     collector:
       module: plugins.script_executor
       class: SSHPlugin
     default_script: linux
-
+    target_policy:
+      mode: remote_channel
 default_executor: job

@@ -1,41 +1,43 @@
+import hashlib
 import logging
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional, cast
 import re
+import time
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, cast
 from zoneinfo import ZoneInfo
+
 from croniter import croniter
-from celery import current_app
+from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
-from django.db import transaction
+
+from apps.alerts.aggregation.builder.alert_builder import AlertBuilder
+from apps.alerts.aggregation.builder.synthetic_alert_builder import SyntheticAlertBuilder
+from apps.alerts.aggregation.engine.connection import DuckDBConnection
+from apps.alerts.aggregation.query.builder import SQLBuilder
 from apps.alerts.aggregation.recovery.recovery_checker import AlertRecoveryChecker
-from apps.alerts.models.alert_operator import AlarmStrategy
-from apps.alerts.models.models import Level, Event, Alert
-from apps.alerts.constants import (
-    EventAction,
-    AlarmStrategyType,
-    AlertStatus,
-    SessionStatus,
-    HeartbeatStatus,
-    HeartbeatCheckMode,
-    HeartbeatActivationMode,
-)
-from apps.alerts.constants.constants import EventStatus
 from apps.alerts.aggregation.strategy.matcher import StrategyMatcher
 from apps.alerts.aggregation.window.factory import WindowFactory
-from apps.alerts.aggregation.query.builder import SQLBuilder
-from apps.alerts.aggregation.engine.connection import DuckDBConnection
-from apps.alerts.aggregation.builder.alert_builder import AlertBuilder
-from apps.alerts.aggregation.builder.synthetic_alert_builder import (
-    SyntheticAlertBuilder,
+from apps.alerts.constants import (
+    AlarmStrategyType,
+    AlertStatus,
+    EventAction,
+    HeartbeatActivationMode,
+    HeartbeatCheckMode,
+    HeartbeatStatus,
+    SessionStatus,
 )
-from apps.core.logger import alert_logger as logger
-from apps.alerts.utils.util import parse_aggregation_window_size, str_to_md5
-from apps.alerts.constants.constants import LevelType
+from apps.alerts.constants.constants import EventStatus, LevelType
+from apps.alerts.models.alert_operator import AlarmStrategy
+from apps.alerts.models.models import Alert, Event, Level
 from apps.alerts.serializers.strategy import ALLOWED_DIMENSIONS, DIMENSION_NAME_PATTERN
+from apps.alerts.utils.util import parse_aggregation_window_size, str_to_md5
+from apps.core.logger import alert_logger as logger
 
 
 class AggregationProcessor:
+    # TODO(timezone): 心跳 cron 时区硬编码 Asia/Shanghai，对非 +8 部署（海外客户）或用户以其他时区
+    # 配置心跳 cron 时，deadline 会整体偏移。需要可配置化设计，需产品确认时区契约后单独立项。
     HEARTBEAT_CRON_SOURCE_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
     def __init__(self):
@@ -65,6 +67,9 @@ class AggregationProcessor:
         return validated or ["event_id"]
 
     def process_aggregation(self):
+        round_started = time.monotonic()
+        failed_strategies: List[Dict[str, Any]] = []
+        ok_count = 0
         try:
             active_strategies = self._get_active_strategies()
             if not active_strategies:
@@ -78,12 +83,50 @@ class AggregationProcessor:
                 sum(1 for strategy in active_strategies if strategy.strategy_type == AlarmStrategyType.MISSING_DETECTION),
             )
 
+            # 策略级隔离：单策略失败不中断同轮后续策略。
             for strategy in active_strategies:
+                strategy_started = time.monotonic()
                 logger.info("[AlertAggregation] 处理策略: %s (ID: %s)", strategy.name, strategy.id)
-                self._process_strategy(strategy, timezone.now())
+                try:
+                    self._process_strategy(strategy, timezone.now())
+                    ok_count += 1
+                    logger.info(
+                        "[AlertAggregation] strategy_done strategy_id=%s name=%s duration_ms=%s",
+                        strategy.id,
+                        strategy.name,
+                        int((time.monotonic() - strategy_started) * 1000),
+                    )
+                except Exception as e:
+                    logger.exception(
+                        "[AlertAggregation] strategy_failed strategy_id=%s name=%s duration_ms=%s",
+                        strategy.id,
+                        strategy.name,
+                        int((time.monotonic() - strategy_started) * 1000),
+                    )
+                    failed_strategies.append(
+                        {
+                            "strategy_id": strategy.id,
+                            "name": strategy.name,
+                            "error": str(e),
+                        }
+                    )
 
-            logger.info("[AlertAggregation] 所有策略处理完成")
+            logger.info(
+                "[AlertAggregation] round_done strategies=%s ok=%s failed=%s duration_ms=%s failed_ids=%s",
+                len(active_strategies),
+                ok_count,
+                len(failed_strategies),
+                int((time.monotonic() - round_started) * 1000),
+                [item["strategy_id"] for item in failed_strategies],
+            )
             logger.info("[AlertAggregation] 缺失检查任务结束")
+
+            if failed_strategies:
+                raise RuntimeError(
+                    "聚合轮次部分失败: "
+                    f"{len(failed_strategies)}/{len(active_strategies)} 个策略失败, "
+                    f"strategy_ids={[item['strategy_id'] for item in failed_strategies]}"
+                )
 
         except Exception as e:
             logger.exception("[AlertAggregation] 聚合处理失败: %s", e)
@@ -127,16 +170,29 @@ class AggregationProcessor:
 
         logger.info(
             "[AlertAggregation] 策略 %s: 查询时间窗口=%s分钟, 起始时间=%s",
-            strategy.name, window_size, cutoff_time.isoformat(),
+            strategy.name,
+            window_size,
+            cutoff_time.isoformat(),
         )
 
         # 排除已被屏蔽的事件：屏蔽策略命中的事件不应再参与聚合产出告警
-        events = Event.objects.filter(
-            received_at__gte=cutoff_time,
-            action=EventAction.CREATED,
-        ).exclude(
-            # 被屏蔽事件不参与聚合建警（事件级·不建警）
-            status=EventStatus.SHIELD,
+        events = (
+            Event.objects.filter(
+                received_at__gte=cutoff_time,
+                action=EventAction.CREATED,
+            )
+            .exclude(
+                # 被屏蔽事件不参与聚合建警（事件级·不建警）
+                status=EventStatus.SHIELD,
+            )
+            .exclude(
+                # 当前策略已经闭环的告警事件不得再次进入窗口，避免关闭后重复建警。
+                # 只限定当前策略，防止一个策略的闭环误伤其他策略对同一事件的聚合。
+                alert__in=Alert.objects.filter(
+                    rule_id=str(strategy.pk),
+                    status__in=AlertStatus.CLOSED_STATUS,
+                ),
+            )
         )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("[AlertAggregation] 策略 %s: 时间范围内事件总数=%s", strategy.name, events.count())
@@ -179,6 +235,7 @@ class AggregationProcessor:
 
         except Exception as e:  # noqa
             logger.exception("[AlertAggregation] 策略 %s 处理失败", strategy.name)
+            raise
 
     def _process_missing_detection_strategy(self, strategy: AlarmStrategy, now: datetime) -> None:
         logger.info(
@@ -346,7 +403,7 @@ class AggregationProcessor:
             if now_in_tz < first_expected:
                 deadline = first_expected + grace_period
                 logger.debug(
-                    "deadline 计算结果: strategy_id=%s, now=%s, monitoring_start=%s, first_expected=%s, deadline=%s, project_timezone=%s, cron_timezone=%s",
+                    "deadline 计算结果: strategy_id=%s, now=%s, monitoring_start=%s, first_expected=%s, deadline=%s, project_timezone=%s, cron_timezone=%s",  # noqa: E501
                     strategy.id,
                     now_in_tz.isoformat(),
                     monitoring_start.isoformat(),
@@ -375,7 +432,7 @@ class AggregationProcessor:
                     return None
                 deadline = next_expected + grace_period
                 logger.debug(
-                    "deadline 计算结果: strategy_id=%s, now=%s, last_heartbeat=%s, previous_expected=%s, next_expected=%s, deadline=%s, project_timezone=%s, cron_timezone=%s",
+                    "deadline 计算结果: strategy_id=%s, now=%s, last_heartbeat=%s, previous_expected=%s, next_expected=%s, deadline=%s, project_timezone=%s, cron_timezone=%s",  # noqa: E501
                     strategy.id,
                     now_in_tz.isoformat(),
                     last_heartbeat_in_tz.isoformat(),
@@ -393,7 +450,7 @@ class AggregationProcessor:
             raise
 
         logger.debug(
-            "deadline 计算结果: strategy_id=%s, now=%s, monitoring_start=%s, last_heartbeat=%s, previous_expected=%s, deadline=%s, project_timezone=%s, cron_timezone=%s",
+            "deadline 计算结果: strategy_id=%s, now=%s, monitoring_start=%s, last_heartbeat=%s, previous_expected=%s, deadline=%s, project_timezone=%s, cron_timezone=%s",  # noqa: E501
             strategy.id,
             now_in_tz.isoformat(),
             monitoring_start.isoformat(),
@@ -422,7 +479,13 @@ class AggregationProcessor:
         # 缺失检测告警与常规聚合/即时一致，需进入自动分派链路；
         # 当前处于 select_for_update 事务内，故延迟到提交后再调度，避免回滚后空跑。
         alert_id = alert.alert_id
-        transaction.on_commit(lambda: self._schedule_auto_assignment([alert_id]))
+
+        def _dispatch_created():
+            from apps.alerts.service.alert_lifecycle import dispatch_alert_lifecycle
+
+            dispatch_alert_lifecycle([alert_id], "created", auto_assign=True)
+
+        transaction.on_commit(_dispatch_created)
         return alert
 
     def _recover_missing_alert(
@@ -439,9 +502,11 @@ class AggregationProcessor:
         active_alert.last_event_time = now
         active_alert.save(update_fields=["status", "last_event_time", "updated_at"])
 
+        from apps.alerts.service.recovery_notify import notify_alert_recovered
         from apps.alerts.service.reminder_service import ReminderService
 
         ReminderService.stop_reminder_task(active_alert)
+        transaction.on_commit(lambda a=active_alert: notify_alert_recovered(a))
         logger.info(
             "自动恢复成功: strategy_id=%s, alert_id=%s",
             strategy.id,
@@ -520,7 +585,9 @@ class AggregationProcessor:
 
             logger.debug(
                 "[AlertAggregation] 策略 %s: 窗口配置 type=%s, size=%s分钟",
-                strategy.name, window_config.window_type, window_config.window_size_minutes,
+                strategy.name,
+                window_config.window_type,
+                window_config.window_size_minutes,
             )
 
             sql_query = self.sql_builder.build_aggregation_sql(
@@ -547,7 +614,7 @@ class AggregationProcessor:
 
         except Exception as e:
             logger.error("[AlertAggregation] 策略 %s: 维度 %s 聚合失败: %s", strategy.name, dimensions, e, exc_info=True)
-            return False
+            raise
 
     def _create_or_update_alerts(
         self,
@@ -558,6 +625,7 @@ class AggregationProcessor:
         """创建或更新告警"""
 
         logger.info("[AlertAggregation] 策略 %s: 开始创建/更新告警, 结果数=%s", strategy.name, len(aggregation_results))
+        self._log_dimension_fallback_summary(strategy, dimensions, aggregation_results)
         alert_levels = list(Level.objects.filter(level_type=LevelType.ALERT).values("level_id", "level_name", "level_display_name"))
         success_count = 0
         fail_count = 0
@@ -578,18 +646,26 @@ class AggregationProcessor:
                         group_by_field=",".join(dimensions),
                     )
 
-                    # 如果是新创建的告警，记录ID用于后续自动分配
-                    if is_new_alert:
+                    # 需要(重新)分派:新建告警,或仍处 UNASSIGNED 的存量告警。
+                    # 后者覆盖"首次分派 0 命中/失败"的死亡序列——告警停留 UNASSIGNED 时,
+                    # 新事件必须把它重新送入分派链路,否则永远不会再被分派。
+                    needs_assignment = is_new_alert or alert.status == AlertStatus.UNASSIGNED
+                    if needs_assignment:
                         should_delay_assignment = alert.is_session_alert and alert.session_status == SessionStatus.OBSERVING
 
                         if should_delay_assignment:
                             logger.info(
-                                "策略 %s: 新建会话窗口告警 %s 仍在观察期，等待超时确认后再自动分派",
+                                "策略 %s: 会话窗口告警 %s 仍在观察期，等待超时确认后再自动分派",
                                 strategy.name,
                                 alert.alert_id,
                             )
                         else:
                             new_alert_ids.append(alert.alert_id)
+                            if not is_new_alert:
+                                logger.info(
+                                    "[AlertAggregation] 已有 UNASSIGNED 告警收到新事件，触发重试分派: alert_id=%s",
+                                    alert.alert_id,
+                                )
 
                     # 检查是否应该自动恢复
                     if AlertRecoveryChecker.check_and_recover_alert(alert):
@@ -598,25 +674,84 @@ class AggregationProcessor:
                     success_count += 1
                     logger.debug(
                         "[AlertAggregation] 策略 %s: 告警处理成功 fingerprint=%s",
-                        strategy.name, result.get("fingerprint"),
+                        strategy.name,
+                        result.get("fingerprint"),
                     )
             except Exception as e:
                 fail_count += 1
                 logger.error(
                     "[AlertAggregation] 策略 %s: 告警创建/更新失败 fingerprint=%s: %s",
-                    strategy.name, result.get("fingerprint"), e,
+                    strategy.name,
+                    result.get("fingerprint"),
+                    e,
                     exc_info=True,
                 )
 
         logger.info(
             "[AlertAggregation] 策略 %s: 告警处理完成, 成功=%s, 失败=%s, 自动恢复=%s",
-            strategy.name, success_count, fail_count, recovered_count,
+            strategy.name,
+            success_count,
+            fail_count,
+            recovered_count,
         )
         # 异步执行新创建告警的自动分配（不阻塞聚合流程）
         if new_alert_ids:
-            self._schedule_auto_assignment(new_alert_ids)
+            try:
+                self._schedule_auto_assignment(new_alert_ids)
+            except Exception:
+                # 分派调度依赖 outbox/celery 等外部资源,其失败不得拖垮整轮聚合
+                # (否则告警虽建成但伪装成"聚合失败",且 last_execute_time 不推进
+                # 导致下轮重扫整个窗口)。重试由后续聚合轮次(UNASSIGNED 重试)
+                # 与 beat_retry_unassigned_assignment 兜底负责。
+                logger.exception(
+                    "[AlertAggregation] 策略 %s: 自动分派调度失败,告警数=%s",
+                    strategy.name,
+                    len(new_alert_ids),
+                )
+
+        if fail_count:
+            raise RuntimeError(f"策略 {strategy.name} 有 {fail_count} 个告警组创建失败")
 
         return success_count
+
+    @staticmethod
+    def _log_dimension_fallback_summary(
+        strategy: AlarmStrategy,
+        dimensions: List[str],
+        aggregation_results: List[Dict[str, Any]],
+    ) -> None:
+        """全部聚合维度为空时 SQL 会降级到 external_id；每策略每轮汇总一条 warning。"""
+        fallback_groups = [
+            result for result in aggregation_results if AggregationProcessor._is_dimension_fallback(result.get("used_dimension_fallback"))
+        ]
+        if not fallback_groups:
+            return
+
+        sample_external_ids = []
+        for result in fallback_groups[:3]:
+            sample = result.get("effective_group_dimension")
+            if sample is None or sample == "":
+                continue
+            sample_external_ids.append(str(sample)[:128])
+
+        logger.warning(
+            "[AlertAggregation] dimension_fallback strategy_id=%s name=%s group_by=%s " "fallback_groups=%s sample_external_ids=%s",
+            strategy.id,
+            strategy.name,
+            dimensions,
+            len(fallback_groups),
+            sample_external_ids,
+        )
+
+    @staticmethod
+    def _is_dimension_fallback(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return value != 0
+        return str(value).strip().lower() in {"true", "1", "t", "yes"}
 
     @staticmethod
     def _mark_strategy_executed(strategy: AlarmStrategy, now: datetime) -> None:
@@ -632,9 +767,7 @@ class AggregationProcessor:
         if not global_level:
             # 未配置 ALERT 类型 Level 时无法判定严重/普通级别，跳过标题改写，避免 IndexError。
             logger.warning("[AlertAggregation] 未配置 ALERT 类型 Level，跳过指纹标题规范化")
-            result["fingerprint"] = str_to_md5(
-                fingerprint.split("|", 1)[1] if "|" in fingerprint else fingerprint
-            )
+            result["fingerprint"] = str_to_md5(fingerprint.split("|", 1)[1] if "|" in fingerprint else fingerprint)
             return
         raw_fingerprint = fingerprint.split("|", 1)[1] if "|" in fingerprint else fingerprint
         now_level = result["alert_level"]
@@ -645,6 +778,12 @@ class AggregationProcessor:
         normal_level = [str(i) for i in global_level[1:]]
         result["fingerprint"] = str_to_md5(raw_fingerprint)
         fingerprint_is_md5 = re.fullmatch(r"[0-9a-fA-F]{32}", raw_fingerprint)
+        fingerprint_values = [segment.split("=", 1)[1] if "=" in segment else segment for segment in raw_fingerprint.split("|") if segment]
+        display_fingerprint = ""
+        if fingerprint_values:
+            primary_value = fingerprint_values[-1]
+            context_values = fingerprint_values[:-1]
+            display_fingerprint = f"{primary_value}（{'，'.join(context_values)}）" if context_values else primary_value
 
         def _build_description() -> str:
             if event_count == 1 and first_event_description:
@@ -652,12 +791,12 @@ class AggregationProcessor:
             return f"影响范围：{result['alert_description']}"
 
         if str(now_level) in critical_level:
-            if not fingerprint_is_md5:
-                result["alert_title"] = f"{raw_fingerprint} 发生严重问题"
+            if not fingerprint_is_md5 and display_fingerprint:
+                result["alert_title"] = f"{display_fingerprint} 发生严重问题"
                 result["alert_description"] = _build_description()
         if str(now_level) in normal_level:
-            if not fingerprint_is_md5:
-                result["alert_title"] = f"{raw_fingerprint} 检测到异常"
+            if not fingerprint_is_md5 and display_fingerprint:
+                result["alert_title"] = f"{display_fingerprint} 检测到异常"
                 result["alert_description"] = _build_description()
 
     @staticmethod
@@ -683,13 +822,17 @@ class AggregationProcessor:
         Args:
             alert_ids: 新创建的告警ID列表
         """
-        try:
-            from apps.alerts.tasks import async_auto_assignment_for_alerts
+        from apps.alerts.service.alert_lifecycle import dispatch_alert_lifecycle
 
-            logger.info("[AlertAggregation] 调度自动分配任务，告警数量: %s", len(alert_ids))
-            current_app.send_task(async_auto_assignment_for_alerts.name, args=[alert_ids])
-            logger.debug("[AlertAggregation] 自动分配任务已提交到队列")
-
-        except Exception as e:  # noqa
-            logger.exception("[AlertAggregation] 调度自动分配任务失败")
-            # 调度失败不影响聚合主流程
+        alert_versions = Alert.objects.filter(alert_id__in=alert_ids).values_list("alert_id", "last_event_time")
+        dedupe_key = "\0".join(
+            f"{alert_id}:{last_event_time.isoformat() if last_event_time else ''}" for alert_id, last_event_time in sorted(alert_versions)
+        )
+        attempt_key = hashlib.sha256(dedupe_key.encode("utf-8")).hexdigest()
+        logger.info("[AlertAggregation] 持久化自动分配意图，告警数量: %s", len(alert_ids))
+        dispatch_alert_lifecycle(
+            alert_ids,
+            "created",
+            auto_assign=True,
+            auto_assign_dedupe_key=f"aggregation:{attempt_key}",
+        )

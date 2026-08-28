@@ -36,11 +36,16 @@
     {
       "metric_group": "Router",
       "name": "device_cpu_usage",
-      "query": "avg(device_cpu_usage{instance_type='router', __$labels__}) by (instance_id)",
+      "query": "device_cpu_usage{instance_type='router', __$labels__}",
       "display_name": "CPU Usage",
       "data_type": "Number",
       "unit": "percent",
-      "dimensions": [],
+      "dimensions": [
+        {
+          "name": "index",
+          "description": "SNMP table row index"
+        }
+      ],
       "instance_id_keys": [
         "instance_id"
       ],
@@ -335,7 +340,7 @@
     {
       "metric_group": "Traffic",
       "name": "device_total_incoming_traffic",
-      "query": "sum(rate(interface_ifInOctets{instance_type='router', __$labels__}[5m])) by (instance_id)",
+      "query": "sum(rate(interface_ifHCInOctets{instance_type='router', __$labels__}[5m])) by (instance_id)",
       "display_name": "Device Total Incoming Traffic Rate",
       "data_type": "Number",
       "unit": "byteps",
@@ -348,7 +353,7 @@
     {
       "metric_group": "Traffic",
       "name": "device_total_outgoing_traffic",
-      "query": "sum(rate(interface_ifOutOctets{instance_type='router', __$labels__}[5m])) by (instance_id)",
+      "query": "sum(rate(interface_ifHCOutOctets{instance_type='router', __$labels__}[5m])) by (instance_id)",
       "display_name": "Device Total Outgoing Traffic Rate",
       "data_type": "Number",
       "unit": "byteps",

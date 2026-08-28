@@ -1,4 +1,10 @@
-python3 manage.py migrate || true
+if python3 manage.py migrate; then
+    :
+else
+    migrate_status=$?
+    echo "数据库迁移失败，停止启动；请修复迁移问题后重新启动容器" >&2
+    exit "$migrate_status"
+fi
 python3 manage.py createcachetable django_cache
 python3 manage.py collectstatic --noinput
 
@@ -35,11 +41,13 @@ fi
 # 设置进程数量环境变量默认值
 export APP_WORKERS=${APP_WORKERS:-8}
 export CELERY_CONCURRENCY=${CELERY_CONCURRENCY:-4}
+export DASHBOARD_REPORT_RENDER_CONCURRENCY=${DASHBOARD_REPORT_RENDER_CONCURRENCY:-2}
 export NATS_NUMPROCS=${NATS_NUMPROCS:-4}
 
 echo "进程配置:"
 echo "  APP_WORKERS=$APP_WORKERS"
 echo "  CELERY_CONCURRENCY=$CELERY_CONCURRENCY"
+echo "  DASHBOARD_REPORT_RENDER_CONCURRENCY=$DASHBOARD_REPORT_RENDER_CONCURRENCY"
 echo "  NATS_NUMPROCS=$NATS_NUMPROCS"
 
 supervisord -n

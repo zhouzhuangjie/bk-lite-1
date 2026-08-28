@@ -5,8 +5,7 @@ import { Button, message, Spin, Tooltip } from 'antd';
 import { RelationshipsProvider } from '@/app/cmdb/context/relationships';
 import SideMenuLayout, { WithSideMenuLayoutProps } from '../components/sub-layout';
 import { useRouter } from 'next/navigation';
-import { getIconUrl } from '@/app/cmdb/utils/common';
-import Image from 'next/image';
+import ModelIcon from '@/app/cmdb/components/model-icon';
 import { useSearchParams } from 'next/navigation';
 import attrLayoutStyle from './layout.module.scss';
 import { useTranslation } from '@/utils/i18n';
@@ -21,31 +20,32 @@ const LayoutContent: React.FC<{ children: React.ReactNode }> = ({ children }) =>
   const objIcon: string = searchParams.get('icn') || '';
   const modelName: string = searchParams.get('model_name') || '';
   const modelId: string = searchParams.get('model_id') || '';
-  const instId: string = searchParams.get('inst_id') || '';
+  const instUuid: string = searchParams.get('inst_uuid') || '';
   const instName: string = searchParams.get('inst_name') || searchParams.get('ip_addr') || '--';
   const { t } = useTranslation();
   const { isFollowed, followAsset, unfollowAsset, submitting } = useFollowedAssets();
-  const followed = modelId && instId ? isFollowed(modelId, instId) : false;
+  const followed = modelId && instUuid ? isFollowed(modelId, instUuid) : false;
 
   const handleBackButtonClick = () => {
     router.back();
   };
 
   const handleFollowClick = async () => {
-    if (!modelId || !instId) return;
+    if (!modelId || !instUuid) return;
     if (followed) {
-      await unfollowAsset(modelId, instId);
+      await unfollowAsset(modelId, instUuid);
       message.success(t('AssetSearch.unfollowSuccess'));
       return;
     }
-    await followAsset({ model_id: modelId, inst_id: instId });
+    await followAsset({ model_id: modelId, inst_uuid: instUuid });
     message.success(t('AssetSearch.followSuccess'));
   };
 
   const intro = (
     <header className="grid grid-cols-[30px_minmax(0,1fr)_28px] items-start gap-[10px]">
-      <Image
-        src={getIconUrl({ icn: objIcon, model_id: modelId })}
+      <ModelIcon
+        icon={objIcon}
+        modelId={modelId}
         className="block"
         alt={t('picture')}
         width={30}
@@ -76,8 +76,8 @@ const LayoutContent: React.FC<{ children: React.ReactNode }> = ({ children }) =>
   };
 
   return (
-    <div className={`flex flex-col ${attrLayoutStyle.attrLayout}`}>
-      <Spin spinning={pageLoading}>
+    <div className={`flex flex-col h-full min-h-0 w-full min-w-0 ${attrLayoutStyle.attrLayout}`}>
+      <Spin spinning={pageLoading} wrapperClassName="h-full min-h-0 [&_.ant-spin-container]:h-full">
         <SideMenuLayout {...layoutProps} />
       </Spin>
     </div>

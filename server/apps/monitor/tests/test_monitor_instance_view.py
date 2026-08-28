@@ -1,11 +1,33 @@
 import json
+import threading
+import time
 import types
 
+import pytest
+import requests
+
+from apps.core.exceptions.base_app_exception import BaseAppException
+from apps.core.utils.current_team_scope import CurrentTeamDataScope
 from apps.monitor.models.collect_config import CollectConfig
-from apps.monitor.models.monitor_object import MonitorInstance, MonitorObject
+from apps.monitor.models.monitor_object import MonitorInstance, MonitorInstanceOrganization, MonitorObject
 from apps.monitor.models.plugin import MonitorPlugin
 from apps.monitor.utils.dimension import build_safe_instance_id
 from apps.monitor.views import monitor_instance as monitor_instance_view
+
+NODE_MGMT_PATH = "apps.monitor.services.monitor_instance_removal.NodeMgmt"
+
+
+def _superuser_actor_context():
+    scope = CurrentTeamDataScope(1, frozenset({1}), False, "tester", "default", True)
+    return {
+        "is_superuser": True,
+        "current_team": 1,
+        "username": "tester",
+        "domain": "default",
+        "group_list": [],
+        "include_children": False,
+        "data_scope": scope,
+    }
 
 
 def test_remove_monitor_instance_refreshes_flow_cloud_regions(db, monkeypatch):
@@ -21,11 +43,13 @@ def test_remove_monitor_instance_refreshes_flow_cloud_regions(db, monkeypatch):
     refresh_calls = []
 
     monkeypatch.setattr(monitor_instance_view, "_build_actor_context", lambda request: {"current_team": 1})
-    monkeypatch.setattr(monitor_instance_view, "_ensure_operate_instances", lambda request, instance_ids, actor_context=None: instance_ids)
-    monkeypatch.setattr(monitor_instance_view, "cleanup_policy_sources", lambda instance_ids: None)
     monkeypatch.setattr(
         monitor_instance_view,
-        "NodeMgmt",
+        "_ensure_operate_instances",
+        lambda request, instance_ids, actor_context=None, allow_missing=False: instance_ids,
+    )
+    monkeypatch.setattr(
+        NODE_MGMT_PATH,
         lambda: types.SimpleNamespace(delete_child_configs=lambda ids: None, delete_configs=lambda ids: None),
     )
     monkeypatch.setattr(
@@ -41,8 +65,7 @@ def test_remove_monitor_instance_refreshes_flow_cloud_regions(db, monkeypatch):
 
     monitor_instance_view.MonitorInstanceViewSet().remove_monitor_instance(request)
 
-    instance.refresh_from_db()
-    assert instance.is_deleted is True
+    assert not MonitorInstance.objects.filter(id=instance.id).exists()
     assert refresh_calls == [(3,)]
 
 
@@ -59,10 +82,13 @@ def test_remove_monitor_instance_registers_refresh_before_cleanup(db, monkeypatc
     refresh_calls = []
 
     monkeypatch.setattr(monitor_instance_view, "_build_actor_context", lambda request: {"current_team": 1})
-    monkeypatch.setattr(monitor_instance_view, "_ensure_operate_instances", lambda request, instance_ids, actor_context=None: instance_ids)
     monkeypatch.setattr(
         monitor_instance_view,
-        "NodeMgmt",
+        "_ensure_operate_instances",
+        lambda request, instance_ids, actor_context=None, allow_missing=False: instance_ids,
+    )
+    monkeypatch.setattr(
+        NODE_MGMT_PATH,
         lambda: types.SimpleNamespace(delete_child_configs=lambda ids: None, delete_configs=lambda ids: None),
     )
     monkeypatch.setattr(
@@ -70,8 +96,7 @@ def test_remove_monitor_instance_registers_refresh_before_cleanup(db, monkeypatc
         lambda *region_ids: refresh_calls.append(region_ids),
     )
     monkeypatch.setattr(
-        monitor_instance_view,
-        "cleanup_policy_sources",
+        "apps.monitor.services.monitor_instance_removal.cleanup_policy_sources",
         lambda instance_ids: (_ for _ in ()).throw(RuntimeError("cleanup failed")),
     )
 
@@ -81,15 +106,13 @@ def test_remove_monitor_instance_registers_refresh_before_cleanup(db, monkeypatc
         user=types.SimpleNamespace(username="tester", domain="default", is_superuser=True, group_list=[]),
     )
 
-    try:
+    with pytest.raises(BaseAppException) as exc_info:
         monitor_instance_view.MonitorInstanceViewSet().remove_monitor_instance(request)
-        assert False, "expected cleanup failure"
-    except RuntimeError as error:
-        assert str(error) == "cleanup failed"
 
     instance.refresh_from_db()
-    assert instance.is_deleted is True
-    assert refresh_calls == [(5,)]
+    assert instance.is_deleted is False
+    assert "删除监控实例失败" in str(exc_info.value)
+    assert refresh_calls == []
 
 
 def test_remove_monitor_instance_always_cleans_configs(db, monkeypatch):
@@ -120,11 +143,13 @@ def test_remove_monitor_instance_always_cleans_configs(db, monkeypatch):
     cleanup_calls = {"child": None, "base": None}
 
     monkeypatch.setattr(monitor_instance_view, "_build_actor_context", lambda request: {"current_team": 1})
-    monkeypatch.setattr(monitor_instance_view, "_ensure_operate_instances", lambda request, instance_ids, actor_context=None: instance_ids)
-    monkeypatch.setattr(monitor_instance_view, "cleanup_policy_sources", lambda instance_ids: None)
     monkeypatch.setattr(
         monitor_instance_view,
-        "NodeMgmt",
+        "_ensure_operate_instances",
+        lambda request, instance_ids, actor_context=None, allow_missing=False: instance_ids,
+    )
+    monkeypatch.setattr(
+        NODE_MGMT_PATH,
         lambda: types.SimpleNamespace(
             delete_child_configs=lambda ids: cleanup_calls.__setitem__("child", ids),
             delete_configs=lambda ids: cleanup_calls.__setitem__("base", ids),
@@ -139,10 +164,44 @@ def test_remove_monitor_instance_always_cleans_configs(db, monkeypatch):
 
     monitor_instance_view.MonitorInstanceViewSet().remove_monitor_instance(request)
 
-    instance.refresh_from_db()
-    assert instance.is_deleted is True
+    assert not MonitorInstance.objects.filter(id=instance.id).exists()
     assert cleanup_calls == {"child": [child_config.id], "base": [base_config.id]}
     assert CollectConfig.objects.filter(monitor_instance_id=instance.id).count() == 0
+
+
+def test_remove_monitor_instance_passes_manual_lifecycle_context(db, monkeypatch):
+    remove_calls = []
+    monkeypatch.setattr(
+        monitor_instance_view,
+        "_build_actor_context",
+        lambda request: {"current_team": 1, "username": "page-operator"},
+    )
+    monkeypatch.setattr(
+        monitor_instance_view,
+        "_ensure_operate_instances",
+        lambda request, instance_ids, actor_context=None, allow_missing=False: instance_ids,
+    )
+    monkeypatch.setattr(
+        monitor_instance_view.MonitorInstanceRemovalService,
+        "remove",
+        lambda instance_ids, **kwargs: remove_calls.append((instance_ids, kwargs)),
+    )
+    request = types.SimpleNamespace(
+        data={"instance_ids": ["manual-instance"]},
+        user=types.SimpleNamespace(username="fallback-operator"),
+    )
+
+    monitor_instance_view.MonitorInstanceViewSet().remove_monitor_instance(request)
+
+    assert remove_calls == [
+        (
+            ["manual-instance"],
+            {
+                "operator": "page-operator",
+                "reason": "manual_instance_deleted",
+            },
+        )
+    ]
 
 
 def _create_effective_plugin_fixture():
@@ -260,6 +319,97 @@ def test_effective_plugins_service_deduplicates_configured_reported_plugin(db, m
     assert by_name["HostRemote"]["id"] == configured_plugin.id
     assert by_name["HostRemote"]["status"] == "normal"
     assert by_name["HostRemote"]["collect_mode"] == "auto"
+
+
+def test_effective_plugins_service_deduplicates_status_queries_with_bounded_concurrency(db, monkeypatch):
+    from apps.monitor.services import effective_plugins
+
+    monitor_object = MonitorObject.objects.create(
+        name="EffectivePluginBatch",
+        display_name="Effective Plugin Batch",
+        instance_id_keys=["instance_id"],
+    )
+    for index in range(10):
+        plugin = MonitorPlugin.objects.create(
+            name=f"BatchPlugin{index}",
+            status_query=f'any({{kind="{index % 5}"}}) by (instance_id)',
+        )
+        plugin.monitor_object.add(monitor_object)
+
+    lock = threading.Lock()
+    active = 0
+    peak_active = 0
+    calls = []
+
+    class StubVictoriaMetricsAPI:
+        def query(self, query, **kwargs):
+            nonlocal active, peak_active
+            with lock:
+                calls.append(query)
+                active += 1
+                peak_active = max(peak_active, active)
+            time.sleep(0.03)
+            with lock:
+                active -= 1
+            if 'kind="4"' in query:
+                raise RuntimeError("one plugin status unavailable")
+            return {"data": {"result": [{"metric": {"instance_id": "host-a"}, "value": [100, "1"]}]}}
+
+    monkeypatch.setattr(effective_plugins, "VictoriaMetricsAPI", StubVictoriaMetricsAPI)
+
+    result = effective_plugins.MonitorEffectivePluginService.get_effective_plugins(
+        monitor_object.id,
+        "('host-a',)",
+    )
+
+    assert len(result) == 8
+    assert len(calls) == 5
+    assert len(set(calls)) == 5
+    assert 1 < peak_active <= 8
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [(None, 8), ("invalid", 8), ("0", 1), ("-1", 1), ("1000", 32)],
+)
+def test_vm_query_worker_config_is_safe_and_bounded(monkeypatch, raw_value, expected):
+    from apps.monitor.utils import vm_query_batch
+
+    if raw_value is None:
+        monkeypatch.delenv("MONITOR_VM_QUERY_MAX_WORKERS", raising=False)
+    else:
+        monkeypatch.setenv("MONITOR_VM_QUERY_MAX_WORKERS", raw_value)
+
+    assert vm_query_batch._resolve_vm_query_max_workers() == expected
+
+
+def test_vm_query_batch_worker_one_is_serial_and_timeout_is_isolated(monkeypatch):
+    from apps.monitor.utils import vm_query_batch
+
+    monkeypatch.setattr(vm_query_batch, "VM_QUERY_MAX_WORKERS", 1)
+    active = 0
+    peak_active = 0
+
+    def query(query_text):
+        nonlocal active, peak_active
+        active += 1
+        peak_active = max(peak_active, active)
+        try:
+            if query_text == "timeout":
+                raise requests.Timeout("VM query timed out")
+            time.sleep(0.01)
+            return query_text.upper()
+        finally:
+            active -= 1
+
+    results, errors = vm_query_batch.run_unique_vm_queries(
+        ["first", "timeout", "first", "last"],
+        query,
+    )
+
+    assert results == {"first": "FIRST", "last": "LAST"}
+    assert isinstance(errors["timeout"], requests.Timeout)
+    assert peak_active == 1
 
 
 def test_effective_plugins_service_resolves_derived_instance_without_row(db, monkeypatch):
@@ -566,6 +716,121 @@ def test_primary_object_plugin_list_deduplicates_flow_configured_and_reported_pl
     assert plugins[0]["config_source"] == "configured_reported"
 
 
+def test_primary_object_plugin_list_batches_and_aggregates_collection_nodes(db, monkeypatch):
+    from apps.monitor.services import monitor_instance
+
+    monitor_object = MonitorObject.objects.create(
+        name="CollectionNodeHost",
+        display_name="Collection Node Host",
+        instance_id_keys=["instance_id"],
+    )
+    instance = MonitorInstance.objects.create(
+        id="('host-a',)",
+        name="Host A",
+        monitor_object=monitor_object,
+    )
+    MonitorInstanceOrganization.objects.create(monitor_instance=instance, organization=7)
+    automatic_plugin = MonitorPlugin.objects.create(
+        name="AutomaticPlugin",
+        display_name="Automatic Plugin",
+        collector="Telegraf",
+        collect_type="host",
+        status_query="automatic_query",
+    )
+    automatic_plugin.monitor_object.add(monitor_object)
+    manual_plugin = MonitorPlugin.objects.create(
+        name="ManualPlugin",
+        display_name="Manual Plugin",
+        collector="push_api",
+        collect_type="push_api",
+        status_query="manual_query",
+    )
+    manual_plugin.monitor_object.add(monitor_object)
+    unbound_plugin = MonitorPlugin.objects.create(
+        name="UnboundPlugin",
+        display_name="Unbound Plugin",
+        collector="Telegraf",
+        collect_type="disk",
+        status_query="unbound_query",
+    )
+    unbound_plugin.monitor_object.add(monitor_object)
+    for config_id, config_type in (("child-b", "mem"), ("child-a", "cpu")):
+        CollectConfig.objects.create(
+            id=config_id,
+            monitor_instance=instance,
+            monitor_plugin=automatic_plugin,
+            collector="Telegraf",
+            collect_type="host",
+            config_type=config_type,
+            file_type="toml",
+            is_child=True,
+        )
+    CollectConfig.objects.create(
+        id="child-unbound",
+        monitor_instance=instance,
+        monitor_plugin=unbound_plugin,
+        collector="Telegraf",
+        collect_type="disk",
+        config_type="disk",
+        file_type="toml",
+        is_child=True,
+    )
+
+    class StubVictoriaMetricsAPI:
+        def query(self, query, **kwargs):
+            return {
+                "data": {
+                    "result": [
+                        {
+                            "metric": {"instance_id": "host-a"},
+                            "value": [100, "1"],
+                        }
+                    ]
+                }
+            }
+
+    calls = []
+
+    class StubNodeMgmt:
+        def get_child_config_nodes_by_ids(self, ids, organization_ids):
+            calls.append((ids, organization_ids))
+            return [
+                {
+                    "id": "child-a",
+                    "nodes": [
+                        {"id": "node-2", "name": "Beta"},
+                        {"id": "node-1", "name": "Alpha"},
+                    ],
+                },
+                {
+                    "id": "child-b",
+                    "nodes": [
+                        {"id": "node-1", "name": "Alpha"},
+                    ],
+                },
+            ]
+
+    monkeypatch.setattr(monitor_instance, "VictoriaMetricsAPI", StubVictoriaMetricsAPI)
+    monkeypatch.setattr(monitor_instance, "NodeMgmt", StubNodeMgmt)
+
+    result = monitor_instance.InstanceSearch(
+        monitor_object,
+        {"page": 1, "page_size": 10},
+        qs=MonitorInstance.objects.all(),
+        locale="zh-Hans",
+        visible_organization_ids=frozenset({7}),
+    ).search_by_primary_object()
+
+    assert calls == [(["child-a", "child-b", "child-unbound"], [7])]
+    plugins = {plugin["name"]: plugin for plugin in result["results"][0]["plugins"]}
+    assert plugins["AutomaticPlugin"]["collector_nodes"] == [
+        {"id": "node-1", "name": "Alpha"},
+        {"id": "node-2", "name": "Beta"},
+    ]
+    assert plugins["UnboundPlugin"]["collector_nodes"] == []
+    assert plugins["ManualPlugin"]["collector_nodes"] == []
+
+
 def test_get_instance_configs_uses_plugin_id_over_collector_for_child_configs(db, monkeypatch):
     from apps.monitor.services import node_mgmt
 
@@ -698,11 +963,12 @@ def test_effective_plugins_action_normalizes_clean_instance_id(db, monkeypatch):
         display_name="Host",
         instance_id_keys=["instance_id"],
     )
-    MonitorInstance.objects.create(
+    instance = MonitorInstance.objects.create(
         id="('host-a',)",
         name="Host A",
         monitor_object=monitor_object,
     )
+    MonitorInstanceOrganization.objects.create(monitor_instance=instance, organization=1)
 
     service_calls = {}
     expected = [{"id": 12, "name": "HostRemote"}]
@@ -714,18 +980,11 @@ def test_effective_plugins_action_normalizes_clean_instance_id(db, monkeypatch):
             return expected
 
     monkeypatch.setattr(monitor_instance_view, "MonitorEffectivePluginService", StubService)
-    # 仅 mock actor_context(超管,跳过组织权限),保留真实 _ensure_operate_instances 以触发存在性查询。
+    # 仅 mock actor_context，保留真实 _ensure_operate_instances 以触发存在性与 current_team 查询。
     monkeypatch.setattr(
         monitor_instance_view,
         "_build_actor_context",
-        lambda request: {
-            "is_superuser": True,
-            "current_team": 1,
-            "username": "tester",
-            "domain": "default",
-            "group_list": [],
-            "include_children": False,
-        },
+        lambda request: _superuser_actor_context(),
     )
 
     request = types.SimpleNamespace(
@@ -740,9 +999,7 @@ def test_effective_plugins_action_normalizes_clean_instance_id(db, monkeypatch):
         ),
     )
 
-    response = monitor_instance_view.MonitorInstanceViewSet().effective_plugins(
-        request, str(monitor_object.id)
-    )
+    response = monitor_instance_view.MonitorInstanceViewSet().effective_plugins(request, str(monitor_object.id))
     payload = json.loads(response.content)
 
     assert service_calls["args"] == (monitor_object.id, "('host-a',)", "zh-Hans")
@@ -769,18 +1026,11 @@ def test_effective_plugins_action_allows_derived_instance_without_row(db, monkey
             return expected
 
     monkeypatch.setattr(monitor_instance_view, "MonitorEffectivePluginService", StubService)
-    # 超管 + 真实 _ensure_operate_instances，触发存在性查询路径（无行不再抛异常）。
+    # 超管 + 真实 _ensure_operate_instances，触发 current_team 路径（无行不再抛异常）。
     monkeypatch.setattr(
         monitor_instance_view,
         "_build_actor_context",
-        lambda request: {
-            "is_superuser": True,
-            "current_team": 1,
-            "username": "tester",
-            "domain": "default",
-            "group_list": [],
-            "include_children": False,
-        },
+        lambda request: _superuser_actor_context(),
     )
 
     request = types.SimpleNamespace(
@@ -795,9 +1045,7 @@ def test_effective_plugins_action_allows_derived_instance_without_row(db, monkey
         ),
     )
 
-    response = monitor_instance_view.MonitorInstanceViewSet().effective_plugins(
-        request, str(monitor_object.id)
-    )
+    response = monitor_instance_view.MonitorInstanceViewSet().effective_plugins(request, str(monitor_object.id))
     payload = json.loads(response.content)
 
     assert payload["data"] == expected
@@ -849,9 +1097,7 @@ def test_effective_plugins_action_keeps_multi_dimension_instance_id(monkeypatch)
         ),
     )
 
-    response = monitor_instance_view.MonitorInstanceViewSet().effective_plugins(
-        request, "19"
-    )
+    response = monitor_instance_view.MonitorInstanceViewSet().effective_plugins(request, "19")
     payload = json.loads(response.content)
 
     assert service_calls["args"] == (
@@ -860,3 +1106,80 @@ def test_effective_plugins_action_keeps_multi_dimension_instance_id(monkeypatch)
         "zh-Hans",
     )
     assert payload["data"] == expected
+
+
+def test_monitor_instance_list_passes_normalized_instance_id(monkeypatch):
+    """list 可选 instance_id：标量归一为存储键后再交给 service。"""
+    captured = {}
+
+    def fake_scope(request):
+        return CurrentTeamDataScope(1, frozenset({1}), False, "tester", "default", True)
+
+    def fake_get_monitor_instance(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return {"count": 1, "results": [{"instance_id": "('h1',)", "instance_name": "主机1"}]}
+
+    monkeypatch.setattr(monitor_instance_view, "resolve_current_team_data_scope", fake_scope)
+    monkeypatch.setattr(
+        monitor_instance_view,
+        "get_permission_rules",
+        lambda *args, **kwargs: {"team": [1], "instance": []},
+    )
+    monkeypatch.setattr(
+        monitor_instance_view,
+        "scope_permission_queryset",
+        lambda *args, **kwargs: MonitorInstance.objects.none(),
+    )
+    monkeypatch.setattr(
+        monitor_instance_view.MonitorObjectService,
+        "get_monitor_instance",
+        staticmethod(fake_get_monitor_instance),
+    )
+
+    request = types.SimpleNamespace(
+        GET={"instance_id": "h1", "page": "1", "page_size": "1"},
+        COOKIES={"current_team": "1"},
+        user=types.SimpleNamespace(
+            username="tester",
+            domain="default",
+            locale="zh-Hans",
+            is_superuser=True,
+            group_list=[],
+        ),
+    )
+    response = monitor_instance_view.MonitorInstanceViewSet().monitor_instance_list(request, "19")
+    payload = json.loads(response.content)
+
+    assert captured["kwargs"]["instance_id"] == "('h1',)"
+    assert payload["data"]["count"] == 1
+
+
+def test_monitor_instance_list_invalid_instance_id_returns_empty(monkeypatch):
+    monkeypatch.setattr(
+        monitor_instance_view,
+        "resolve_current_team_data_scope",
+        lambda request: CurrentTeamDataScope(1, frozenset({1}), False, "tester", "default", True),
+    )
+    called = {"service": False}
+
+    def boom(*args, **kwargs):
+        called["service"] = True
+        raise AssertionError("service should not run for invalid instance_id")
+
+    monkeypatch.setattr(
+        monitor_instance_view.MonitorObjectService,
+        "get_monitor_instance",
+        staticmethod(boom),
+    )
+
+    request = types.SimpleNamespace(
+        GET={"instance_id": "()"},
+        COOKIES={"current_team": "1"},
+        user=types.SimpleNamespace(is_superuser=True, group_list=[]),
+    )
+    response = monitor_instance_view.MonitorInstanceViewSet().monitor_instance_list(request, "19")
+    payload = json.loads(response.content)
+
+    assert called["service"] is False
+    assert payload["data"] == {"count": 0, "results": []}

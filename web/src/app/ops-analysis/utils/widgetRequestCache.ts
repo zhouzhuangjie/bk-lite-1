@@ -1,36 +1,25 @@
-export interface WidgetRequestCacheEntry {
-  rawData: any;
-  baselineData: any;
-  dataValidation: { isValid: boolean; message?: string } | null;
-}
+const inflightWidgetRequests = new Map<string, Promise<unknown>>();
 
-const widgetRequestCache = new Map<string, WidgetRequestCacheEntry>();
+export const buildWidgetRequestCacheKey = ({
+  scopeId,
+  requestVersionKey,
+  requestSignature,
+}: {
+  scopeId?: string | number;
+  requestVersionKey: string;
+  requestSignature: string;
+}) => `${scopeId ?? 'dashboard'}:${requestVersionKey}:${requestSignature}`;
 
-export const getCachedWidgetRequest = (
+export const getOrCreateInflightWidgetRequest = async <T,>(
   requestKey: string,
-): WidgetRequestCacheEntry | undefined => widgetRequestCache.get(requestKey);
+  createRequest: () => Promise<T>,
+): Promise<T> => {
+  const existingRequest = inflightWidgetRequests.get(requestKey) as Promise<T> | undefined;
+  if (existingRequest) return existingRequest;
 
-export const setWidgetRequestSuccessCache = (
-  requestKey: string,
-  entry: WidgetRequestCacheEntry,
-) => {
-  widgetRequestCache.set(requestKey, entry);
-};
-
-export const setWidgetRequestFailureCache = (
-  requestKey: string,
-  message: string,
-) => {
-  widgetRequestCache.set(requestKey, {
-    rawData: null,
-    baselineData: null,
-    dataValidation: {
-      isValid: false,
-      message,
-    },
+  const requestPromise = createRequest().finally(() => {
+    inflightWidgetRequests.delete(requestKey);
   });
-};
-
-export const clearWidgetRequestCache = () => {
-  widgetRequestCache.clear();
+  inflightWidgetRequests.set(requestKey, requestPromise as Promise<unknown>);
+  return requestPromise;
 };

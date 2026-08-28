@@ -1,6 +1,7 @@
 import React from 'react';
 
 import { ConfigAnalysisReport, ConfigAnalysisReportItem, ConfigAnalysisSeveritySection } from '@/app/opspilot/types/global';
+import { getConfigAnalysisSummaryText } from './configAnalysisReportSummary';
 
 interface ConfigAnalysisReportCardProps {
   report: ConfigAnalysisReport;
@@ -176,14 +177,16 @@ const ConfigAnalysisReportCard: React.FC<ConfigAnalysisReportCardProps> = ({ rep
   const hasIssues = severitySections.length > 0 || problematicCount > 0;
   const hasIssueDetails = severitySections.length > 0 || recommendationRows.length > 0;
   const degradedCount = severitySections.filter(section => section.degraded).length;
-  const summaryText =
-    report.summary.top_recommendation?.trim() ||
-    (hasIssues
-      ? '当前报告返回了问题统计，但结构化明细暂未返回，请结合原始扫描结果继续排查。'
-      : '当前扫描结果未发现明显风险，暂无额外修复建议。');
+  const summaryText = getConfigAnalysisSummaryText({
+    problematicCount,
+    hasIssueDetails,
+    topRecommendation: report.summary.top_recommendation,
+  });
   const scopeItems = [
     report.scope?.cluster_name || report.cluster_name,
-    report.scope?.namespace ? `命名空间：${report.scope.namespace}` : null,
+    report.scope?.namespace
+      ? `命名空间：${Array.isArray(report.scope.namespace) ? report.scope.namespace.join('、') : report.scope.namespace}`
+      : null,
     report.scope?.instance_name ? `实例：${report.scope.instance_name}` : null,
     report.scope?.target_name
       ? `对象：${report.scope.target_name}`
@@ -379,11 +382,14 @@ const ConfigAnalysisReportCard: React.FC<ConfigAnalysisReportCardProps> = ({ rep
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 bg-white text-slate-700">
-                      {recommendationRows.map(row => {
+                      {recommendationRows.map((row, idx) => {
                         const priorityStyle = recommendationPriorityStyles[row.priority];
 
                         return (
-                          <tr key={`${row.priority}-${row.action}`} className="align-top">
+                          // 用 idx + priority + action + target 保证 key unique
+                          // 同 severity 同修复动作 的 issue 会重复(例如两个 high 都推荐
+                          // "添加 livenessProbe 和 readinessProbe"),单靠 priority+action 撞 key
+                          <tr key={`${idx}-${row.priority}-${row.action}-${row.target}`} className="align-top">
                             <td className="px-4 py-2.5">
                               <span className={`inline-flex h-7 min-w-10 items-center justify-center whitespace-nowrap rounded-full border px-2.5 text-xs font-semibold ${priorityStyle}`}>
                                 {row.priority}

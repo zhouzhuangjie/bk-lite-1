@@ -3,7 +3,6 @@ import {ButtonProps} from 'antd';
 import {
   AgentStepProgressData,
   A2UIReportContract,
-  Annotation,
   BrowserStepAction,
   BrowserStepProgressData,
   BrowserTaskReceivedData,
@@ -16,6 +15,26 @@ export type { BrowserTaskReceivedData };
 export type BrowserStepProgressValue = BrowserStepProgressData;
 export type BrowserTaskReceivedValue = BrowserTaskReceivedData;
 export type AgentStepProgressValue = AgentStepProgressData;
+
+export interface PlannedExecutionStepValue {
+  phase: 'start' | 'end' | string;
+  step_index: number;
+  total_steps: number;
+  objective: string;
+  tools?: string[];
+  status?: string;
+  error?: string;
+}
+
+/** DeepAgent 规划阶段状态（非思考内容，仅告诉用户「正在规划」） */
+export interface PlannedExecutionStatusValue {
+  phase: 'planning' | 'replanning' | 'planned' | 'idle' | string;
+  step_count?: number;
+  goal?: string;
+  replan_count?: number;
+  reason?: string;
+}
+
 export interface SkillViewValue {
   items: SkillViewItem[];
 }
@@ -62,6 +81,7 @@ export interface ConfigDiffReportValue {
   report_id: string;
   title: string;
   cluster_name: string;
+  skill_id?: number;
   a2ui?: A2UIReportContract;
   items: Array<{
     workload_name: string;
@@ -71,6 +91,7 @@ export interface ConfigDiffReportValue {
     summary: string;
     before_yaml: string;
     after_yaml: string;
+    skill_id?: number;
   }>;
 }
 
@@ -84,7 +105,7 @@ export interface ConfigAnalysisReportItemValue {
 
 export interface ConfigAnalysisReportScopeValue {
   cluster_name?: string;
-  namespace?: string | null;
+  namespace?: string | string[] | null;
   instance_name?: string | null;
   name?: string | null;
   target_name?: string | null;
@@ -187,7 +208,6 @@ export interface CustomChatSSEProps {
       reason?: string;
     };
   } | null>;
-  showMarkOnly?: boolean;
   initialMessages?: CustomChatMessage[];
   mode?: 'chat' | 'display';
   guide?: string;
@@ -236,50 +256,11 @@ export interface AGUIMessage {
   message?: string;
   code?: string;
   name?: string;
-  value?: BrowserStepProgressValue | BrowserTaskReceivedValue | ApprovalRequestValue | UserChoiceRequestValue | AgentStepProgressValue | SubAgentProgressValue | SkillViewValue | ConfigAnalysisReportValue | Record<string, unknown>;
-}
-
-export interface ReferenceModalState {
-  visible: boolean;
-  loading: boolean;
-  title: string;
-  content: string;
-}
-
-export interface DrawerContentState {
-  visible: boolean;
-  title: string;
-  content: string;
-  chunkType?: "Document" | "QA" | "Graph";
-  graphData?: { nodes: any[], edges: any[] };
+  value?: BrowserStepProgressValue | BrowserTaskReceivedValue | ApprovalRequestValue | UserChoiceRequestValue | AgentStepProgressValue | SubAgentProgressValue | SkillViewValue | ConfigAnalysisReportValue | PlannedExecutionStepValue | Record<string, unknown>;
 }
 
 export interface GuideParseResult {
   text: string;
   items: string[];
   renderedHtml: string;
-}
-
-export interface ReferenceParams {
-  refNumber: string;
-  chunkId: string | null;
-  knowledgeId: string | null;
-}
-
-export interface MessageActionsProps {
-  message: CustomChatMessage;
-  onCopy: (content: string) => void;
-  onRegenerate: (id: string) => void;
-  onDelete: (id: string) => void;
-  onMark: (message: CustomChatMessage) => void;
-  showMarkOnly?: boolean;
-}
-
-export interface AnnotationModalProps {
-  visible: boolean;
-  showMarkOnly?: boolean;
-  annotation: Annotation | null;
-  onSave: (annotation?: Annotation) => void;
-  onRemove: (id: string | undefined) => void;
-  onCancel: () => void;
 }

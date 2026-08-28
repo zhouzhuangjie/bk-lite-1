@@ -3,8 +3,5 @@
  */
 export {
   getColorByThreshold,
-  validateThresholds,
-  formatDisplayValue,
-  getValueByPath,
-  type ThresholdColorConfig,
+  isFiniteNumber,
 } from '@/app/ops-analysis/utils/thresholdUtils';

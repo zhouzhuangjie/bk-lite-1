@@ -1,4 +1,4 @@
-import type { Meta, StoryObj } from '@storybook/react';
+import type { Meta, StoryObj } from '@storybook/nextjs';
 import Password from '@/components/password';
 
 const meta: Meta<typeof Password> = {
@@ -29,6 +29,15 @@ export const DirectEdit: Story = {
     value: '',
     clickToEdit: false,
     placeholder: 'Type password directly',
+  },
+};
+
+export const TrimOuterWhitespace: Story = {
+  args: {
+    value: '',
+    clickToEdit: false,
+    trimOuterWhitespace: true,
+    placeholder: 'Paste a password with surrounding whitespace',
   },
 };
 

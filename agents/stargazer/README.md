@@ -1,412 +1,242 @@
 # Stargazer
 
-云资源采集和监控代理服务
+Stargazer 是配置采集与业务监控采集代理。运行形态为单个无状态 Sanic 服务；不再启动
+ARQ Worker，也不把 Redis 当作任务队列。
 
-## 🚀 快速启动
+完整设计见
+[`specs/changes/stargazer-stateless-async-collection/spec.md`](../../specs/changes/stargazer-stateless-async-collection/spec.md)。
 
-### 开发环境
-
-```bash
-# 1. 启动 Worker（终端1）
-python start_worker.py
-
-# 2. 启动 Server（终端2）
-python server.py
-```
-
-### 重要提示
-
-1. **必须先启动 Worker，再启动 Server**
-2. **Server 和 Worker 的 Redis 配置必须完全一致**
-3. **同一台机器只运行一个 Worker 实例**（除非需要提高并发）
-4. **任务完成后会自动清除标记，允许重复采集**
-
----
-
-## 📋 配置说明
-
-### 核心配置（.env）
+## 启动
 
 ```bash
-# ============ Redis 配置 ============
-# 关键：Server 和 Worker 必须一致
-REDIS_HOST=localhost
-REDIS_PORT=6379
-REDIS_PASSWORD=your_redis_password
-REDIS_DB=0
-
-# Redis 连接池配置（生产环境重要）
-REDIS_SOCKET_TIMEOUT=5
-REDIS_CONNECT_TIMEOUT=5
-REDIS_MAX_RETRY=3
-
-# ============ 任务队列配置 ============
-# Worker 最大并发任务数（根据服务器性能调整）
-TASK_MAX_JOBS=10
-
-# 单个任务超时时间（秒）- 根据采集任务复杂度调整
-TASK_JOB_TIMEOUT=300
-
-# 任务失败重试次数
-TASK_MAX_TRIES=3
-
-# 任务结果保留时间（秒）
-TASK_KEEP_RESULT=3600
-
-# 健康检查间隔（秒）
-HEALTH_CHECK_INTERVAL=30
-
-# ============ NATS 配置 ============
-NATS_SERVERS=nats://localhost:4222
-NATS_USERNAME=your_nats_username
-NATS_PASSWORD=your_nats_password
-# NATS_PROTOCOL=tls
-# NATS_TLS_CA_FILE=/path/to/ca.pem
+uv sync
+uv run python server.py
 ```
 
-### 网络拓扑发现契约
+服务启动时建立普通异步 Redis Client 和 NATS 连接，并初始化统一
+`CollectionApplication`。Docker/Kubernetes 通过增加 Pod 数量扩展不同采集运行的吞吐；首版不把
+单个运行拆到多个 Pod。
 
-- `topology_protocols` 支持 `lldp`、`cdp`、`fdb`、`arp`，用于控制 Stargazer 构建事实时启用的协议集合。
-- `topology_fallback_strategy` 是上游 CMDB 的消费策略参数，不由 Stargazer 解析；Stargazer 只负责保留原始 `network_topo` 并额外输出拓扑事实。
-- Stargazer 对网络设备始终保留原始 `network_topo` 结果，并额外输出 `network_topology_facts`，不会覆盖原始拓扑。
-- 下游 CMDB 会优先使用 `network_topology_facts` 建边，解析不了的链路再回退到 `network_topo`。
+## HTTP 任务约定
 
-### 性能调优
+配置采集与 `/api/monitor/*` 的薄租约 ID 由服务端对请求做规范化指纹派生
+（`METHOD` + path + 排序 query + 业务 headers），形如 `req_<sha256>`；调用方不必传
+`X-Task-ID`。响应头会回传派生 ID。同一 Telegraf input / 直触发在业务 headers/query
+不变时指纹稳定，用于防重叠；凭据或参数变更会换键。
 
-#### 调整并发数
+相同指纹且租约仍有效时返回 `202 duplicate-active`；本 Pod 容量已满返回 `429` 和
+`Retry-After`。一次多 IP 请求只创建一个顶层运行，每个 IP 是一个目标逻辑任务，目标
+内部按输入顺序串行尝试凭据。
+
+Redis 只保存运行租约、凭据 ID 亲和/冷冻和 Deferred callback 上下文，不保存密码、
+Token、community 或私钥。移除持久队列后，Pod 故障丢单依赖下周期用相同请求指纹再次触发。
+
+### Monitor 接口鉴权迁移
+
+`/api/monitor/*` 支持 Bearer Token 鉴权，并通过显式模式分阶段迁移：
 
 ```bash
-# 高性能服务器
-TASK_MAX_JOBS=50
-
-# 低性能服务器
-TASK_MAX_JOBS=5
+# 兼容期默认值：保留旧 Telegraf 请求，并记录其鉴权状态
+STARGAZER_MONITOR_AUTH_MODE=legacy
+STARGAZER_MONITOR_AUTH_TOKEN=<current-token>
+# 轮换期可同时接受上一枚 Token
+STARGAZER_MONITOR_AUTH_PREVIOUS_TOKEN=<previous-token>
 ```
 
-#### 调整超时时间
+先在 `legacy` 模式配置当前 Token，再逐个让调用方发送
+`Authorization: Bearer <current-token>`。确认兼容日志中的调用均为 `valid` 后，把模式切为
+`enforce`；此时缺失或错误的凭据返回 `401`，运行时不会创建采集任务。`enforce` 未配置当前或
+上一枚 Token 时失败关闭并返回 `503`。Token 轮换时先把旧值移到 previous、发布新值，确认调用方
+完成切换后再移除 previous。若上线后需要回滚，只需把模式恢复为 `legacy`，旧调用立即恢复，健康
+检查与非 monitor 蓝图不受影响。
+
+## 并发与超时
+
+目标并发**只从环境变量读取**（代码默认值仅作缺省），改配置重启即可，不必改代码：
 
 ```bash
-# VMware 采集可能需要更长时间
-TASK_JOB_TIMEOUT=600
+MAX_ACTIVE_RUNS=16
+# 配置采集目标并发；设为 0 表示不限制（尽快打满机器、靠监控扩容）
+MAX_ACTIVE_TARGETS=250
+# 网络拓扑基础配额；普通采集完全空闲时可借用普通容量的一半
+NETWORK_TOPOLOGY_MAX_ACTIVE_TARGETS=50
+TARGET_TASK_WINDOW=250
+REDIS_MAX_CONNECTIONS=2560
+REDIS_POOL_TIMEOUT=2
+# 默认 RESP2，兼容不支持 HELLO 的旧 Redis / 代理；仅在确认服务端支持 RESP3 时设为 3
+REDIS_PROTOCOL=2
+PREFLIGHT_TIMEOUT=15
+PROBE_TIMEOUT=15
+COLLECTION_TIMEOUT=60
+PUBLISH_QUEUE_TIMEOUT=60
+PUBLISH_DELIVERY_TIMEOUT=30
+PUBLISH_TOTAL_TIMEOUT=120
+RUN_LEASE_TTL=600
+RUN_LEASE_HEARTBEAT=30
+COLLECTION_SHUTDOWN_GRACE=30
+EVENT_LOOP_LAG_INTERVAL=1
+CAPACITY_LOG_INTERVAL=180
+OUTBOUND_ALLOWED_CIDRS=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7
+OUTBOUND_ALLOWED_DOMAINS=
 ```
 
-#### 多 Worker 实例
+这些值都是部署参数。未设置时默认 `MAX_ACTIVE_TARGETS=250`、
+`NETWORK_TOPOLOGY_MAX_ACTIVE_TARGETS=50`、`TARGET_TASK_WINDOW=250`。这些参数是单 Pod、跨所有运行
+共享的配置采集目标并发与任务窗口；
+全局调度器在 Run 之间 round-robin，单个大 Run 不再预占 worker。需要临时去掉目标并发上限时：
 
 ```bash
-# 启动多个 Worker 进程以提高吞吐量
-for i in {1..4}; do
-    python start_worker.py &
-done
+MAX_ACTIVE_TARGETS=0
+TARGET_TASK_WINDOW=0
 ```
 
----
+网络拓扑使用共享目标池，`NETWORK_TOPOLOGY_MAX_ACTIVE_TARGETS` 是普通采集存在时的基础配额。
+当普通目标既未运行也未排队时，拓扑最多再借用普通容量的一半：动态上限为
+`基础配额 + floor((全局目标容量 - 基础配额) / 2)`。因此默认 `250/50` 下拓扑可临时运行到 150；
+普通任务到达后立即停止派发超出基础配额的新拓扑目标，但不会抢占已经运行的目标，空出的全局槽位
+优先回流普通采集。若同时把 `MAX_ACTIVE_TARGETS` 和 `TARGET_TASK_WINDOW` 设为 `0`，由于全局容量
+不再有可计算的有限边界，拓扑借槽关闭并保持基础配额。
 
-## 🚢 生产环境部署
+`MAX_ACTIVE_RUNS` 仍保留 run 级准入；满了返回 busy/429。
 
-### 使用 Supervisor 管理进程（推荐）
+`REDIS_MAX_CONNECTIONS` 应不小于目标并发并留租约余量（推荐
+`≳ MAX_ACTIVE_TARGETS`；目标不限制时按机器与 Redis `maxclients` 自行抬高）。多 Pod 时还要保证
+`单池峰值 × Pod 数 < Redis maxclients`。池满时会有限等待
+`REDIS_POOL_TIMEOUT` 秒，而不是立刻 `MaxConnectionsError` 打崩整轮 run。
 
-#### 1. 安装 Supervisor
+`REDIS_PROTOCOL` 默认 `2`（RESP2）。`redis-py` 8+ 默认会走 RESP3 并发送 `HELLO`；
+若 Redis 过旧或不支持 `HELLO` 的代理会在启动 `ping` 时直接失败，因此显式钉在 RESP2。
+
+`PREFLIGHT_TIMEOUT` 与 `PROBE_TIMEOUT` 分别控制协议预检和插件 AccessProbe，默认均为 15 秒。
+是否执行 IP 预检不再由全局环境变量控制。每个请求仅在 `params.ip_precheck` 为 `true`、`1`、
+`yes` 或 `on` 时执行协议连通性预检及插件 AccessProbe；缺失或为其他值时跳过这些探测，直接进入
+正式采集。CIDR/SSRF 出站安全检查不属于可选预检，无论请求开关如何都必须执行。
+`COLLECTION_TIMEOUT` 是正式采集缺省值 60 秒，插件 YAML executor 的 `timeout` 优先；
+发布阶段拆为三层：`PUBLISH_QUEUE_TIMEOUT` 默认 60 秒，控制等待有界发布队列接纳结果；
+`PUBLISH_DELIVERY_TIMEOUT` 默认 30 秒，控制实际 NATS publish/flush；`PUBLISH_TOTAL_TIMEOUT`
+默认 120 秒，控制单目标发布全生命周期。兼容期未配置 `PUBLISH_DELIVERY_TIMEOUT` 时回退读取
+`PUBLISH_TIMEOUT`。ICMP 不作为硬过滤条件。
+
+发布总超时发生在 NATS transport 触达前时会安全撤销队列项，不会在后台晚发，也不会误记为
+`delivery_unknown`；周期任务的结果幂等 ID 包含本轮 `attempt_id`。
+直接 IP 与域名解析后的每个可用地址都必须落在 `OUTBOUND_ALLOWED_CIDRS`；配置
+`OUTBOUND_ALLOWED_DOMAINS` 后，域名还必须同时命中该名单，域名名单不能绕过 CIDR 边界。
+生产环境应按实际采集边界收窄这两项。
+
+所有注册插件必须暴露异步入口。原生异步实现直接 `await`；同步 SDK 由插件自身在异步入口中
+显式调用 `asyncio.to_thread(self._sync_collect)`，并必须给 SDK 配置真实连接/读取超时。
+运行时没有同步插件 Adapter 和专用线程池。
+
+各配置采集插件的真实 I/O 模型、异步依赖与兼容路径见
+[`docs/configuration-plugin-async-matrix.md`](docs/configuration-plugin-async-matrix.md)。
+
+## 健康与观测
+
+- `/api/health/`：进程存活；
+- `/api/health/ready`：Redis 与统一运行时就绪；
+- `/api/health/stats`：活动运行、并发配置和事件循环延迟；
+- `/api/health/metrics`：Prometheus 格式的运行时指标。
+
+重点观察 `active_runs`、`active_targets`、接纳拒绝、事件循环 lag、预检失败、插件超时、结果
+发布失败、Redis 连接池等待/超时，以及凭据状态 Redis 错误。日志和指标只允许任务、目标、插件、凭据 ID 与稳定错误码，不得记录凭据
+正文。
+
+运行时默认每 3 分钟输出一次 `event=collection_capacity`，专门记录
+`MAX_ACTIVE_TARGETS`（默认 250）全局异步目标槽位的已用、剩余、利用率和峰值，同时包含待调度
+目标/Run、发布队列利用率、事件循环 lag、进程 CPU/RSS/线程/FD，以及 cgroup CPU 限额、内存
+利用率和 CPU throttling 增量。可通过 `CAPACITY_LOG_INTERVAL` 调整周期；该日志用于压测后判断
+是否调整 `MAX_ACTIVE_TARGETS`，不代表线程池并发。若 lag P99 持续超过 1 秒、CPU 限额利用率或
+cgroup 内存利用率持续超过 80%、发布队列长期超过 80%，或 throttling 增量持续增长，不应继续
+上调并发，应先定位事件循环阻塞、CPU/内存限额或发布瓶颈。健康接口中字段为 `-1` 表示当前平台
+不可采集。
+
+`collection_capacity` 保留英文 `event` 便于日志平台检索，正文按中文分为“任务、目标并发、配置、
+发布队列、事件循环、进程、容器”七段，并自动给出 `空闲 / 正常 / 繁忙 / 需关注` 状态及中文提示。
+不可采集的进程或 cgroup 数据显示为“不可用”，不再直接展示 `-1`。
+
+### 配置采集日志约定
+
+配置采集在生产 INFO 级别保留 Run 生命周期；每个失败目标额外保留可检索的终态和安全异常上下文，
+不记录凭据正文：
+
+- `collection_run_started`：中文“任务开始”，优先记录 `instance_id`，缺失时才回退记录 `task_id`；
+  同时包含 `plugin_ref`、`plugin_name`、`model_id`、目标数、凭据数和租约；
+- `collection_progress`：Run 约每完成 10% 输出一条，最多约 11 条；包含插件、完成/活动/待处理数、
+  最近完成目标、中文结果和最多 5 个活动目标样本；
+- `target_collection_succeeded`：仅网络设备 SNMP 采集成功时，每个 IP 输出一条 INFO，包含凭据标识和
+  单目标采集耗时（不记录凭据内容）；
+- `target_collection_failed`：每个失败目标输出一条；协议无响应会明确记录
+  `stage=access_probe reason=timeout timeout_seconds=10`，不伪装成插件代码异常；
+- `collection_run_summary`：中文“任务汇总”，包含总目标、采集成功/失败、不可达、延后处理、跳过、
+  发布统计、总耗时、聚合后的失败类型，以及最多 3 个脱敏失败样本；
+- `plugin_exception`：插件执行、协议预检或插件内部捕获到的每个异常均记录，包含 `task_id`、
+  `plugin_ref`、`model_id`、`plugin_name`、`target`、`error_type`、脱敏且有长度上限的
+  `error_message`，以及有界 `call_chain` / `source_context`；不记录局部变量、请求头或凭据；
+- `snmp_facts_collection_started`：SNMP 插件每次正式采集输出当前目标 IP 和任务、插件上下文；执行器
+  不再重复输出通用的目标开始日志；
+- `collection_run_terminal`：中文“任务结束”，包含中文终态和总耗时，同时保留稳定英文 `status`；
+- `collection_capacity`：每 3 分钟输出中文容量快照，明确区分采集任务和目标任务，并展示目标的
+  等待执行、正在执行、本轮已完成和容器启动后累计已完成数量，以及进程和容器资源；
+- `result_publish_failed`：每个 Run 最多 3 个发布失败样本，只保留发布阶段、稳定原因和重试次数；
+  完整发布错误计数与样本合并到 `collection_run_summary` 的中文“发布失败类型”、
+  “发布失败样本”字段；
+- `nats_metrics_publish_succeeded`：每个 NATS 指标发布分块成功后输出一条 INFO，包含任务、主题、
+  成功行数、总行数和取消前跳过的行数；
+- NATS、Redis、租约、发布终态等 WARNING/ERROR：保留单次失败诊断字段。
+
+日志统一写 stdout，由日志平台按 `event`、`task_id`、`plugin_ref`、`model_id`、`target` 建立字段和
+视图；不再创建 SNMP 专用日志文件。
+
+常用本地检索：
 
 ```bash
-pip install supervisor
+rg 'task_id=<task-id>' stargazer.log
+rg 'event=collection_run_(started|summary|terminal)' stargazer.log
+rg 'event=collection_progress|event=target_collection_failed' stargazer.log
+rg 'event=plugin_exception' stargazer.log
+rg 'event=snmp_facts_collection_started|target=<ip>' stargazer.log
+rg 'event=collection_capacity' stargazer.log
 ```
 
-#### 2. 创建配置文件 `/etc/supervisor/conf.d/stargazer.conf`
+## Host Remote
 
-```ini
-[program:stargazer_worker]
-command=/path/to/venv/bin/python /path/to/stargazer/start_worker.py
-directory=/path/to/stargazer
-user=your_user
-autostart=true
-autorestart=true
-redirect_stderr=true
-stdout_logfile=/var/log/stargazer/worker.log
-stdout_logfile_maxbytes=50MB
-stdout_logfile_backups=10
-environment=PATH="/path/to/venv/bin"
+Host Remote 提交返回 `Deferred`。每个目标使用独立 callback ID；可信上下文包含父任务 ID、
+目标、owner、fencing token、真实 `attempt_id`、Executor caller 和一次性 v2 token。回调先匹配
+完整身份，再用单个 Lua 快照核对 Redis generation、latest-run tombstone 与可选 active run 的
+fence、attempt 和 owner；该指针在 run 返回 `Deferred` 并完成薄租约后继续存在，latest-run 又在
+每次 acquire 时原子推进，因此新 run 即使在创建首个 context 前结束也会让旧 generation 失败关闭。
+首次保存 callback payload 时会再次原子核对三层身份，并移除 raw payload 中已消费的 token。
+token 由独立环境密钥和不可变执行身份确定性 HMAC 派生，Redis 只存摘要。失败时不会 claim、
+清 running 或启动处理。创建 callback context 的 Lua 同时核验当前 run 并保留首次身份，让同 task 重投幂等；失败
+重投不删除共享 context，而由 1 小时 TTL / 300 秒 pre-accept sweeper 有界收敛。处理任务直接注册
+在 Sanic 本地生命周期中，不再进入 ARQ。
 
-[program:stargazer_server]
-command=/path/to/venv/bin/python /path/to/stargazer/server.py
-directory=/path/to/stargazer
-user=your_user
-autostart=true
-autorestart=true
-redirect_stderr=true
-stdout_logfile=/var/log/stargazer/server.log
-stdout_logfile_maxbytes=50MB
-stdout_logfile_backups=10
-environment=PATH="/path/to/venv/bin"
-```
+滚动升级时 `HOST_REMOTE_CALLBACK_V2_ENABLED` 默认关闭；先升级并排空旧 Executor/context/retry，
+再设置至少 32 字符的 `HOST_REMOTE_CALLBACK_TOKEN_SECRET` 并启用。旧 `remote-` callback 仅在
+context TTL/deadline 内兼容，排空后可把 `HOST_REMOTE_CALLBACK_LEGACY_MAX_AGE_SECONDS` 设为 0。
+回滚前先关闭 v2 新签发并排空 v2 context、执行任务及 Executor retry；无法排空时保留 v2 handler。
 
-#### 3. 启动服务
+该 token 只阻断无法读取任务请求的盲伪造；共享 NATS 管理员仍能观察 token。最终信任根需用
+独立服务身份和最小 subject ACL，或 Executor 独立签名完成，相关治理完成前 Issue #4280 保持开放。
+
+## 网络拓扑发现契约
+
+- `topology_protocols` 支持 `lldp`、`cdp`、`fdb`、`arp`；
+- `topology_fallback_strategy` 由上游 CMDB 消费，Stargazer 不解释；
+- 原始 `network_topo` 始终保留，同时输出 `network_topology_facts`；
+- 下游优先用事实建边，无法解析时再回退原始结果。
+
+## 验证
 
 ```bash
-sudo supervisorctl reread
-sudo supervisorctl update
-sudo supervisorctl start stargazer_worker
-sudo supervisorctl start stargazer_server
+uv run pytest -q -o addopts='' \
+  tests/test_collection_runtime.py \
+  tests/test_target_collection_executor.py \
+  tests/test_redis_collection_state.py \
+  tests/test_async_plugin_contract.py \
+  tests/test_collection_load.py
 ```
 
-### 使用 Systemd 管理进程
-
-#### 1. 创建 Worker 服务 `/etc/systemd/system/stargazer-worker.service`
-
-```ini
-[Unit]
-Description=Stargazer ARQ Worker
-After=network.target redis.target
-
-[Service]
-Type=simple
-User=your_user
-WorkingDirectory=/path/to/stargazer
-Environment="PATH=/path/to/venv/bin"
-ExecStart=/path/to/venv/bin/python start_worker.py
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-#### 2. 创建 Server 服务 `/etc/systemd/system/stargazer-server.service`
-
-```ini
-[Unit]
-Description=Stargazer Sanic Server
-After=network.target redis.target
-
-[Service]
-Type=simple
-User=your_user
-WorkingDirectory=/path/to/stargazer
-Environment="PATH=/path/to/venv/bin"
-ExecStart=/path/to/venv/bin/python server.py
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-#### 3. 启动服务
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable stargazer-worker stargazer-server
-sudo systemctl start stargazer-worker stargazer-server
-sudo systemctl status stargazer-worker stargazer-server
-```
-
----
-
-## 🔍 常用命令
-
-```bash
-# 验证配置是否一致
-python verify_config.py
-
-# 检查 Redis 和队列状态
-python check_redis_status.py
-
-# 查找运行中的 Worker
-ps aux | grep start_worker
-
-# 清理旧的任务结果
-python clean_old_results.py
-```
-
----
-
-## 📊 监控和维护
-
-### 查看日志
-
-```bash
-# Supervisor
-sudo supervisorctl tail -f stargazer_worker
-sudo supervisorctl tail -f stargazer_server
-
-# Systemd
-sudo journalctl -u stargazer-worker -f
-sudo journalctl -u stargazer-server -f
-```
-
-### 重启服务
-
-```bash
-# Supervisor
-sudo supervisorctl restart stargazer_worker
-sudo supervisorctl restart stargazer_server
-
-# Systemd
-sudo systemctl restart stargazer-worker
-sudo systemctl restart stargazer-server
-```
-
-### 查看队列状态
-
-```bash
-# 连接 Redis 查看
-redis-cli -h <host> -p <port> -a <password> -n <db>
-> KEYS task:running:*    # 查看正在执行的任务
-> ZCARD arq:queue        # 查看队列中的任务数
-> KEYS arq:result:*      # 查看任务结果
-```
-
-### 监控指标
-
-Redis 中的关键键：
-
-- `task:running:{task_id}` - 正在执行的任务
-- `arq:queue` - 待执行队列
-- `arq:result:{task_id}` - 任务结果
-
-### 清理旧数据
-
-```bash
-# 清理旧的任务结果（可选）
-python clean_old_results.py
-```
-
----
-
-## 🎯 去重逻辑
-
-- ✅ 任务正在执行时 → 拒绝重复入队
-- ✅ 任务已完成 → 允许再次入队
-- ✅ 自动清理标记（TTL=360秒）
-
----
-
-## 🐛 故障排查
-
-### Worker 无法接收任务
-
-**症状**：Server 显示 `enqueue_job returned None`
-
-**排查步骤**：
-1. 检查 Worker 是否在运行
-   ```bash
-   ps aux | grep start_worker
-   ```
-
-2. 验证 Redis 配置是否一致
-   ```bash
-   python verify_config.py
-   ```
-
-3. 检查 Redis 连接
-   ```bash
-   python check_redis_status.py
-   ```
-
-4. 查看 Worker 日志是否有错误
-
-### 任务重复执行
-
-**原因**：多个 Worker 实例在运行
-
-**解决方法**：
-```bash
-# 查找所有 Worker 进程
-ps aux | grep start_worker
-
-# 杀掉多余的进程
-kill -9 <PID>
-
-# 只保留一个 Worker 运行
-```
-
-### 任务无法再次入队
-
-**原因**：运行标记没有被清除
-
-**解决方法**：
-```bash
-# 手动清除运行标记
-redis-cli -h <host> -p <port> -a <password> -n <db>
-> DEL task:running:<task_id>
-
-# 或使用脚本清理
-python clean_old_results.py
-```
-
-### 常见问题速查表
-
-| 问题 | 原因 | 解决方法 |
-|------|------|----------|
-| enqueue_job 返回 None | Worker 未运行 | 检查 Worker 进程 |
-| 任务不重复执行 | 标记未清除 | 查看日志确认清除标记 |
-| 配置不一致 | Redis DB 不同 | 运行 verify_config.py |
-
----
-
-## 🔒 安全建议
-
-1. **使用环境变量**：不要在代码中硬编码密码
-2. **限制 Redis 访问**：配置防火墙规则
-3. **使用 TLS**：生产环境启用 Redis TLS
-4. **日志脱敏**：不要在日志中输出密码
-5. **定期更新依赖**：`pip install -U arq sanic`
-
----
-
-## 💾 备份和恢复
-
-### 备份配置
-
-```bash
-# 备份 .env 文件
-cp .env .env.backup
-
-# 备份 Redis 数据（如果需要）
-redis-cli -h <host> -p <port> -a <password> BGSAVE
-```
-
-### 恢复
-
-```bash
-# 恢复配置
-cp .env.backup .env
-
-# 重启服务
-sudo systemctl restart stargazer-worker stargazer-server
-```
-
----
-
-## 📚 项目结构
-
-```
-stargazer/
-├── api/                    # API 路由
-│   ├── collect.py         # 采集任务 API
-│   ├── health.py          # 健康检查 API
-│   └── monitor.py         # 监控指标 API
-├── common/                # 公共模块
-│   └── cmp/              # 云管平台集成
-├── core/                  # 核心模块
-│   ├── config.py         # 配置管理
-│   ├── worker.py         # ARQ Worker 配置
-│   ├── redis_config.py   # Redis 统一配置
-│   └── task_queue.py     # 任务队列管理
-├── plugins/               # 采集插件
-│   ├── vmware_info.py    # VMware 采集
-│   ├── aws_info.py       # AWS 采集
-│   ├── aliyun_info.py    # 阿里云采集
-│   └── ...               # 其他插件
-├── tasks/                 # 任务处理
-│   ├── collectors/       # 采集器
-│   └── handlers/         # 任务处理器
-├── server.py             # Sanic Server 入口
-├── start_worker.py       # Worker 启动脚本
-└── config.yml            # 应用配置
-```
-
----
-
-## 📄 许可证
-
-[在此添加许可证信息]
+负载测试覆盖 `255 IP × 5 凭据 × 200 目标并发`，验证并发上界、不可达目标过滤、事件循环
+响应和 Task 清理。
+`MAX_TARGETS_PER_RUN` 限制单次请求目标数（默认 10000）；`RUN_DEADLINE` 设置整个运行的硬超时秒数，`0` 表示不额外限制，仍受连接和插件超时保护。

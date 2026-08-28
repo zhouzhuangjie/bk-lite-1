@@ -18,6 +18,8 @@ export interface ChildObject {
 }
 
 // 监控对象
+export type CleanupTimeoutUnit = 'minute' | 'hour' | 'day';
+
 export interface MonitorObjectItem {
   id: number;
   name: string;
@@ -29,7 +31,12 @@ export interface MonitorObjectItem {
   level?: string; // 'base' | 'derivative'
   parent?: number | null; // 父对象ID
   is_visible: boolean;
-  is_builtin?: boolean; // 是否内置对象（内置对象不可编辑删除）
+  is_builtin?: boolean; // 是否内置对象（定义不可修改或删除，运行配置可编辑）
+  cleanup_policy?: 'no_cleanup' | 'timeout';
+  cleanup_timeout_value?: number;
+  cleanup_timeout_unit?: CleanupTimeoutUnit;
+  // 兼容升级前的接口返回；新请求使用 cleanup_timeout_value。
+  cleanup_timeout_days?: number;
   order: number;
   description?: string;
   children?: ChildObject[];
@@ -55,6 +62,11 @@ export interface ObjectFormData {
   type_id: string;
   description?: string;
   children?: ChildObject[];
+  is_builtin?: boolean;
+  cleanup_policy?: 'no_cleanup' | 'timeout';
+  cleanup_timeout_value?: number;
+  cleanup_timeout_unit?: CleanupTimeoutUnit;
+  cleanup_timeout_days?: number;
 }
 
 // API 请求参数
@@ -82,7 +94,10 @@ export interface DisplayMetricBinding {
 export interface DisplayColumn {
   name: string;
   type?: 'metric' | 'field';
+  // 语义列标记，如云平台子对象 IP；由内置种子写入，用户编辑时原样保留
+  role?: 'resource_ip';
   sort_order: number;
+  variable_id?: string;
   metrics: DisplayMetricBinding[];
 }
 

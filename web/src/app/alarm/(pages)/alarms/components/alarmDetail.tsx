@@ -14,6 +14,7 @@ import { useSettingApi } from '@/app/alarm/api/settings';
 import { useCommon } from '@/app/alarm/context/common';
 import { useStateMap } from '@/app/alarm/constants/alarm';
 import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
+import CompactEmptyState from '@/components/compact-empty-state';
 import {
   Drawer,
   Button,
@@ -23,7 +24,6 @@ import {
   Tooltip,
   message,
   Spin,
-  Empty,
 } from 'antd';
 import {
   StateMap,
@@ -45,7 +45,6 @@ import {
   Pagination,
   TimeLineItem,
 } from '@/app/alarm/types/types';
-
 const AlertDetail = forwardRef<ModalRef, ModalConfig & { readonly?: boolean }>(
   ({ handleAction, readonly = false }, ref) => {
     const STATE_MAP = useStateMap();
@@ -90,13 +89,6 @@ const AlertDetail = forwardRef<ModalRef, ModalConfig & { readonly?: boolean }>(
       },
     ];
 
-    useEffect(() => {
-      if (!groupVisible || !formData.id) {
-        return;
-      }
-      getEventListData({ alert_id: formData.id });
-    }, [groupVisible, formData.id]);
-
     const getEventListData = async (params: any) => {
       setEventLoading(true);
       try {
@@ -113,10 +105,17 @@ const AlertDetail = forwardRef<ModalRef, ModalConfig & { readonly?: boolean }>(
     };
 
     useEffect(() => {
-      if (activeTab === 'event' && groupVisible && formData.id) {
-        getEventListData({ alert_id: formData.id });
+      if (activeTab !== 'event' || !groupVisible || !formData.id) {
+        return;
       }
-    }, [pagination.current, pagination.pageSize, activeTab]);
+      getEventListData({ alert_id: formData.id });
+    }, [
+      pagination.current,
+      pagination.pageSize,
+      activeTab,
+      groupVisible,
+      formData.id,
+    ]);
 
     useImperativeHandle(ref, () => ({
       showModal: ({
@@ -133,6 +132,7 @@ const AlertDetail = forwardRef<ModalRef, ModalConfig & { readonly?: boolean }>(
         setTitle(title);
         setFormData(form);
         setActiveTab(defaultTab);
+        setPagination((prev) => ({ ...prev, current: 1, total: 0 }));
       },
     }));
 
@@ -246,9 +246,12 @@ const AlertDetail = forwardRef<ModalRef, ModalConfig & { readonly?: boolean }>(
     return (
       <Drawer
         title={
-          <div className="flex items-center">
-            <span>{t('alarms.alertDetail')} </span>
-            <span className="text-[var(--color-text-2)] text-sm">-{title}</span>
+          <div className="flex min-w-0 items-center">
+            <span className="shrink-0">{t('alarms.alertDetail')} </span>
+            <EllipsisWithTooltip
+              className="min-w-0 truncate text-sm text-[var(--color-text-2)]"
+              text={`-${title}`}
+            />
           </div>
         }
         open={groupVisible}
@@ -262,9 +265,9 @@ const AlertDetail = forwardRef<ModalRef, ModalConfig & { readonly?: boolean }>(
         }
       >
         <div>
-          <div className="flex justify-between">
-            <div>
-              <Tag color={levelMap[formData.level] as string}>
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="flex min-w-0 flex-1 items-center gap-2">
+              <Tag className="shrink-0" color={levelMap[formData.level] as string}>
                 <div className="flex items-center">
                   <Icon
                     type={
@@ -279,27 +282,31 @@ const AlertDetail = forwardRef<ModalRef, ModalConfig & { readonly?: boolean }>(
                   )?.level_display_name || '--'}
                 </div>
               </Tag>
-              <b>{formData.content || '--'}</b>
+              <EllipsisWithTooltip
+                className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap font-semibold"
+                text={formData.content || '--'}
+              />
             </div>
             {!readonly && (
-              <div>
-                <span className="mr-2">
-                  {!formData.incident_name && (
-                    <DeclareIncident
-                      rowData={[formData]}
-                      onSuccess={() => {
-                        handleAction();
-                        setGroupVisible(false);
-                      }}
-                    />
-                  )}
-                </span>
+              <div className="flex shrink-0 items-center gap-2">
+                {!formData.incident_name && (
+                  <DeclareIncident
+                    rowData={[formData]}
+                    buttonSize="small"
+                    onSuccess={() => {
+                      handleAction();
+                      setGroupVisible(false);
+                    }}
+                  />
+                )}
                 <AlarmAction
                   rowData={[formData]}
+                  btnSize="small"
                   displayMode="dropdown"
                   onAction={() => {
+                    // 修复：原 onAction 里还调 handleCancel()，会让用户点完执行动作时
+                    // 右侧 Drawer 被关闭，妨碍继续操作；现在保留刷新、不再关闭 Drawer。
                     handleAction?.();
-                    handleCancel();
                   }}
                 />
               </div>
@@ -357,22 +364,6 @@ const AlertDetail = forwardRef<ModalRef, ModalConfig & { readonly?: boolean }>(
           {isBaseInfo && (
             <div className="flex flex-col gap-4">
               <BaseInfo detail={formData} />
-              {formData?.enrichment && Object.keys(formData.enrichment).length > 0 && (
-                <div className="mt-2">
-                  <div className="font-medium mb-2">{t('settings.enrichmentTitle')}</div>
-                  {Object.entries(formData.enrichment as Record<string, Record<string, any>>).map(([ns, fields]) => (
-                    <div key={ns} className="mb-2">
-                      <div className="text-[var(--color-text-3)] mb-1">{ns}</div>
-                      {Object.entries(fields || {}).map(([k, v]) => (
-                        <div key={k} className="flex gap-2 text-sm">
-                          <span className="text-[var(--color-text-3)]">{k}:</span>
-                          <span>{typeof v === 'object' ? JSON.stringify(v) : String(v)}</span>
-                        </div>
-                      ))}
-                    </div>
-                  ))}
-                </div>
-              )}
               <RelatedAlertsPanel alert={formData} onRefresh={handleAction} />
             </div>
           )}
@@ -406,10 +397,7 @@ const AlertDetail = forwardRef<ModalRef, ModalConfig & { readonly?: boolean }>(
                   <Timeline items={timeLineData} />
                 </div>
               ) : (
-                <Empty
-                  image={Empty.PRESENTED_IMAGE_SIMPLE}
-                  description={t('common.noData')}
-                />
+                <CompactEmptyState description={t('common.noData')} />
               )}
             </Spin>
           )}

@@ -1,6 +1,11 @@
 @import "tailwindcss/preflight";
 @import "tailwindcss/utilities";
 @import "tailwindcss";
+@import "../app/ops-analysis/components/widgets/application3D/application3DChrome.css";
+
+/* Docs mention token patterns; exclude so Tailwind does not emit invalid utilities. */
+@source not "../**/*.md";
+@source not "../**/*.mdc";
 
 /* Enterprise generated routes are gitignored, so Tailwind skips them.
    Use direct @source paths (not globs) — parentheses in glob patterns
@@ -35,137 +40,101 @@
 }
 
 :root {
-  --color-primary: #155AEF;
-  --color-primary-bg-active: #e1edfc;
-  --color-secondary: #F2F4F7;
-  --color-text-1: #1E252E;
-  --color-text-2: #475468;
-  --color-text-3: #7588A3;
-  --color-text-4: #B2BDCC;
-  --color-text-active: #155AEF;
-  --color-text-hover: #1018280A;
-  --color-bg: #FFFFFF;
-  --color-bg-hover: #f2f4f7;
-  --color-bg-active: #155aef14;
-  --color-border: #eaecf0;
-  --color-border-1: #EDEFF3;
-  --color-border-2: #E6E9EE;
-  --color-border-3: #D1D7E1;
-  --color-border-4: #B2BDCC;
-  --color-fill-1: #F6F8F9;
-  --color-fill-2: #F4F5F8;
-  --color-fill-3: #EDEFF3;
-  --color-fill-4: #E6E9EE;
-  --color-fill-5: #D1D7E1;
-  --color-bg-1: #FFFFFF;
-  --color-bg-2: #FFFFFF;
-  --color-bg-3: #FFFFFF;
-  --color-bg-4: #F4F5F8;
-  --color-bg-5: #F4F5F8;
-  --color-bg-6: rgba(255,255,255, 0.16);
-  --color-bg-7: rgba(255,255,255, 0.12);
-  --color-success: #27C274;
-  --color-fail: #F43B2C;
-
-  --color-background-body: var(--color-secondary);
-  --color-components-nav-button-text: var(--color-text-2);
-  --color-components-nav-button-text-active: var(--color-primary);
-  --color-components-nav-button-bg: var(--color-bg);
-  --color-components-nav-button-bg-active: #FCFCFD;
-  --color-components-nav-button-bg-hover: var(--color-text-hover);
-  --color-components-nav-border: var(--color-border);
-
-  --color-components-side-nav-text: var(--color-text-2);
-  --color-components-side-nav-text-active: var(--color-primary);
-  --color-components-side-nav-text-active-bg: var(--color-bg-active);
-  --color-components-side-nav-hover-bg: var(--color-bg-hover);
-  --color-components-side-nav-bg: var(--color-bg);
-
-  --color-primary-bg: var(--color-bg);
-  --color-modal-header-color: #f5f8ff;
-  --color-bg-image-gradient-1: #e3e8ff;
-  --color-bg-image-gradient-2: #f9fafb;
-  --color-portal-card-shadow: rgba(33,59,99, 0.1);
-  --color-portal-surface-soft: #edf4ff;
-  --color-portal-surface-soft-2: #f8fbff;
-  --color-portal-surface-overlay: rgba(255,255,255, 0.76);
-  --color-portal-preview-border: #d9e2f0;
-  --color-portal-preview-border-strong: #d6e1f1;
-  --color-portal-preview-divider: #e7edf6;
-  --color-portal-preview-shell: rgba(255,255,255, 0.96);
-  --color-portal-preview-tab-bg: #edf3fc;
-  --color-portal-preview-icon-bg: #f4f7fc;
-
   --ant-dropdown-padding-block: 5px;
   --ant-popover-inner-padding: 12px;
+  --bk-webchat-dock-width: 0px;
 }
 
-.dark {
-  --color-primary: #155AEF;
-  --color-primary-bg-active: #172637;
-  --color-secondary: #1d1d20;
-  --color-text-1: rgba(255,255,255, 0.9);
-  --color-text-2: rgba(255,255,255, 0.7);
-  --color-text-3: rgba(255,255,255, 0.5);
-  --color-text-4: rgba(255,255,255, 0.3);
-  --color-text-active: #f4f4f5;
-  --color-text-hover: #c8ceda0a;
-  --color-bg: #141414;
-  --color-bg-hover: #c8ceda24;
-  --color-bg-active: #155aef14;
-  --color-border: #333333;
-  --color-border-1: rgba(255,255,255, 0.1);
-  --color-border-2: rgba(255,255,255, 0.2);
-  --color-border-3: rgba(255,255,255, 0.4);
-  --color-border-4: #B2BDCC;
-  --color-fill-1: rgba(255,255,255, 0.04);
-  --color-fill-2: rgba(255,255,255, 0.08);
-  --color-fill-3: rgba(255,255,255, 0.12);
-  --color-fill-4: rgba(255,255,255, 0.16);
-  --color-fill-5: rgba(255,255,255, 0.2);
-  --color-bg-1: #071d2c;
-  --color-bg-2: #0C2536;
-  --color-bg-3: #162d3e;
-  --color-bg-4: #203A4E;
-  --color-bg-5: #3D576A;
-  --color-bg-6: rgba(255,255,255, 0.16);
-  --color-bg-7: rgba(255,255,255, 0.12);
-
-  --color-background-body: var(--color-secondary);
-  --color-components-nav-button-text: var(--color-text-2);
-  --color-components-nav-button-text-active: var(--color-text-active);
-  --color-components-nav-button-bg: var(--color-bg);
-  --color-components-nav-button-bg-active: var(--color-bg-hover);
-  --color-components-nav-button-border: var(--color-border);
-  --color-components-nav-button-bg-hover: var(--color-text-hover);
-  --color-components-nav-border: var(--color-border);
-
-  --color-components-side-nav-text: var(--color-text-2);
-  --color-components-side-nav-text-active: var(--color-primary);
-  --color-components-side-nav-text-active-bg: var(--color-bg-active);
-  --color-components-side-nav-hover-bg: var(--color-bg-hover);
-  --color-components-side-nav-bg: var(--color-bg);
-
-  --color-primary-bg: var(--color-secondary);
-  --color-modal-header-color: var(--color-bg-2);
-  --color-bg-image-gradient-1: #2e313a;
-  --color-bg-image-gradient-2: #161719;
-  --color-portal-card-shadow: rgba(0,0,0, 0.28);
-  --color-portal-surface-soft: #13273a;
-  --color-portal-surface-soft-2: #0e1f2f;
-  --color-portal-surface-overlay: rgba(7,29,44, 0.78);
-  --color-portal-preview-border: rgba(255,255,255, 0.12);
-  --color-portal-preview-border-strong: rgba(255,255,255, 0.16);
-  --color-portal-preview-divider: rgba(255,255,255, 0.08);
-  --color-portal-preview-shell: rgba(7,29,44, 0.88);
-  --color-portal-preview-tab-bg: #213548;
-  --color-portal-preview-icon-bg: rgba(255,255,255, 0.08);
+/* application3D Screen chrome — dark-scene values; identical in both themes. */
+:root,
+html.dark {
+  --color-application3d-text: #ffffff;
+  --color-application3d-text-muted: rgba(255, 255, 255, 0.55);
+  --color-application3d-text-subtle: rgba(255, 255, 255, 0.6);
+  --color-application3d-loading-overlay: rgba(2, 8, 20, 0.7);
+  --color-application3d-refresh-border: #233e67;
+  --color-application3d-refresh-bg: rgba(6, 45, 90, 0.8);
+  --color-application3d-detail-mask: rgba(0, 0, 0, 0.5);
+  --color-application3d-surface-overlay: rgba(0, 0, 0, 0.2);
+  --color-application3d-surface-hover: rgba(255, 255, 255, 0.1);
+  --color-application3d-alarm-panel-bg: linear-gradient(111.38deg, rgba(7, 27, 56, 0.8) 1.8%, rgba(1, 11, 24, 0.8) 98.54%);
+  --color-application3d-alarm-panel-border: #233e67;
+  --color-application3d-alarm-panel-shadow: 0 0 20px rgba(0, 0, 0, 0.76);
+  /* Detail expand layer: shared frosted glass (status is accent only). */
+  --color-application3d-detail-glass-bg: linear-gradient(
+    165deg,
+    rgba(22, 34, 52, 0.72) 0%,
+    rgba(12, 20, 34, 0.78) 48%,
+    rgba(8, 14, 26, 0.82) 100%
+  );
+  --color-application3d-detail-glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  --color-application3d-detail-glass-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+  --color-application3d-detail-right-border: rgba(96, 180, 220, 0.42);
+  --color-application3d-detail-right-shadow:
+    0 0 0 1px rgba(96, 180, 220, 0.18),
+    0 0 18px rgba(56, 140, 190, 0.22),
+    0 14px 40px rgba(0, 0, 0, 0.34),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  --color-application3d-detail-stat-bg: rgba(8, 16, 28, 0.55);
+  --color-application3d-detail-stat-border: rgba(148, 168, 192, 0.22);
+  --color-application3d-detail-row-bg: rgba(10, 18, 32, 0.58);
+  --color-application3d-detail-row-border: rgba(140, 164, 192, 0.24);
+  --color-application3d-detail-row-hover-bg: rgba(16, 26, 42, 0.68);
+  --color-application3d-detail-row-hover-border: rgba(168, 188, 212, 0.36);
+  --color-application3d-detail-separator: rgba(160, 180, 204, 0.16);
+  --color-application3d-severity-critical: #ff5a52;
+  --color-application3d-severity-error: #e8862a;
+  --color-application3d-severity-warning: #e8b04a;
+  --color-application3d-severity-info: #5eb0ff;
+  --color-application3d-severity-badge-critical-bg: rgba(220, 56, 48, 0.92);
+  --color-application3d-severity-badge-error-bg: rgba(200, 108, 28, 0.9);
+  --color-application3d-severity-badge-warning-bg: rgba(196, 126, 40, 0.9);
+  --color-application3d-severity-badge-info-bg: rgba(59, 112, 168, 0.9);
+  --color-application3d-severity-badge-critical-border: rgba(255, 110, 100, 0.85);
+  --color-application3d-severity-badge-error-border: rgba(232, 140, 60, 0.85);
+  --color-application3d-severity-badge-warning-border: rgba(236, 176, 80, 0.85);
+  --color-application3d-severity-badge-info-border: rgba(110, 180, 250, 0.8);
+  --color-application3d-metric-stroke: #349eff;
+  --color-application3d-metric-marker: #dea91f;
+  --color-application3d-detail-cta-border: rgba(214, 226, 240, 0.32);
+  --color-application3d-detail-cta-text: rgba(248, 250, 252, 0.96);
+  --color-application3d-detail-cta-bg: linear-gradient(180deg, rgba(38, 54, 76, 0.62) 0%, rgba(16, 26, 40, 0.66) 100%);
+  --color-application3d-detail-cta-shadow: 0 0 7px rgba(198, 214, 232, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.16);
+  --color-application3d-detail-cta-hover-border: rgba(226, 236, 248, 0.46);
+  --color-application3d-detail-cta-hover-bg: linear-gradient(180deg, rgba(48, 66, 90, 0.68) 0%, rgba(20, 32, 48, 0.7) 100%);
+  --color-application3d-detail-cta-hover-shadow: 0 0 10px rgba(198, 214, 232, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.2);
+  --color-application3d-detail-cta-focus: rgba(214, 226, 240, 0.55);
+  --color-application3d-back-cta-border: rgba(186, 200, 216, 0.16);
+  --color-application3d-back-cta-text: rgba(226, 232, 240, 0.86);
+  --color-application3d-back-cta-bg: rgba(14, 22, 34, 0.45);
+  --color-application3d-back-cta-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --color-application3d-back-cta-hover-border: rgba(198, 212, 228, 0.28);
+  --color-application3d-back-cta-hover-bg: rgba(22, 32, 46, 0.52);
+  --color-application3d-back-cta-hover-text: rgba(236, 240, 246, 0.94);
+  --color-application3d-back-cta-focus: rgba(186, 200, 216, 0.4);
+  --color-application3d-panel-normal-gradient: linear-gradient(180deg, #064790 0%, #062d5a 100%);
+  --color-application3d-panel-normal-border: rgba(52, 158, 255, 0.8);
+  --color-application3d-panel-normal-shadow: 0 0 20px 4px rgba(52, 158, 255, 0.57), inset 0 0 4px rgba(52, 158, 255, 0.71);
+  --color-application3d-panel-fatal-gradient: linear-gradient(180deg, #862012 0%, #560f05 100%);
+  --color-application3d-panel-fatal-border: rgba(255, 70, 58, 0.8);
+  --color-application3d-panel-fatal-shadow: 0 0 20px 4px rgba(255, 52, 39, 0.57), inset 0 0 4px rgba(255, 52, 39, 0.71);
+  --color-application3d-panel-warning-gradient: linear-gradient(180deg, #ba561d 0%, #562205 100%);
+  --color-application3d-panel-warning-border: rgba(255, 122, 47, 0.8);
+  --color-application3d-panel-warning-shadow: 0 0 20px 4px rgba(255, 122, 47, 0.57), inset 0 0 4px rgba(255, 122, 47, 0.71);
+  --color-application3d-panel-error-gradient: linear-gradient(180deg, #8a3a12 0%, #4a1c08 100%);
+  --color-application3d-panel-error-border: rgba(217, 112, 7, 0.8);
+  --color-application3d-panel-error-shadow: 0 0 20px 4px rgba(217, 112, 7, 0.45), inset 0 0 4px rgba(217, 112, 7, 0.6);
+  --color-application3d-panel-info-gradient: linear-gradient(180deg, #1d4f7a 0%, #0f2a44 100%);
+  --color-application3d-panel-info-border: rgba(96, 165, 250, 0.7);
+  --color-application3d-panel-info-shadow: 0 0 16px 3px rgba(96, 165, 250, 0.28), inset 0 0 4px rgba(96, 165, 250, 0.4);
+  --color-application3d-panel-remain-gradient: linear-gradient(180deg, #a48639 0%, #553d0f 100%);
+  --color-application3d-panel-remain-border: rgba(255, 188, 17, 0.8);
+  --color-application3d-panel-remain-shadow: 0 0 20px 4px rgba(255, 188, 17, 0.57), inset 0 0 4px rgba(255, 188, 17, 0.71);
 }
 
 body {
   color: var(--color-components-nav-button-text);
   background: var(--color-background-body);
-  min-width: 1280px;
 }
 
 html:not(.dark) body {
@@ -199,12 +168,26 @@ html:not(.dark) body {
 }
 
 .header-bg {
-  background: inherit;
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
+  background: transparent;
+  border-bottom: 1px solid transparent;
   position: sticky;
   top: 0;
   z-index: 1000;
+  transition: background-color 180ms ease, border-color 180ms ease;
+}
+
+.header-bg-scrolled {
+  background-color: var(--color-background-body);
+  border-bottom-color: var(--color-border-1);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+html:not(.dark) .header-bg-scrolled {
+  background-image: url('/system-bg.jpg');
+  background-position: left top;
+  background-size: cover;
+  background-attachment: fixed;
 }
 
 .main-content {

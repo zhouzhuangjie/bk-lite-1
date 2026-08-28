@@ -126,14 +126,14 @@ def check_dangerous_patterns(template_str: str) -> None:
 
     description = _find_dangerous_pattern(template_lower, GLOBAL_DANGEROUS_PATTERNS)
     if description:
-        logger.warning(f"[SSTI] 检测到危险模式: {description}, template={template_str[:100]}...")
+        logger.warning("[SSTI] 检测到危险模式: %s, template=%s...", description, template_str[:100])
         raise TemplateSecurityError(f"模板包含禁止的模式: {description}")
 
     # 仅在真正的 Jinja2 表达式内部检查高危替代，避免将普通文本字符误判为 SSTI。
     for expression in JINJA_EXPRESSION_PATTERN.findall(template_lower):
         description = _find_dangerous_pattern(expression, EXPRESSION_DANGEROUS_PATTERNS)
         if description:
-            logger.warning(f"[SSTI] 检测到危险模式: {description}, template={template_str[:100]}...")
+            logger.warning("[SSTI] 检测到危险模式: %s, template=%s...", description, template_str[:100])
             raise TemplateSecurityError(f"模板包含禁止的模式: {description}")
 
 
@@ -260,4 +260,38 @@ def build_sandboxed_env(
     env.tests.clear()
     if extra_filters:
         env.filters.update(extra_filters)
+    return env
+
+
+def build_trusted_file_template_env(
+    loader=None,
+    undefined=DebugUndefined,
+    *,
+    autoescape: bool = False,
+    trim_blocks: bool = False,
+    lstrip_blocks: bool = False,
+    extra_filters: dict | None = None,
+    extra_tests: dict | None = None,
+) -> SandboxedEnvironment:
+    """构建用于仓库内可信文件模板的最小权限 Jinja2 环境。
+
+    与 ``build_sandboxed_env`` 的不可信字符串模板边界不同，仓库内模板需要调用
+    macro 以及公开的数据容器方法。这里保留标准 ``SandboxedEnvironment`` 的属性
+    安全检查，同时清空 Jinja 默认 globals、filters 和 tests，再由调用方逐项恢复
+    已审计的能力。
+    """
+    env = SandboxedEnvironment(
+        loader=loader or BaseLoader(),
+        undefined=undefined,
+        autoescape=autoescape,
+        trim_blocks=trim_blocks,
+        lstrip_blocks=lstrip_blocks,
+    )
+    env.globals.clear()
+    env.filters.clear()
+    env.tests.clear()
+    if extra_filters:
+        env.filters.update(extra_filters)
+    if extra_tests:
+        env.tests.update(extra_tests)
     return env

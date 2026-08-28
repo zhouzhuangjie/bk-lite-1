@@ -1,13 +1,12 @@
 """CMDB 实例视图剩余分支覆盖：拓扑、全文检索、导入/导出、show_field、模型实例计数、代理列表。
 
-对照 spec/prd/CMDB·资产：拓扑查询、全文检索（含校验）、Excel 导入导出、展示字段配置、
+对照 specs/capabilities/legacy-prd-cmdb-资产.md：拓扑查询、全文检索（含校验）、Excel 导入导出、展示字段配置、
 按模型实例计数、云区域代理列表（节点管理）。
 """
 
 import io
 import json
 
-import openpyxl
 import pytest
 from django.core.files.uploadedfile import SimpleUploadedFile
 from rest_framework import status
@@ -16,6 +15,10 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 from apps.cmdb.views.instance import InstanceViewSet
 
 VIEWS = "apps.cmdb.views.instance"
+
+
+def U(value: int) -> str:
+    return f"123e4567-e89b-42d3-a456-{value:012d}"
 
 
 @pytest.fixture
@@ -35,12 +38,14 @@ def _perm(monkeypatch):
         lambda request, model_id="", permission_type=None: {1: {"permission_instances_map": {}, "inst_names": []}},
     )
     monkeypatch.setattr(
+        f"{VIEWS}.ModelManage.search_model_info",
+        lambda model_id: {"model_id": model_id, "model_name": model_id, "is_visible": True},
+    )
+    monkeypatch.setattr(
         f"{VIEWS}.InstanceViewSet.require_instance_permission",
         lambda self, request, instance, operator=None: None,
     )
-    monkeypatch.setattr(
-        f"{VIEWS}.CmdbRulesFormatUtil.has_object_permission", lambda **k: True
-    )
+    monkeypatch.setattr(f"{VIEWS}.CmdbRulesFormatUtil.has_object_permission", lambda **k: True)
 
 
 def _req(method, user, data=None, query="", files=None, team="1"):
@@ -72,80 +77,58 @@ def _body(response):
 
 @pytest.mark.django_db
 def test_topo_search_not_found(superuser, monkeypatch):
-    monkeypatch.setattr(f"{VIEWS}.InstanceManage.query_entity_by_id", lambda pk: {})
-    response = InstanceViewSet.as_view({"get": "topo_search"})(
-        _req("get", superuser), model_id="host", inst_id="5"
-    )
+    monkeypatch.setattr(f"{VIEWS}.InstanceManage.query_entity_by_uuid", lambda pk: {})
+    response = InstanceViewSet.as_view({"get": "topo_search"})(_req("get", superuser), model_id="host", inst_uuid=U(5))
     assert response.status_code == status.HTTP_404_NOT_FOUND
 
 
 @pytest.mark.django_db
 def test_topo_search_ok(superuser, monkeypatch):
-    monkeypatch.setattr(f"{VIEWS}.InstanceManage.query_entity_by_id",
-                        lambda pk: {"_id": 5, "model_id": "host"})
-    monkeypatch.setattr(f"{VIEWS}.InstanceManage.topo_search_lite",
-                        lambda *a, **k: {"src_result": {"_id": 5}})
-    response = InstanceViewSet.as_view({"get": "topo_search"})(
-        _req("get", superuser), model_id="host", inst_id="5"
-    )
+    monkeypatch.setattr(f"{VIEWS}.InstanceManage.query_entity_by_uuid", lambda pk: {"_id": 5, "inst_uuid": U(5), "model_id": "host"})
+    monkeypatch.setattr(f"{VIEWS}.InstanceManage.topo_search_lite_by_uuid", lambda *a, **k: {"src_result": {"inst_uuid": U(5)}})
+    response = InstanceViewSet.as_view({"get": "topo_search"})(_req("get", superuser), model_id="host", inst_uuid=U(5))
     assert response.status_code == status.HTTP_200_OK
 
 
 @pytest.mark.django_db
 def test_topo_search_expand_post_missing_inst_id(superuser):
-    response = InstanceViewSet.as_view({"post": "topo_search_expand_post"})(
-        _req("post", superuser, data={"parent_id": []})
-    )
+    response = InstanceViewSet.as_view({"post": "topo_search_expand_post"})(_req("post", superuser, data={"parent_uuids": []}))
     assert response.status_code == status.HTTP_400_BAD_REQUEST
 
 
 @pytest.mark.django_db
 def test_topo_search_expand_post_bad_inst_id(superuser):
-    response = InstanceViewSet.as_view({"post": "topo_search_expand_post"})(
-        _req("post", superuser, data={"inst_id": "abc"})
-    )
+    response = InstanceViewSet.as_view({"post": "topo_search_expand_post"})(_req("post", superuser, data={"inst_uuid": ""}))
     assert response.status_code == status.HTTP_400_BAD_REQUEST
 
 
 @pytest.mark.django_db
 def test_topo_search_expand_post_not_found(superuser, monkeypatch):
-    monkeypatch.setattr(f"{VIEWS}.InstanceManage.query_entity_by_id", lambda pk: {})
-    response = InstanceViewSet.as_view({"post": "topo_search_expand_post"})(
-        _req("post", superuser, data={"inst_id": 5, "parent_id": 1})
-    )
+    monkeypatch.setattr(f"{VIEWS}.InstanceManage.query_entity_by_uuid", lambda pk: {})
+    response = InstanceViewSet.as_view({"post": "topo_search_expand_post"})(_req("post", superuser, data={"inst_uuid": U(5), "parent_uuids": U(1)}))
     assert response.status_code == status.HTTP_404_NOT_FOUND
 
 
 @pytest.mark.django_db
 def test_topo_search_expand_post_ok(superuser, monkeypatch):
-    monkeypatch.setattr(f"{VIEWS}.InstanceManage.query_entity_by_id",
-                        lambda pk: {"_id": 5, "model_id": "host"})
-    monkeypatch.setattr(f"{VIEWS}.InstanceManage.topo_search_expand",
-                        lambda *a, **k: {"src_result": {"_id": 5}})
-    response = InstanceViewSet.as_view({"post": "topo_search_expand_post"})(
-        _req("post", superuser, data={"inst_id": 5, "parent_id": [1]})
-    )
+    monkeypatch.setattr(f"{VIEWS}.InstanceManage.query_entity_by_uuid", lambda pk: {"_id": 5, "inst_uuid": U(5), "model_id": "host"})
+    monkeypatch.setattr(f"{VIEWS}.InstanceManage.topo_search_expand_by_uuid", lambda *a, **k: {"src_result": {"inst_uuid": U(5)}})
+    response = InstanceViewSet.as_view({"post": "topo_search_expand_post"})(_req("post", superuser, data={"inst_uuid": U(5), "parent_uuids": [U(1)]}))
     assert response.status_code == status.HTTP_200_OK
 
 
 @pytest.mark.django_db
 def test_topo_search_test_config_ok(superuser, monkeypatch):
-    monkeypatch.setattr(f"{VIEWS}.InstanceManage.query_entity_by_id",
-                        lambda pk: {"_id": 5, "model_id": "host"})
-    monkeypatch.setattr(f"{VIEWS}.InstanceManage.topo_search_test_config",
-                        lambda iid, mid: {"ok": True})
-    response = InstanceViewSet.as_view({"get": "topo_search_test_config"})(
-        _req("get", superuser), model_id="host", inst_id="5"
-    )
+    monkeypatch.setattr(f"{VIEWS}.InstanceManage.query_entity_by_uuid", lambda pk: {"_id": 5, "inst_uuid": U(5), "model_id": "host"})
+    monkeypatch.setattr(f"{VIEWS}.InstanceManage.topo_search_test_config", lambda iid, mid: {"ok": True})
+    response = InstanceViewSet.as_view({"get": "topo_search_test_config"})(_req("get", superuser), model_id="host", inst_uuid=U(5))
     assert response.status_code == status.HTTP_200_OK
 
 
 @pytest.mark.django_db
 def test_topo_search_test_config_not_found(superuser, monkeypatch):
-    monkeypatch.setattr(f"{VIEWS}.InstanceManage.query_entity_by_id", lambda pk: {})
-    response = InstanceViewSet.as_view({"get": "topo_search_test_config"})(
-        _req("get", superuser), model_id="host", inst_id="5"
-    )
+    monkeypatch.setattr(f"{VIEWS}.InstanceManage.query_entity_by_uuid", lambda pk: {})
+    response = InstanceViewSet.as_view({"get": "topo_search_test_config"})(_req("get", superuser), model_id="host", inst_uuid=U(5))
     assert response.status_code == status.HTTP_404_NOT_FOUND
 
 
@@ -156,45 +139,33 @@ def test_topo_search_test_config_not_found(superuser, monkeypatch):
 
 @pytest.mark.django_db
 def test_fulltext_search_view(superuser, monkeypatch):
-    monkeypatch.setattr(f"{VIEWS}.InstanceManage.fulltext_search",
-                        lambda **k: [{"_id": 1, "inst_name": "h"}])
-    response = InstanceViewSet.as_view({"post": "fulltext_search"})(
-        _req("post", superuser, data={"search": "h"})
-    )
+    monkeypatch.setattr(f"{VIEWS}.InstanceManage.fulltext_search", lambda **k: [{"_id": 1, "inst_name": "h"}])
+    response = InstanceViewSet.as_view({"post": "fulltext_search"})(_req("post", superuser, data={"search": "h"}))
     assert response.status_code == status.HTTP_200_OK
 
 
 @pytest.mark.django_db
 def test_fulltext_search_stats_view_no_keyword(superuser):
-    response = InstanceViewSet.as_view({"post": "fulltext_search_stats"})(
-        _req("post", superuser, data={})
-    )
+    response = InstanceViewSet.as_view({"post": "fulltext_search_stats"})(_req("post", superuser, data={}))
     assert _body(response)["result"] is False
 
 
 @pytest.mark.django_db
 def test_fulltext_search_stats_view_ok(superuser, monkeypatch):
-    monkeypatch.setattr(f"{VIEWS}.InstanceManage.fulltext_search_stats",
-                        lambda **k: {"total": 1, "model_stats": []})
-    response = InstanceViewSet.as_view({"post": "fulltext_search_stats"})(
-        _req("post", superuser, data={"search": "h"})
-    )
+    monkeypatch.setattr(f"{VIEWS}.InstanceManage.fulltext_search_stats", lambda **k: {"total": 1, "model_stats": []})
+    response = InstanceViewSet.as_view({"post": "fulltext_search_stats"})(_req("post", superuser, data={"search": "h"}))
     assert response.status_code == status.HTTP_200_OK
 
 
 @pytest.mark.django_db
 def test_fulltext_search_by_model_no_search(superuser):
-    response = InstanceViewSet.as_view({"post": "fulltext_search_by_model"})(
-        _req("post", superuser, data={"model_id": "host"})
-    )
+    response = InstanceViewSet.as_view({"post": "fulltext_search_by_model"})(_req("post", superuser, data={"model_id": "host"}))
     assert _body(response)["result"] is False
 
 
 @pytest.mark.django_db
 def test_fulltext_search_by_model_no_model_id(superuser):
-    response = InstanceViewSet.as_view({"post": "fulltext_search_by_model"})(
-        _req("post", superuser, data={"search": "h"})
-    )
+    response = InstanceViewSet.as_view({"post": "fulltext_search_by_model"})(_req("post", superuser, data={"search": "h"}))
     assert _body(response)["result"] is False
 
 
@@ -228,9 +199,7 @@ def test_fulltext_search_by_model_ok(superuser, monkeypatch):
         f"{VIEWS}.InstanceManage.fulltext_search_by_model",
         lambda **k: {"total": 1, "data": []},
     )
-    response = InstanceViewSet.as_view({"post": "fulltext_search_by_model"})(
-        _req("post", superuser, data={"search": "h", "model_id": "host"})
-    )
+    response = InstanceViewSet.as_view({"post": "fulltext_search_by_model"})(_req("post", superuser, data={"search": "h", "model_id": "host"}))
     assert response.status_code == status.HTTP_200_OK
 
 
@@ -241,11 +210,8 @@ def test_fulltext_search_by_model_ok(superuser, monkeypatch):
 
 @pytest.mark.django_db
 def test_inst_export_view(superuser, monkeypatch):
-    monkeypatch.setattr(f"{VIEWS}.InstanceManage.inst_export",
-                        lambda **k: io.BytesIO(b"xlsxdata"))
-    response = InstanceViewSet.as_view({"post": "inst_export"})(
-        _req("post", superuser, data={"inst_ids": []}), model_id="host"
-    )
+    monkeypatch.setattr(f"{VIEWS}.InstanceManage.inst_export", lambda **k: io.BytesIO(b"xlsxdata"))
+    response = InstanceViewSet.as_view({"post": "inst_export"})(_req("post", superuser, data={"inst_ids": []}), model_id="host")
     assert response.status_code == 200
     assert response["Content-Disposition"].startswith("attachment")
 
@@ -257,11 +223,8 @@ def test_inst_export_view(superuser, monkeypatch):
 
 @pytest.mark.django_db
 def test_download_template_view(superuser, monkeypatch):
-    monkeypatch.setattr(f"{VIEWS}.InstanceManage.download_import_template",
-                        lambda mid: io.BytesIO(b"xlsxdata"))
-    response = InstanceViewSet.as_view({"get": "download_template"})(
-        _req("get", superuser), model_id="host"
-    )
+    monkeypatch.setattr(f"{VIEWS}.InstanceManage.download_import_template", lambda mid: io.BytesIO(b"xlsxdata"))
+    response = InstanceViewSet.as_view({"get": "download_template"})(_req("get", superuser), model_id="host")
     assert response.status_code == 200
 
 
@@ -293,9 +256,7 @@ def test_inst_import_no_file(superuser, monkeypatch):
         "apps.system_mgmt.utils.group_utils.GroupUtils.get_all_child_groups",
         lambda t, include_self=True, group_list=None: [int(t)],
     )
-    response = InstanceViewSet.as_view({"post": "inst_import"})(
-        _req("post", superuser, files={}, team="1"), model_id="host"
-    )
+    response = InstanceViewSet.as_view({"post": "inst_import"})(_req("post", superuser, files={}, team="1"), model_id="host")
     body = _body(response)
     assert body["result"] is False
 
@@ -311,9 +272,7 @@ def test_inst_import_ok(superuser, monkeypatch):
         lambda self, model_id, file_stream, operator, allowed_org_ids=None: {"success": True, "message": "OK"},
     )
     f = SimpleUploadedFile("a.xlsx", b"data")
-    response = InstanceViewSet.as_view({"post": "inst_import"})(
-        _req("post", superuser, files={"file": f}, team="1"), model_id="host"
-    )
+    response = InstanceViewSet.as_view({"post": "inst_import"})(_req("post", superuser, files={"file": f}, team="1"), model_id="host")
     body = _body(response)
     assert body["result"] is True
 
@@ -325,26 +284,21 @@ def test_inst_import_ok(superuser, monkeypatch):
 
 @pytest.mark.django_db
 def test_show_field_create_or_update(superuser, monkeypatch):
-    monkeypatch.setattr(f"{VIEWS}.InstanceManage.create_or_update",
-                        lambda data: {"model_id": data["model_id"]})
-    response = InstanceViewSet.as_view({"post": "create_or_update"})(
-        _req("post", superuser, data=["a", "b"]), model_id="host"
-    )
+    monkeypatch.setattr(f"{VIEWS}.InstanceManage.create_or_update", lambda data: {"model_id": data["model_id"]})
+    response = InstanceViewSet.as_view({"post": "create_or_update"})(_req("post", superuser, data=["a", "b"]), model_id="host")
     assert response.status_code == status.HTTP_200_OK
 
 
 @pytest.mark.django_db
 def test_show_field_get_info(superuser, monkeypatch):
-    monkeypatch.setattr(f"{VIEWS}.InstanceManage.get_info",
-                        lambda mid, uname: {"model_id": mid, "show_fields": []})
+    monkeypatch.setattr(f"{VIEWS}.InstanceManage.get_info", lambda mid, uname: {"model_id": mid, "show_fields": []})
     response = InstanceViewSet.as_view({"get": "get_info"})(_req("get", superuser), model_id="host")
     assert response.status_code == status.HTTP_200_OK
 
 
 @pytest.mark.django_db
 def test_model_inst_count(superuser, monkeypatch):
-    monkeypatch.setattr(f"{VIEWS}.InstanceManage.model_inst_count",
-                        lambda **k: [{"model_id": "host", "count": 3}])
+    monkeypatch.setattr(f"{VIEWS}.InstanceManage.model_inst_count", lambda **k: [{"model_id": "host", "count": 3}])
     response = InstanceViewSet.as_view({"get": "model_inst_count"})(_req("get", superuser))
     assert response.status_code == status.HTTP_200_OK
 

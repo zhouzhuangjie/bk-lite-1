@@ -10,6 +10,7 @@
 认证方式：通过 API Token（由 APISecretMiddleware 验证）
 """
 
+from django.db import transaction
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
@@ -102,7 +103,14 @@ class OpenImportExportViewSet(OpenAPIViewSet):
         if model is not None:
             qs = model.objects.filter(id__in=object_ids)
             if current_team is not None:
-                qs = qs.filter(groups__contains=current_team)
+                from django.db.models import Q
+
+                from apps.operation_analysis.common.datasource_visibility import expand_datasource_org_query
+
+                org_query = Q(groups__contains=current_team)
+                if object_type == ObjectType.DATASOURCE.value:
+                    org_query = expand_datasource_org_query(org_query, include_all_builtins=False)
+                qs = qs.filter(org_query)
             return list(qs.values_list("id", flat=True))
 
         if object_type == ObjectType.NAMESPACE.value:
@@ -159,26 +167,36 @@ class OpenImportExportViewSet(OpenAPIViewSet):
         groups = self._require_groups(request)
         organization_id = groups[0]
 
-        filtered_ids = ImportExportAuthorizationService.filter_export_object_ids(
-            request,
-            object_type,
-            object_ids,
-            current_team=organization_id,
-        )
+        with transaction.atomic():
+            filtered_ids = ImportExportAuthorizationService.filter_export_object_ids(
+                request,
+                object_type,
+                object_ids,
+                current_team=organization_id,
+                allow_partial=ImportExportAuthorizationService.is_legacy_export_dependency_permission_mode(),
+            )
+            authorized_dependencies = ImportExportAuthorizationService.validate_export_dependencies(
+                request,
+                scope,
+                object_type,
+                filtered_ids,
+                current_team=organization_id,
+            )
 
-        logger.info(
-            "Open API export request: object_type=%s, object_ids=%s, organization_id=%s",
-            object_type,
-            object_ids,
-            organization_id,
-        )
+            logger.info(
+                "Open API export request: object_type=%s, object_ids=%s, organization_id=%s",
+                object_type,
+                object_ids,
+                organization_id,
+            )
 
-        result = ExportService.export_objects(
-            scope_type=scope,
-            object_type=object_type,
-            object_ids=filtered_ids,
-            organization_id=organization_id,
-        )
+            result = ExportService.export_objects(
+                scope_type=scope,
+                object_type=object_type,
+                object_ids=filtered_ids,
+                organization_id=organization_id,
+                authorized_dependencies=authorized_dependencies,
+            )
 
         return Response(result, status=status.HTTP_200_OK)
 

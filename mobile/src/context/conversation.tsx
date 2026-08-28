@@ -22,7 +22,6 @@ export interface SessionState {
  */
 interface StreamController {
     abort: () => void;
-    isRunning: boolean;
 }
 
 /**
@@ -40,6 +39,9 @@ type RenderMarkdownFn = (text: string) => React.ReactNode;
  * - 超过最大数量时自动清理最老的非活跃会话
  */
 class ConversationManager {
+    private readonly STREAM_TEXT_FLUSH_INTERVAL_MS = 16;
+    private messageIdSequence = 0;
+    private scopeGeneration = 0;
     private sessions: Map<string, SessionState> = new Map();
     private streamControllers: Map<string, StreamController> = new Map();
     private listeners: Set<() => void> = new Set();
@@ -309,6 +311,23 @@ class ConversationManager {
         // 先取消正在进行的流式请求
         this.abortStream(sessionId);
         this.sessions.delete(sessionId);
+        const orderIndex = this.accessOrder.indexOf(sessionId);
+        if (orderIndex > -1) {
+            this.accessOrder.splice(orderIndex, 1);
+        }
+        this.notifyListeners();
+    }
+
+    /**
+     * 清理当前账号的全部会话状态，用于登出、401 与账号切换。
+     */
+    clearAll(): void {
+        this.scopeGeneration++;
+        this.streamControllers.forEach((controller) => controller.abort());
+        this.streamControllers.clear();
+        this.sessions.clear();
+        this.accessOrder = [];
+        this._runningSessionIdsCache = [];
         this.notifyListeners();
     }
 
@@ -320,6 +339,7 @@ class ConversationManager {
         if (controller) {
             controller.abort();
             this.streamControllers.delete(sessionId);
+            this.setAIRunning(sessionId, false);
         }
     }
 
@@ -370,10 +390,15 @@ class ConversationManager {
     ): Promise<void> {
         // 初始化会话
         this.initSession(sessionId);
+        const responseScopeGeneration = this.scopeGeneration;
+
+        // 先结束旧流，再标记新流运行，避免旧流取消状态覆盖同会话的新请求。
+        this.abortStream(sessionId);
 
         const userMessageTimestamp = Date.now();
-        const userMsgId = `user-${userMessageTimestamp}`;
-        const aiMsgId = `ai-${userMessageTimestamp}`;
+        const messageIdSuffix = `${userMessageTimestamp}-${this.messageIdSequence++}`;
+        const userMsgId = `user-${messageIdSuffix}`;
+        const aiMsgId = `ai-${messageIdSuffix}`;
 
         // 添加用户消息和 AI loading 消息
         this.setAIRunning(sessionId, true);
@@ -414,28 +439,32 @@ class ConversationManager {
             ]);
         }
 
-        // 创建取消控制器
-        let aborted = false;
+        // 同一会话只保留一条活跃流，并将取消传递到底层请求。
+        const abortController = new AbortController();
         const controller: StreamController = {
-            abort: () => { aborted = true; },
-            isRunning: true,
+            abort: () => abortController.abort(),
         };
         this.streamControllers.set(sessionId, controller);
 
-        // 启动流式处理
-        await this.handleAGUIEventStream(
-            sessionId,
-            bot,
-            nodeId,
-            userMessage,
-            aiMsgId,
-            renderMarkdown,
-            errorMessage,
-            () => aborted
-        );
-
-        // 清理控制器
-        this.streamControllers.delete(sessionId);
+        try {
+            await this.handleAGUIEventStream(
+                sessionId,
+                bot,
+                nodeId,
+                userMessage,
+                aiMsgId,
+                renderMarkdown,
+                errorMessage,
+                abortController.signal,
+                responseScopeGeneration,
+            );
+        } finally {
+            // 仅允许当前流收尾，避免旧流结束时覆盖同一会话的新请求状态。
+            if (this.streamControllers.get(sessionId) === controller) {
+                this.streamControllers.delete(sessionId);
+                this.setAIRunning(sessionId, false);
+            }
+        }
     }
 
     /**
@@ -449,20 +478,110 @@ class ConversationManager {
         aiMsgId: string,
         renderMarkdown: RenderMarkdownFn,
         errorMessage: string,
-        isAborted: () => boolean
+        signal: AbortSignal,
+        responseScopeGeneration: number,
     ): Promise<void> {
         let thinkingAccumulated = '';
         let currentTextSegmentIndex = 0;
         let messageAccumulated = '';
         let totalMessageAccumulated = '';
+        let textSegmentFinalized = true;
+        let pendingTextFlush: ReturnType<typeof setTimeout> | undefined;
         const toolArgsAccumulated: Record<string, string> = {};
 
+        const updateTextSegment = (content: React.ReactNode, isStreamingText: boolean): void => {
+            this.updateMessages(sessionId, (prev) =>
+                prev.map((msg) => {
+                    if (msg.id !== aiMsgId) {
+                        return msg;
+                    }
+
+                    const parts = msg.contentParts || [];
+                    const existingTextPartIndex = parts.findIndex(p =>
+                        p.type === 'text' && p.segmentIndex === currentTextSegmentIndex
+                    );
+                    const textPart = {
+                        type: 'text' as const,
+                        content,
+                        segmentIndex: currentTextSegmentIndex,
+                        isStreamingText,
+                    };
+
+                    if (existingTextPartIndex >= 0) {
+                        const updatedParts = [...parts];
+                        updatedParts[existingTextPartIndex] = textPart;
+                        return {
+                            ...msg,
+                            status: content ? 'success' : msg.status,
+                            contentParts: updatedParts,
+                        };
+                    }
+
+                    return {
+                        ...msg,
+                        status: content ? 'success' : msg.status,
+                        contentParts: [...parts, textPart],
+                    };
+                })
+            );
+        };
+
+        const flushTextSegment = (renderFinal: boolean): void => {
+            if (pendingTextFlush !== undefined) {
+                clearTimeout(pendingTextFlush);
+                pendingTextFlush = undefined;
+            }
+            if (!messageAccumulated) {
+                return;
+            }
+            updateTextSegment(
+                renderFinal ? renderMarkdown(messageAccumulated) : messageAccumulated,
+                !renderFinal,
+            );
+            textSegmentFinalized = renderFinal;
+        };
+
+        const scheduleTextFlush = (): void => {
+            if (pendingTextFlush !== undefined) {
+                return;
+            }
+            pendingTextFlush = setTimeout(() => {
+                pendingTextFlush = undefined;
+                if (!signal.aborted && !textSegmentFinalized) {
+                    updateTextSegment(messageAccumulated, true);
+                }
+            }, this.STREAM_TEXT_FLUSH_INTERVAL_MS);
+        };
+
+        const preservePartialText = (): void => {
+            if (!textSegmentFinalized) {
+                flushTextSegment(false);
+            }
+            this.setMessageMarkdown(sessionId, aiMsgId, totalMessageAccumulated);
+        };
+
+        const preserveCancelledText = (): void => {
+            // 登出、401 或账号切换已清空原作用域时，旧流不得写回同 ID 的新会话。
+            if (responseScopeGeneration !== this.scopeGeneration) {
+                return;
+            }
+            preservePartialText();
+            this.updateMessages(sessionId, (prev) =>
+                prev.map((msg) =>
+                    msg.id === aiMsgId
+                        ? { ...msg, status: 'interrupted' as const }
+                        : msg
+                )
+            );
+        };
+
         try {
-            const eventStream = aiChatStream(bot, nodeId, userMessage, sessionId);
+            const eventStream = aiChatStream(bot, nodeId, userMessage, sessionId, { signal });
 
             for await (const event of eventStream) {
                 // 检查是否已取消
-                if (isAborted()) {
+                if (signal.aborted) {
+                    preserveCancelledText();
                     return;
                 }
 
@@ -607,55 +726,26 @@ class ConversationManager {
                         break;
 
                     case 'TEXT_MESSAGE_START':
+                        if (!textSegmentFinalized) {
+                            flushTextSegment(true);
+                        }
                         messageAccumulated = '';
                         currentTextSegmentIndex++;
+                        textSegmentFinalized = false;
+                        // 先占位以保持文本、工具和组件事件的到达顺序；空内容不会实际渲染。
+                        updateTextSegment('', true);
                         break;
 
                     case 'TEXT_MESSAGE_CONTENT':
                         const textDelta = event.delta || event.msg || '';
                         messageAccumulated += textDelta;
                         totalMessageAccumulated += textDelta;
-
-                        const renderedContent = renderMarkdown(messageAccumulated);
-
-                        this.updateMessages(sessionId, (prev) =>
-                            prev.map((msg) => {
-                                if (msg.id === aiMsgId) {
-                                    const parts = msg.contentParts || [];
-                                    const existingTextPartIndex = parts.findIndex(p =>
-                                        p.type === 'text' && p.segmentIndex === currentTextSegmentIndex
-                                    );
-
-                                    if (existingTextPartIndex >= 0) {
-                                        const updatedParts = [...parts];
-                                        updatedParts[existingTextPartIndex] = {
-                                            type: 'text' as const,
-                                            content: renderedContent,
-                                            segmentIndex: currentTextSegmentIndex
-                                        };
-                                        return {
-                                            ...msg,
-                                            status: 'success',
-                                            contentParts: updatedParts
-                                        };
-                                    } else {
-                                        return {
-                                            ...msg,
-                                            status: 'success',
-                                            contentParts: [...parts, {
-                                                type: 'text' as const,
-                                                content: renderedContent,
-                                                segmentIndex: currentTextSegmentIndex
-                                            }]
-                                        };
-                                    }
-                                }
-                                return msg;
-                            })
-                        );
+                        textSegmentFinalized = false;
+                        scheduleTextFlush();
                         break;
 
                     case 'TEXT_MESSAGE_END':
+                        flushTextSegment(true);
                         break;
 
                     case 'CUSTOM':
@@ -682,6 +772,9 @@ class ConversationManager {
                         break;
 
                     case 'RUN_FINISHED':
+                        if (!textSegmentFinalized) {
+                            flushTextSegment(true);
+                        }
                         this.setMessageMarkdown(sessionId, aiMsgId, totalMessageAccumulated);
                         this.updateMessages(sessionId, (prev) =>
                             prev.map((msg) => {
@@ -695,10 +788,21 @@ class ConversationManager {
                             })
                         );
                         this.setAIRunning(sessionId, false);
-                        break;
+                        return;
                 }
             }
+
+            if (signal.aborted) {
+                preserveCancelledText();
+                return;
+            }
+            throw new Error('AI response stream ended before RUN_FINISHED');
         } catch (error) {
+            if (signal.aborted || (error instanceof Error && error.name === 'AbortError')) {
+                preserveCancelledText();
+                return;
+            }
+            preservePartialText();
             console.error('API 事件流处理错误:', error);
             this.setAIRunning(sessionId, false);
 
@@ -710,7 +814,8 @@ class ConversationManager {
                             ? {
                                 ...msg,
                                 message: errorMessage,
-                                status: 'ended' as const,
+                                status: 'interrupted' as const,
+                                streamError: errorMessage,
                             }
                             : msg
                     );
@@ -720,12 +825,17 @@ class ConversationManager {
                         {
                             id: aiMsgId,
                             message: errorMessage,
-                            status: 'ended' as const,
+                            status: 'interrupted' as const,
+                            streamError: errorMessage,
                             timestamp: Date.now(),
                         }
                     ];
                 }
             });
+        } finally {
+            if (pendingTextFlush !== undefined) {
+                clearTimeout(pendingTextFlush);
+            }
         }
     }
 }

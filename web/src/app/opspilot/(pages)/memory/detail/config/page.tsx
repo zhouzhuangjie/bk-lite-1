@@ -111,48 +111,17 @@ export default function MemoryConfigPage() {
 
   const referenceMemory = memories.find(m => m.id === testRefId);
 
-  // Prototype-based styles
-  const cardStyle: React.CSSProperties = {
-    border: '1px solid var(--color-border-2, #dde5f0)',
-    borderRadius: '10px',
-    background: 'var(--color-bg-1, #fff)',
-    overflow: 'hidden',
-  };
-
-  const cardHeadStyle: React.CSSProperties = {
-    height: '40px',
-    borderBottom: '1px solid var(--color-border-2, #e7edf6)',
-    padding: '0 14px',
-    display: 'flex',
-    alignItems: 'center',
-    background: 'var(--color-fill-2, #f7f9fc)',
-    color: 'var(--color-text-1, #314660)',
-    fontSize: '13px',
-    fontWeight: 700,
-  };
-
-  const cardBodyStyle: React.CSSProperties = {
-    padding: '14px',
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '12px',
-  };
-
-  const labelStyle: React.CSSProperties = {
-    fontSize: '13px',
-    color: 'var(--color-text-2, #5c6d84)',
-    fontWeight: 600,
-  };
-
-  const hintStyle: React.CSSProperties = {
-    marginTop: '6px',
-    fontSize: '11px',
-    lineHeight: 1.6,
-    color: 'var(--color-text-3, #8494ab)',
-  };
+  const cardClassName = 'overflow-hidden rounded-[10px] border border-[var(--color-border-2)] bg-[var(--color-bg-1)]';
+  const cardHeadClassName = 'flex h-10 items-center border-b border-[var(--color-border-2)] bg-[var(--color-fill-2)] px-3.5 text-[13px] font-bold text-[var(--color-text-1)]';
+  const cardBodyClassName = 'flex flex-col gap-3 p-3.5';
+  const labelClassName = 'text-[13px] font-semibold text-[var(--color-text-2)]';
+  const hintClassName = 'mt-1.5 text-[11px] leading-relaxed text-[var(--color-text-3)]';
 
   return (
-    <div className="relative h-full">
+    /* 小屏让出自然高度,触发 sub-layout .sectionContext overflow-auto 出滚动条;
+       lg 及以上撑满。`relative` 是给 loading overlay 用的 absolute 锚点,
+       任何宽度都要保留。 */
+    <div className="relative lg:h-full">
       {loading && (
         <div className="absolute inset-0 min-h-[500px] bg-opacity-50 z-50 flex items-center justify-center">
           <Spin spinning={loading} />
@@ -163,81 +132,87 @@ export default function MemoryConfigPage() {
           form={form}
           onFinish={onFinish}
           layout="horizontal"
-          className="h-full"
+          // 小屏让出自然高度(触发 sub-layout .sectionContext overflow-auto 出滚动条),
+          // lg 及以上才撑满,让 write rule / test result 卡片 flex:1 拿到更多 textarea 高度。
+          className="lg:h-full"
         >
-          <div className="flex gap-4 h-full">
-            {/* Left: Config Form - flex-[6] for 6:4 ratio */}
-            <div className="flex-[6] flex flex-col gap-3 min-w-0">
+          {/* 响应式:小屏单列堆叠,lg(≥1024px)及以上恢复 6:4 双列。
+              用 grid + lg:col-span 替代 flex-[6]/flex-[4],避免小屏两列硬挤
+              (label 92px + input 在 6/10 宽度下被压到 60~80px,无法阅读);
+              grid-cols-1 默认让每列拿到全宽,form label 横向不被挤,纵向滚动
+              由 sub-layout 的 .sectionContext overflow-auto 兜底。 */}
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-10 lg:h-full">
+            {/* Left: Config Form - 6/10 on large screens */}
+            <div className="flex flex-col gap-3 min-w-0 lg:col-span-6">
               {/* Basic Info Card */}
-              <div style={cardStyle}>
-                <div style={cardHeadStyle}>{t('memory.basicInfo')}</div>
-                <div style={cardBodyStyle}>
-                  <Form.Item 
-                    label={t('memory.name')} 
-                    name="name" 
+              <div className={cardClassName}>
+                <div className={cardHeadClassName}>{t('memory.basicInfo')}</div>
+                <div className={cardBodyClassName}>
+                  <Form.Item
+                    label={t('memory.name')}
+                    name="name"
                     rules={[{ required: true, message: `${t('common.inputMsg')}${t('memory.name')}` }]}
                     labelCol={{ style: { width: '92px', textAlign: 'right' } }}
                     wrapperCol={{ flex: 1 }}
-                    style={{ marginBottom: '12px' }}
+                    className="mb-3"
                   >
                     <Input />
                   </Form.Item>
-                  <Form.Item 
-                    label={t('memory.scope')} 
-                    name="scope" 
+                  <Form.Item
+                    label={t('memory.scope')}
+                    name="scope"
                     rules={[{ required: true }]}
                     labelCol={{ style: { width: '92px', textAlign: 'right' } }}
                     wrapperCol={{ flex: 1 }}
-                    style={{ marginBottom: '12px' }}
+                    className="mb-3"
                   >
                     <Select disabled>
                       <Select.Option value="personal">{t('memory.personal')}</Select.Option>
                       <Select.Option value="team">{t('memory.team')}</Select.Option>
                     </Select>
                   </Form.Item>
-                  <Form.Item 
-                    label={t('memory.organization')} 
+                  <Form.Item
+                    label={t('memory.organization')}
                     name="team"
                     rules={[{ required: true, message: `${t('common.selectMsg')}${t('memory.organization')}` }]}
                     labelCol={{ style: { width: '92px', textAlign: 'right' } }}
                     wrapperCol={{ flex: 1 }}
-                    style={{ marginBottom: '12px' }}
+                    className="mb-3"
                   >
                     <GroupTreeSelect multiple />
                   </Form.Item>
-                  <Form.Item 
-                    label={t('memory.introduction')} 
+                  <Form.Item
+                    label={t('memory.introduction')}
                     name="introduction"
                     labelCol={{ style: { width: '92px', textAlign: 'right' } }}
                     wrapperCol={{ flex: 1 }}
-                    style={{ marginBottom: 0 }}
+                    className="mb-0"
                   >
-                    <TextArea rows={3} style={{ minHeight: '96px' }} />
+                    <TextArea rows={3} className="min-h-24" />
                   </Form.Item>
                 </div>
               </div>
 
               {/* Write Rule Card */}
-              <div style={{ ...cardStyle, flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-                <div style={cardHeadStyle}>{t('memory.writeRuleTitle')}</div>
-                <div style={{ ...cardBodyStyle, flex: 1, minHeight: 0 }}>
-                  <Form.Item 
-                    name="write_rule" 
+              <div className={`${cardClassName} flex min-h-0 flex-1 flex-col`}>
+                <div className={cardHeadClassName}>{t('memory.writeRuleTitle')}</div>
+                <div className={`${cardBodyClassName} min-h-0 flex-1`}>
+                  <Form.Item
+                    name="write_rule"
                     rules={[{ required: true, message: `${t('common.inputMsg')}${t('memory.writeRule')}` }]}
-                    label={<span style={labelStyle}>{t('memory.writeRule')}</span>}
-                    extra={<span style={{ fontSize: '11px', color: 'var(--color-text-3, #8494ab)' }}>{t('memory.writeRuleHint')}</span>}
-                    style={{ flex: 1, marginBottom: '16px', display: 'flex', flexDirection: 'column', minHeight: 0 }}
-                    className="flex-1-form-item"
+                    label={<span className={labelClassName}>{t('memory.writeRule')}</span>}
+                    extra={<span className="text-[11px] text-[var(--color-text-3)]">{t('memory.writeRuleHint')}</span>}
+                    className="mb-4 flex min-h-0 flex-1 flex-col"
                   >
-                    <TextArea style={{ flex: 1, minHeight: '120px', resize: 'vertical' }} />
+                    <TextArea className="min-h-[120px] flex-1 resize-y" />
                   </Form.Item>
-                  
-                  <Form.Item 
-                    name="default_model" 
+
+                  <Form.Item
+                    name="default_model"
                     rules={[{ required: true, message: `${t('common.selectMsg')}${t('memory.defaultModel')}` }]}
-                    label={<span style={labelStyle}>{t('memory.defaultModel')}</span>}
-                    extra={<span style={{ fontSize: '11px', color: 'var(--color-text-3, #8494ab)' }}>{t('memory.defaultModelHint')}</span>}
-                    style={{ marginBottom: 0 }}
+                    label={<span className={labelClassName}>{t('memory.defaultModel')}</span>}
+                    extra={<span className="text-[11px] text-[var(--color-text-3)]">{t('memory.defaultModelHint')}</span>}
+                    className="mb-0"
                   >
                     <Select
                       placeholder="e.g. DeepSeek-V3.1"
@@ -255,11 +230,11 @@ export default function MemoryConfigPage() {
               {/* Save Button */}
               <div className="flex justify-end">
                 <PermissionWrapper requiredPermissions={['Edit']}>
-                  <Button 
-                    type="primary" 
+                  <Button
+                    type="primary"
                     htmlType="submit"
                     loading={saving}
-                    style={{ height: '32px', borderRadius: '8px', padding: '0 12px', fontSize: '12px', fontWeight: 600 }}
+                    className="h-8 rounded-lg px-3 text-xs font-semibold"
                   >
                     {t('common.save')}
                   </Button>
@@ -267,24 +242,24 @@ export default function MemoryConfigPage() {
               </div>
             </div>
 
-            {/* Right: Test Panel - flex-[4] for 6:4 ratio */}
-            <div className="flex-[4] flex flex-col gap-3 min-w-0">
+            {/* Right: Test Panel - 4/10 on large screens */}
+            <div className="flex flex-col gap-3 min-w-0 lg:col-span-4">
               {/* Test Input Card */}
-              <div style={cardStyle}>
-                <div style={cardHeadStyle}>{t('memory.testTitle')}</div>
-                <div style={cardBodyStyle}>
+              <div className={cardClassName}>
+                <div className={cardHeadClassName}>{t('memory.testTitle')}</div>
+                <div className={cardBodyClassName}>
                   <div>
-                    <div style={labelStyle} className="mb-2">{t('memory.testInputTitle')}</div>
-                    <p style={hintStyle} className="mb-2 mt-0">{t('memory.testInputDesc')}</p>
+                    <div className={`${labelClassName} mb-2`}>{t('memory.testInputTitle')}</div>
+                    <p className={`${hintClassName} mb-2 mt-0`}>{t('memory.testInputDesc')}</p>
                     <TextArea 
                       rows={5}
                       value={testInput} 
                       onChange={e => setTestInput(e.target.value)}
-                      style={{ minHeight: '120px' }}
+                      className="min-h-[120px]"
                     />
                   </div>
-                  <div className="flex items-center gap-2 mt-2">
-                    <span style={{ fontSize: '13px', color: 'var(--color-text-2, #5c6d84)' }}>{t('memory.testReferenceLabel')}</span>
+                  <div className="mt-2 flex items-center gap-2">
+                    <span className="text-[13px] text-[var(--color-text-2)]">{t('memory.testReferenceLabel')}</span>
                     <Select 
                       className="w-48"
                       value={testRefId}
@@ -300,8 +275,7 @@ export default function MemoryConfigPage() {
                       type="primary" 
                       loading={testing} 
                       onClick={handleTest} 
-                      className="ml-auto"
-                      style={{ height: '32px', borderRadius: '8px', padding: '0 12px', fontSize: '12px', fontWeight: 600 }}
+                      className="ml-auto h-8 rounded-lg px-3 text-xs font-semibold"
                     >
                       {t('memory.testButton')}
                     </Button>
@@ -310,8 +284,8 @@ export default function MemoryConfigPage() {
               </div>
 
               {/* Test Result Card */}
-              <div style={{ ...cardStyle, flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-                <div style={{ ...cardHeadStyle, justifyContent: 'space-between' }}>
+              <div className={`${cardClassName} flex min-h-0 flex-1 flex-col`}>
+                <div className={`${cardHeadClassName} justify-between`}>
                   <span>{t('memory.testResultTitle')}</span>
                   {testRefId && (
                     <div className="flex bg-[var(--color-fill-2)] p-1 rounded gap-1">
@@ -332,52 +306,20 @@ export default function MemoryConfigPage() {
                     </div>
                   )}
                 </div>
-                <div style={{ ...cardBodyStyle, flex: 1, minHeight: 0 }}>
+                <div className={`${cardBodyClassName} min-h-0 flex-1`}>
                   {!testResult && activeTab === 'result' ? (
-                    <div 
-                      className="flex-1 flex flex-col justify-center items-center"
-                      style={{ 
-                        border: '1px solid var(--color-border-2, #dde5f0)', 
-                        borderRadius: '8px', 
-                        background: 'var(--color-fill-1, #f7f9fc)',
-                        padding: '24px',
-                      }}
-                    >
-                      <div style={{ fontSize: '13px', fontWeight: 500, color: 'var(--color-text-2, #5c6d84)', marginBottom: '4px' }}>
+                    <div className="flex flex-1 flex-col items-center justify-center rounded-lg border border-[var(--color-border-2)] bg-[var(--color-fill-1)] p-6">
+                      <div className="mb-1 text-[13px] font-medium text-[var(--color-text-2)]">
                         {t('memory.testWaiting')}
                       </div>
-                      <div style={hintStyle}>{t('memory.testWaitingHint')}</div>
+                      <div className={hintClassName}>{t('memory.testWaitingHint')}</div>
                     </div>
                   ) : activeTab === 'reference' && referenceMemory ? (
-                    <div 
-                      className="flex-1 overflow-auto"
-                      style={{ 
-                        padding: '12px', 
-                        background: 'var(--color-fill-1, #f7f9fc)', 
-                        borderRadius: '8px', 
-                        border: '1px solid var(--color-border-2, #dde5f0)', 
-                        fontSize: '13px', 
-                        lineHeight: 1.6, 
-                        fontFamily: 'monospace',
-                        whiteSpace: 'pre-wrap',
-                      }}
-                    >
+                    <div className="flex-1 overflow-auto whitespace-pre-wrap rounded-lg border border-[var(--color-border-2)] bg-[var(--color-fill-1)] p-3 font-mono text-[13px] leading-relaxed">
                       {referenceMemory.content}
                     </div>
                   ) : (
-                    <div 
-                      className="flex-1 overflow-auto"
-                      style={{ 
-                        padding: '12px', 
-                        background: 'var(--color-fill-1, #f7f9fc)', 
-                        borderRadius: '8px', 
-                        border: '1px solid var(--color-border-2, #dde5f0)', 
-                        fontSize: '13px', 
-                        lineHeight: 1.6, 
-                        fontFamily: 'monospace',
-                        whiteSpace: 'pre-wrap',
-                      }}
-                    >
+                    <div className="flex-1 overflow-auto whitespace-pre-wrap rounded-lg border border-[var(--color-border-2)] bg-[var(--color-fill-1)] p-3 font-mono text-[13px] leading-relaxed">
                       {testResult?.result || ''}
                     </div>
                   )}

@@ -23,13 +23,15 @@ import { MSSQL_TOP_DB_QUERIES } from './queries';
 import { topDbBars } from './parse';
 import styles from './index.module.scss';
 
-// 数据库类对象首行统一带「运行时长」(放首位);KpiSection 上限 6 列(含采集状态卡)即最多 5 张 KPI,
-// 故用运行时长替换信息密度较低的「信号等待占比」(其语义仍由「等待时间趋势」图保留)。
+// 数据库类对象首行统一带「运行时长」(放首位);采集状态 + 5 张 KPI = 6 列一行。
+// 用运行时长替换信息密度较低的「信号等待占比」(其语义仍由「等待时间趋势」图保留)。
 const SUMMARY_TITLES = ['运行时长', '读延迟', '批量请求速率', '缓存命中率', '卷可用空间'];
 const PRIMARY_CHART_TITLES = ['等待时间趋势', '请求耗时趋势', '读写延迟'];
+// 一线排障：阻塞/内存授予与编译/死锁紧挨主趋势，单独成节避免挤进 CPU/吞吐。
+const CONCURRENCY_CHART_TITLES = ['并发与内存压力', '计划缓存与死锁'];
 const SECONDARY_CHART_TITLES = ['CPU 使用情况', '读写吞吐'];
-const RING_TITLES = ['缓存命中分布', '存储空间分布'];
-const BAR_TITLES = ['调度器压力', '请求资源消耗'];
+const RING_TITLES = ['存储空间分布'];
+const BAR_TITLES = ['调度器压力'];
 const TOP_DB_CONCURRENCY = 3;
 
 export default function MssqlDashboardPage() {
@@ -43,6 +45,7 @@ export default function MssqlDashboardPage() {
 
   const summaryCards = useFilteredSummaryCards(dashboard.summaryCards, SUMMARY_TITLES);
   const primaryCharts = useFilteredChartPanels(dashboard.chartPanels, PRIMARY_CHART_TITLES);
+  const concurrencyCharts = useFilteredChartPanels(dashboard.chartPanels, CONCURRENCY_CHART_TITLES);
   const secondaryCharts = useFilteredChartPanels(dashboard.chartPanels, SECONDARY_CHART_TITLES);
   const rings = useFilteredRingPanels(dashboard.ringPanels, RING_TITLES);
   const bars = useFilteredBarPanels(dashboard.barPanels, BAR_TITLES);
@@ -61,7 +64,9 @@ export default function MssqlDashboardPage() {
     }
     let active = true;
     runWithConcurrency(MSSQL_TOP_DB_QUERIES, TOP_DB_CONCURRENCY, async (q) =>
-      getInstanceQuery(buildSearchParams(q.query, q.unit, idValues, instanceIdKeys, timeValues, undefined, undefined, currentInstanceInterval))
+      // autoConvert=false:禁用服务端单位自动换算,否则会与前端 formatMetricValue 双重换算
+      //(如 ms 被后端先换成 hour,前端再按 ms 格式化,量级错乱)。见 postgresql 同因。
+      getInstanceQuery(buildSearchParams(q.query, q.unit, idValues, instanceIdKeys, timeValues, undefined, false, currentInstanceInterval))
         .then((res: any) => [q.key, topDbBars(res, q.unit, q.color)] as const)
         .catch(() => [q.key, [] as BarItem[]] as const)
     ).then((entries) => {
@@ -83,16 +88,28 @@ export default function MssqlDashboardPage() {
       dashboardContent={
         <>
           <div className={styles.sectionLabel}>健康概览</div>
-          <KpiSection dashboard={dashboard} summaryCards={summaryCards} styles={styles} />
+          <KpiSection dashboard={dashboard} summaryCards={summaryCards} kpiCols={6} styles={styles} />
 
           <div className={styles.sectionLabel}>性能与等待趋势</div>
           <TrendSection charts={primaryCharts} onXRangeChange={dashboard.onXRangeChange} loading={dashboard.loading} styles={styles} />
 
-          <div className={styles.sectionLabel}>缓存与存储分布</div>
-          <InsightSection rings={rings} bars={[]} ringSpanClass={() => styles.span6} styles={styles} />
+          <div className={styles.sectionLabel}>并发与故障</div>
+          <TrendSection
+            charts={concurrencyCharts}
+            onXRangeChange={dashboard.onXRangeChange}
+            loading={dashboard.loading}
+            spanClass={() => styles.span6}
+            styles={styles}
+          />
 
-          <div className={styles.sectionLabel}>调度与请求压力</div>
-          <InsightSection bars={bars} barSpanClass={() => styles.span6} styles={styles} />
+          <div className={styles.sectionLabel}>存储与调度</div>
+          <InsightSection
+            rings={rings}
+            bars={bars}
+            ringSpanClass={() => styles.span6}
+            barSpanClass={() => styles.span6}
+            styles={styles}
+          />
 
           <div className={styles.sectionLabel}>CPU 与 I/O 吞吐</div>
           <TrendSection

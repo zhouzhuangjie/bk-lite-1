@@ -12,6 +12,7 @@ import { DEFAULT_THRESHOLD_COLORS } from '@/app/ops-analysis/constants/threshold
 import { ThresholdColorConfig } from '@/app/ops-analysis/utils/thresholdUtils';
 import { buildTreeData } from '@/app/ops-analysis/(pages)/view/topology/utils/dataTreeUtils';
 import { canEnableCompare } from '@/app/ops-analysis/utils/compareQuery';
+import { getDateRangeTimezone } from '@/app/ops-analysis/utils/dateRange';
 
 interface UseSingleValueConfigProps {
   form: FormInstance;
@@ -123,12 +124,14 @@ export function useSingleValueConfig({
         } else {
           newValue = Math.max(currentValue - 5, nextValue + 1);
         }
-      } else {
+      } else if (prev.length > 0) {
         const values = prev
           .map((t) => parseFloat(t.value))
           .filter((v) => !isNaN(v));
         const maxValue = Math.max(...values);
-        newValue = Math.min(maxValue + 10, 100);
+        newValue = Number.isFinite(maxValue)
+          ? Math.min(maxValue + 10, 100)
+          : 50;
       }
       const existingValues = prev
         .map((t) => parseFloat(t.value))
@@ -167,6 +170,10 @@ export function useSingleValueConfig({
       const requestParams = processDataSourceParams({
         sourceParams: selectedDataSource.params,
         userParams,
+        resolutionContext: {
+          referenceNow: Date.now(),
+          timezone: getDateRangeTimezone(),
+        },
       });
 
       if (
@@ -177,7 +184,7 @@ export function useSingleValueConfig({
         requestParams.namespace_id = builtinNamespaceId;
       }
 
-      const data = await getSourceDataByApiId(resolvedId, requestParams);
+      const { data } = await getSourceDataByApiId(resolvedId, requestParams);
       const tree = buildTreeData(data, selectedDataSource.field_schema);
       setSingleValueTreeData(tree);
     } catch (error) {

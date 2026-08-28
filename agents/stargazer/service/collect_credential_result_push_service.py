@@ -1,8 +1,8 @@
 # -- coding: utf-8 --
 import os
 
-from core.credential_state_cache import CredentialStateCache
-from core.nats_utils import nats_publish
+from core.infra.credential_state_cache import CredentialStateCache
+from core.infra.nats_utils import nats_publish
 
 
 COLLECT_CREDENTIAL_RESULT_PUSH_INTERVAL_SECONDS = int(os.getenv("COLLECT_CREDENTIAL_RESULT_PUSH_INTERVAL", "900"))
@@ -15,12 +15,15 @@ COLLECT_CREDENTIAL_RESULT_PUSH_SUBJECT = os.getenv(
 class CollectCredentialResultPushService:
     @staticmethod
     def build_results_payload(events: list[dict]) -> dict:
-        next_since = ""
-        for item in events or []:
-            finished_at = str((item or {}).get("finished_at") or "")
-            if finished_at and finished_at > next_since:
-                next_since = finished_at
-        return {"results": events or [], "next_since": next_since}
+        next_since = (
+            CredentialStateCache.event_cursor(events[-1]) if events else ""
+        )
+        results = []
+        for event in events or []:
+            public_event = dict(event or {})
+            public_event.pop(CredentialStateCache._STREAM_CURSOR_FIELD, None)
+            results.append(public_event)
+        return {"results": results, "next_since": next_since}
 
     @staticmethod
     async def list_results(since: str = "", limit: int = 500) -> dict:
@@ -45,9 +48,10 @@ class CollectCredentialResultPushService:
         if not events:
             return {"pushed": 0, "next_since": since}
 
-        next_since = CollectCredentialResultPushService.build_results_payload(events).get("next_since") or since
+        result_payload = CollectCredentialResultPushService.build_results_payload(events)
+        next_since = result_payload.get("next_since") or since
         payload = {
-            "events": events,
+            "events": result_payload["results"],
             "next_since": next_since,
         }
         nats_namespace = os.getenv("NATS_NAMESPACE", "bklite")

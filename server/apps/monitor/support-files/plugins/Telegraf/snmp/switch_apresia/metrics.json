@@ -13,6 +13,7 @@
     "instance_id"
   ],
   "supplementary_indicators": [
+    "snmp_uptime",
     "device_cpu_usage",
     "device_temperature_celsius",
     "device_psu_state"
@@ -21,11 +22,16 @@
     {
       "metric_group": "CPU",
       "name": "device_cpu_usage",
-      "query": "max(device_cpu_usage{instance_type='switch', __$labels__}) by (instance_id)",
+      "query": "device_cpu_usage{instance_type='switch', __$labels__}",
       "display_name": "CPU Utilization",
       "data_type": "Number",
       "unit": "percent",
-      "dimensions": [],
+      "dimensions": [
+        {
+          "name": "index",
+          "description": "SNMP table row index"
+        }
+      ],
       "instance_id_keys": [
         "instance_id"
       ],
@@ -34,11 +40,16 @@
     {
       "metric_group": "Temperature",
       "name": "device_temperature_celsius",
-      "query": "max(device_temperature_celsius{instance_type='switch', __$labels__}) by (instance_id)",
+      "query": "device_temperature_celsius{instance_type='switch', __$labels__}",
       "display_name": "Temperature",
       "data_type": "Number",
       "unit": "celsius",
-      "dimensions": [],
+      "dimensions": [
+        {
+          "name": "index",
+          "description": "SNMP table row index"
+        }
+      ],
       "instance_id_keys": [
         "instance_id"
       ],
@@ -47,11 +58,16 @@
     {
       "metric_group": "Hardware Status",
       "name": "device_fan_state",
-      "query": "max(device_fan_state{instance_type='switch', __$labels__}) by (instance_id)",
+      "query": "device_fan_state{instance_type='switch', __$labels__}",
       "display_name": "Fan State",
       "data_type": "Enum",
       "unit": "[{\"name\":\"正常\",\"id\":1,\"color\":\"#1ac44a\"},{\"name\":\"异常\",\"id\":2,\"color\":\"#ff4d4f\"}]",
-      "dimensions": [],
+      "dimensions": [
+        {
+          "name": "fanIndex",
+          "description": "Fan index"
+        }
+      ],
       "instance_id_keys": [
         "instance_id"
       ],
@@ -60,11 +76,16 @@
     {
       "metric_group": "Hardware Status",
       "name": "device_psu_state",
-      "query": "max(device_psu_state{instance_type='switch', __$labels__}) by (instance_id)",
+      "query": "device_psu_state{instance_type='switch', __$labels__}",
       "display_name": "Power Supply State",
       "data_type": "Enum",
       "unit": "[{\"name\":\"正常\",\"id\":1,\"color\":\"#1ac44a\"},{\"name\":\"异常\",\"id\":2,\"color\":\"#ff4d4f\"}]",
-      "dimensions": [],
+      "dimensions": [
+        {
+          "name": "psuIndex",
+          "description": "Power supply index"
+        }
+      ],
       "instance_id_keys": [
         "instance_id"
       ],
@@ -105,6 +126,19 @@
         "instance_id"
       ],
       "description": "This metric calculates the average rate of bytes sent over the past 5 minutes, measured in bytes per second, from the 64-bit IF-MIB ifHCOutOctets counter (ifXTable). The 64-bit counter avoids the rapid wrap of the 32-bit ifOutOctets on high-speed switch ports, keeping the rate accurate."
+    },
+    {
+      "metric_group": "Base",
+      "name": "snmp_uptime",
+      "query": "sum(snmp_uptime{instance_type='switch', __$labels__}/100) by (instance_id)",
+      "display_name": "System Uptime",
+      "data_type": "Number",
+      "unit": "s",
+      "dimensions": [],
+      "instance_id_keys": [
+        "instance_id"
+      ],
+      "description": "This metric indicates the uptime of the device since the last restart. By monitoring the uptime, network administrators can understand the stability and reliability of the device and identify potential reboot or failure issues."
     }
   ]
 }

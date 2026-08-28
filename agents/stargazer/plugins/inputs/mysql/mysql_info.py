@@ -8,10 +8,12 @@ A standalone script to gather information about MySQL servers.
 """
 
 from decimal import Decimal
-import pymysql
-from pymysql.constants import CLIENT
 
+import aiomysql
+from core.collection.contracts import AccessProbeResult, AccessProbeStatus
 from core.decorator import timer
+from pymysql.constants import CLIENT
+from pymysql.err import OperationalError
 from sanic.log import logger
 
 
@@ -19,62 +21,80 @@ class MysqlInfo:
     """Class for collecting MySQL instance information."""
 
     def __init__(self, kwargs):
-        self.host = kwargs.get('host', 'localhost')
-        self.port = int(kwargs.get('port', 3306))
-        self.user = kwargs.get('user')
-        self.password = kwargs.get('password', '')
-        self.database = kwargs.get('database', '')
-        self.timeout = int(kwargs.get('timeout', 10))
+        self.host = kwargs.get("host", "localhost")
+        self.port = int(kwargs.get("port", 3306))
+        self.user = kwargs.get("user")
+        self.password = kwargs.get("password", "")
+        self.database = kwargs.get("database", "")
+        self.timeout = 10  # 连接超时硬编码；表单 timeout 由框架作单对象预算
         self.client_flag = CLIENT.MULTI_STATEMENTS
-        self.cursorclass = pymysql.cursors.DictCursor
         self.info = {
-            'version': {},
-            'databases': {},
-            'settings': {},
-            'global_status': {},
-            'engines': {},
-            'users': {},
-            'master_status': {},
-            'slave_hosts': {},
-            'slave_status': {},
-            'replication_errors': {},
+            "version": {},
+            "databases": {},
+            "settings": {},
+            "global_status": {},
+            "engines": {},
+            "users": {},
+            "master_status": {},
+            "slave_hosts": {},
+            "slave_status": {},
+            "replication_errors": {},
         }
         self.connection = None
         self.cursor = None
 
-        # self._connect()
-
-    def _connect(self):
+    async def _connect(self):
         """Establish MySQL connection."""
         try:
-            self.connection = pymysql.connect(
+            self.connection = await aiomysql.connect(
                 host=self.host,
                 port=self.port,
                 user=self.user,
                 password=self.password,
-                database=self.database,
+                db=self.database or None,
                 client_flag=self.client_flag,
-                cursorclass=self.cursorclass,
                 connect_timeout=self.timeout,
+                autocommit=True,
             )
-            self.cursor = self.connection.cursor()
+            self.cursor = await self.connection.cursor(aiomysql.DictCursor)
         except Exception as e:
-            raise RuntimeError(f"Failed to connect to MySQL: {str(e)}")
+            raise RuntimeError("Failed to connect to MySQL") from e
 
-    def _exec_sql(self, query):
+    async def probe(self) -> AccessProbeResult:
+        try:
+            await self._connect()
+            rows = await self._exec_sql("SHOW GLOBAL VARIABLES LIKE 'version'")
+            version = str(rows[0].get("Value") or "") if rows else ""
+            return AccessProbeResult(
+                status=AccessProbeStatus.READY,
+                evidence={"server_version": version},
+            )
+        except RuntimeError as error:
+            cause = error.__cause__
+            error_number = cause.args[0] if cause is not None and cause.args else None
+            if error_number == 1045 or (isinstance(cause, OperationalError) and cause.args and cause.args[0] == 1045):
+                return AccessProbeResult(
+                    status=AccessProbeStatus.AUTH_FAILED,
+                    error_code="authentication_failed",
+                )
+            raise
+        finally:
+            await self.close()
+
+    async def _exec_sql(self, query):
         """Execute SQL query and return results."""
         try:
-            self.cursor.execute(query)
-            return self.cursor.fetchall()
+            await self.cursor.execute(query)
+            return await self.cursor.fetchall()
         except Exception as e:
             raise RuntimeError(f"Error executing SQL '{query}': {str(e)}")
 
-    def _exec_first_query(self, queries):
+    async def _exec_first_query(self, queries):
         """Execute the first successful SQL query from a list."""
         last_err = None
         for query in queries:
             try:
-                return self._exec_sql(query)
+                return await self._exec_sql(query)
             except Exception as err:
                 last_err = err
         raise RuntimeError(str(last_err))
@@ -95,140 +115,113 @@ class MysqlInfo:
         except (ValueError, TypeError):
             return val
 
-    def _collect(self):
+    async def _collect(self):
         """Collect all possible subsets."""
-        self._get_databases()
-        self._get_global_variables()
-        # self._get_global_status()
-        # self._get_engines()
-        # self._get_users()
-        self._safe_collect("master_status", self._get_master_status)
-        self._safe_collect("slave_status", self._get_slave_status)
-        self._safe_collect("slave_hosts", self._get_slaves)
+        await self._get_databases()
+        await self._get_global_variables()
+        await self._safe_collect("master_status", self._get_master_status)
+        await self._safe_collect("slave_status", self._get_slave_status)
+        await self._safe_collect("slave_hosts", self._get_slaves)
 
-    def _safe_collect(self, name, func):
+    async def _safe_collect(self, name, func):
         """Collect optional data without failing the full run."""
         try:
-            func()
+            await func()
         except Exception as err:
             logger.warning("mysql_info collect %s failed: %s", name, str(err))
-            self.info['replication_errors'][name] = str(err)
+            self.info["replication_errors"][name] = str(err)
 
-    def _get_databases(self):
+    async def _get_databases(self):
         """Get info about databases."""
-        query = ('SELECT table_schema AS "name", '
-                 'SUM(data_length + index_length) AS "size" '
-                 'FROM information_schema.TABLES GROUP BY table_schema')
-        res = self._exec_sql(query)
+        query = 'SELECT table_schema AS "name", ' 'SUM(data_length + index_length) AS "size" ' "FROM information_schema.TABLES GROUP BY table_schema"
+        res = await self._exec_sql(query)
         if res:
             for db in res:
-                self.info['databases'][db['name']] = {'size': int(db['size'])}
+                self.info["databases"][db["name"]] = {"size": int(db["size"])}
 
-    def _get_global_variables(self):
+    async def _get_global_variables(self):
         """Get global variables (instance settings)."""
-        res = self._exec_sql('SHOW GLOBAL VARIABLES')
+        res = await self._exec_sql("SHOW GLOBAL VARIABLES")
         if res:
             for var in res:
-                self.info['settings'][var['Variable_name']] = self._convert(var['Value'])
+                self.info["settings"][var["Variable_name"]] = self._convert(var["Value"])
 
-            full = self.info['settings']['version']
-            self.info['version'] = {"version": full}
-            self._ensure_server_uuid()
+            full = self.info["settings"]["version"]
+            self.info["version"] = {"version": full}
+            await self._ensure_server_uuid()
 
-    def _ensure_server_uuid(self):
+    async def _ensure_server_uuid(self):
         """Ensure server_uuid is populated for old versions."""
-        if self.info['settings'].get("server_uuid"):
+        if self.info["settings"].get("server_uuid"):
             return
         try:
-            res = self._exec_sql('SELECT @@server_uuid AS server_uuid')
+            res = await self._exec_sql("SELECT @@server_uuid AS server_uuid")
             if res:
-                self.info['settings']['server_uuid'] = res[0].get('server_uuid')
+                self.info["settings"]["server_uuid"] = res[0].get("server_uuid")
         except Exception as err:
             logger.warning("mysql_info get server_uuid failed: %s", str(err))
 
-    def _get_global_status(self):
-        """Get global status."""
-        res = self._exec_sql('SHOW GLOBAL STATUS')
-        if res:
-            for var in res:
-                self.info['global_status'][var['Variable_name']] = self._convert(var['Value'])
-
-    def _get_engines(self):
-        """Get storage engines info."""
-        res = self._exec_sql('SHOW ENGINES')
-        if res:
-            for line in res:
-                engine = line['Engine']
-                self.info['engines'][engine] = {k: v for k, v in line.items() if k != 'Engine'}
-
-    def _get_users(self):
-        """Get user info."""
-        res = self._exec_sql('SELECT * FROM mysql.user')
-        if res:
-            for line in res:
-                host = line['Host']
-                user = line['User']
-
-                if host not in self.info['users']:
-                    self.info['users'][host] = {}
-
-                self.info['users'][host][user] = {
-                    k: self._convert(v)
-                    for k, v in line.items()
-                    if k not in ('Host', 'User')
-                }
-
-    def _get_master_status(self):
+    async def _get_master_status(self):
         """Get master status if the instance is a master."""
-        res = self._exec_first_query([
-            'SHOW MASTER STATUS',
-            'SHOW BINARY LOG STATUS',
-        ])
+        res = await self._exec_first_query(
+            [
+                "SHOW MASTER STATUS",
+                "SHOW BINARY LOG STATUS",
+            ]
+        )
         if res:
             for line in res:
                 for vname, val in line.items():
-                    self.info['master_status'][vname] = self._convert(val)
+                    self.info["master_status"][vname] = self._convert(val)
 
-    def _get_slave_status(self):
+    async def _get_slave_status(self):
         """Get slave status if the instance is a slave."""
-        res = self._exec_first_query([
-            'SHOW SLAVE STATUS',
-            'SHOW REPLICA STATUS',
-        ])
+        res = await self._exec_first_query(
+            [
+                "SHOW SLAVE STATUS",
+                "SHOW REPLICA STATUS",
+            ]
+        )
         if res and len(res) > 0:
-            line = res[0]  # SHOW SLAVE STATUS returns only one row
+            line = res[0]
             host = self._get_first_key(line, ["Master_Host", "Source_Host"])
             port = self._get_first_key(line, ["Master_Port", "Source_Port"])
             user = self._get_first_key(line, ["Master_User", "Source_User"])
 
-            if host not in self.info['slave_status']:
-                self.info['slave_status'][host] = {}
-            if port not in self.info['slave_status'][host]:
-                self.info['slave_status'][host][port] = {}
-            if user not in self.info['slave_status'][host][port]:
-                self.info['slave_status'][host][port][user] = {}
+            if host not in self.info["slave_status"]:
+                self.info["slave_status"][host] = {}
+            if port not in self.info["slave_status"][host]:
+                self.info["slave_status"][host][port] = {}
+            if user not in self.info["slave_status"][host][port]:
+                self.info["slave_status"][host][port][user] = {}
 
             for vname, val in line.items():
                 if vname not in (
-                    'Master_Host', 'Master_Port', 'Master_User',
-                    'Source_Host', 'Source_Port', 'Source_User',
+                    "Master_Host",
+                    "Master_Port",
+                    "Master_User",
+                    "Source_Host",
+                    "Source_Port",
+                    "Source_User",
                 ):
-                    self.info['slave_status'][host][port][user][vname] = self._convert(val)
+                    self.info["slave_status"][host][port][user][vname] = self._convert(val)
 
-    def _get_slaves(self):
+    async def _get_slaves(self):
         """Get slave hosts info if the instance is a master."""
-        res = self._exec_first_query([
-            'SHOW SLAVE HOSTS',
-            'SHOW REPLICA HOSTS',
-        ])
+        res = await self._exec_first_query(
+            [
+                "SHOW SLAVE HOSTS",
+                "SHOW REPLICA HOSTS",
+            ]
+        )
         if res:
             for line in res:
-                srv_id = line['Server_id']
-                if srv_id not in self.info['slave_hosts']:
-                    self.info['slave_hosts'][srv_id] = {}
+                srv_id = line["Server_id"]
+                if srv_id not in self.info["slave_hosts"]:
+                    self.info["slave_hosts"][srv_id] = {}
                 for vname, val in line.items():
-                    if vname != 'Server_id':
-                        self.info['slave_hosts'][srv_id][vname] = self._convert(val)
+                    if vname != "Server_id":
+                        self.info["slave_hosts"][srv_id][vname] = self._convert(val)
 
     def _get_replication_info(self):
         """Get replication role and cluster hints."""
@@ -237,13 +230,13 @@ class MysqlInfo:
         master_port = None
         master_user = None
         master_uuid = None
-        server_uuid = self.info['settings'].get("server_uuid")
+        server_uuid = self.info["settings"].get("server_uuid")
         slave_io_running = None
         slave_sql_running = None
 
-        if self.info['slave_status']:
+        if self.info["slave_status"]:
             role = "slave"
-            for host, ports in self.info['slave_status'].items():
+            for host, ports in self.info["slave_status"].items():
                 for port, users in ports.items():
                     for user, status in users.items():
                         master_host = host
@@ -255,11 +248,10 @@ class MysqlInfo:
                         break
                     break
                 break
-        elif self.info['master_status'] or self.info['slave_hosts']:
+        elif self.info["master_status"] or self.info["slave_hosts"]:
             role = "master"
 
-        has_slaves = bool(self.info['slave_hosts'])
-        cluster_id = None
+        has_slaves = bool(self.info["slave_hosts"])
         if role == "slave" and master_uuid:
             cluster_id = master_uuid
         elif role == "master" and server_uuid:
@@ -285,17 +277,15 @@ class MysqlInfo:
         }
 
     @timer(logger=logger)
-    def list_all_resources(self):
-        """
-        Convert collected data to a standard format.
-        """
+    async def list_all_resources(self):
+        """Convert collected data to a standard format."""
         try:
-            self._connect()
-            self._collect()
+            await self._connect()
+            await self._collect()
             model_data = {
                 "ip_addr": self.host,
                 "port": self.port,
-                "version": self.info['version']['version'],
+                "version": self.info["version"]["version"],
                 "enable_binlog": self.info["settings"].get("log_bin"),
                 "sync_binlog": self.info["settings"].get("sync_binlog"),
                 "max_conn": self.info["settings"].get("max_connections"),
@@ -313,17 +303,20 @@ class MysqlInfo:
             inst_data = {"result": {"mysql": [model_data]}, "success": True}
         except Exception as err:  # noqa
             import traceback
+
             logger.error(f"mysql_info main error! {traceback.format_exc()}")
             inst_data = {"result": {"cmdb_collect_error": str(err)}, "success": False}
 
         finally:
-            self.close()
+            await self.close()
 
         return inst_data
 
-    def close(self):
+    async def close(self):
         """Close the MySQL connection."""
         if self.cursor:
-            self.cursor.close()
+            await self.cursor.close()
+            self.cursor = None
         if self.connection:
             self.connection.close()
+            self.connection = None

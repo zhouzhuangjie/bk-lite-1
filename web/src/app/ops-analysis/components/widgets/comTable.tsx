@@ -3,15 +3,19 @@ import React, {
   useState,
   useMemo,
   useCallback,
+  useRef,
 } from 'react';
-import { Button, Dropdown, Input, Select, DatePicker, Tooltip, message } from 'antd';
-import { MoreOutlined, SearchOutlined } from '@ant-design/icons';
+import { Button, Input, Select, DatePicker, Tooltip, message } from 'antd';
+import { SearchOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
-import dayjs from 'dayjs';
 import { useTranslation } from '@/utils/i18n';
 import CustomTable from '@/components/custom-table';
-import { formatOpsRequestTime } from '@/app/ops-analysis/utils/dateTime';
-import { getOpsChartThemeByMode } from '@/app/ops-analysis/utils/chartTheme';
+import MoreActionsDropdown from '@/components/more-actions-dropdown';
+import type { MoreActionsDropdownItem } from '@/components/more-actions-dropdown';
+import {
+  getOpsChartThemeByMode,
+  isScreenChartThemeMode,
+} from '@/app/ops-analysis/utils/chartTheme';
 import {
   parseTableLikeData,
   resolveTableLikeColumns,
@@ -26,11 +30,19 @@ import type {
   TableFilterFieldConfig,
   DashboardActionConfig,
 } from '@/app/ops-analysis/types/dashBoard';
+import { useShareMode } from '@/app/ops-analysis/context/shareMode';
 import {
   buildDashboardActionUrl,
   resolveDashboardActionParams,
 } from '@/app/ops-analysis/utils/dashboardActions';
+import { resolveTableCellPresentation } from '@/app/ops-analysis/utils/tableCellStyle';
 import { getScreenWidgetScale } from './shared/screenMetrics';
+import { supportsServerPagination } from '@/app/ops-analysis/utils/tablePagination';
+import {
+  applyTableRowFilters,
+  buildTableQueryList,
+} from '@/app/ops-analysis/utils/tableQueryList';
+import { useTableBodyScrollY } from './shared/useTableBodyScrollY';
 
 const { RangePicker } = DatePicker;
 const DEFAULT_CELL_MAX_WIDTH = 260;
@@ -59,6 +71,8 @@ const ComTable: React.FC<ComTableProps> = ({
   onQueryChange,
 }) => {
   const { t } = useTranslation();
+  const shareMode = useShareMode();
+  const tableContainerRef = useRef<HTMLDivElement | null>(null);
   const [filters, setFilters] = useState<Record<string, any>>({});
   const [keywordDrafts, setKeywordDrafts] = useState<Record<string, string>>(
     {},
@@ -70,11 +84,11 @@ const ComTable: React.FC<ComTableProps> = ({
       current: 1,
       pageSize: 20,
     });
-  const usesScreenDarkTheme = config?.chartThemeMode === 'screen-dark';
+  const usesScreenTheme = isScreenChartThemeMode(config?.chartThemeMode);
   const screenTableTheme = getOpsChartThemeByMode(config?.chartThemeMode);
   const widgetScale = getScreenWidgetScale(screenRenderContext);
   const screenTableStyle = useMemo(() => {
-    if (!usesScreenDarkTheme) return undefined;
+    if (!usesScreenTheme) return undefined;
 
     return {
       '--ops-screen-table-bg': screenTableTheme.panelBg,
@@ -84,6 +98,12 @@ const ComTable: React.FC<ComTableProps> = ({
       '--ops-screen-table-heading': screenTableTheme.panelTitleColor,
       '--ops-screen-table-muted': screenTableTheme.singleValueMetaColor,
       '--ops-screen-table-accent': screenTableTheme.pieValueColor,
+      '--ops-screen-table-row-bg': screenTableTheme.panelBg,
+      '--ops-screen-table-row-alt-bg': screenTableTheme.panelSubtleBg,
+      '--ops-screen-table-row-hover-bg': screenTableTheme.legendHoverBg,
+      '--ops-screen-table-control-bg': screenTableTheme.panelBg,
+      '--ops-screen-table-scrollbar-thumb': screenTableTheme.axisPointerColor,
+      '--ops-screen-table-scrollbar-track': screenTableTheme.panelSubtleBg,
       '--ops-screen-table-header-font-size': `${Math.round(14 * widgetScale)}px`,
       '--ops-screen-table-body-font-size': `${Math.round(13 * widgetScale)}px`,
       '--ops-screen-table-line-height': `${Math.round(20 * widgetScale)}px`,
@@ -93,16 +113,35 @@ const ComTable: React.FC<ComTableProps> = ({
       '--ops-screen-table-pagination-gap': `${Math.round(6 * widgetScale)}px`,
       '--ops-screen-table-scrollbar-size': `${Math.round(8 * widgetScale)}px`,
     } as React.CSSProperties;
-  }, [screenTableTheme, usesScreenDarkTheme, widgetScale]);
+  }, [screenTableTheme, usesScreenTheme, widgetScale]);
   
-  const { tableData, pagination } = useMemo(() => {
-    const parsed = parseTableLikeData<TableDataItem>(rawData, queryPagination);
+  const supportsPaginationParams = useMemo(
+    () => supportsServerPagination(dataSource?.params),
+    [dataSource?.params],
+  );
+
+  const { tableData, pagination, isPaginated } = useMemo(() => {
+    const parsed = parseTableLikeData<TableDataItem>(
+      rawData,
+      queryPagination,
+      supportsPaginationParams,
+    );
 
     return {
       tableData: parsed.rows,
       pagination: parsed.pagination,
+      isPaginated: parsed.isPaginated,
     };
-  }, [rawData, queryPagination.current, queryPagination.pageSize]);
+  }, [rawData, queryPagination.current, queryPagination.pageSize, supportsPaginationParams]);
+  const displayedTableData = useMemo(
+    () => applyTableRowFilters(tableData, filters),
+    [filters, tableData],
+  );
+  const tableScrollY = useTableBodyScrollY({
+    containerRef: tableContainerRef,
+    hasPagination: isPaginated,
+    scale: widgetScale,
+  });
 
   const filterFields = useMemo<TableFilterFieldConfig[]>(() => {
     return config?.tableConfig?.filterFields || [];
@@ -142,6 +181,10 @@ const ComTable: React.FC<ComTableProps> = ({
 
   const handleActionClick = useCallback(
     (action: DashboardActionConfig, record: TableDataItem) => {
+      if (shareMode) {
+        message.warning(t('dashboard.shareNavigationDisabled'));
+        return;
+      }
       const params = resolveDashboardActionParams(action.params, record);
       const url = buildDashboardActionUrl(action.url, params);
       if (!url) {
@@ -156,12 +199,12 @@ const ComTable: React.FC<ComTableProps> = ({
 
       window.location.href = url;
     },
-    [t],
+    [shareMode, t],
   );
 
   const renderActionButtons = useCallback(
     (actions: DashboardActionConfig[], record: TableDataItem) => {
-      if (actions.length === 0) {
+      if (shareMode || actions.length === 0) {
         return '-';
       }
 
@@ -182,31 +225,19 @@ const ComTable: React.FC<ComTableProps> = ({
             </Button>
           ))}
           {dropdownActions.length > 0 && (
-            <Dropdown
-              trigger={['click']}
-              menu={{
-                items: dropdownActions.map((action, index) => ({
-                  key: String(index),
-                  label: action.text,
-                })),
-                onClick: ({ key }) => {
-                  const action = dropdownActions[Number(key)];
-                  if (action) {
-                    handleActionClick(action, record);
-                  }
-                },
-              }}
-            >
-              <Button type="link" size="small" className="p-0">
-                {t('common.more')}
-                <MoreOutlined />
-              </Button>
-            </Dropdown>
+            <MoreActionsDropdown
+              items={dropdownActions.map<MoreActionsDropdownItem>((action, index) => ({
+                key: String(index),
+                label: action.text,
+                onClick: () => handleActionClick(action, record),
+              }))}
+              buttonType="link"
+            />
           )}
         </div>
       );
     },
-    [handleActionClick, t],
+    [handleActionClick, shareMode, t],
   );
 
   const antColumns = useMemo((): ColumnsType<TableDataItem> => {
@@ -224,20 +255,40 @@ const ComTable: React.FC<ComTableProps> = ({
             return renderActionButtons(columnActions, record);
           }
 
-          const cellText = text === null || text === undefined ? '' : String(text);
-          const displayText = cellText.trim() ? cellText : '--';
+          const presentation = resolveTableCellPresentation(text, col);
+          if (presentation.mode === 'colorBackground') {
+            return (
+              <Tooltip placement="topLeft" title={presentation.tooltipText}>
+                <div
+                  role="img"
+                  aria-label={presentation.tooltipText}
+                  style={{
+                    width: 16,
+                    height: 16,
+                    borderRadius: 3,
+                    background: presentation.color,
+                  }}
+                >
+                  <span className="sr-only">{presentation.tooltipText}</span>
+                </div>
+              </Tooltip>
+            );
+          }
 
           return (
-            <Tooltip placement="topLeft" title={displayText}>
+            <Tooltip placement="topLeft" title={presentation.displayText}>
               <div
                 style={{
                   maxWidth: DEFAULT_CELL_MAX_WIDTH,
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap',
+                  ...(presentation.color
+                    ? { color: presentation.color, fontWeight: 600 }
+                    : {}),
                 }}
               >
-                {displayText}
+                {presentation.displayText}
               </div>
             </Tooltip>
           );
@@ -251,45 +302,12 @@ const ComTable: React.FC<ComTableProps> = ({
   useEffect(() => {
     if (!onQueryChange) return;
 
-    const queryParams: Record<string, any> = {
-      page: queryPagination.current,
-      page_size: queryPagination.pageSize,
-    };
-    const queryList: Array<Record<string, any>> = [];
-
-    Object.entries(filters).forEach(([key, value]) => {
-      if (value === null || value === undefined || value === '') {
-        return;
-      }
-
-      if (
-        Array.isArray(value) &&
-        value.length === 2 &&
-        dayjs.isDayjs(value[0]) &&
-        dayjs.isDayjs(value[1])
-      ) {
-        queryList.push({
-          field: key,
-          type: 'time',
-          start: formatOpsRequestTime(value[0]),
-          end: formatOpsRequestTime(value[1]),
-        });
-        return;
-      }
-
-      if (typeof value === 'string') {
-        const text = value.trim();
-        if (!text) {
-          return;
-        }
-        queryList.push({
-          field: key,
-          type: 'str*',
-          value: text,
-        });
-      }
-    });
-
+    const queryParams: Record<string, any> = {};
+    if (supportsPaginationParams) {
+      queryParams.page = queryPagination.current;
+      queryParams.page_size = queryPagination.pageSize;
+    }
+    const queryList = buildTableQueryList(filters);
     if (queryList.length > 0) {
       queryParams.query_list = queryList;
     }
@@ -299,6 +317,7 @@ const ComTable: React.FC<ComTableProps> = ({
     onQueryChange,
     queryPagination,
     filters,
+    supportsPaginationParams,
   ]);
 
   useEffect(() => {
@@ -378,7 +397,7 @@ const ComTable: React.FC<ComTableProps> = ({
 
     return (
       <div
-        className={`mb-3 flex flex-wrap gap-2 ${usesScreenDarkTheme ? styles.screenDarkFilters : ''}`}
+        className="mb-3 flex flex-wrap gap-2"
       >
         {searchableFilterFields.length > 0 && (
           <div className="flex items-center">
@@ -417,7 +436,23 @@ const ComTable: React.FC<ComTableProps> = ({
                 <Input
                   placeholder={t('dashboard.searchPlaceholder')}
                   suffix={
-                    <SearchOutlined style={{ color: 'var(--color-text-3)' }} />
+                    <SearchOutlined
+                      className="cursor-pointer"
+                      style={{
+                        color: 'var(--ops-screen-table-muted, var(--color-text-3))',
+                      }}
+                      onClick={() => {
+                        if (!activeKeywordFieldKey) {
+                          return;
+                        }
+                        handleKeywordFilterCommit(
+                          activeKeywordFieldKey,
+                          keywordDrafts[activeKeywordFieldKey]
+                            ?? filters[activeKeywordFieldKey]
+                            ?? '',
+                        );
+                      }}
+                    />
                   }
                   value={
                     activeKeywordFieldKey
@@ -472,40 +507,45 @@ const ComTable: React.FC<ComTableProps> = ({
 
   return (
     <div
-      className={`h-full flex flex-col ${usesScreenDarkTheme ? styles.screenDarkRoot : ''}`}
+      className={`h-full flex flex-col ${usesScreenTheme ? styles.screenDarkRoot : ''}`}
       style={screenTableStyle}
     >
       {renderFilters()}
 
       <div
+        ref={tableContainerRef}
         className={`flex-1 min-h-0 ${
-          usesScreenDarkTheme
+          usesScreenTheme
             ? `overflow-hidden ${styles.screenDarkTableWrap}`
-            : 'overflow-visible'
+            : 'overflow-hidden'
         }`}
       >
         <CustomTable
-          className={usesScreenDarkTheme ? styles.screenDarkTable : undefined}
+          className={usesScreenTheme ? styles.screenDarkTable : undefined}
           columns={antColumns}
-          dataSource={tableData}
+          dataSource={displayedTableData}
           loading={loading}
           rowKey={(record, index) =>
             record.id || record.key || index?.toString() || '0'
           }
           size="small"
-          pagination={{
-            current: pagination.current,
-            pageSize: pagination.pageSize,
-            total: pagination.total,
-            showSizeChanger: {
-              getPopupContainer: () => document.body,
-            },
-            showQuickJumper: true,
-            showTotal: (total) =>
-              `${t('common.total')} ${total} ${t('common.items')}`,
-          }}
-          onChange={handleTableChange}
-          scroll={{ x: 'max-content' }}
+          pagination={
+            isPaginated
+              ? {
+                current: pagination.current,
+                pageSize: pagination.pageSize,
+                total: pagination.total,
+                showSizeChanger: {
+                  getPopupContainer: () => document.body,
+                },
+                showQuickJumper: true,
+                showTotal: (total) =>
+                  `${t('common.total')} ${total} ${t('common.items')}`,
+              }
+              : false
+          }
+          onChange={isPaginated ? handleTableChange : undefined}
+          scroll={{ x: 'max-content', y: tableScrollY }}
         />
       </div>
     </div>

@@ -4,6 +4,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import BaseTaskForm, { BaseTaskRef } from './baseTask';
 import styles from '../index.module.scss';
 import { useTranslation } from '@/utils/i18n';
+import { useCollectionFormLayout } from '../hooks/useCollectionFormLayout';
 import { Form, Spin, Select, Input } from 'antd';
 import {
   getCleanupFormValues,
@@ -44,6 +45,7 @@ const K8sTaskForm: React.FC<K8sTaskFormProps> = ({
   onAfterSave,
 }) => {
   const { t } = useTranslation();
+  const collectionFormLayout = useCollectionFormLayout();
   const baseRef = useRef<BaseTaskRef>(null as any);
   const { model_id: modelId } = modelItem;
   const { copyTaskData, setCopyTaskData } = useAssetManageStore();
@@ -91,7 +93,7 @@ const K8sTaskForm: React.FC<K8sTaskFormProps> = ({
       : undefined,
     formatValues: (values) => {
       const instance = baseRef.current?.instOptions?.find(
-        (item: any) => item.value === values.instId
+        (item) => item.value === values.instUuid
       );
 
       // collector_cluster_id 和 cloud_region_id 写入到 instance + params，
@@ -103,19 +105,22 @@ const K8sTaskForm: React.FC<K8sTaskFormProps> = ({
         }
         : undefined;
 
+      const baseData = formatTaskValues({
+        values,
+        baseRef,
+        selectedNode,
+        modelItem,
+        modelId,
+        formatCycleValue,
+      });
+
       return {
-        ...formatTaskValues({
-          values,
-          baseRef,
-          selectedNode,
-          modelItem,
-          modelId,
-          formatCycleValue,
-        }),
+        ...baseData,
         instances: enrichedInstance ? [enrichedInstance] : [],
         input_method: 0,
         ip_range: '',
         params: {
+          ...baseData.params,
           collector_cluster_id: values.collector_cluster_id,
           cloud_region_id: values.cloud_region_id,
         },
@@ -129,7 +134,8 @@ const K8sTaskForm: React.FC<K8sTaskFormProps> = ({
     ...values,
     taskName: isCopy ? '' : values.name,
     organization: values.team || [],
-    instId: values.instances?.[0]?._id,
+    instUuid: values.instances?.[0]?.inst_uuid,
+    ip_precheck: Boolean(values.params?.ip_precheck),
     collector_cluster_id:
       values.instances?.[0]?.collector_cluster_id ??
       values.params?.collector_cluster_id ??
@@ -156,9 +162,8 @@ const K8sTaskForm: React.FC<K8sTaskFormProps> = ({
   return (
     <Spin spinning={loading} wrapperClassName={styles.k8sTaskSpin}>
       <Form
+        {...collectionFormLayout}
         form={form}
-        layout="horizontal"
-        labelCol={{ span: 5 }}
         onFinish={onFinish}
         initialValues={K8S_FORM_INITIAL_VALUES}
       >
@@ -170,11 +175,8 @@ const K8sTaskForm: React.FC<K8sTaskFormProps> = ({
           submitLoading={submitLoading}
           instPlaceholder={`${t('common.select')} ${t('Collection.k8sTask.selectK8S')}`}
           submitText={onAfterSave ? `${t('common.next')} →` : undefined}
-          timeoutProps={{
-            min: 0,
-            defaultValue: 60,
-            addonAfter: t('Collection.k8sTask.second'),
-          }}
+          showTimeout={false}
+          showIpPrecheck={false}
         >
           <Form.Item
             label={t('Collection.k8sTask.collectorClusterId') || 'Cluster ID'}

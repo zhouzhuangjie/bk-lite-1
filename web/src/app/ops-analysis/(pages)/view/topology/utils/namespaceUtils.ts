@@ -1,17 +1,21 @@
 import type { Graph, Node } from '@antv/x6';
 import type { DatasourceItem, ParamItem } from '@/app/ops-analysis/types/dataSource';
+import type { DateRangeValue } from '@/app/ops-analysis/types/dateRange';
 import type { LayoutItem, UnifiedFilterDefinition, FilterValue } from '@/app/ops-analysis/types/dashBoard';
 import type { ViewConfigFormValues } from '@/app/ops-analysis/types/topology';
 import {
+  type BindableParamType,
   getFilterDefinitionId,
   getBindableFilterParams,
 } from '@/app/ops-analysis/utils/widgetDataTransform';
+import { validateDateRangeValue } from '@/app/ops-analysis/utils/dateRange';
 import {
   buildRelativeTimeRangeFilterValue,
 } from '@/app/ops-analysis/utils/filterValue';
 import {
   syncFilterValuesWithDefinitions,
 } from '@/app/ops-analysis/utils/unifiedFilterState';
+import { isFiniteNumber } from '@/app/ops-analysis/utils/thresholdUtils';
 
 export { syncFilterValuesWithDefinitions };
 
@@ -70,15 +74,6 @@ export const collectNamespaceIdsFromNodes = (
   return namespaceIds;
 };
 
-export const datasourceSupportsNamespace = (
-  dataSource: DatasourceItem | undefined,
-  namespaceId: number | undefined,
-): boolean => {
-  if (!dataSource || namespaceId === undefined) return true;
-  if (!dataSource.namespaces || dataSource.namespaces.length === 0) return true;
-  return dataSource.namespaces.includes(namespaceId);
-};
-
 /**
  * 将 X6 图表节点转换为 LayoutItem 格式
  * 用于 UnifiedFilterConfigModal 组件
@@ -126,7 +121,7 @@ export const buildFiltersFromNodes = (
 
   const discoveredParams = new Map<
     string,
-    ParamItem & { type: 'string' | 'timeRange' }
+    ParamItem & { type: BindableParamType }
   >();
 
   const nodes = graphInstance.getNodes();
@@ -176,6 +171,13 @@ export const buildFiltersFromNodes = (
       }
     }
 
+    if (param.type === 'dateRange') {
+      defaultValue = validateDateRangeValue(defaultValue).valid
+        && defaultValue !== null
+        ? { ...(defaultValue as DateRangeValue) }
+        : null;
+    }
+
     return {
       id,
       key: param.name,
@@ -188,6 +190,29 @@ export const buildFiltersFromNodes = (
       options: existing?.options,
     };
   });
+};
+
+const VALUE_FORMAT_CHART_TYPES = new Set([
+  'single',
+  'gauge',
+  'line',
+  'bar',
+  'pie',
+  'multiValue',
+]);
+
+const applyValueFormatFields = (
+  valueConfig: Record<string, unknown>,
+  values: ViewConfigFormValues,
+) => {
+  if (values.unit !== undefined) valueConfig.unit = values.unit;
+  if (values.unitId !== undefined) valueConfig.unitId = values.unitId;
+  if (isFiniteNumber(values.conversionFactor)) {
+    valueConfig.conversionFactor = values.conversionFactor;
+  }
+  if (isFiniteNumber(values.decimalPlaces)) {
+    valueConfig.decimalPlaces = values.decimalPlaces;
+  }
 };
 
 /**
@@ -211,23 +236,29 @@ export const buildValueConfig = (
   if (values.chartThemeMode && values.chartThemeMode !== 'default') {
     valueConfig.chartThemeMode = values.chartThemeMode;
   }
+  if (values.chartType && VALUE_FORMAT_CHART_TYPES.has(values.chartType)) {
+    applyValueFormatFields(valueConfig, values);
+  }
   if (values.chartType === 'single') {
     valueConfig.compare = !!values.compare;
+    valueConfig.compareMode = values.compareMode || 'percent';
     valueConfig.selectedFields = values.selectedFields;
     valueConfig.thresholdColors = values.thresholdColors;
-    if (values.unit !== undefined) valueConfig.unit = values.unit;
-    if (values.conversionFactor !== undefined) valueConfig.conversionFactor = values.conversionFactor;
-    if (values.decimalPlaces !== undefined) valueConfig.decimalPlaces = values.decimalPlaces;
   }
   if (values.chartType === 'gauge') {
     valueConfig.selectedFields = values.selectedFields;
     valueConfig.thresholdColors = values.thresholdColors;
-    if (values.unit !== undefined) valueConfig.unit = values.unit;
-    if (values.conversionFactor !== undefined) valueConfig.conversionFactor = values.conversionFactor;
-    if (values.decimalPlaces !== undefined) valueConfig.decimalPlaces = values.decimalPlaces;
     if (values.gaugeMin !== undefined) valueConfig.gaugeMin = values.gaugeMin;
     if (values.gaugeMax !== undefined) valueConfig.gaugeMax = values.gaugeMax;
     if (values.gaugeShape !== undefined) valueConfig.gaugeShape = values.gaugeShape;
+  }
+  if (values.chartType === 'multiValue') {
+    if (values.thresholdColors?.length) {
+      valueConfig.thresholdColors = values.thresholdColors;
+    }
+    if (values.valueMappings?.length) {
+      valueConfig.valueMappings = values.valueMappings;
+    }
   }
   if (
     (values.chartType === 'table' || values.chartType === 'eventTable') &&

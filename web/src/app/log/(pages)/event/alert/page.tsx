@@ -1,5 +1,5 @@
 'use client';
-import React, { useEffect, useState, useRef, useMemo } from 'react';
+import React, { useEffect, useState, useRef, useMemo, useCallback } from 'react';
 import {
   Input,
   Button,
@@ -14,7 +14,7 @@ import {
 import useApiClient from '@/utils/request';
 import { useTranslation } from '@/utils/i18n';
 import Icon from '@/components/icon';
-import { getRandomColor, getRecentTimeRange } from '@/app/log/utils/common';
+import { getRecentTimeRange } from '@/app/log/utils/common';
 import {
   ColumnItem,
   ModalRef,
@@ -32,6 +32,7 @@ import CustomTable from '@/components/custom-table';
 import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
 import TimeSelector from '@/components/time-selector';
 import Permission from '@/components/permission';
+import Collapse from '@/components/collapse';
 import StackedBarChart from '@/app/log/components/charts/stackedBarChart';
 import AlertDetail from './alertDetail';
 import { useLocalizedTime } from '@/hooks/useLocalizedTime';
@@ -44,6 +45,12 @@ import { useLevelList, useStateMap } from '@/app/log/hooks/event';
 import useLogEventApi from '@/app/log/api/event';
 import useLogIntegrationApi from '@/app/log/api/integration';
 import { cloneDeep } from 'lodash';
+import UserAvatar from '@/components/user-avatar';
+import { formatUserDisplayName } from '@/utils/userDisplay';
+import { useHabitExpanded } from '@/hooks/useHabitExpanded';
+import useLogUserHabitApi, {
+  LOG_ALERT_CHART_HABIT_KEY
+} from '@/app/log/api/userHabit';
 const { Search } = Input;
 const { Option } = Select;
 
@@ -51,6 +58,7 @@ const Alert: React.FC = () => {
   const { isLoading } = useApiClient();
   const { getLogAlert, patchLogAlert, getLogAlertStats } = useLogEventApi();
   const { getCollectTypes } = useLogIntegrationApi();
+  const { getUserHabit, saveUserHabit } = useLogUserHabitApi();
   const { t } = useTranslation();
   const STATE_MAP = useStateMap();
   const LEVEL_LIST = useLevelList();
@@ -88,6 +96,20 @@ const Alert: React.FC = () => {
   });
   const [activeTab, setActiveTab] = useState<string>('activeAlarms');
   const [chartData, setChartData] = useState<Record<string, any>[]>([]);
+  const loadChartHabit = useCallback(
+    () => getUserHabit(LOG_ALERT_CHART_HABIT_KEY),
+    [getUserHabit]
+  );
+  const saveChartHabit = useCallback(
+    (value: { expanded: boolean }) =>
+      saveUserHabit(LOG_ALERT_CHART_HABIT_KEY, value),
+    [saveUserHabit]
+  );
+  const [chartExpanded, onChartToggle] = useHabitExpanded({
+    enabled: !isLoading,
+    load: loadChartHabit,
+    save: saveChartHabit
+  });
   const [objects, setObjects] = useState<ObjectItem[]>([]);
   const [confirmLoading, setConfirmLoading] = useState(false);
 
@@ -115,11 +137,6 @@ const Alert: React.FC = () => {
       title: t('log.event.alertName'),
       dataIndex: 'alert_name',
       key: 'alert_name'
-    },
-    {
-      title: t('log.integration.collectType'),
-      dataIndex: 'collect_type_name',
-      key: 'collect_type_name'
     },
     {
       title: t('log.event.alertType'),
@@ -154,31 +171,24 @@ const Alert: React.FC = () => {
         <>{t(`log.event.${record.notice ? 'notified' : 'unnotified'}`)}</>
       )
     },
-    {
-      title: t('common.operator'),
-      dataIndex: 'operator',
-      key: 'operator',
-      render: (_, { operator }) => {
-        return operator ? (
-          <div className="column-user" title={operator}>
-            <span
-              className="user-avatar"
-              style={{ background: getRandomColor() }}
-            >
-              {operator.slice(0, 1).toLocaleUpperCase()}
-            </span>
-            <span className="user-name">
-              <EllipsisWithTooltip
-                className="w-full overflow-hidden text-ellipsis whitespace-nowrap"
-                text={operator}
+    ...(activeTab === 'historicalAlarms'
+      ? [
+        {
+          title: t('common.operator'),
+          dataIndex: 'operator',
+          key: 'operator',
+          render: (_: unknown, { operator }: TableDataItem) =>
+            operator ? (
+              <UserAvatar
+                userName={formatUserDisplayName(operator, userList)}
+                size="small"
               />
-            </span>
-          </div>
-        ) : (
-          <>--</>
-        );
-      }
-    },
+            ) : (
+              <>--</>
+            )
+        }
+      ]
+      : []),
     {
       title: t('common.action'),
       key: 'action',
@@ -504,31 +514,28 @@ const Alert: React.FC = () => {
           </div>
           <Spin spinning={chartLoading}>
             <div className={alertStyle.chartWrapper}>
-              <div className="flex items-center justify-between mb-[2px]">
-                <div className="text-[14px] ml-[10px] relative">
-                  {t('log.event.distributionMap')}
+              <Collapse
+                title={t('log.event.distributionMap')}
+                icon={
                   <Tooltip
                     placement="top"
                     title={t(`log.event.${activeTab}MapTips`)}
                   >
-                    <div
-                      className="absolute cursor-pointer"
-                      style={{
-                        top: '-4px',
-                        right: '-14px'
-                      }}
-                    >
+                    <span className="cursor-pointer">
                       <Icon
                         type="a-shuoming2"
                         className="text-[14px] text-[var(--color-text-3)]"
                       />
-                    </div>
+                    </span>
                   </Tooltip>
+                }
+                isOpen={chartExpanded}
+                onToggle={onChartToggle}
+              >
+                <div className={alertStyle.chart}>
+                  <StackedBarChart data={chartData} colors={LEVEL_MAP as any} />
                 </div>
-              </div>
-              <div className={alertStyle.chart}>
-                <StackedBarChart data={chartData} colors={LEVEL_MAP as any} />
-              </div>
+              </Collapse>
             </div>
           </Spin>
           <div className={alertStyle.table}>
@@ -543,7 +550,12 @@ const Alert: React.FC = () => {
             />
             <CustomTable
               className="w-full"
-              scroll={{ y: 'calc(100vh - 606px)', x: 'max-content' }}
+              scroll={{
+                y: chartExpanded
+                  ? 'calc(100vh - 606px)'
+                  : 'calc(100vh - 496px)',
+                x: 'max-content'
+              }}
               columns={columns}
               dataSource={tableData}
               pagination={pagination}

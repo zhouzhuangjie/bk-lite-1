@@ -1,0 +1,127 @@
+# 模块 ARD：OpsPilot（AI 助手）
+
+> Migrated from `spec/ARD/modules/opspilot.md` as legacy capability evidence.
+
+> 路径 `server/apps/opspilot` ｜ API 前缀 `api/v1/opspilot/`
+
+## 1. 职责【已实现/已存在】
+AI 助手平台：Wiki 知识库、Bot 编排、LLM 厂商接入、工作流自动化与记忆管理。历史文件切分 / 问答对 / 图谱 RAG 产品面已下线。
+
+## 2. 数据模型与存储【已实现/已存在】
+
+模型可按子域分组（文件即子域边界）。下表覆盖各子域全部模型类。
+
+**模型供应商 / 技能子域（`models/model_provider_mgmt.py`）**
+
+| 模型 | 行 | 说明 |
+|------|----|------|
+| ModelVendor | `:27` | 厂商（OpenAI/Azure/Aliyun/Zhipu/Baidu/Anthropic/DeepSeek/other）；`api_key` 加密；含持久化字段 `protocol_type`（CharField，choices=openai/anthropic，迁移 `0049_modelvendor_protocol_type.py`，默认 openai）（`:30`） |
+| LLMModel | `:68` | LLM 模型（关联厂商）。`protocol_type` 为只读 property（`:100-110`）：anthropic 厂商→anthropic；deepseek/other→读取 `vendor.protocol_type`；其余→openai，支撑非 OpenAI 协议接入 |
+| EmbedProvider / RerankProvider | `:118,154` | Embed / Rerank 模型（密钥经厂商解密） |
+| OCRProvider | `:190` | OCR 解析提供方（EncryptMixin，供 KnowledgeDocument 解析） |
+| LLMSkill | `:232` | 智能体/技能（LLM 模型、提示词、工具列表、技能类型、对话历史窗口、Wiki 知识库绑定 `wiki_knowledge_bases` 等；可关联技能包） |
+| SkillPackage | `:296` | 技能包元数据，供 LLMSkill 关联并在运行时注入命中提示 |
+| SkillTools | `:295` | 工具集（参数、标签、tools 列表，可复用注册） |
+| SkillRequestLog | `:309` | 技能调用请求日志（请求/响应明细、来源 IP、成败状态） |
+
+**Bot / 工作流子域（`models/bot_mgmt.py`）**
+
+| 模型 | 行 | 说明 |
+|------|----|------|
+| Bot / BotChannel | `:22,70` | Bot（Rasa 模型/技能/渠道/部署）、渠道（GitLab/钉钉/企微/企微机器人/公众号，渠道密钥加密） |
+| BotConversationHistory | `:172` | Bot 对话历史（用户/机器人角色、引用知识、通道用户） |
+| ConversationTag | `:189` | 对话标注（问题/答案关联到知识库与文档） |
+| RasaModel | `:200` | Rasa 模型文件（MinIO `munchkin-private`） |
+| ChannelUser / ChannelGroup / UserGroup | `:220,239,248` | 消息通道用户、通道群组、用户-群组关联 |
+| BotWorkFlow | `:256` | 机器人工作流（flow/web JSON，保存时同步 ChatApplication） |
+| ChatApplication | `:421` | 聊天应用（按工作流入口节点自动生成，mobile/web_chat 两类） |
+| WorkflowAttachmentAsset | `:290` | 工作流附件资产（关联 FileKnowledge，下载令牌、execution/attachment 去重约束） |
+| WorkFlowTaskResult | `:278` | 工作流执行主记录（执行实例、状态、输入/输出） |
+| WorkFlowTaskNodeResult | `:325` | 工作流节点执行明细（节点输入/输出、状态、耗时） |
+| WorkFlowConversationHistory | `:361` | ChatFlow 对话历史（用户输入 + 系统输出两条/次，入口类型分流，定时触发不记录） |
+
+**知识库子域（`models/wiki_mgmt.py`，已替换历史 `knowledge_mgmt` RAG 模型）**
+
+| 模型 | 行 | 说明 |
+|------|----|------|
+| WikiKnowledgeBase | `:11` | Wiki 知识库本体：用途/结构说明、生成规则、目录启用状态 |
+| WikiStructureRevision | `:57` | 不可变目录结构快照 |
+| WikiDirectory / Material / KnowledgePage | `:80` / `:146` / `:213` | 目录、材料（file/web/text）与页面；智能体经 `LLMSkill.wiki_knowledge_bases` 绑定 |
+
+> 证据来源：server/apps/opspilot/models/wiki_mgmt.py:11-67　|　同步基线：61bace9f　|　【已实现】
+
+**记忆子域（`models/memory_mgmt.py`）**
+
+| 模型 | 行 | 说明 |
+|------|----|------|
+| MemorySpace | `:9` | 记忆空间（当前仅落地本地存储引擎，按个人/团队范围隔离，配置敏感字段加密） |
+| Memory | `:104` | 记忆条目（按用户/组织隔离，标题 + 内容） |
+| MemoryWriteCache | `:137` | 记忆批量写缓存（workflow/node/target 去重，PENDING/PROCESSING 状态机） |
+
+**其他（`models/user_pin.py`）**
+
+| 模型 | 行 | 说明 |
+|------|----|------|
+| UserPin | `:4` | 用户置顶记录（按用户隔离，置顶 Bot 或 LLMSkill） |
+
+**存储**：PostgreSQL + **pgvector**（向量）；MinIO（知识文件/Rasa 模型/工作流附件，桶 `munchkin-private`）；Elasticsearch（metis 工具检索）。
+
+## 3. 接口【已实现/已存在】
+`model_provider_mgmt/*`、`bot_mgmt/*`、`channel_mgmt/*`、`wiki_mgmt/*`、`memory_mgmt/*`。知识库 HTTP 前缀为 `wiki_mgmt/`，旧 `knowledge_mgmt/*` 已下线。
+
+企业微信智能机器人入口【已实现/已存在】：`execute_chat_flow_enterprise_wechat_aibot/<bot_id>/` 支持 GET 回调校验与 POST 消息接收，消息清洗后转为 ChatFlow 输入，通过异步任务发送 Markdown 回复；非文本消息直接返回固定提示（`urls.py:139-143`、`utils/enterprise_wechat_aibot_chat_flow_utils.py:61-211`）。
+
+对应 PRD：[[legacy-prd-opspilot-工作台.md#3. 关键能力]]；对应功能清单：[[legacy-fuctionlist-10-opspilot-功能清单.md#8. 对外接口与触发]]
+> 证据来源：server/apps/opspilot/urls.py:139-143，server/apps/opspilot/utils/enterprise_wechat_aibot_chat_flow_utils.py:61-211　|　同步基线：83091efe　|　【已实现】
+
+技能包接口 `skill_packages` 支持 ZIP 导入并关联 `LLMSkill.skill_packages`，运行时按命中策略注入提示（证据：`urls.py:41`、`viewsets/llm_view.py:420,628`、`services/skill_package/importer.py:28`、`services/skill_package/runtime.py:56`）。
+
+## 4. AI / RAG 集成【已实现/已存在】
+- 仓库内提示词模板以最小权限沙箱加载：默认清空模板全局对象、过滤器和测试能力，仅按模板实际需要显式白名单恢复能力；当前 RAG 模板仅恢复字符串转换过滤器，并保留 Jinja 沙箱的属性访问限制。该契约防止模板通过默认辅助对象取得非业务数据，同时保持既有检索提示词可编译、可渲染。
+
+> 证据来源：server/apps/core/utils/safe_template.py:266-297，server/apps/opspilot/metis/utils/template_loader.py:93-100，server/apps/opspilot/tests/test_template_loader_security_service.py:12-46　|　同步基线：d2769559　|　【已实现】
+
+- LangChain（`langchain_core.messages`）；`metis/llm/` 引擎（分块：fixed/semantic/recursive；embedding manager）。
+- LLM 客户端超时策略【已实现/已存在】：所有模型调用默认读取 `LLM_INVOKE_TIMEOUT`，缺省 300 秒；调用方可显式覆盖超时值，用于区分普通对话、通知节点优化和记忆写入等长耗时场景（`metis/llm/common/llm_client_factory.py:24-59`）。
+- 内置工具（`metis/llm/tools/tools_loader.py:31-52` 的 `ToolsLoader.TOOL_MODULES`，约 19 类）：attachment_file、agent_browser、browser_use、current_time（date）、duckduckgo（search）、elasticsearch、fetch、github、jenkins、kubernetes、kubernetes_data_collection、mssql、mysql、oracle、postgres、python、redis、shell、ssh；CMDB 工具当前仍未由 `ToolsLoader` 启用（`:35` 注释）。
+- monitor 工具不在 `TOOL_MODULES`，由 `services/builtin_tools.py:4,58` 单独装配（与 redis/mysql/oracle/mssql/attachment_file 一并作为内置工具暴露）。
+
+### CMDB 工具实例响应契约【已实现】
+
+CMDB 工具以 `inst_uuid` 作为实例的外部身份。`cmdb_search_instances`、`cmdb_get_instance`、`cmdb_create_instance`、`cmdb_update_instance` 与 `cmdb_batch_update_instances` 的实例响应统一经序列化边界返回：剥离顶层 `_id`、`_labels`、`permission`，并对创建/更新时间等保留字段使用公开名称。`cmdb_create_instance` 本轮已从原始结果改为经过该统一序列化边界的结果。
+
+- `cmdb_topo_search` 不在上述实例响应契约范围内；其拓扑结果是否需要递归剥离同类内部字段，当前未见统一实现，需确认。【待确认】
+- 创建结果的序列化变更可能影响绕过 `ToolsLoader` 的遗留直接调用方；是否存在此类消费者，当前未见明确调用证据，需确认。【待确认】
+
+> 证据来源：server/apps/opspilot/metis/llm/tools/tools_loader.py:30-53，server/apps/opspilot/metis/llm/tools/cmdb/instances.py:24-26,30-66,70-96,98-133,137-160,166-194,249-280，server/apps/opspilot/tests/test_tools_cmdb_service.py:59-75,121-157,187-201　|　同步基线：b98b782a7　|　【已实现 / 待确认】
+- AG-UI 兼容 LangGraph Overwrite(messages) 包装【已实现/已存在】：`BasicGraph` 新增静态方法 `_unwrap_overwrite_messages`（`metis/llm/chain/graph.py:778-783`），在 `_handle_chain_end_messages`（`:807`）与 `_handle_chain_end_messages_dedup`（`:909`）解析 `output.messages` 后统一调用解包：当消息被 LangGraph 包装为 `Overwrite(messages)` 时从其 `value` 取实际消息列表，避免 `Overwrite` 类型阻断 `ToolMessage`/`AIMessage` 发射；缺值或非 `Overwrite` 类型时透传原值。配套静态测试 `test_agui_stream.py:596-652` 覆盖 Overwrite 包裹时 AG-UI 能正确解包并发出 `TOOL_CALL_RESULT` 与 `TEXT_MESSAGE_CONTENT`。
+- 知识问答：技能绑定 Wiki 知识库后由对话链路注入 Wiki 上下文；`chat_service.py` 将 `enable_naive_rag` 固定为 `False`，不再提供产品面的朴素/问答对/图谱 RAG 开关。
+- **外部依赖更正**（基于代码核对）：
+  - Kubernetes：**已使用**，但经运行时 `kubeconfig_data` 参数加载（`metis/llm/tools/kubernetes/{utils,connection}.py`），**非** `KUBE_CONFIG_FILE` 环境变量。
+  - `METIS_SERVER_URL`、`MUNCHKIN_BASE_URL`、`CONVERSATION_MQ_*`：仅在 `config.py` 中定义，**代码中未被引用**（占位/预留）。【待确认是否为历史遗留】
+
+## 5. 任务与 NATS【已实现/已存在】
+- 定时（`config.py`）：`cleanup-expired-workflow-attachments`（每日 3 点）、`flush-pending-memory-write-cache`（每日 0 点）。
+- NATS（`nats_api.py` 中 `@nats_client.register` 注册，共 5 个）：`get_opspilot_module_list`（`:65`）、`get_opspilot_module_data`（`:85`）、`get_guest_provider`（`:118`）、`consume_bot_event`（`:162`）、`trigger_workflow_by_nats`（`:212`）。
+- 企业微信智能机器人异步任务【已实现/已存在】：`process_enterprise_wechat_aibot_message` 负责消费短连接消息并执行业务工作流，`process_enterprise_wechat_aibot_reply` 负责异步发送 Markdown 回复并在成功后标记消息完成（`tasks.py:1257-1299`）。
+- 工作流敏感配置保护【已实现/已存在】：保存 `BotWorkFlow` 时会对企业微信智能机器人节点的 webhook / websocket 凭据做加密；API 回显支持掩码保留与运行时解密（`models/bot_mgmt.py:270-275`、`utils/workflow_sensitive_config.py:8-118`）。
+- 通知节点邮件正文优化【已实现/已存在】：通知节点在 `notificationType=email` 且配置 `llmOptimizeModel` 时，会用选定 LLM 将渲染后的正文整理为 HTML 片段，再连同工作流附件一起走既有通知渠道发送；优化失败时记录告警并回退原始正文（`utils/chat_flow_utils/nodes/action/action.py:23-59,255-299`）。
+- 记忆写入超时独立配置【已实现/已存在】：记忆写入相关的 LLM 客户端构建统一单独读取 `MEMORY_WRITE_LLM_TIMEOUT`，默认 600 秒，不再复用通用调用超时；该配置同时服务记忆规范化与缓存批量落库场景（`tasks.py:81-106`）。
+
+对应 PRD：[[legacy-prd-opspilot-工作台.md#4. 关键规则]]；对应功能清单：[[legacy-fuctionlist-10-opspilot-功能清单.md#6. 工作台（Studio）与 ChatFlow]]
+> 证据来源：server/apps/opspilot/tasks.py:81-106,1257-1299，server/apps/opspilot/models/bot_mgmt.py:270-275，server/apps/opspilot/utils/workflow_sensitive_config.py:8-118，server/apps/opspilot/utils/chat_flow_utils/nodes/action/action.py:23-59,255-299　|　同步基线：a9d981aeb　|　【已实现】
+
+## 6. 风险 / 待确认
+- `METIS_SERVER_URL`/`MUNCHKIN_BASE_URL`/`CONVERSATION_MQ_*` 在 config.py 定义但未被代码引用——是历史遗留还是外部联动入口【待确认】。
+- LLM 调用的成本/限流/审计【待确认】。
+
+## 2026-07-01 Code-ARD 校准
+- `[opspilot#20260701-020]` 补录技能包模型、导入接口、ZIP 导入和运行时提示注入链路。
+- `[opspilot#20260701-021]` 补录初始化与工具同步管理命令。
+
+## 2026-07-09 Code-ARD 校准
+- `[opspilot#20260709-001]` AG-UI 兼容 LangGraph `Overwrite(messages)` 包装：`BasicGraph._unwrap_overwrite_messages` 在 `_handle_chain_end_messages` 与 `_handle_chain_end_messages_dedup` 解析 `output.messages` 后统一解包，避免 `Overwrite` 阻断 `ToolMessage`/`AIMessage` 发射。
+- `[opspilot#20260709-002]` 知识库资料 `update` 预览补充受影响原因文案：`preview_material_update` 在拼装受影响页面载荷时显式传 `update_reason`（`services/wiki/update_service.py:107-114`）。
+
+## 7. 证据来源
+`server/apps/opspilot/{urls.py,models/*,services/*,metis/llm/*,tasks.py,config.py,nats_api.py,utils/enterprise_wechat_aibot_chat_flow_utils.py,utils/workflow_sensitive_config.py}`；模型表见 `models/{model_provider_mgmt.py,bot_mgmt.py,wiki_mgmt.py,memory_mgmt.py,user_pin.py}`；内置工具见 `metis/llm/tools/tools_loader.py:31-52`、`services/builtin_tools.py`；protocol_type 持久化见 `migrations/0049_modelvendor_protocol_type.py`；超时策略见 `metis/llm/common/llm_client_factory.py:24-59`。

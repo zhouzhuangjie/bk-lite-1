@@ -5,7 +5,11 @@ import { ThresholdField } from '@/app/monitor/types';
 import { StrategyFields } from '@/app/monitor/types/event';
 import { useCommon } from '@/app/monitor/context/common';
 import { SCHEDULE_UNIT_MAP } from '@/app/monitor/constants/event';
-import { isStringArray } from '@/app/monitor/utils/common';
+import {
+  getMetricThresholdEnumState,
+  getThresholdUnitOptions,
+  shouldShowThresholdUnitSelector
+} from './strategyDetailUtils';
 import ThresholdList from './thresholdList';
 
 const { Option } = Select;
@@ -18,16 +22,11 @@ const NO_DATA_ALERT_OPTIONS = [
   { value: 'warning', labelKey: 'triggerWarningAlert' }
 ];
 
-interface EnumOption {
-  id: number;
-  name: string;
-  color?: string;
-}
-
 interface AlertConditionsFormProps {
   enableAlerts: string[];
   threshold: ThresholdField[];
   calculationUnit: string | null;
+  thresholdUnit: string | null;
   noDataAlert: number | null;
   nodataUnit: string;
   noDataRecovery: number | null;
@@ -35,9 +34,10 @@ interface AlertConditionsFormProps {
   noDataAlertLevel: string;
   noDataAlertName: string;
   metricUnit: string | null;
+  isFormulaMode: boolean;
   onEnableAlertsChange: (val: string[]) => void;
   onThresholdChange: (value: ThresholdField[]) => void;
-  onCalculationUnitChange: (val: string) => void;
+  onThresholdUnitChange: (val: string) => void;
   onNodataUnitChange: (val: string) => void;
   onNoDataAlertChange: (e: number | null) => void;
   onNodataRecoveryUnitChange: (val: string) => void;
@@ -50,13 +50,15 @@ interface AlertConditionsFormProps {
 const AlertConditionsForm: React.FC<AlertConditionsFormProps> = ({
   threshold,
   calculationUnit,
+  thresholdUnit,
   noDataAlert,
   nodataUnit,
   noDataAlertLevel,
   noDataAlertName,
   metricUnit,
+  isFormulaMode,
   onThresholdChange,
-  onCalculationUnitChange,
+  onThresholdUnitChange,
   onNoDataAlertChange,
   onNoDataAlertLevelChange,
   onNoDataAlertNameChange,
@@ -66,46 +68,39 @@ const AlertConditionsForm: React.FC<AlertConditionsFormProps> = ({
   const commonContext = useCommon();
   const unitList = commonContext?.unitList || [];
 
-  // 判断是否为枚举类型指标
-  const isEnumMetric = useMemo(() => {
-    return metricUnit ? isStringArray(metricUnit) : false;
-  }, [metricUnit]);
+  const { isEnumMetric, enumOptions } = useMemo(
+    () => getMetricThresholdEnumState({ isFormulaMode, metricUnit }),
+    [isFormulaMode, metricUnit]
+  );
 
-  // 枚举类型的选项列表
-  const enumOptions = useMemo((): EnumOption[] => {
-    if (!isEnumMetric || !metricUnit) return [];
-    try {
-      return JSON.parse(metricUnit);
-    } catch {
-      return [];
-    }
-  }, [isEnumMetric, metricUnit]);
+  // 阈值单位只由计算结果量纲约束，与当前选择的阈值展示单位解耦。
+  const thresholdFilterBase = calculationUnit;
 
-  // 根据指标单位过滤单位列表，只显示相同 system 的单位
-  const filteredUnitOptions = useMemo(() => {
-    // 枚举类型不需要单位选项
-    if (isEnumMetric) return [];
-    // 排除 none 和 short 单位
-    const baseFilteredList = unitList.filter(
-      (item) => !['none', 'short'].includes(item.unit_id)
-    );
-    const metricUnitItem = unitList.find((item) => item.unit_id === metricUnit);
-    if (!metricUnitItem || !metricUnit) {
-      return [];
-    }
-    const targetSystem = metricUnitItem.system;
-    // 过滤出相同 system 的单位
-    return baseFilteredList.filter((item) => item.system === targetSystem);
-  }, [unitList, metricUnit, isEnumMetric]);
+  const filteredUnitOptions = useMemo(
+    () =>
+      getThresholdUnitOptions({
+        unitList,
+        metricUnit: thresholdFilterBase,
+        isEnumMetric
+      }),
+    [unitList, thresholdFilterBase, isEnumMetric]
+  );
 
-  // 验证阈值
+  const showUnitSelector = shouldShowThresholdUnitSelector({
+    isFormulaMode,
+    isEnumMetric,
+    calculationUnit: thresholdFilterBase,
+    unitList
+  });
+
+  // 验证阈值：仅在展示单位选择器时要求 thresholdUnit
   const validateThreshold = async () => {
     if (
       threshold.length &&
       (threshold.some((item) => {
         return !item.method;
       }) ||
-        (!isEnumMetric && !calculationUnit))
+        (showUnitSelector && !thresholdUnit))
     ) {
       return Promise.reject(new Error(t('monitor.events.thresholdValidate')));
     }
@@ -139,11 +134,12 @@ const AlertConditionsForm: React.FC<AlertConditionsFormProps> = ({
                 <ThresholdList
                   data={threshold}
                   onChange={onThresholdChange}
-                  calculationUnit={calculationUnit}
-                  onUnitChange={onCalculationUnitChange}
+                  thresholdUnit={thresholdUnit}
+                  onThresholdUnitChange={onThresholdUnitChange}
                   unitOptions={filteredUnitOptions}
                   isEnumMetric={isEnumMetric}
                   enumOptions={enumOptions}
+                  showUnitSelector={showUnitSelector}
                 />
               </Form.Item>
 
@@ -261,7 +257,6 @@ const AlertConditionsForm: React.FC<AlertConditionsFormProps> = ({
                     value={noDataAlertName}
                     placeholder={t('monitor.events.noDataAlertName')}
                     onChange={(e) => onNoDataAlertNameChange(e.target.value)}
-                    disabled
                   />
                 </Form.Item>
               )}

@@ -1,13 +1,15 @@
 """告警源视图集覆盖测试。
 
-对照 spec/prd/告警中心·集成：告警源增删改查、对接指引、组织密钥管理、事件统计。
+对照当前集成页面契约：告警源只读查询、对接指引、组织密钥管理、事件统计。
 """
 
 import json
+import subprocess
+from pathlib import Path
 
 import pytest
 from rest_framework import status
-from rest_framework.test import APIRequestFactory, force_authenticate
+from rest_framework.test import APIClient, APIRequestFactory, force_authenticate
 
 from apps.alerts.models.alert_source import AlertSource
 from apps.alerts.models.models import Level
@@ -17,6 +19,13 @@ from apps.alerts.views.alert_source import AlertSourceModelViewSet
 @pytest.fixture
 def superuser(authenticated_user):
     authenticated_user.is_superuser = True
+    return authenticated_user
+
+
+@pytest.fixture
+def permission_user(authenticated_user):
+    authenticated_user.is_superuser = False
+    authenticated_user.permission = {}
     return authenticated_user
 
 
@@ -47,7 +56,7 @@ def _make_source(source_id="s1", source_type="restful", **over):
 
 
 # --------------------------------------------------------------------------
-# CRUD
+# read-only interface and permissions
 # --------------------------------------------------------------------------
 
 
@@ -86,6 +95,135 @@ def test_alert_source_integration_guide(superuser, event_level):
     assert payload["data"]["source_id"] == "s1"
 
 
+@pytest.mark.django_db
+def test_integration_view_only_allows_overview_queries(permission_user, event_level):
+    src = _make_source("s1", source_type="zabbix")
+    permission_user.permission = {"alarm": {"Integration-View"}}
+
+    list_response = AlertSourceModelViewSet.as_view({"get": "list"})(_request("get", "/alert_source/", permission_user))
+    stats_response = AlertSourceModelViewSet.as_view({"get": "daily_event_stats"})(
+        _request("get", "/alert_source/daily_event_stats/", permission_user)
+    )
+    retrieve_response = AlertSourceModelViewSet.as_view({"get": "retrieve"})(
+        _request("get", f"/alert_source/{src.id}/", permission_user),
+        pk=str(src.id),
+    )
+    guide_response = AlertSourceModelViewSet.as_view({"get": "integration_guide"})(
+        _request("get", f"/alert_source/{src.id}/integration-guide/", permission_user),
+        pk=str(src.id),
+    )
+
+    assert list_response.status_code == status.HTTP_200_OK
+    assert stats_response.status_code == status.HTTP_200_OK
+    assert retrieve_response.status_code == status.HTTP_403_FORBIDDEN
+    assert guide_response.status_code == status.HTTP_403_FORBIDDEN
+
+
+@pytest.mark.django_db
+def test_integration_detail_allows_detail_and_guide(permission_user, event_level):
+    src = _make_source("s1", source_type="zabbix")
+    permission_user.permission = {"alarm": {"Integration-Detail"}}
+
+    retrieve_response = AlertSourceModelViewSet.as_view({"get": "retrieve"})(
+        _request("get", f"/alert_source/{src.id}/", permission_user),
+        pk=str(src.id),
+    )
+    guide_response = AlertSourceModelViewSet.as_view({"get": "integration_guide"})(
+        _request("get", f"/alert_source/{src.id}/integration-guide/", permission_user),
+        pk=str(src.id),
+    )
+
+    assert retrieve_response.status_code == status.HTTP_200_OK
+    assert guide_response.status_code == status.HTTP_200_OK
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("method", "action", "path", "kwargs"),
+    [
+        ("get", "list", "/alert_source/", {}),
+        ("get", "retrieve", "/alert_source/{id}/", {"pk": "{id}"}),
+        ("get", "integration_guide", "/alert_source/{id}/integration-guide/", {"pk": "{id}"}),
+        ("get", "daily_event_stats", "/alert_source/daily_event_stats/", {}),
+    ],
+)
+def test_alert_source_queries_reject_user_without_integration_permission(
+    permission_user,
+    event_level,
+    method,
+    action,
+    path,
+    kwargs,
+):
+    src = _make_source("s1", source_type="zabbix")
+    path = path.format(id=src.id)
+    kwargs = {key: value.format(id=src.id) for key, value in kwargs.items()}
+    response = AlertSourceModelViewSet.as_view({method: action})(
+        _request(method, path, permission_user),
+        **kwargs,
+    )
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("method", "action", "path", "data", "kwargs"),
+    [
+        ("get", "k8s_meta", "/alert_source/k8s_meta/", None, {}),
+        ("post", "snmp_trap_nodes", "/alert_source/snmp_trap_nodes/", {"page": 1}, {}),
+        ("post", "k8s_render", "/alert_source/k8s_render/", {}, {}),
+        ("post", "k8s_install_command", "/alert_source/k8s_install_command/", {}, {}),
+        (
+            "post",
+            "k8s_download",
+            "/alert_source/k8s_download/deploy_yaml/",
+            {},
+            {"file_key": "deploy_yaml"},
+        ),
+    ],
+)
+def test_integration_view_cannot_call_detail_guide_actions(
+    permission_user,
+    method,
+    action,
+    path,
+    data,
+    kwargs,
+):
+    permission_user.permission = {"alarm": {"Integration-View"}}
+    response = AlertSourceModelViewSet.as_view({method: action})(
+        _request(method, path, permission_user, data=data),
+        **kwargs,
+    )
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("method", "path", "data"),
+    [
+        ("post", "/alert_source/", {"name": "new", "source_id": "new", "source_type": "restful"}),
+        ("put", "/alert_source/{id}/", {"name": "updated"}),
+        ("patch", "/alert_source/{id}/", {"name": "patched"}),
+        ("delete", "/alert_source/{id}/", None),
+    ],
+)
+def test_alert_source_default_write_methods_are_not_exposed(superuser, method, path, data):
+    src = _make_source("s1")
+    path = f"/api/v1/alerts/api{path.format(id=src.id)}"
+    client = APIClient()
+    client.force_authenticate(user=superuser)
+    request_method = getattr(client, method)
+    response = request_method(path) if data is None else request_method(path, data=data, format="json")
+
+    assert response.status_code == status.HTTP_405_METHOD_NOT_ALLOWED
+    assert not AlertSource.objects.filter(source_id="new").exists()
+    src.refresh_from_db()
+    assert src.name == "源1"
+
+
 # --------------------------------------------------------------------------
 # team_secrets actions
 # --------------------------------------------------------------------------
@@ -113,6 +251,51 @@ def test_team_secret_add_list_remove(superuser):
     resp_rm = AlertSourceModelViewSet.as_view({"post": "remove_team_secret"})(req_rm, pk=str(src.id))
     _render(resp_rm)
     assert resp_rm.status_code == status.HTTP_200_OK
+    src.refresh_from_db()
+    assert src.team_secrets == {}
+
+
+@pytest.mark.django_db
+def test_integration_detail_allows_team_secret_operations(permission_user):
+    src = _make_source("s1")
+    permission_user.permission = {"alarm": {"Integration-Detail"}}
+
+    add_response = AlertSourceModelViewSet.as_view({"post": "add_team_secret"})(
+        _request("post", f"/alert_source/{src.id}/team_secrets/add/", permission_user, data={"team_id": 5}),
+        pk=str(src.id),
+    )
+    list_response = AlertSourceModelViewSet.as_view({"get": "list_team_secrets"})(
+        _request("get", f"/alert_source/{src.id}/team_secrets/", permission_user),
+        pk=str(src.id),
+    )
+    regenerate_response = AlertSourceModelViewSet.as_view({"post": "regenerate_team_secret"})(
+        _request("post", f"/alert_source/{src.id}/team_secrets/regenerate/", permission_user, data={"team_id": 5}),
+        pk=str(src.id),
+    )
+    remove_response = AlertSourceModelViewSet.as_view({"post": "remove_team_secret"})(
+        _request("post", f"/alert_source/{src.id}/team_secrets/remove/", permission_user, data={"team_id": 5}),
+        pk=str(src.id),
+    )
+
+    assert add_response.status_code == status.HTTP_200_OK
+    assert list_response.status_code == status.HTTP_200_OK
+    assert regenerate_response.status_code == status.HTTP_200_OK
+    assert remove_response.status_code == status.HTTP_200_OK
+    src.refresh_from_db()
+    assert src.team_secrets == {}
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("permission", ["Integration-View", "Integration-Edit"])
+def test_team_secret_operations_reject_non_detail_permissions(permission_user, permission):
+    src = _make_source("s1")
+    permission_user.permission = {"alarm": {permission}}
+    response = AlertSourceModelViewSet.as_view({"post": "add_team_secret"})(
+        _request("post", f"/alert_source/{src.id}/team_secrets/add/", permission_user, data={"team_id": 5}),
+        pk=str(src.id),
+    )
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
     src.refresh_from_db()
     assert src.team_secrets == {}
 
@@ -209,6 +392,94 @@ def test_k8s_deploy_yaml_embeds_secret_hash_for_rolling_restart():
     assert yaml_a == yaml_a2
 
 
+@pytest.fixture
+def k8s_image_export_paths(monkeypatch, tmp_path):
+    from apps.alerts.views import alert_source as alert_source_module
+
+    exported_paths = []
+
+    def fake_docker_save(command, **kwargs):
+        output_path = Path(command[3])
+        output_path.write_bytes(b"image-tar")
+        exported_paths.append(output_path)
+
+    monkeypatch.setattr(alert_source_module.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(alert_source_module.subprocess, "run", fake_docker_save)
+    return exported_paths
+
+
+@pytest.fixture
+def k8s_image_response(monkeypatch):
+    from django.http import response as django_response
+
+    from apps.core.utils.web_utils import WebUtils
+
+    monkeypatch.setattr(django_response.signals.request_finished, "send", lambda **kwargs: [])
+    return lambda: WebUtils.response_file(
+        AlertSourceModelViewSet._build_k8s_image_tar_file(),
+        "kubernetes-event-exporter.tar",
+    )
+
+
+@pytest.mark.unit
+def test_k8s_image_tar_is_removed_after_response_stream_finishes(k8s_image_export_paths, k8s_image_response):
+    response = k8s_image_response()
+    exported_path = k8s_image_export_paths[0]
+
+    assert b"".join(response.streaming_content) == b"image-tar"
+    assert exported_path.exists()
+
+    response.close()
+
+    assert not exported_path.exists()
+
+
+@pytest.mark.unit
+def test_k8s_image_tar_is_removed_when_response_closes_early(k8s_image_export_paths, k8s_image_response):
+    response = k8s_image_response()
+    exported_path = k8s_image_export_paths[0]
+
+    response.close()
+
+    assert not exported_path.exists()
+
+
+@pytest.mark.unit
+def test_k8s_image_tar_is_removed_when_docker_save_fails(monkeypatch, k8s_image_export_paths):
+    from apps.alerts.views import alert_source as alert_source_module
+
+    def failing_docker_save(command, **kwargs):
+        output_path = Path(command[3])
+        output_path.write_bytes(b"partial-image-tar")
+        k8s_image_export_paths.append(output_path)
+        raise subprocess.CalledProcessError(1, command, stderr="docker save failed")
+
+    monkeypatch.setattr(alert_source_module.subprocess, "run", failing_docker_save)
+
+    with pytest.raises(RuntimeError, match="docker save failed"):
+        AlertSourceModelViewSet._build_k8s_image_tar_file()
+
+    assert not k8s_image_export_paths[0].exists()
+
+
+@pytest.mark.unit
+def test_k8s_image_tar_is_removed_when_export_is_interrupted(monkeypatch, k8s_image_export_paths):
+    from apps.alerts.views import alert_source as alert_source_module
+
+    def interrupted_docker_save(command, **kwargs):
+        output_path = Path(command[3])
+        output_path.write_bytes(b"partial-image-tar")
+        k8s_image_export_paths.append(output_path)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(alert_source_module.subprocess, "run", interrupted_docker_save)
+
+    with pytest.raises(KeyboardInterrupt):
+        AlertSourceModelViewSet._build_k8s_image_tar_file()
+
+    assert not k8s_image_export_paths[0].exists()
+
+
 @pytest.mark.django_db
 def test_team_secret_add_rejected_for_snmp_trap(superuser):
     """SNMP Trap 源不允许配置组织密钥。"""
@@ -283,40 +554,7 @@ def test_team_secret_remove_missing(superuser):
 
 
 @pytest.mark.django_db
-def test_alert_source_create(superuser):
-    data = {"name": "新源", "source_id": "new-src", "source_type": "restful"}
-    request = _request("post", "/alert_source/", superuser, data=data)
-    response = AlertSourceModelViewSet.as_view({"post": "create"})(request)
-    _render(response)
-    assert response.status_code == status.HTTP_201_CREATED
-    src = AlertSource.objects.get(source_id="new-src")
-    # 序列化器 validate 会基于 source_type 构建默认 config
-    assert isinstance(src.config, dict)
-
-
-@pytest.mark.django_db
-def test_alert_source_update(superuser):
-    src = _make_source("s1")
-    data = {"name": "改名", "source_id": "s1", "source_type": "restful"}
-    request = _request("put", f"/alert_source/{src.id}/", superuser, data=data)
-    response = AlertSourceModelViewSet.as_view({"put": "update"})(request, pk=str(src.id))
-    _render(response)
-    assert response.status_code == status.HTTP_200_OK
-    src.refresh_from_db()
-    assert src.name == "改名"
-
-
-@pytest.mark.django_db
-def test_alert_source_destroy(superuser):
-    src = _make_source("s1")
-    request = _request("delete", f"/alert_source/{src.id}/", superuser)
-    response = AlertSourceModelViewSet.as_view({"delete": "destroy"})(request, pk=str(src.id))
-    _render(response)
-    assert response.status_code == status.HTTP_200_OK
-
-
-@pytest.mark.django_db
-def test_snmp_trap_nodes(superuser, monkeypatch):
+def test_snmp_trap_nodes(permission_user, monkeypatch):
     from apps.alerts.views import alert_source as as_mod
 
     class FakeNodeMgmt:
@@ -324,7 +562,8 @@ def test_snmp_trap_nodes(superuser, monkeypatch):
             return {"count": 1, "nodes": [{"id": "n1"}]}
 
     monkeypatch.setattr(as_mod, "NodeMgmt", FakeNodeMgmt)
-    request = _request("post", "/alert_source/snmp_trap_nodes/", superuser, data={"page": 1})
+    permission_user.permission = {"alarm": {"Integration-Detail"}}
+    request = _request("post", "/alert_source/snmp_trap_nodes/", permission_user, data={"page": 1})
     request.COOKIES["current_team"] = "1"
     response = AlertSourceModelViewSet.as_view({"post": "snmp_trap_nodes"})(request)
     payload = _render(response)
@@ -333,14 +572,17 @@ def test_snmp_trap_nodes(superuser, monkeypatch):
 
 
 @pytest.mark.django_db
-def test_k8s_install_command(superuser):
+def test_k8s_install_command(permission_user):
     # K8s 接入强制走组织密钥路径：source 需配 team_secrets，请求需带合法 team_secret。
     _make_source(
-        "k8s", source_type="webhook", config={"url": "/recv"},
+        "k8s",
+        source_type="webhook",
+        config={"url": "/recv"},
         team_secrets={"1": "team-sec-1"},
     )
+    permission_user.permission = {"alarm": {"Integration-Detail"}}
     data = {"server_url": "https://host:8000", "cluster_name": "prod", "team_secret": "team-sec-1"}
-    request = _request("post", "/alert_source/k8s_install_command/", superuser, data=data)
+    request = _request("post", "/alert_source/k8s_install_command/", permission_user, data=data)
     response = AlertSourceModelViewSet.as_view({"post": "k8s_install_command"})(request)
     payload = _render(response)
     assert response.status_code == status.HTTP_200_OK
@@ -349,32 +591,37 @@ def test_k8s_install_command(superuser):
 
 
 @pytest.mark.django_db
-def test_k8s_install_command_requires_team_secret(superuser):
+def test_k8s_install_command_requires_team_secret(permission_user):
     """K8s 接入强制要求 team_secret(组织密钥),缺失应被拒。"""
     from apps.core.exceptions.base_app_exception import BaseAppException
 
     _make_source(
-        "k8s", source_type="webhook", config={"url": "/recv"},
+        "k8s",
+        source_type="webhook",
+        config={"url": "/recv"},
         team_secrets={"1": "team-sec-1"},
     )
+    permission_user.permission = {"alarm": {"Integration-Detail"}}
     data = {"server_url": "https://host:8000", "cluster_name": "prod"}  # 故意不传 team_secret
-    request = _request("post", "/alert_source/k8s_install_command/", superuser, data=data)
+    request = _request("post", "/alert_source/k8s_install_command/", permission_user, data=data)
     with pytest.raises(BaseAppException):
         AlertSourceModelViewSet.as_view({"post": "k8s_install_command"})(request)
 
 
 @pytest.mark.django_db
-def test_k8s_meta_not_found(superuser):
-    request = _request("get", "/alert_source/k8s_meta/", superuser)
+def test_k8s_meta_not_found(permission_user):
+    permission_user.permission = {"alarm": {"Integration-Detail"}}
+    request = _request("get", "/alert_source/k8s_meta/", permission_user)
     response = AlertSourceModelViewSet.as_view({"get": "k8s_meta"})(request)
     _render(response)
     assert response.status_code == status.HTTP_404_NOT_FOUND
 
 
 @pytest.mark.django_db
-def test_k8s_meta_found(superuser):
+def test_k8s_meta_found(permission_user):
     _make_source("k8s", source_type="webhook", config={"url": "/recv", "method": "POST"})
-    request = _request("get", "/alert_source/k8s_meta/", superuser)
+    permission_user.permission = {"alarm": {"Integration-Detail"}}
+    request = _request("get", "/alert_source/k8s_meta/", permission_user)
     response = AlertSourceModelViewSet.as_view({"get": "k8s_meta"})(request)
     payload = _render(response)
     assert response.status_code == status.HTTP_200_OK
@@ -394,3 +641,41 @@ def test_daily_event_stats(superuser):
     payload = _render(response)
     assert response.status_code == status.HTTP_200_OK
     assert "today" in json.dumps(payload, ensure_ascii=False) or payload["data"] is not None
+
+
+@pytest.mark.django_db
+def test_daily_event_stats_user_timezone_day_boundary(superuser):
+    """daily_event_stats 的"今日"应按用户时区日界切分，而非 UTC 日界。
+
+    场景：UTC 2026-07-24 16:30（Asia/Shanghai 2026-07-25 00:30）收到事件。
+    UTC+8 用户在本地 7-25 00:35 查询时，该事件应计入"今日"（7-25），
+    而非按 UTC 日界计入"昨日"（7-24）。
+    """
+    import zoneinfo
+    from unittest.mock import patch
+
+    from django.utils import timezone as dj_timezone
+
+    from apps.alerts.models.models import Event
+
+    src = _make_source("s-tz")
+    # UTC 7-24 16:30 = Asia/Shanghai 7-25 00:30（用户时区的"今天"）
+    utc_dt = dj_timezone.datetime(2026, 7, 24, 16, 30, 0, tzinfo=dj_timezone.utc)
+    event = Event.objects.create(source=src, raw_data={}, title="t", level="0", start_time=utc_dt, event_id="E-tz")
+    Event.objects.filter(pk=event.pk).update(received_at=utc_dt)
+
+    shanghai = zoneinfo.ZoneInfo("Asia/Shanghai")
+    dj_timezone.activate(shanghai)
+    try:
+        # 模拟用户在 Asia/Shanghai 7-25 00:35 查询（即 UTC 7-24 16:35）
+        fake_now_utc = dj_timezone.datetime(2026, 7, 24, 16, 35, 0, tzinfo=dj_timezone.utc)
+        with patch("apps.alerts.views.alert_source.timezone.now", return_value=fake_now_utc):
+            request = _request("get", "/alert_source/daily_event_stats/", superuser)
+            response = AlertSourceModelViewSet.as_view({"get": "daily_event_stats"})(request)
+            payload = _render(response)
+    finally:
+        dj_timezone.deactivate()
+
+    assert response.status_code == status.HTTP_200_OK
+    # 按用户时区日界，UTC 7-24 16:30 属于 Asia/Shanghai 7-25（今日），today_count >= 1
+    assert payload["data"]["today_count"] >= 1, f"按用户时区日界，事件应计入今日，实际 today_count={payload['data']['today_count']}"

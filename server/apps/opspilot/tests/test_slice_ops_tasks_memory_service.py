@@ -16,8 +16,10 @@
 cleanup_expired_workflow_attachments（存储清理）。DB 用真实 Postgres。
 """
 
-import pydantic.root_model  # noqa  预热
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
+import pydantic.root_model  # noqa  预热
 import pytest
 
 from apps.opspilot import tasks
@@ -63,7 +65,7 @@ def _make_space(**kw):
 class TestProcessMemoryWriteNoModel:
     def test_无模型创建个人记忆(self):
         sp = _make_space()
-        tasks.process_memory_write(
+        result = tasks.process_memory_write(
             memory_space_id=sp.id,
             title="T",
             content="第一条",
@@ -71,17 +73,14 @@ class TestProcessMemoryWriteNoModel:
             owner_domain="d.com",
         )
         mem = Memory.objects.get(memory_space=sp, owner_username="alice")
+        assert result is None
         assert mem.content == "第一条"
         assert mem.organization_id is None
 
     def test_无模型追加到现有记忆(self):
         sp = _make_space()
-        Memory.objects.create(
-            memory_space=sp, title="T", content="旧", owner_username="bob", owner_domain="d.com", created_by="bob"
-        )
-        tasks.process_memory_write(
-            memory_space_id=sp.id, title="T2", content="新", owner_username="bob", owner_domain="d.com"
-        )
+        Memory.objects.create(memory_space=sp, title="T", content="旧", owner_username="bob", owner_domain="d.com", created_by="bob")
+        tasks.process_memory_write(memory_space_id=sp.id, title="T2", content="新", owner_username="bob", owner_domain="d.com")
         mem = Memory.objects.get(memory_space=sp, owner_username="bob")
         assert "旧" in mem.content and "新" in mem.content
         # 不重复创建
@@ -89,17 +88,46 @@ class TestProcessMemoryWriteNoModel:
 
     def test_组织记忆按organization_id唯一(self):
         sp = _make_space(scope=MemorySpace.SCOPE_TEAM)
-        tasks.process_memory_write(
-            memory_space_id=sp.id, title="T", content="org内容", owner_username="组A", owner_domain="", organization_id=7
-        )
+        tasks.process_memory_write(memory_space_id=sp.id, title="T", content="org内容", owner_username="组A", owner_domain="", organization_id=7)
         mem = Memory.objects.get(memory_space=sp, organization_id=7)
         assert mem.content == "org内容"
 
     def test_记忆空间不存在抛错(self):
         with pytest.raises(MemorySpace.DoesNotExist):
+            tasks.process_memory_write(memory_space_id=999999, title="T", content="c", owner_username="x", owner_domain="d")
+
+    @pytest.mark.django_db(transaction=True)
+    def test_并发写入同一目标只创建一条并保留两次内容(self, mocker):
+        sp = _make_space()
+        original_get_memory = tasks._get_memory_for_target
+        first_reads_done = Barrier(2)
+
+        def synchronized_get_memory(*args, **kwargs):
+            memory = original_get_memory(*args, **kwargs)
+            if not kwargs.get("for_update", False):
+                first_reads_done.wait(timeout=5)
+            return memory
+
+        mocker.patch.object(tasks, "_get_memory_for_target", side_effect=synchronized_get_memory)
+
+        def write(content):
             tasks.process_memory_write(
-                memory_space_id=999999, title="T", content="c", owner_username="x", owner_domain="d"
+                memory_space_id=sp.id,
+                title="T",
+                content=content,
+                owner_username="alice",
+                owner_domain="d.com",
             )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(write, content) for content in ("第一条", "第二条")]
+            for future in futures:
+                future.result(timeout=10)
+
+        memories = list(Memory.objects.filter(memory_space=sp, owner_username="alice", owner_domain="d.com"))
+        assert len(memories) == 1
+        assert "第一条" in memories[0].content
+        assert "第二条" in memories[0].content
 
 
 # ===========================================================================
@@ -110,9 +138,7 @@ class TestProcessMemoryWriteWithModel:
         sp = _make_space(write_rule="只保留要点", default_model="5")
         fake = _FakeClient("规范化后的内容")
         mocker.patch.object(tasks, "_build_memory_write_client", return_value=fake)
-        tasks.process_memory_write(
-            memory_space_id=sp.id, title="T", content="原始很长内容", owner_username="u", owner_domain="d"
-        )
+        tasks.process_memory_write(memory_space_id=sp.id, title="T", content="原始很长内容", owner_username="u", owner_domain="d")
         mem = Memory.objects.get(memory_space=sp, owner_username="u")
         assert mem.content == "规范化后的内容"
         # write_rule 触发了一次 LLM 规范化
@@ -120,29 +146,21 @@ class TestProcessMemoryWriteWithModel:
 
     def test_有现有记忆走LLM智能合并(self, mocker):
         sp = _make_space(default_model="5")
-        Memory.objects.create(
-            memory_space=sp, title="旧标题", content="旧内容", owner_username="u", owner_domain="d", created_by="u"
-        )
+        Memory.objects.create(memory_space=sp, title="旧标题", content="旧内容", owner_username="u", owner_domain="d", created_by="u")
         merged_json = '```json\n{"title": "合并标题", "content": "合并内容"}\n```'
         fake = _FakeClient(merged_json)
         mocker.patch.object(tasks, "_build_memory_write_client", return_value=fake)
-        tasks.process_memory_write(
-            memory_space_id=sp.id, title="T", content="新内容", owner_username="u", owner_domain="d"
-        )
+        tasks.process_memory_write(memory_space_id=sp.id, title="T", content="新内容", owner_username="u", owner_domain="d")
         mem = Memory.objects.get(memory_space=sp, owner_username="u")
         assert mem.title == "合并标题"
         assert mem.content == "合并内容"
 
     def test_合并JSON解析失败回退追加(self, mocker):
         sp = _make_space(default_model="5")
-        Memory.objects.create(
-            memory_space=sp, title="旧标题", content="旧内容", owner_username="u", owner_domain="d", created_by="u"
-        )
+        Memory.objects.create(memory_space=sp, title="旧标题", content="旧内容", owner_username="u", owner_domain="d", created_by="u")
         fake = _FakeClient("不是合法JSON的返回")
         mocker.patch.object(tasks, "_build_memory_write_client", return_value=fake)
-        tasks.process_memory_write(
-            memory_space_id=sp.id, title="T", content="新内容", owner_username="u", owner_domain="d"
-        )
+        tasks.process_memory_write(memory_space_id=sp.id, title="T", content="新内容", owner_username="u", owner_domain="d")
         mem = Memory.objects.get(memory_space=sp, owner_username="u")
         # 解析失败 -> 简单追加（旧+新）
         assert "旧内容" in mem.content and "新内容" in mem.content
@@ -151,9 +169,7 @@ class TestProcessMemoryWriteWithModel:
     def test_配置模型但client构建失败回退直写(self, mocker):
         sp = _make_space(default_model="5")
         mocker.patch.object(tasks, "_build_memory_write_client", return_value=None)
-        tasks.process_memory_write(
-            memory_space_id=sp.id, title="T", content="直写内容", owner_username="u", owner_domain="d"
-        )
+        tasks.process_memory_write(memory_space_id=sp.id, title="T", content="直写内容", owner_username="u", owner_domain="d")
         mem = Memory.objects.get(memory_space=sp, owner_username="u")
         assert mem.content == "直写内容"
 
@@ -165,9 +181,7 @@ class TestProcessMemoryWriteCache:
     def test_缺workflow回退直接写入(self, mocker):
         sp = _make_space()
         direct = mocker.patch.object(tasks, "process_memory_write")
-        tasks.process_memory_write_cache(
-            memory_space_id=sp.id, title="T", content="c", owner_username="u", owner_domain="d", workflow_id=None
-        )
+        tasks.process_memory_write_cache(memory_space_id=sp.id, title="T", content="c", owner_username="u", owner_domain="d", workflow_id=None)
         direct.assert_called_once()
         # 没有创建缓存
         assert MemoryWriteCache.objects.count() == 0
@@ -273,11 +287,7 @@ class TestFlushOrchestration:
         bot = Bot.objects.create(name="b", team=[1], usage_team=[1])
         wf = BotWorkFlow.objects.create(
             bot=bot,
-            flow_json={
-                "nodes": [
-                    {"id": "mw1", "type": "memory_write", "data": {"config": {"memorySpace": sp.id, "title": "记忆"}}}
-                ]
-            },
+            flow_json={"nodes": [{"id": "mw1", "type": "memory_write", "data": {"config": {"memorySpace": sp.id, "title": "记忆"}}}]},
         )
         MemoryWriteCache.objects.create(workflow_id=wf.id, node_id="mw1", memory_target_id="u@d", content="Z")
         flush = mocker.patch.object(tasks, "flush_memory_write_cache_for_node")
@@ -344,20 +354,21 @@ class TestChatFlowCeleryTasks:
         bot = Bot.objects.create(name="b", team=[1], usage_team=[1], online=True, created_by="creator")
         BotWorkFlow.objects.create(bot=bot, flow_json={"nodes": [], "edges": []})
         engine = _FakeEngine()
-        mocker.patch.object(tasks, "create_chat_flow_engine", return_value=engine)
+        create = mocker.patch.object(tasks, "create_chat_flow_engine", return_value=engine)
         tasks.chat_flow_celery_task(bot_id=bot.id, node_id="nodeA", message="你好")
+        create.assert_called_once_with(mocker.ANY, "nodeA", entry_type="celery")
         assert engine.executed == {
             "last_message": "你好",
             "user_id": "creator",
             "bot_id": bot.id,
             "node_id": "nodeA",
+            "entry_type": "celery",
         }
+        assert "caller_identity" not in engine.executed
 
     def test_test_execute_workflow不存在短路(self, mocker):
         create = mocker.patch.object(tasks, "create_chat_flow_engine")
-        tasks.chat_flow_test_execute_task(
-            workflow_id=999999, node_id="n", input_data={"last_message": "x"}, entry_type="openai", execution_id="e1"
-        )
+        tasks.chat_flow_test_execute_task(workflow_id=999999, node_id="n", input_data={"last_message": "x"}, entry_type="openai", execution_id="e1")
         create.assert_not_called()
 
     def test_test_execute正常标记is_test(self, mocker):
@@ -365,9 +376,7 @@ class TestChatFlowCeleryTasks:
         wf = BotWorkFlow.objects.create(bot=bot, flow_json={"nodes": [], "edges": []})
         engine = _FakeEngine()
         mocker.patch.object(tasks, "create_chat_flow_engine", return_value=engine)
-        tasks.chat_flow_test_execute_task(
-            workflow_id=wf.id, node_id="n", input_data={"last_message": "x"}, entry_type="restful", execution_id="e1"
-        )
+        tasks.chat_flow_test_execute_task(workflow_id=wf.id, node_id="n", input_data={"last_message": "x"}, entry_type="restful", execution_id="e1")
         assert engine.is_test is True
         assert engine.entry_type == "restful"
         assert engine.executed == {"last_message": "x"}

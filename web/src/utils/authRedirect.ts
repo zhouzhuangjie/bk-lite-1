@@ -1,4 +1,6 @@
 export const AUTH_POPUP_SUCCESS_MESSAGE = 'bk-lite-auth-popup-success';
+export const LOGIN_AUTH_RESULT_RETURN_MESSAGE = 'bk-lite-login-auth-result-return';
+export const SIGNIN_WINDOW_NAME = 'bk-lite-signin';
 
 function isThirdLoginFlagEnabled(thirdLogin?: string | boolean | null): boolean {
   if (typeof thirdLogin === 'boolean') {
@@ -52,6 +54,30 @@ function isSameOriginUrl(targetUrl: string, knownOrigin?: string): boolean {
   }
 }
 
+export function toSafeRelativeCallbackUrl(callbackUrl?: string, currentOrigin?: string): string {
+  const targetUrl = callbackUrl || '/';
+  const isProtocolRelative = targetUrl.startsWith('//');
+
+  if (targetUrl.startsWith('/') && !isProtocolRelative) {
+    return targetUrl;
+  }
+
+  if (isProtocolRelative) {
+    return '/';
+  }
+
+  try {
+    const parsed = new URL(targetUrl);
+    if (!isSameOriginUrl(targetUrl, currentOrigin)) {
+      return '/';
+    }
+
+    return `${parsed.pathname}${parsed.search}${parsed.hash}` || '/';
+  } catch {
+    return '/';
+  }
+}
+
 export function buildThirdLoginCallbackUrl(
   callbackUrl?: string,
   token?: string,
@@ -93,6 +119,46 @@ export function buildThirdLoginCallbackUrl(
   } catch (error) {
     console.error('Failed to build third login callback URL:', error);
     return '/';
+  }
+}
+
+export function buildLegacyThirdLoginCallbackUrl(
+  callbackUrl?: string,
+  token?: string,
+  thirdLoginCode?: string,
+): string {
+  if (!callbackUrl || !token || !thirdLoginCode) {
+    return '/';
+  }
+
+  try {
+    const url = new URL(callbackUrl);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      return '/';
+    }
+
+    url.searchParams.set('third_login_code', thirdLoginCode);
+    url.searchParams.set('token', token);
+    return url.toString();
+  } catch {
+    return '/';
+  }
+}
+
+export function getLegacyThirdLoginCode(callbackUrl?: string): string | undefined {
+  if (!callbackUrl) {
+    return undefined;
+  }
+
+  try {
+    const url = new URL(callbackUrl);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      return undefined;
+    }
+
+    return url.searchParams.get('third_login_code') || undefined;
+  } catch {
+    return undefined;
   }
 }
 

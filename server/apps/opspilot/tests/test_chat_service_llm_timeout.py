@@ -14,8 +14,14 @@
 
 import os
 import re
+import time
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
+
+from apps.opspilot.metis.llm.chain.entity import BasicLLMRequest
+from apps.opspilot.metis.llm.common.llm_client_factory import LLMClientFactory
 
 # ---------------------------------------------------------------------------
 # Lazy imports of the target modules to avoid Django bootstrap at collection time
@@ -57,14 +63,14 @@ class TestChatServiceFutureTimeout:
 
     def test_future_result_has_timeout(self, chat_service_src):
         """
-        future.result() 必须携带 timeout 参数。
+        整轮 agent 执行必须有超时预算（worker_done.wait(timeout=...)）。
 
-        revert 修复（还原为 `future.result()`）后，此测试应失败。
+        revert 修复（去掉 timeout）后，此测试应失败。
         """
-        match = re.search(r"future\.result\s*\(([^)]*)\)", chat_service_src)
-        assert match, "chat_service.py 中未找到 future.result() 调用"
+        match = re.search(r"worker_done\.wait\s*\(([^)]*)\)", chat_service_src)
+        assert match, "chat_service.py 中未找到 worker_done.wait() 调用"
         args = match.group(1).strip()
-        assert "timeout" in args, f"future.result() 缺少 timeout 参数，当前参数为：({args})。" "没有 timeout 参数时，LLM 卡死会导致 worker 线程永久阻塞（Issue #3718）。"
+        assert "timeout" in args, f"worker_done.wait() 缺少 timeout 参数，当前参数为：({args})。" "没有 timeout 参数时，LLM 卡死会导致调用方永久阻塞（Issue #3718）。"
 
     def test_llm_invoke_timeout_env_var_referenced(self, chat_service_src):
         """
@@ -89,7 +95,7 @@ class TestChatServiceFutureTimeout:
         TimeoutError 处理块应返回 error_type='TimeoutError'，便于前端区分超时与其他错误。
         """
         # Find the TimeoutError handler block
-        idx = chat_service_src.find("except concurrent.futures.TimeoutError")
+        idx = chat_service_src.rfind("except concurrent.futures.TimeoutError")
         assert idx != -1, "未找到 TimeoutError 处理块"
         # Check the next 500 chars for the error_type field
         handler_snippet = chat_service_src[idx : idx + 600]
@@ -99,6 +105,55 @@ class TestChatServiceFutureTimeout:
     def test_os_is_imported(self, chat_service_src):
         """os 模块必须被 import，用于 os.getenv('LLM_INVOKE_TIMEOUT', ...)"""
         assert "import os" in chat_service_src, "chat_service.py 缺少 import os，无法调用 os.getenv()"
+
+    def test_timeout_returns_without_waiting_for_running_worker(self, mocker, monkeypatch):
+        """整轮预算耗尽后应立即返回，不能等待仍在运行的 agent 线程。"""
+        from apps.opspilot.services.chat_service import ChatService
+
+        class BlockingGraph:
+            async def execute(self, _request):
+                # 略长于 AGENT_EXECUTE_TIMEOUT=1，确保触发超时；
+                # 不宜过长，避免后台 daemon 线程拖慢测试进程收尾。
+                time.sleep(1.2)
+                return SimpleNamespace(
+                    message="late response",
+                    total_tokens=0,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    browser_steps=[],
+                )
+
+        mocker.patch(
+            "apps.opspilot.services.chat_service.LLMModel.objects.get",
+            return_value=MagicMock(id=1),
+        )
+        mocker.patch(
+            "apps.opspilot.services.chat_service.ChatService.format_chat_server_kwargs",
+            return_value=({}, {}, {}),
+        )
+        mocker.patch(
+            "apps.opspilot.services.chat_service.create_agent_instance",
+            return_value=(BlockingGraph(), MagicMock()),
+        )
+        mocker.patch(
+            "apps.opspilot.services.chat_service._is_eventlet_environment",
+            return_value=False,
+        )
+        monkeypatch.setenv("AGENT_EXECUTE_TIMEOUT", "1")
+
+        started_at = time.perf_counter()
+        result, _, _ = ChatService.invoke_chat({"llm_model": 1, "skill_type": "test"})
+        elapsed = time.perf_counter() - started_at
+
+        assert result["success"] is False
+        assert result["error_type"] == "TimeoutError"
+        assert elapsed < 1.5, f"超时返回仍等待了后台线程: {elapsed:.3f}s"
+
+    def test_timeout_path_cleans_db_connections_in_worker(self, chat_service_src):
+        """worker finally 必须 close_old_connections；超时使用 daemon 线程避免阻塞退出。"""
+        assert "close_old_connections" in chat_service_src
+        assert "timed_out_holder" in chat_service_src
+        assert "daemon=True" in chat_service_src
 
 
 class TestLLMClientFactoryTimeout:
@@ -129,6 +184,50 @@ class TestLLMClientFactoryTimeout:
             "llm_client_factory.py 未使用 LLM_INVOKE_TIMEOUT 环境变量。" "client-level timeout 应与 future.result() 超时保持一致。"
         )
 
+    def test_llm_client_factory_default_timeout_is_300_seconds(self, factory_src):
+        """未显式传入 timeout 时，LLM client 底座默认超时应为 300 秒。"""
+        assert 'os.getenv("LLM_INVOKE_TIMEOUT", "300")' in factory_src
+        assert "timeout=15" not in factory_src
+
     def test_os_is_imported_in_factory(self, factory_src):
         """os 模块必须被 import，用于 os.getenv()"""
         assert "import os" in factory_src, "llm_client_factory.py 缺少 import os，无法调用 os.getenv()"
+
+    @patch("apps.opspilot.metis.llm.common.llm_client_factory.OpenAI")
+    def test_isolated_openai_uses_request_timeout(self, mock_openai, monkeypatch):
+        """
+        知识库构建使用 invoke_isolated，isolated OpenAI 客户端也必须支持按请求覆盖 timeout。
+
+        revert 后（仍固定 timeout=60.0）此测试失败。
+        """
+        mock_openai.return_value = MagicMock()
+        monkeypatch.setenv("LLM_INVOKE_TIMEOUT", "61")
+        request = BasicLLMRequest(
+            protocol_type="openai",
+            openai_api_key="sk-key",
+            openai_api_base="https://api.openai.com",
+            extra_config={"timeout": 240},
+        )
+
+        LLMClientFactory.create_isolated_client(request)
+
+        assert mock_openai.call_args[1]["timeout"] == 240.0
+
+    @patch("apps.opspilot.metis.llm.common.llm_client_factory.anthropic.Anthropic")
+    def test_isolated_anthropic_uses_env_timeout(self, mock_anthropic, monkeypatch):
+        """
+        Anthropic isolated 客户端未显式传 request timeout 时，应回退 LLM_INVOKE_TIMEOUT。
+
+        revert 后（仍固定 timeout=60.0）此测试失败。
+        """
+        mock_anthropic.return_value = MagicMock()
+        monkeypatch.setenv("LLM_INVOKE_TIMEOUT", "180")
+        request = BasicLLMRequest(
+            protocol_type="anthropic",
+            openai_api_key="sk-key",
+            openai_api_base="https://api.anthropic.com",
+        )
+
+        LLMClientFactory.create_isolated_client(request)
+
+        assert mock_anthropic.call_args[1]["timeout"] == 180.0

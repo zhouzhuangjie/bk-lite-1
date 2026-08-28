@@ -1,18 +1,24 @@
 name: vastbase
-version: "1.0.0"
+version: 1.0.0
 category: database
 metadata:
-  display_name: "海量数据库Vastbase"
-  description: "海量数据库Vastbase 数据库协议采集插件（PG 兼容）"
-  author: "WeOps"
-  tags: [database, vastbase]
+  display_name: 海量数据库Vastbase
+  description: 海量数据库Vastbase 数据库协议采集插件（PG 兼容）
+  author: WeOps
+  tags:
+  - database
+  - vastbase
   cloud_protocol: false
   model_id: vastbase
 executors:
   protocol:
     type: protocol
-    timeout: 30
+    execution_mode: async
+    capacity_group: default
     collector:
       module: plugins.inputs.vastbase.vastbase_info
       class: VastbaseInfo
+    target_policy:
+      mode: tcp
+      port: 5432
 default_executor: protocol

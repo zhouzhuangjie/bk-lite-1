@@ -1,8 +1,13 @@
 'use client';
-import { useEffect, useState, useRef } from 'react';
-import { Spin, Button, Form, message, Steps } from 'antd';
+import { useEffect, useMemo, useState, useRef } from 'react';
+import { Spin, Button, Form, Input, message, Steps } from 'antd';
 import useApiClient from '@/utils/request';
+import OperateModal from '@/components/operate-modal';
 import useMonitorApi from '@/app/monitor/api';
+import {
+  fetchAllMetricsGroups,
+  fetchAllMonitorMetrics
+} from '@/app/monitor/api/fetchMetricCatalogPages';
 import useEventApi from '@/app/monitor/api/event';
 import { useTranslation } from '@/utils/i18n';
 import {
@@ -10,7 +15,6 @@ import {
   UserItem,
   SegmentedItem,
   TableDataItem,
-  GroupInfo,
   ObjectItem,
   MetricItem,
   IndexViewItem,
@@ -38,6 +42,7 @@ import NotificationForm from './notificationForm';
 import MetricPreview from './metricPreview';
 import VariablesTable from './variablesTable';
 import { isStringArray } from '@/app/monitor/utils/common';
+import { loadMonitorPluginsByObjectCached } from '@/app/monitor/utils/monitorPluginCache';
 import {
   getMetricDimensionNames,
   sanitizeGroupBy
@@ -46,33 +51,66 @@ import {
   COMPARISON_METHOD,
   ENUM_COMPARISON_METHOD
 } from '@/app/monitor/constants/event';
-import { resolveInitialMetricPluginId } from './strategyDetailUtils';
+import {
+  buildMetricUnitCascaderOptions,
+  getCalculationUnitOnMetricRowsChange,
+  getReverseModeCalculationUnit,
+  getThresholdUnitOnCalculationUnitChange,
+  pruneNoticeUsers,
+  shouldRequireNoticeUsers,
+  resolveEffectiveCalculationUnit,
+  resolveInitialMetricPluginId,
+  resolveThresholdUnit,
+  resolveUnitOnMetricSelect,
+  restoreCalculationUnitState
+} from './strategyDetailUtils';
+import { MetricExpressionRow } from './metricExpressionTypes';
+import {
+  buildMetricExpressionQueryCondition,
+  createMetricRow,
+  DEFAULT_FORMULA_EXPRESSION,
+  DEFAULT_FORMULA_RESULT_NAME,
+  getMetricExpressionModeForRows,
+  MetricExpressionMode,
+  resolveMetricExpressionUnits,
+  toMetricExpressionStateFromQueryCondition
+} from './formulaExpressionUtils';
 const defaultGroup = ['instance_id'];
-
-// 过滤无效的单位值（none 、 short 和 JSON 字符串格式 已从单位列表中移除，不能作为单位值）
-const filterInvalidUnit = (unit: string | null | undefined): string | null => {
-  if (!unit || unit === 'none' || unit === 'short' || isStringArray(unit)) {
-    return null;
-  }
-  return unit;
-};
 
 const StrategyOperation = () => {
   const { t } = useTranslation();
+  const translateWithFallback = (key: string, fallback: string) => {
+    const value = t(key);
+    return value === key ? fallback : value;
+  };
   const { post, put, isLoading } = useApiClient();
   const {
     getMetricsGroup,
     getMonitorMetrics,
     getMonitorPlugin,
-    getMonitorObject
+    getMonitorObject,
+    getAllUsers
   } = useMonitorApi();
-  const { getMonitorPolicy, getSystemChannelList } = useEventApi();
+  const { getMonitorPolicy, getSystemChannelList, savePolicyTemplate } = useEventApi();
   const commonContext = useCommon();
+  const unitList = commonContext?.unitList || [];
+  const groupedUnitOptions = useMemo(
+    () => buildMetricUnitCascaderOptions(commonContext?.groupedUnitList || []),
+    [commonContext?.groupedUnitList]
+  );
   const searchParams = useSearchParams();
   const [form] = Form.useForm();
   const router = useRouter();
-  const { getGroupIds } = useObjectConfigInfo();
-  const userList: UserItem[] = commonContext?.userList || [];
+  const organizations = Form.useWatch('organizations', form);
+  const [noticeUserList, setNoticeUserList] = useState<UserItem[]>([]);
+  const [noticeUserLoadKey, setNoticeUserLoadKey] = useState('');
+  const organizationKey = useMemo(() => {
+    return (Array.isArray(organizations) ? organizations : [])
+      .map((item) => Number(item))
+      .filter((item) => Number.isFinite(item) && item > 0)
+      .sort((a, b) => a - b)
+      .join(',');
+  }, [organizations]);
   const instRef = useRef<ModalRef>(null);
   const formContainerRef = useRef<HTMLDivElement>(null);
   const basicInfoRef = useRef<HTMLDivElement>(null);
@@ -85,8 +123,28 @@ const StrategyOperation = () => {
   const type = searchParams.get('type') || '';
   const detailId = searchParams.get('id');
   const detailName = searchParams.get('name') || '--';
+  const isCreateFlow = ['builtIn', 'add'].includes(type);
+  const { getGroupIds, ready: objectConfigReady } = useObjectConfigInfo(monitorName);
   const [pageLoading, setPageLoading] = useState<boolean>(false);
   const [confirmLoading, setConfirmLoading] = useState<boolean>(false);
+  const [templateSaving, setTemplateSaving] = useState<boolean>(false);
+  const [templateSavedOnce, setTemplateSavedOnce] = useState(false);
+  const [templateConfirmVisible, setTemplateConfirmVisible] = useState(false);
+  const [templateMetaDefaults, setTemplateMetaDefaults] = useState({
+    name: '',
+    description: '',
+  });
+  const [templateMetaForm] = Form.useForm<{ name: string; description: string }>();
+  const pendingTemplateConfigRef = useRef<StrategyFields | null>(null);
+  const templateSubmittingRef = useRef(false);
+  // create 流程：从当前页面“保存模版”成功后，只允许创建 1 次（需要重新进入页面才能再创建）。
+  // 用 ref 做同步锁，避免后端请求已完成但弹窗尚未完全关闭前出现重复请求。
+  const templateSavedOnceRef = useRef(false);
+
+  useEffect(() => {
+    if (!templateConfirmVisible) return;
+    templateMetaForm.setFieldsValue(templateMetaDefaults);
+  }, [templateConfirmVisible, templateMetaDefaults, templateMetaForm]);
   const [source, setSource] = useState<SourceFeild>({
     type: '',
     values: []
@@ -94,20 +152,47 @@ const StrategyOperation = () => {
   const [metric, setMetric] = useState<string | null>(null);
   const [metrics, setMetrics] = useState<MetricItem[]>([]);
   const [metricsLoading, setMetricsLoading] = useState<boolean>(false);
-  const [labels, setLabels] = useState<string[]>([]);
   const [unit, setUnit] = useState<string>('min');
   const [periodUnit, setPeriodUnit] = useState<string>('min');
   const [nodataUnit, setNodataUnit] = useState<string>('min');
   const [noDataRecoveryUnit, setNoDataRecoveryUnit] = useState<string>('min');
   const [conditions, setConditions] = useState<FilterItem[]>([]);
+  const [metricRows, setMetricRows] = useState<MetricExpressionRow[]>([
+    createMetricRow(0)
+  ]);
+  const [metricExpressionMode, setMetricExpressionMode] =
+    useState<MetricExpressionMode>('metric');
+  const [formulaResultName, setFormulaResultName] = useState<string>(
+    () =>
+      translateWithFallback(
+        'monitor.events.formulaDefaultResultName',
+        DEFAULT_FORMULA_RESULT_NAME
+      )
+  );
+  const [formulaExpression, setFormulaExpression] =
+    useState<string>(DEFAULT_FORMULA_EXPRESSION);
+  const [labelsByRef, setLabelsByRef] = useState<Record<string, string[]>>({});
   const [noDataAlert, setNoDataAlert] = useState<number | null>(null);
   const [noDataRecovery, setNoDataRecovery] = useState<number | null>(null);
   const [noDataAlertLevel, setNoDataAlertLevel] = useState<string>('none');
   const [noDataAlertName, setNoDataAlertName] = useState<string>('');
   const [objects, setObjects] = useState<ObjectItem[]>([]);
+  const currentMonitorObject = useMemo(
+    () =>
+      objects.find((item) => String(item.id) === String(monitorObjId)),
+    [objects, monitorObjId]
+  );
   const [groupBy, setGroupBy] = useState<string[]>(
     getGroupIds(monitorName as string)?.default || defaultGroup
   );
+
+  useEffect(() => {
+    if (!objectConfigReady || !monitorName) return;
+    const defaults = getGroupIds(monitorName)?.default;
+    if (defaults?.length) {
+      setGroupBy((prev) => (prev === defaultGroup || prev.length === 0 ? defaults : prev));
+    }
+  }, [objectConfigReady, monitorName, getGroupIds]);
   const [groupAlgorithm, setGroupAlgorithm] = useState<string | null>('avg');
   const [period, setPeriod] = useState<number | null>(null);
   const [algorithm, setAlgorithm] = useState<string | null>(null);
@@ -133,12 +218,34 @@ const StrategyOperation = () => {
     }
   ]);
   const [calculationUnit, setCalculationUnit] = useState<string | null>(null);
+  const [thresholdUnit, setThresholdUnit] = useState<string | null>(null);
   const [pluginList, setPluginList] = useState<SegmentedItem[]>([]);
   const [originMetricData, setOriginMetricData] = useState<IndexViewItem[]>([]);
   const [initMetricData, setInitMetricData] = useState<MetricItem[]>([]);
   const [channelList, setChannelList] = useState<ChannelItem[]>([]);
   const [enableAlerts, setEnableAlerts] = useState<string[]>(['threshold']);
   const initialMetricPluginIdRef = useRef<string | number | undefined>(undefined);
+  const effectiveCalculationUnit = resolveEffectiveCalculationUnit({
+    isFormulaMode: metricExpressionMode === 'formula',
+    unit: calculationUnit,
+    unitList
+  });
+  const effectiveThresholdUnit = resolveThresholdUnit({
+    thresholdUnit,
+    calculationUnit: effectiveCalculationUnit,
+    unitList
+  });
+
+  useEffect(() => {
+    if (!unitList.length) return;
+    setThresholdUnit((current) =>
+      getThresholdUnitOnCalculationUnitChange({
+        thresholdUnit: current,
+        calculationUnit: effectiveCalculationUnit,
+        unitList
+      })
+    );
+  }, [effectiveCalculationUnit, unitList]);
 
   useEffect(() => {
     if (!isLoading) {
@@ -154,6 +261,118 @@ const StrategyOperation = () => {
       });
     }
   }, [isLoading]);
+
+  // 通知人候选按策略所属组织渲染；组织变更后自动剔除越界已选通知人
+  useEffect(() => {
+    const applyPrunedNoticeUsers = (
+      pruned: Array<string | number>
+    ) => {
+      form.setFieldValue('notice_users', pruned);
+      // 开启通知且渠道需要通知人时，清空后立即触发校验，阻止带着空通知人保存
+      if (
+        shouldRequireNoticeUsers({
+          notice: form.getFieldValue('notice'),
+          noticeTypeIds: form.getFieldValue('notice_type_ids') || [],
+          channelList
+        }) &&
+        pruned.length === 0
+      ) {
+        Promise.resolve().then(() => {
+          form.validateFields(['notice_users']).catch(() => undefined);
+        });
+      }
+    };
+
+    const orgIds = organizationKey
+      ? organizationKey.split(',').map((item) => Number(item))
+      : [];
+
+    if (!orgIds.length) {
+      setNoticeUserList([]);
+      setNoticeUserLoadKey('');
+      const current = form.getFieldValue('notice_users') || [];
+      if (Array.isArray(current) && current.length) {
+        applyPrunedNoticeUsers([]);
+      } else if (
+        shouldRequireNoticeUsers({
+          notice: form.getFieldValue('notice'),
+          noticeTypeIds: form.getFieldValue('notice_type_ids') || [],
+          channelList
+        })
+      ) {
+        Promise.resolve().then(() => {
+          form.validateFields(['notice_users']).catch(() => undefined);
+        });
+      }
+      return;
+    }
+
+    let cancelled = false;
+    getAllUsers(orgIds)
+      .then((users) => {
+        if (cancelled) return;
+        const list = Array.isArray(users) ? users : [];
+        setNoticeUserList(list);
+        setNoticeUserLoadKey(organizationKey);
+        const current = form.getFieldValue('notice_users') || [];
+        const pruned = pruneNoticeUsers(current, list);
+        if (
+          Array.isArray(current) &&
+          (pruned.length !== current.length ||
+            pruned.some(
+              (item, index) => String(item) !== String(current[index])
+            ))
+        ) {
+          applyPrunedNoticeUsers(pruned);
+        } else if (
+          pruned.length === 0 &&
+          shouldRequireNoticeUsers({
+            notice: form.getFieldValue('notice'),
+            noticeTypeIds: form.getFieldValue('notice_type_ids') || [],
+            channelList
+          })
+        ) {
+          Promise.resolve().then(() => {
+            form.validateFields(['notice_users']).catch(() => undefined);
+          });
+        }
+      })
+      .catch(() => {
+        // 拉取失败时不改动已选通知人，避免误清空
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [organizationKey, form, channelList]);
+
+  // dealDetail 可能再次用详情里的 notice_users 覆盖表单，候选就绪后需再裁一次
+  useEffect(() => {
+    if (!organizationKey || noticeUserLoadKey !== organizationKey) {
+      return;
+    }
+    const current = form.getFieldValue('notice_users') || [];
+    const pruned = pruneNoticeUsers(current, noticeUserList);
+    if (
+      Array.isArray(current) &&
+      (pruned.length !== current.length ||
+        pruned.some((item, index) => String(item) !== String(current[index])))
+    ) {
+      form.setFieldValue('notice_users', pruned);
+      if (
+        shouldRequireNoticeUsers({
+          notice: form.getFieldValue('notice'),
+          noticeTypeIds: form.getFieldValue('notice_type_ids') || [],
+          channelList
+        }) &&
+        pruned.length === 0
+      ) {
+        Promise.resolve().then(() => {
+          form.validateFields(['notice_users']).catch(() => undefined);
+        });
+      }
+    }
+  }, [formData, noticeUserList, noticeUserLoadKey, organizationKey, form, channelList]);
 
   useEffect(() => {
     form.resetFields();
@@ -206,13 +425,22 @@ const StrategyOperation = () => {
           const target = initMetricData.find((item) => item.name === _metricId);
           if (target) {
             const _labels = getMetricDimensionNames(target?.dimensions);
-            setLabels(_labels);
-            setCalculationUnit(filterInvalidUnit(target?.unit));
+            const initialBuiltInUnit = resolveUnitOnMetricSelect(target?.unit);
+            setCalculationUnit(initialBuiltInUnit);
             // 计算完整的分组维度选项列表并设置为所有选项
             const fixedList =
               getGroupIds(monitorName as string)?.list || defaultGroup;
             const allGroupByOptions = [...new Set([...fixedList, ..._labels])];
             setGroupBy(allGroupByOptions);
+            setMetricRows([
+              createMetricRow(0, {
+                metricId: target.id,
+                metricName: target.name,
+                groupAlgorithm: initForm.group_algorithm || 'avg',
+                groupBy: allGroupByOptions
+              })
+            ]);
+            setMetricExpressionMode('metric');
           }
         }
       } else if (!_metricId) {
@@ -221,6 +449,13 @@ const StrategyOperation = () => {
         const fixedList =
           getGroupIds(monitorName as string)?.list || defaultGroup;
         setGroupBy(fixedList);
+        setMetricRows([
+          createMetricRow(0, {
+            groupAlgorithm: initForm.group_algorithm || 'avg',
+            groupBy: fixedList
+          })
+        ]);
+        setMetricExpressionMode('metric');
       }
       const instanceIdStr = searchParams.get('instanceId');
       let instanceIds: string[] = [];
@@ -232,7 +467,8 @@ const StrategyOperation = () => {
         type: 'instance',
         values: instanceIds
       });
-    } else {
+    } else if (formData?.id != null) {
+      // 等详情接口回填后再 dealDetail，避免空 formData 把频率/组织等字段冲成空值
       dealDetail(formData);
     }
   }, [type, formData, pluginList, channelList, initMetricData]);
@@ -246,6 +482,32 @@ const StrategyOperation = () => {
       processMetricData(formData);
     }
   }, [initMetricData]);
+
+  useEffect(() => {
+    const nextLabelsByRef: Record<string, string[]> = {};
+    metricRows.forEach((row) => {
+      const target = metrics.find(
+        (item) =>
+          (row.metricId != null && String(item.id) === String(row.metricId)) ||
+          (!!row.metricName && item.name === row.metricName)
+      );
+      nextLabelsByRef[row.ref] = getMetricDimensionNames(target?.dimensions);
+    });
+    setLabelsByRef(nextLabelsByRef);
+
+    if (metricRows.length === 1) {
+      const row = metricRows[0];
+      const target = metrics.find(
+        (item) =>
+          (row.metricId != null && String(item.id) === String(row.metricId)) ||
+          (!!row.metricName && item.name === row.metricName)
+      );
+      setMetric(row.metricName || target?.name || null);
+      setConditions(row.filters || []);
+      setGroupBy(sanitizeGroupBy(row.groupBy || []));
+      setGroupAlgorithm(row.groupAlgorithm || 'avg');
+    }
+  }, [metricRows, metrics]);
 
   useEffect(() => {
     const targetPluginId = resolveInitialMetricPluginId({
@@ -270,7 +532,7 @@ const StrategyOperation = () => {
     setObjects(data);
   };
 
-  const changeCollectType = (id: string) => {
+  const changeCollectType = (id: string | number) => {
     getMetrics({
       monitor_object_id: monitorObjId,
       monitor_plugin_id: id
@@ -283,10 +545,12 @@ const StrategyOperation = () => {
   };
 
   const getPlugins = async () => {
-    const data = await getMonitorPlugin({
-      monitor_object_id: monitorObjId
-    });
-    const plugins = data
+    const plugins = await loadMonitorPluginsByObjectCached(monitorObjId, () =>
+      getMonitorPlugin({
+        monitor_object_id: monitorObjId
+      })
+    );
+    const options = plugins
       .sort((a: PluginItem, b: PluginItem) => {
         const order = (item: PluginItem) =>
           item.is_pre ? 0 : !item.is_custom ? 1 : 2;
@@ -297,7 +561,7 @@ const StrategyOperation = () => {
         value: item.id,
         name: item.name
       }));
-    setPluginList(plugins);
+    setPluginList(options);
   };
 
   const dealDetail = (data: StrategyFields) => {
@@ -315,6 +579,7 @@ const StrategyOperation = () => {
       enable_alerts,
       no_data_recovery_period,
       calculation_unit,
+      threshold_unit,
       no_data_level,
       no_data_alert_name
     } = data;
@@ -329,7 +594,9 @@ const StrategyOperation = () => {
     });
     setGroupBy(sanitizeGroupBy(group_by || []));
     feedbackThreshold(thresholdList);
-    setCalculationUnit(filterInvalidUnit(calculation_unit));
+    const initialUnit = restoreCalculationUnitState(calculation_unit);
+    setCalculationUnit(initialUnit);
+    setThresholdUnit(restoreCalculationUnitState(threshold_unit) || initialUnit);
     setPeriod(period?.value || null);
     setPeriodUnit(period?.type || 'min');
     setGroupAlgorithm(data.group_algorithm || 'avg');
@@ -346,7 +613,7 @@ const StrategyOperation = () => {
     setNodataUnit(no_data_period?.type || 'min');
     setNoDataRecovery(no_data_recovery_period?.value || null);
     setNoDataRecoveryUnit(no_data_recovery_period?.type || '');
-    setUnit(schedule?.type || '');
+    setUnit(schedule?.type || 'min');
     setEnableAlerts(enable_alerts?.length ? enable_alerts : ['threshold']);
     // 设置无数据告警级别和名称
     if (enable_alerts?.includes('no_data') && no_data_level) {
@@ -371,13 +638,21 @@ const StrategyOperation = () => {
     const { query_condition } = data;
     if (query_condition?.type === 'metric' && initMetricData.length > 0) {
       const _metrics = initMetricData.find(
-        (item) => item.id === query_condition?.metric_id
+        (item) => query_condition?.metric_id != null && String(item.id) === String(query_condition.metric_id)
       );
       if (_metrics) {
-        const _labels = getMetricDimensionNames(_metrics?.dimensions);
         setMetric(_metrics?.name || '');
-        setLabels(_labels);
         setConditions(query_condition?.filter || []);
+        setMetricRows([
+          createMetricRow(0, {
+            metricId: _metrics.id,
+            metricName: _metrics.name,
+            filters: query_condition?.filter || [],
+            groupAlgorithm: data.group_algorithm || 'avg',
+            groupBy: sanitizeGroupBy(data.group_by || [])
+          })
+        ]);
+        setMetricExpressionMode('metric');
         const isEnumMetric = isStringArray(_metrics?.unit || '');
         const comparisonMethods = isEnumMetric
           ? ENUM_COMPARISON_METHOD
@@ -396,6 +671,32 @@ const StrategyOperation = () => {
           })
         );
       }
+    } else if (query_condition?.type === 'formula' && initMetricData.length > 0) {
+      const restoredState = toMetricExpressionStateFromQueryCondition(
+        query_condition
+      );
+      const rows = restoredState.rows.map((row) => {
+        const target = initMetricData.find((item) => row.metricId != null && String(item.id) === String(row.metricId));
+        return {
+          ...row,
+          metricName: target?.name || row.metricName
+        };
+      });
+      setMetricRows(rows);
+      setMetricExpressionMode('formula');
+      setCalculationUnit(
+        restoreCalculationUnitState(data.calculation_unit as string | null)
+      );
+      setThresholdUnit(
+        restoreCalculationUnitState(data.threshold_unit as string | null) ||
+          restoreCalculationUnitState(data.calculation_unit as string | null)
+      );
+      setFormulaResultName(restoredState.resultName);
+      setFormulaExpression(restoredState.expression);
+      setMetric(rows[0]?.metricName || null);
+      setConditions(rows[0]?.filters || []);
+      setGroupBy(sanitizeGroupBy(rows[0]?.groupBy || []));
+      setGroupAlgorithm(rows[0]?.groupAlgorithm || 'avg');
     }
   };
 
@@ -434,7 +735,6 @@ const StrategyOperation = () => {
     setMetric(val);
     const target = metrics.find((item) => item.name === val);
     const _labels = getMetricDimensionNames(target?.dimensions);
-    setLabels(_labels);
     // 计算完整的分组维度选项列表（固定列表 + 标签列表，去重）
     const fixedList = getGroupIds(monitorName as string)?.list || defaultGroup;
     const allGroupByOptions = [...new Set([...fixedList, ..._labels])];
@@ -459,58 +759,39 @@ const StrategyOperation = () => {
     setThreshold(newThreshold as any);
 
     // 选择指标后触发验证，清除错误信息（包括指标、条件维度和告警阈值）
-    form.validateFields(['metric', '_conditions_validator', 'threshold']);
-    // 自动设置告警阈值单位为指标的默认单位（过滤掉 none 和 short）
-    const filteredUnit = filterInvalidUnit(target?.unit);
-    if (filteredUnit) {
-      setCalculationUnit(filteredUnit);
-      return;
-    }
-    const unitList = commonContext?.unitList || [];
-    const baseFilteredList = unitList.filter(
-      (item) => !['none', 'short'].includes(item.unit_id)
-    );
-    const metricUnitItem = unitList.find(
-      (item) => item.unit_id === target?.unit
-    );
-    let defaultUnit: string | null = null;
-    if (metricUnitItem) {
-      // 找到相同 system 的第一个单位
-      const sameSystemUnit = baseFilteredList.find(
-        (item) => item.system === metricUnitItem.system
-      );
-      defaultUnit = sameSystemUnit?.unit_id || null;
-    }
-    setCalculationUnit(defaultUnit);
+    form.validateFields(['metric', 'threshold']);
+    // none/short/枚举 → null，禁止再按 system===null 回落到 cps 等独立单位
+    const nextUnit = resolveUnitOnMetricSelect(target?.unit);
+    setCalculationUnit(nextUnit);
+    setThresholdUnit(nextUnit);
   };
 
   const getMetrics = async (params = {}, type = '') => {
     try {
       setMetricsLoading(true);
-      const getGroupList = getMetricsGroup(params);
-      const getMetrics = getMonitorMetrics(params);
+      const getGroupList = fetchAllMetricsGroups(getMetricsGroup, params);
+      const getMetrics = fetchAllMonitorMetrics(getMonitorMetrics, params);
       Promise.all([getGroupList, getMetrics])
         .then((res) => {
-          const metricData = cloneDeep(res[1] || []);
-          setMetrics(res[1] || []);
-          const groupData = res[0].map((item: GroupInfo) => ({
+          const metricData = cloneDeep(res[1].items);
+          setMetrics(res[1].items);
+          const groupData: IndexViewItem[] = res[0].items.map((item) => ({
             ...item,
+            id: Number(item.id),
             child: []
           }));
           metricData.forEach((metric: MetricItem) => {
             const target = groupData.find(
-              (item: GroupInfo) => item.id === metric.metric_group
+              (item) => item.id === metric.metric_group
             );
             if (target) {
-              target.child.push(metric);
+              target.child?.push(metric);
             }
           });
-          const _groupData = groupData.filter(
-            (item: any) => !!item.child?.length
-          );
+          const _groupData = groupData.filter((item) => !!item.child?.length);
           setOriginMetricData(_groupData);
           if (type === 'init') {
-            setInitMetricData(res[1] || []);
+            setInitMetricData(res[1].items);
           }
         })
         .finally(() => {
@@ -526,13 +807,47 @@ const StrategyOperation = () => {
     setFormData(data);
   };
 
-  const handleGroupByChange = (val: string[]) => {
-    setGroupBy(sanitizeGroupBy(val));
-  };
+  const handleMetricRowsChange = (rows: MetricExpressionRow[]) => {
+    const previousPrimaryMetricName = metricRows[0]?.metricName;
+    const nextPrimaryMetricName = rows[0]?.metricName;
+    const previousMode = metricExpressionMode;
+    const nextMode = getMetricExpressionModeForRows(rows);
+    setMetricExpressionMode(nextMode);
+    setMetricRows(rows);
 
-  const handleConditionsChange = (newConditions: FilterItem[]) => {
-    setConditions(newConditions);
-    form.validateFields(['_conditions_validator']);
+    if (nextMode === 'formula') {
+      setCalculationUnit((current) =>
+        getCalculationUnitOnMetricRowsChange({
+          previousMode,
+          nextMode,
+          currentCalculationUnit: current,
+          unitList
+        })
+      );
+    } else {
+      // 从公式切回单指标时,阈值单位回退到主指标的单位
+      const primaryMetric = metrics.find(
+        (item) => item.name === nextPrimaryMetricName
+      );
+      const retracted = getReverseModeCalculationUnit({
+        previousMode,
+        nextMode,
+        primaryMetricUnit: primaryMetric?.unit ?? null
+      });
+      if (retracted !== undefined) {
+        setCalculationUnit(retracted);
+      }
+    }
+
+    if (
+      rows.length === 1 &&
+      nextPrimaryMetricName &&
+      nextPrimaryMetricName !== previousPrimaryMetricName
+    ) {
+      handleMetricChange(nextPrimaryMetricName);
+    }
+
+    form.validateFields(['metric']).catch(() => undefined);
   };
 
   const handleUnitChange = (val: string) => {
@@ -556,10 +871,6 @@ const StrategyOperation = () => {
 
   const handleAlgorithmChange = (val: string) => {
     setAlgorithm(val);
-  };
-
-  const handleGroupAlgorithmChange = (val: string) => {
-    setGroupAlgorithm(val);
   };
 
   const handleNodataUnitChange = (val: string) => {
@@ -592,7 +903,12 @@ const StrategyOperation = () => {
     setThreshold(value);
   };
 
-  const handleCalculationUnitChange = (unit: string) => {
+  const handleThresholdUnitChange = (unit: string) => {
+    setThresholdUnit(unit);
+    form.validateFields(['threshold']);
+  };
+
+  const handleFormulaResultUnitChange = (unit: string) => {
     setCalculationUnit(unit);
     form.validateFields(['threshold']);
   };
@@ -609,9 +925,8 @@ const StrategyOperation = () => {
     window.open(url, '_blank', 'noopener,noreferrer');
   };
 
-  const createStrategy = () => {
-    form?.validateFields().then((values) => {
-      const params = cloneDeep(values);
+  const buildStrategyParams = (values: any): StrategyFields | null => {
+      const params: any = cloneDeep(values);
       delete params._conditions_validator;
       delete params.no_data_level;
       delete params.no_data_alert_name;
@@ -619,6 +934,7 @@ const StrategyOperation = () => {
         (item) => item.value === params.collect_type
       );
       const isTrapPlugin = target?.name === 'SNMP Trap';
+      let selectedMetricSourceUnit: string | null | undefined = null;
       if (isTrapPlugin) {
         params.query_condition = {
           type: 'pmq',
@@ -628,23 +944,54 @@ const StrategyOperation = () => {
         params.group_algorithm = 'avg';
         params.algorithm = 'last_over_time';
       } else {
-        const mertricTarget = metrics.find((item) => item.name === metric);
-        params.query_condition = {
-          type: 'metric',
-          metric_id: mertricTarget?.id,
-          filter: conditions
-        };
+        try {
+          params.query_condition = buildMetricExpressionQueryCondition({
+            mode: metricExpressionMode,
+            resultName: formulaResultName,
+            expression: formulaExpression,
+            rows: metricRows
+          });
+        } catch (error) {
+          message.error(
+            error instanceof Error
+              ? error.message
+              : t('monitor.events.metricValidate')
+          );
+          return null;
+        }
+        const primaryMetric = metricRows[0];
+        const mertricTarget = metrics.find(
+          (item) =>
+            (primaryMetric?.metricId != null &&
+              String(item.id) === String(primaryMetric.metricId)) ||
+            item.name === primaryMetric?.metricName
+        );
+        selectedMetricSourceUnit = mertricTarget?.unit;
         params.source = source;
-        params.metric_unit = isStringArray(mertricTarget?.unit)
-          ? ''
-          : mertricTarget?.unit;
       }
-      params.group_algorithm = params.group_algorithm || groupAlgorithm || 'avg';
+      params.group_algorithm =
+        params.group_algorithm ||
+        metricRows[0]?.groupAlgorithm ||
+        groupAlgorithm ||
+        'avg';
       params.algorithm = params.algorithm || algorithm || 'avg_over_time';
       params.threshold = threshold.filter(
         (item) => !!item.value || item.value === 0
       );
-      params.calculation_unit = calculationUnit || '';
+      const policyUnits = isTrapPlugin
+        ? { metricUnit: '', calculationUnit: '', thresholdUnit: '' }
+        : resolveMetricExpressionUnits({
+          queryType:
+            metricExpressionMode === 'formula' || metricRows.length > 1
+              ? 'formula'
+              : 'metric',
+          metricUnit: selectedMetricSourceUnit,
+          calculationUnit: effectiveCalculationUnit,
+          thresholdUnit: effectiveThresholdUnit
+        });
+      params.metric_unit = policyUnits.metricUnit;
+      params.calculation_unit = policyUnits.calculationUnit;
+      params.threshold_unit = policyUnits.thresholdUnit;
       params.monitor_object = monitorObjId;
       params.schedule = {
         type: unit,
@@ -679,10 +1026,120 @@ const StrategyOperation = () => {
       }
       params.enable_alerts = _enableAlerts;
       params.recovery_condition = params.recovery_condition || 0;
-      params.group_by = sanitizeGroupBy(groupBy);
+      params.group_by = sanitizeGroupBy(metricRows[0]?.groupBy || groupBy);
       params.enable = true;
-      operateStrategy(params);
+      return params;
+  };
+
+  const createStrategy = () => {
+    form
+      ?.validateFields()
+      .then((values) => {
+        const params = buildStrategyParams(values);
+        if (params) void operateStrategy(params);
+      })
+      .catch(() => {
+        // 校验失败（含通知开启且通知人为空）时阻止创建/保存
+      });
+  };
+
+  const saveTemplate = async () => {
+    if (templateSubmittingRef.current || templateSaving) return;
+    if (isCreateFlow && (templateSavedOnce || templateSavedOnceRef.current)) {
+      message.info(t('monitor.events.templateAlreadySaved', '当前策略已保存为模版'));
+      return;
+    }
+    const trapTemplate = isTrap(form.getFieldValue);
+    const templateFields = [
+      'name',
+      'alert_name',
+      'collect_type',
+      'schedule',
+      'period',
+      'threshold',
+      'trigger_count',
+      'recovery_condition',
+      'no_data_alert_name',
+      ...(trapTemplate ? ['query'] : ['metric', 'algorithm']),
+    ];
+    let validated: Record<string, unknown>;
+    try {
+      validated = await form.validateFields(templateFields);
+    } catch {
+      return;
+    }
+    const params = buildStrategyParams({
+      ...form.getFieldsValue(true),
+      ...validated,
     });
+    if (!params) return;
+    pendingTemplateConfigRef.current = params;
+    const defaultName = String(params.name || validated.name || '').trim();
+    setTemplateMetaDefaults({
+      name: defaultName,
+      description: defaultName,
+    });
+    setTemplateConfirmVisible(true);
+  };
+
+  const resetTemplateConfirm = () => {
+    setTemplateConfirmVisible(false);
+    pendingTemplateConfigRef.current = null;
+    templateMetaForm.resetFields();
+  };
+
+  const closeTemplateConfirm = () => {
+    if (templateSubmittingRef.current) return;
+    resetTemplateConfirm();
+  };
+
+  const confirmSaveTemplate = async (options?: { exitAfterSave?: boolean }) => {
+    if (templateSubmittingRef.current || templateSaving) return;
+    if (isCreateFlow && (templateSavedOnce || templateSavedOnceRef.current)) {
+      message.info(t('monitor.events.templateAlreadySaved', '当前策略已保存为模版'));
+      return;
+    }
+    const config = pendingTemplateConfigRef.current;
+    if (!config) return;
+    let meta: { name: string; description: string };
+    try {
+      meta = await templateMetaForm.validateFields();
+    } catch {
+      return;
+    }
+    const name = String(meta.name || '').trim();
+    if (!name) {
+      templateMetaForm.setFields([
+        {
+          name: 'name',
+          errors: [t('common.required')],
+        },
+      ]);
+      return;
+    }
+    templateSubmittingRef.current = true;
+    setTemplateSaving(true);
+    try {
+      await savePolicyTemplate({
+        monitor_object: monitorObjId,
+        plugin: config.collect_type,
+        name,
+        description: String(meta.description ?? ''),
+        config,
+      });
+      message.success(t('monitor.events.saveTemplateSuccess', '模版保存成功'));
+      if (isCreateFlow) {
+        templateSavedOnceRef.current = true;
+        setTemplateSavedOnce(true);
+      }
+      resetTemplateConfirm();
+      if (options?.exitAfterSave) {
+        goBack();
+      }
+    } finally {
+      templateSubmittingRef.current = false;
+      setTemplateSaving(false);
+    }
   };
 
   const operateStrategy = async (params: StrategyFields) => {
@@ -734,7 +1191,7 @@ const StrategyOperation = () => {
         <div className={strategyStyle.form} ref={formContainerRef}>
           <div className="flex gap-6">
             <div className="w-[820px] flex-shrink-0">
-              <Form form={form} name="basic">
+              <Form form={form} name="basic" scrollToFirstError>
                 <Steps
                   direction="vertical"
                   items={[
@@ -760,21 +1217,28 @@ const StrategyOperation = () => {
                         <MetricDefinitionForm
                           form={form}
                           pluginList={pluginList}
-                          metric={metric}
                           metricsLoading={metricsLoading}
-                          labels={labels}
-                          conditions={conditions}
-                          groupBy={groupBy}
-                          groupAlgorithm={groupAlgorithm}
                           period={period}
                           periodUnit={periodUnit}
                           originMetricData={originMetricData}
                           monitorName={monitorName as string}
+                          metricRows={metricRows}
+                          metricExpressionMode={metricExpressionMode}
+                          resultName={formulaResultName}
+                          expression={formulaExpression}
+                          resultUnit={
+                            metricExpressionMode === 'formula'
+                              ? effectiveCalculationUnit
+                              : null
+                          }
+                          labelsByRef={labelsByRef}
+                          groupedUnitOptions={groupedUnitOptions}
+                          unitList={unitList}
                           onCollectTypeChange={changeCollectType}
-                          onMetricChange={handleMetricChange}
-                          onFiltersChange={handleConditionsChange}
-                          onGroupChange={handleGroupByChange}
-                          onGroupAlgorithmChange={handleGroupAlgorithmChange}
+                          onMetricRowsChange={handleMetricRowsChange}
+                          onResultNameChange={setFormulaResultName}
+                          onExpressionChange={setFormulaExpression}
+                          onResultUnitChange={handleFormulaResultUnitChange}
                           onPeriodChange={handlePeriodChange}
                           onPeriodUnitChange={handlePeriodUnitChange}
                           onAlgorithmChange={handleAlgorithmChange}
@@ -789,7 +1253,8 @@ const StrategyOperation = () => {
                         <AlertConditionsForm
                           enableAlerts={enableAlerts}
                           threshold={threshold}
-                          calculationUnit={calculationUnit}
+                          calculationUnit={effectiveCalculationUnit}
+                          thresholdUnit={effectiveThresholdUnit}
                           noDataAlert={noDataAlert}
                           nodataUnit={nodataUnit}
                           noDataRecovery={noDataRecovery}
@@ -800,9 +1265,10 @@ const StrategyOperation = () => {
                             metrics.find((item) => item.name === metric)
                               ?.unit || null
                           }
+                          isFormulaMode={metricExpressionMode === 'formula'}
                           onEnableAlertsChange={setEnableAlerts}
                           onThresholdChange={handleThresholdChange}
-                          onCalculationUnitChange={handleCalculationUnitChange}
+                          onThresholdUnitChange={handleThresholdUnitChange}
                           onNodataUnitChange={handleNodataUnitChange}
                           onNoDataAlertChange={handleNoDataAlertChange}
                           onNodataRecoveryUnitChange={
@@ -823,7 +1289,7 @@ const StrategyOperation = () => {
                       description: (
                         <NotificationForm
                           channelList={channelList}
-                          userList={userList}
+                          userList={noticeUserList}
                           onLinkToSystemManage={linkToSystemManage}
                         />
                       ),
@@ -835,14 +1301,10 @@ const StrategyOperation = () => {
             </div>
             <div className="flex flex-col flex-1 min-w-[400px]">
               <VariablesTable
+                displayFields={currentMonitorObject?.display_fields}
+                groupBy={sanitizeGroupBy(metricRows[0]?.groupBy || groupBy)}
                 onVariableSelect={(variable: string) => {
-                  const currentAlertName =
-                    form.getFieldValue('alert_name') || '';
-                  form.setFieldsValue({
-                    alert_name: currentAlertName + variable
-                  });
-                  // 自动聚焦到告警名称输入框
-                  basicInfoFormRef.current?.focusAlertName();
+                  basicInfoFormRef.current?.insertVariable(variable);
                 }}
               />
               <MetricPreview
@@ -857,7 +1319,12 @@ const StrategyOperation = () => {
                 periodUnit={periodUnit}
                 algorithm={algorithm}
                 threshold={threshold}
-                calculationUnit={calculationUnit}
+                calculationUnit={effectiveCalculationUnit}
+                thresholdUnit={effectiveThresholdUnit}
+                metricRows={metricRows}
+                metricExpressionMode={metricExpressionMode}
+                resultName={formulaResultName}
+                expression={formulaExpression}
                 scrollContainerRef={formContainerRef}
                 anchorRef={basicInfoRef}
                 fixedGroupByList={
@@ -867,16 +1334,24 @@ const StrategyOperation = () => {
             </div>
           </div>
         </div>
-        <div className={strategyStyle.footer}>
+        <div className={`${strategyStyle.footer} flex gap-2`}>
           <Button
             type="primary"
-            className="mr-[10px]"
             loading={confirmLoading}
             onClick={createStrategy}
           >
             {t('common.confirm')}
           </Button>
-          <Button onClick={goBack}>{t('common.cancel')}</Button>
+            {isCreateFlow && templateSavedOnce ? (
+            <Button onClick={goBack}>{t('common.back')}</Button>
+            ) : (
+            <>
+              <Button loading={templateSaving} onClick={() => void saveTemplate()}>
+                {t('monitor.events.saveTemplate', '保存模版')}
+              </Button>
+              <Button onClick={goBack}>{t('common.cancel')}</Button>
+            </>
+            )}
         </div>
       </div>
       <SelectAssets
@@ -885,6 +1360,60 @@ const StrategyOperation = () => {
         objects={objects}
         onSuccess={onChooseAssets}
       />
+      <OperateModal
+        title={t('monitor.events.saveTemplate', '保存模版')}
+        open={templateConfirmVisible}
+        onCancel={closeTemplateConfirm}
+        maskClosable={!templateSaving}
+        closable={!templateSaving}
+        footer={
+          <div>
+            {isCreateFlow ? (
+              <Button
+                className="mr-[10px]"
+                loading={templateSaving}
+                disabled={templateSaving}
+                onClick={() => void confirmSaveTemplate({ exitAfterSave: true })}
+              >
+                {t('monitor.events.saveAndExit', '保存并退出')}
+              </Button>
+            ) : null}
+            <Button
+              className="mr-[10px]"
+              type="primary"
+              loading={templateSaving}
+              disabled={templateSaving}
+              onClick={() => void confirmSaveTemplate()}
+            >
+              {isCreateFlow ? t('monitor.events.saveAndContinue', '保存并继续') : t('common.confirm')}
+            </Button>
+            <Button disabled={templateSaving} onClick={closeTemplateConfirm}>
+              {t('common.cancel')}
+            </Button>
+          </div>
+        }
+      >
+        <Form
+          form={templateMetaForm}
+          layout="vertical"
+          preserve={false}
+          initialValues={templateMetaDefaults}
+        >
+          <Form.Item
+            label={t('monitor.integrations.templateName')}
+            name="name"
+            rules={[{ required: true, whitespace: true, message: t('common.required') }]}
+          >
+            <Input maxLength={100} />
+          </Form.Item>
+          <Form.Item
+            label={t('monitor.integrations.templateDescription')}
+            name="description"
+          >
+            <Input.TextArea rows={4} />
+          </Form.Item>
+        </Form>
+      </OperateModal>
     </Spin>
   );
 };

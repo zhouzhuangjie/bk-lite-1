@@ -1,0 +1,92 @@
+# Windows 控制器远程安装
+
+Status: implemented
+
+## Problem Statement
+
+Windows 控制器当前只能由用户下载 GUI 安装器后登录主机手动安装。节点管理的“远程安装”任务虽然允许接收 Windows 节点，但实际复用了 Linux SSH 命令执行链路，无法正确连接 WinRM，也会让旧版 PowerShell 的 TLS 下载能力成为兼容性风险。
+
+## Solution
+
+Windows 远程安装采用“Ansible Executor 负责 WinRM 编排，原生 Go bootstrap 负责安装”的两段式链路：
+
+1. Server 创建与目标主机、安装包和云区域绑定的短期安装会话。
+2. Server 在目标云区域选择一个 `ansibleexecutor_linux` 状态正常的容器节点。
+3. Ansible Executor 从 Server NATS Object Store 获取 Windows x86_64 bootstrap，并通过 WinRM 复制到目标主机临时目录。
+4. Executor 把安装会话 URL 写入临时文件，以 `argv` 调用 bootstrap 的 `--url-file` 参数，不把会话放入命令行。
+5. Go bootstrap 使用自身 HTTP/TLS 与 NATS 客户端获取配置和控制器包，在 staging 目录完成有界解压和校验后切换安装目录并注册服务。
+   Server 会话校验当前 `execution_id + attempt` 租约并签发不可延长的执行截止时间；同一安装目录同时使用操作系统文件锁和原子持久化的单调 fencing 记录。bootstrap 在任何备份清理/恢复前，以及正常激活或中断恢复的停止服务前后，通过 HTTPS 向 Server 重新校验租约；停止后的校验失败只重启操作前服务，不写事务标记或切换目录。本地截止时间作为附加防线。
+6. 新服务启动失败时恢复原目录和原服务；若服务管理器连续拒绝停止失败的新服务，则不得冒险替换其在用目录，应保留原目录备份并返回不可自动重试的人工恢复状态；成功切换保留 `cache`、`logs`、`generated` 运行数据。
+7. bootstrap 将与 stdout 相同的结构化事件实时发布到 `installer.progress.<execution_id>`；Server 消费实时事件，并对 Ansible 终态 stdout 回放按事件内容去重。
+8. Ansible `always` 与 Server 侧兜底清理共同删除临时会话文件和 bootstrap；最终成功仍以 Sidecar 回连为准。
+
+这条链路不依赖 PowerShell 的 SSL/TLS 下载能力。Ansible Windows 模块自身仍通过 Windows PowerShell/WinRM 运行模块包装代码，所以这不是“目标机完全不需要 PowerShell”；第一版兼容性基线是 Windows 10 / Windows Server 2016、PowerShell 5.1 或更高版本，执行 bootstrap 前显式预检。安装器的网络下载和 TLS 校验由 Go 实现。
+
+## Compatibility And Security Decisions
+
+- 第一版只支持 Windows x86_64，与现有 Windows Controller 包能力一致。
+- 默认使用 HTTPS 与 NTLM，默认端口为 5986；允许已配置 WinRM HTTPS Listener 的自定义端口，但拒绝 HTTPS+5985。安装与卸载均可显式选择 WinRM HTTP（默认端口 5985），并拒绝 HTTP+5986。HTTP 必须由用户选择，不得把现网 HTTPS 批次无声改成明文。Basic、Kerberos 和 CredSSP 仍不开放。
+- 面向可信内网的 Windows 安装与卸载默认关闭 WinRM 和安装服务 HTTPS 证书校验，页面持续展示风险提示；用户仍可显式开启校验。证书校验开关只对 HTTPS 生效；选择 HTTP 时强制关闭校验并展示更重的明文传输风险提示。
+- WinRM 模块连接显式使用 60 秒 WSMan operation timeout（Ansible 同步设置 70 秒 HTTP read timeout），覆盖高负载主机的模块输入延迟；WSMan fault 170 / `ERROR_BUSY` 单独标记为可重试的 WinRM 资源争用，不得误报为 NATS 或持续网络中断。
+- 自签名 WinRM 与安装服务证书优先通过受控 CA 信任配置解决；显式关闭校验时，页面必须持续提示目标主机和安装服务身份无法确认，以及管理员凭据和安装数据可能被截获或篡改的风险。
+- Windows 远程安装会话和会话返回的 Server URL 必须为 HTTPS；bootstrap 拒绝 HTTP 和 HTTPS 降级重定向。
+- Windows 远程安装只接受密码凭据，不接受 SSH 私钥。
+- 密码继续使用现有 AES 字段暂存，并在单节点任务结束后清空。
+- 安装会话 URL 通过权限受限的 Ansible vars 文件传递，不进入 Executor 进程参数；相关任务启用 `no_log`，任务结束后删除远端会话文件。
+- Executor 恢复执行所需的敏感载荷使用版本化 Fernet 密文持久化，优先使用 `ANSIBLE_PAYLOAD_ENCRYPTION_KEY`，未配置时沿用部署注入的 NATS 密码派生密钥；两者均未配置的兼容场景，在状态数据库旁生成权限为 `0600` 的稳定本机密钥，避免匿名 NATS 的既有部署升级后无法启动。
+- 控制器包下载上限为 4 GiB、解压上限为 8 GiB/100000 个文件；超过边界时在停止旧服务前失败。
+- Ansible Executor 必须与目标节点同云区域且 `ansibleexecutor_linux` 采集器健康；找不到时快速失败，不跨区域兜底。
+- `ansible.windows` 固定为 3.7.0，与仓库现有 `ansible-core==2.18.6` 组合构建，避免部署时自动获取不兼容的新版本。
+- 实时事件 subject 只接受由 Server 生成的 32 位小写十六进制 execution ID；安装器 NATS 用户仅需 `installer.progress.>` 发布权限，发布失败降级到终态 stdout，不阻断安装。
+- Windows 远程安装会话只下发专用 `NATS_INSTALLER_USERNAME/PASSWORD`，且要求 `NATS_PROTOCOL=tls`；不得回退管理员账号或通过明文 NATS 传输凭据。Windows GUI 手动安装默认保留原有兼容策略；云区域显式启用 `NATS_INSTALLER_CREDENTIALS_MODE=strict` 后，GUI 手动安装也必须拒绝管理员账号回退。
+
+## Component Boundary
+
+该能力不是只修改节点管理 App：
+
+- `server/apps/node_mgmt`：API 参数、任务编排、Executor 选择、安装会话和状态收敛。
+- `agents/ansible-executor`：WinRM 与 Windows 文件分发运行时，并固定 collection 版本。
+- `agents/sidecar-installer`：生成无 GUI 的 Windows bootstrap，完成实际下载和安装。
+- `web/src/app/node-manager`：开放 Windows 远程安装入口并收集主机与凭据；默认 HTTPS 与 NTLM，允许批次级显式选择 HTTP；WinRM 和安装服务 HTTPS 证书校验以默认关闭、可显式开启的批次级开关呈现，且仅在 HTTPS 下可用。
+
+不新增独立 WinRM 服务；Server 只调用现有 Ansible Executor RPC，从而复用凭据转 inventory、异步任务查询、NATS 文件分发和 Windows 模块能力。
+
+## Operational Requirements
+
+面向运维发布和流水线改造的完整步骤见
+[`docs/operations/windows-controller-remote-install-release.md`](../../../docs/operations/windows-controller-remote-install-release.md)。
+
+发布前必须：
+
+1. 构建 `agents/sidecar-installer` 的 release artifacts。
+2. 将 `dist/windows/x86_64/bklite-controller-bootstrap.exe` 通过 `installer_init --variant bootstrap` 上传到 `installer/windows/x86_64/bklite-controller-bootstrap.exe`。
+3. 重新构建并发布 Ansible Executor，使其包含固定版本的 `ansible.windows`、`pywinrm` 与载荷加密依赖。
+4. 执行 NodeMgmt 数据库迁移。
+5. 确认每个需要 Windows 远程安装的云区域至少有一个健康 Ansible Executor。
+6. 在目标 Windows 主机预配置 WinRM listener、防火墙和认证方式；HTTPS 默认要求 5986，显式选择 HTTP 时要求 5985。启用证书校验时还需分别配置 Executor 对 WinRM 证书、目标主机对安装服务 HTTPS 证书的信任。
+7. 为安装器 NATS 用户配置 `installer.progress.>` 发布权限，并允许 Server 账号订阅。
+8. 为 Windows 远程安装配置 `NATS_PROTOCOL=tls`、可信服务端证书和专用安装器账号；明文 NATS 或管理员账号回退会快速失败。
+
+## Acceptance Criteria
+
+- Windows 在控制器安装页可选择远程安装，默认账号为 Administrator、默认端口为 5986，默认 HTTPS 与 NTLM；用户可显式选择 HTTP/5985。WinRM 和安装服务 HTTPS 证书校验默认关闭且可由用户在 HTTPS 下显式开启。Windows 远程卸载使用相同默认值和同一套 HTTP opt-in。
+- 关闭证书校验时显示持续风险提示，并把 `winrm_cert_validation=false` 保存到每个任务节点；初次执行和重试均同时关闭 WinRM 与 bootstrap HTTPS 证书校验，但仍拒绝非 HTTPS 的安装会话 URL。选择 HTTP 时显示明文 WinRM 风险提示，证书校验开关不可用。
+- 重试弹窗必须从任务节点带入端口、协议、NTLM 与证书校验状态，显式展示并允许在重试前改选 HTTP 或 HTTPS；只要求重新输入已清理的登录凭据，不得静默恢复默认配置。方案与端口不匹配（HTTPS+5985、HTTP+5986）必须在提交前拒绝。
+- 安装列表、详情和失败摘要使用同一规范步骤；事务安装在 staging 解压阶段失败时统一显示为“解压安装包失败”，完成数只统计成功步骤，后续未执行步骤单独列出。
+- 任务终态优先于安装器明细完整性：节点已回连且任务成功时不得继续显示进行中；明细不完整仅作为“部分明细未上报”提示。运行期间后续步骤为待执行，不标记为缺失；提前回连必须被持久化，并在 bootstrap 收尾期间显示节点已上线。
+- 卸载删除节点记录后，原任务节点快照仍须在任务所属团队及发起人授权边界内持续可读，直至前端取得最终状态；不得因实时节点列表先消失而清空卸载列表、冻结日志抽屉或无限轮询。仍存在但当前无权访问的节点不得被误判为历史快照。
+- Windows 事务安装必须在真实操作边界分别上报解压、写配置和激活服务的 running/success/error，任一时刻最多只有一个活动子步骤。
+- Windows 任务不会调用现有 SSH 执行方法。
+- bootstrap 下发失败、WinRM 连接失败、安装失败或回连超时均进入现有节点任务错误/超时状态。
+- bootstrap 输出的 `BKINSTALL_EVENT` 在 Ansible 返回前实时进入现有安装进度模型；终态 stdout 补偿不丢失失败事件，也不重复步骤。
+- 执行结束后目标临时目录不存在会话 URL 文件和本次 bootstrap 文件。
+- 新包校验失败不得停止旧服务；新服务启动失败必须恢复旧目录和旧服务。仅当无法确认失败的新服务已经停止时，允许安全降级为保留原目录备份并明确标记“需要人工恢复”，不得继续自动重试或强行覆盖在用目录。
+- 下载和解压超过资源边界时快速失败，不修改现有安装。
+- Linux 远程安装入口、认证和执行链路默认与 Windows 手动 GUI 安装行为保持不变；云区域显式启用 `NATS_INSTALLER_CREDENTIALS_MODE=strict` 时，两者都在缺少专用安装凭据时失败关闭。共享安装引擎统一执行下载和解压资源边界。
+
+## Out Of Scope
+
+- 自动开启或修改目标 Windows 的 WinRM、防火墙、证书及本地安全策略。
+- Windows ARM64。
+- 无 WinRM 环境下的 SMB/PsExec/DCOM fallback。
+- Windows 控制器升级和日常操作链路改造。

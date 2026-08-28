@@ -1,3 +1,5 @@
+import shlex
+
 from rest_framework.decorators import action
 from django.http import HttpResponse, JsonResponse, StreamingHttpResponse
 import requests
@@ -329,9 +331,6 @@ class OpenSidecarViewSet(OpenAPIViewSet):
                 }
             }
         """
-        node_name = request.data.get("node_name", "")
-        node_ip = request.data.get("node_details", {}).get("ip", "")
-        logger.debug(f"Received sidecar node update request node_id={node_id}, node_ip={node_ip}, node_name={node_name}")
         check_token_auth(node_id, request)
         return Sidecar.update_node_client(request, node_id)
 
@@ -552,10 +551,25 @@ class OpenSidecarViewSet(OpenAPIViewSet):
         if not token:
             raise BaseAppException("Missing token parameter")
 
-        token_data = InstallTokenService.validate_and_get_token_data(token)
-        serializer = InstallerArtifactQuerySerializer(data=request.query_params, context={"target_os": token_data.get("os", "linux")})
-        serializer.is_valid(raise_exception=True)
-        config = InstallerSessionService.build_session_config(token, serializer.validated_data.get("arch", ""), token_data=token_data)
+        try:
+            token_data = InstallTokenService.inspect_token_data(token)
+            serializer = InstallerArtifactQuerySerializer(
+                data=request.query_params,
+                context={"target_os": token_data.get("os", "linux")},
+            )
+            serializer.is_valid(raise_exception=True)
+            config = InstallerSessionService.build_session_config(
+                token,
+                serializer.validated_data.get("arch", ""),
+                token_data=token_data,
+            )
+            consumed_token_data = InstallTokenService.validate_and_get_token_data(token)
+        except BaseAppException as exception:
+            return WebUtils.response_error(
+                error_message=exception.message,
+                status_code=exception.STATUS_CODE,
+            )
+        config["remaining_usage"] = consumed_token_data["remaining_usage"]
 
         response = JsonResponse(config)
         response["X-Token-Remaining-Usage"] = str(config["remaining_usage"])
@@ -586,20 +600,31 @@ class OpenSidecarViewSet(OpenAPIViewSet):
         if not token:
             raise BaseAppException("Missing token parameter")
 
-        token_data = InstallTokenService.validate_and_get_token_data(token)
-        requested_arch = normalize_cpu_architecture(token_data.get("cpu_architecture", ""))
-        config = InstallerSessionService.build_session_config(token, requested_arch, token_data=token_data)
+        try:
+            token_data = InstallTokenService.inspect_token_data(token)
+            requested_arch = normalize_cpu_architecture(token_data.get("cpu_architecture", ""))
+            config = InstallerSessionService.build_session_config(
+                token,
+                requested_arch,
+                token_data=token_data,
+            )
+            InstallTokenService.validate_and_get_token_data(token)
+        except BaseAppException as exception:
+            return WebUtils.response_error(
+                error_message=exception.message,
+                status_code=exception.STATUS_CODE,
+            )
         installer = config["installer"]
         install_dir = config["install_dir"]
         server_base_url = config["server_url"].replace("/api/v1/node_mgmt/open_api/node", "")
-        installer_url = f"{server_base_url}/api/v1/node_mgmt/open_api/installer/linux/download?token={token}&arch=$DETECTED_ARCH"
-        config_url = f"{server_base_url}/api/v1/node_mgmt/open_api/installer/session?token={token}&arch=$DETECTED_ARCH"
+        installer_url_prefix = f"{server_base_url}/api/v1/node_mgmt/open_api/installer/linux/download?token={token}&arch="
+        config_url_prefix = f"{server_base_url}/api/v1/node_mgmt/open_api/installer/session?token={token}&arch="
 
-        script = f'''#!/bin/bash
-set -euo pipefail
+        script = f"""#!/bin/sh
+set -eu
 
-INSTALL_DIR="{install_dir}"
-INSTALLER_NAME="{installer["filename"]}"
+INSTALL_DIR={shlex.quote(str(install_dir))}
+INSTALLER_NAME={shlex.quote(str(installer["filename"]))}
 TMP_DIR="$(mktemp -d)"
 INSTALLER_PATH="$TMP_DIR/$INSTALLER_NAME"
 DETECTED_ARCH="$(uname -m | tr '[:upper:]' '[:lower:]')"
@@ -610,7 +635,9 @@ elif [ "$DETECTED_ARCH" = "aarch64" ]; then
   DETECTED_ARCH="arm64"
 fi
 
-EXPECTED_ARCH="{requested_arch}"
+EXPECTED_ARCH={shlex.quote(requested_arch)}
+INSTALLER_URL={shlex.quote(installer_url_prefix)}"$DETECTED_ARCH"
+CONFIG_URL={shlex.quote(config_url_prefix)}"$DETECTED_ARCH"
 
 if [ -n "$EXPECTED_ARCH" ] && [ "$DETECTED_ARCH" != "$EXPECTED_ARCH" ]; then
   echo "Error: target architecture $DETECTED_ARCH does not match expected architecture $EXPECTED_ARCH"
@@ -620,12 +647,15 @@ fi
 cleanup() {{
   rm -rf "$TMP_DIR"
 }}
-trap cleanup EXIT
+trap cleanup 0
+trap 'exit 1' 1 2 15
 
 mkdir -p "$INSTALL_DIR"
-curl -sSLk "{installer_url}" -o "$INSTALLER_PATH"
+curl -fsSLk "$INSTALLER_URL" -o "$INSTALLER_PATH"
 chmod +x "$INSTALLER_PATH"
-        exec "$INSTALLER_PATH" --url "{config_url}" --install-dir "$INSTALL_DIR" --skip-tls
-'''
+installer_status=0
+"$INSTALLER_PATH" --url "$CONFIG_URL" --install-dir "$INSTALL_DIR" --skip-tls || installer_status=$?
+exit "$installer_status"
+"""
 
         return HttpResponse(script.encode("utf-8"), content_type="text/plain; charset=utf-8")

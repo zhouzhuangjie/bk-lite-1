@@ -6,6 +6,7 @@ import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { useCollectApi } from '@/app/cmdb/api';
 import { useTranslation } from '@/utils/i18n';
 import { useCollectToolApi } from '@/app/cmdb/api/collectTool';
+import Introduction from '@/components/introduction';
 import type { CollectToolPrefillResponse, Protocol } from '@/app/cmdb/types/collectTool';
 import SnmpTool from './components/snmpDebugTool';
 import IpmiTool from './components/ipmiDebugTool';
@@ -140,24 +141,28 @@ const CollectionToolPage: React.FC = () => {
       label: t('CollectTool.snmpTool'),
       children: (
         <Spin spinning={prefillLoading}>
-          {prefillWarning && activeTab === 'snmp' && (
-            <Alert
-              type="warning"
-              message={prefillWarning}
-              className="mb-4"
-              showIcon
-              closable
-            />
-          )}
-          <SnmpTool
-            accessPointOptions={accessPointOptions}
-            prefill={
-              activeTab === 'snmp' && prefillData?.protocol === 'snmp'
-                ? prefillData.prefill
-                : undefined
-            }
-            taskId={taskId}
-          />
+          <div className="flex h-full min-h-0 flex-col">
+            {prefillWarning && activeTab === 'snmp' && (
+              <Alert
+                type="warning"
+                message={prefillWarning}
+                className="mb-4 shrink-0"
+                showIcon
+                closable
+              />
+            )}
+            <div className="min-h-0 flex-1">
+              <SnmpTool
+                accessPointOptions={accessPointOptions}
+                prefill={
+                  activeTab === 'snmp' && prefillData?.protocol === 'snmp'
+                    ? prefillData.prefill
+                    : undefined
+                }
+                taskId={taskId}
+              />
+            </div>
+          </div>
         </Spin>
       ),
     },
@@ -166,32 +171,40 @@ const CollectionToolPage: React.FC = () => {
       label: t('CollectTool.ipmiTool'),
       children: (
         <Spin spinning={prefillLoading}>
-          {prefillWarning && activeTab === 'ipmi' && (
-            <Alert
-              type="warning"
-              message={prefillWarning}
-              className="mb-4"
-              showIcon
-              closable
-            />
-          )}
-          <IpmiTool
-            accessPointOptions={accessPointOptions}
-            prefill={
-              activeTab === 'ipmi' && prefillData?.protocol === 'ipmi'
-                ? prefillData.prefill
-                : undefined
-            }
-            taskId={taskId}
-          />
+          <div className="flex h-full min-h-0 flex-col">
+            {prefillWarning && activeTab === 'ipmi' && (
+              <Alert
+                type="warning"
+                message={prefillWarning}
+                className="mb-4 shrink-0"
+                showIcon
+                closable
+              />
+            )}
+            <div className="min-h-0 flex-1">
+              <IpmiTool
+                accessPointOptions={accessPointOptions}
+                prefill={
+                  activeTab === 'ipmi' && prefillData?.protocol === 'ipmi'
+                    ? prefillData.prefill
+                    : undefined
+                }
+                taskId={taskId}
+              />
+            </div>
+          </div>
         </Spin>
       ),
     },
   ];
 
   return (
-    <div className="flex flex-col h-full">
-      <div className="flex-1 overflow-hidden px-4 pb-4">
+    <div className="flex h-full min-h-0 flex-col">
+      <Introduction
+        title={t('CollectTool.pageTitle')}
+        message={t('CollectTool.pageDesc')}
+      />
+      <div className="min-h-0 flex-1 overflow-hidden pb-4">
         <Tabs
           activeKey={activeTab}
           onChange={setActiveTab}

@@ -1,3 +1,5 @@
+import { isDashboardExecutionRenderRoute } from '@/app/routeScope';
+
 const SESSION_EXPIRED_EVENT = 'bk-lite:session-expired';
 
 const SESSION_EXPIRY_IGNORED_PATH_PREFIXES = [
@@ -14,8 +16,12 @@ const SESSION_EXPIRY_IGNORED_REQUEST_PATHS = [
   '/api/proxy/core/api/get_bk_settings/',
   '/api/proxy/core/api/get_wechat_settings/',
   '/api/proxy/core/api/login/',
+  '/api/proxy/core/api/get_login_auth_bindings/',
+  '/api/proxy/core/api/start_login_auth/',
   '/api/proxy/core/api/reset_pwd/',
   '/api/proxy/core/api/verify_otp_code/',
+  // 分享 prepare 故意无 Bearer；401 不应当成会话过期
+  '/api/proxy/operation_analysis/api/dashboard_share/prepare/',
 ];
 
 let sessionExpiredDispatched = false;
@@ -27,6 +33,11 @@ export interface SessionExpiredDetail {
 
 export const emitSessionExpired = (detail?: SessionExpiredDetail) => {
   if (typeof window === 'undefined' || sessionExpiredDispatched) {
+    return;
+  }
+
+  // Chromium 报告渲染页：任何 401 都不得弹「登录已过期」，否则会污染 PDF
+  if (isDashboardExecutionRenderRoute(window.location.pathname)) {
     return;
   }
 
@@ -53,7 +64,7 @@ export const isAuthPath = (pathname?: string | null) => {
     return false;
   }
 
-  return ['/auth/signin', '/auth/signout', '/auth/callback'].includes(pathname);
+  return ['/auth/signin', '/auth/signout', '/auth/callback', '/auth/signin/login-auth-result'].includes(pathname);
 };
 
 const resolveRequestUrl = (input?: RequestInfo | URL | string | null) => {
@@ -68,16 +79,6 @@ const resolveRequestUrl = (input?: RequestInfo | URL | string | null) => {
   } catch {
     return null;
   }
-};
-
-export const hasClientAuthToken = () => {
-  if (typeof document === 'undefined') {
-    return false;
-  }
-
-  return document.cookie
-    .split(';')
-    .some((cookie) => cookie.trim().startsWith('bklite_token='));
 };
 
 export const shouldHandleSessionExpiry = (input?: RequestInfo | URL | string | null) => {
@@ -97,16 +98,26 @@ export const shouldHandleSessionExpiry = (input?: RequestInfo | URL | string | n
     return false;
   }
 
+  if (/^\/api\/proxy\/core\/api\/login_auth_requests\/[^/]+\/status$/.test(pathname)) {
+    return false;
+  }
+
   return pathname.startsWith('/api/') || pathname.includes('/api/');
 };
 
-export const shouldTriggerSessionExpiry = (input?: RequestInfo | URL | string | null) => {
+export const shouldTriggerSessionExpiry = (
+  input: RequestInfo | URL | string | null | undefined,
+  currentSessionIdentity: string | null,
+  requestSessionIdentity: string | null = currentSessionIdentity,
+) => {
   if (typeof window === 'undefined') {
     return false;
   }
 
-  return !isAuthPath(window.location.pathname)
-    && hasClientAuthToken()
+  return Boolean(currentSessionIdentity)
+    && requestSessionIdentity === currentSessionIdentity
+    && !isAuthPath(window.location.pathname)
+    && !isDashboardExecutionRenderRoute(window.location.pathname)
     && shouldHandleSessionExpiry(input);
 };
 

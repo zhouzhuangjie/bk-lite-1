@@ -12,13 +12,15 @@ import {
   Pagination,
   ObjectItem,
   ModalRef,
-  TableDataItem
+  TableDataItem,
+  UserItem
 } from '@/app/monitor/types';
 import { SourceFeild } from '@/app/monitor/types/event';
 import CustomTable from '@/components/custom-table';
 import SelectAssets from './selectAssets';
-import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
-import { getRandomColor, findLabelById } from '@/app/monitor/utils/common';
+import UserAvatar from '@/components/user-avatar';
+import { findLabelById } from '@/app/monitor/utils/common';
+import { buildMonitorStrategyDetailUrl } from '@/app/monitor/utils/policyRouteUtils';
 import { useLocalizedTime } from '@/hooks/useLocalizedTime';
 import { PlusOutlined } from '@ant-design/icons';
 import { useRouter, useSearchParams } from 'next/navigation';
@@ -26,6 +28,16 @@ import TreeSelector from '@/app/monitor/components/treeSelector';
 import ResizableSidebar from '@/app/monitor/components/resizableSidebar';
 import Permission from '@/components/permission';
 import { cloneDeep } from 'lodash';
+import { useCommon } from '@/app/monitor/context/common';
+import { formatUserDisplayName } from '@/utils/userDisplay';
+import {
+  getPolicyNameDisambiguation
+} from '@/app/monitor/utils/policyDisplayName';
+import { useMonitorObjectQuery } from '@/app/monitor/hooks/useMonitorObjectQuery';
+import {
+  resolveMonitorObjectQueryId,
+  resolveMonitorObjectTreeKey
+} from '@/app/monitor/utils/monitorObjectQuery';
 
 const Strategy: React.FC = () => {
   const { t } = useTranslation();
@@ -35,8 +47,10 @@ const Strategy: React.FC = () => {
     useEventApi();
   const searchParams = useSearchParams();
   const { convertToLocalizedTime } = useLocalizedTime();
-  const objId = searchParams.get('objId');
+  const commonContext = useCommon();
+  const userList: UserItem[] = commonContext?.userList || [];
   const router = useRouter();
+  const { syncObjectId } = useMonitorObjectQuery();
   const instRef = useRef<ModalRef>(null);
   const policyAbortControllerRef = useRef<AbortController | null>(null);
   const policyRequestIdRef = useRef<number>(0);
@@ -59,7 +73,28 @@ const Strategy: React.FC = () => {
     {
       title: t('common.name'),
       dataIndex: 'name',
-      key: 'name'
+      key: 'name',
+      render: (_, record) => {
+        const monitorObj = objects.find((item) => item.id === record.monitor_object);
+        const enriched = {
+          ...record,
+          monitor_object_display_name: monitorObj?.display_name || monitorObj?.name
+        };
+        const secondary = getPolicyNameDisambiguation(enriched, tableData);
+        return (
+          <div>
+            <div title={String(record.name || '--')}>{record.name || '--'}</div>
+            {secondary ? (
+              <div
+                className="mt-0.5 text-[12px] leading-4 text-[var(--color-text-3)]"
+                title={secondary}
+              >
+                {secondary}
+              </div>
+            ) : null}
+          </div>
+        );
+      }
     },
     {
       title: t('monitor.events.monitoringTarget'),
@@ -85,26 +120,15 @@ const Strategy: React.FC = () => {
       title: t('common.creator'),
       dataIndex: 'created_by',
       key: 'created_by',
-      render: (_, { created_by }) => {
-        return created_by ? (
-          <div className="column-user" title={created_by}>
-            <span
-              className="user-avatar"
-              style={{ background: getRandomColor() }}
-            >
-              {created_by.slice(0, 1).toLocaleUpperCase()}
-            </span>
-            <span className="user-name">
-              <EllipsisWithTooltip
-                className="w-full overflow-hidden text-ellipsis whitespace-nowrap"
-                text={created_by}
-              />
-            </span>
-          </div>
+      render: (_, { created_by }) =>
+        created_by ? (
+          <UserAvatar
+            userName={formatUserDisplayName(created_by, userList)}
+            size="small"
+          />
         ) : (
           <>--</>
-        );
-      }
+        )
     },
     {
       title: t('common.createTime'),
@@ -204,6 +228,7 @@ const Strategy: React.FC = () => {
   const handleObjectChange = async (id: string) => {
     cancelAllRequests();
     setObjectId(id);
+    syncObjectId(id);
   };
 
   const openInstModal = (row: TableDataItem) => {
@@ -265,8 +290,10 @@ const Strategy: React.FC = () => {
     const currentRequestId = ++policyRequestIdRef.current;
     try {
       setTableLoading(true);
-      const params = getParams(text);
-      params.monitor_object_id = objectId;
+      const params = {
+        ...getParams(text),
+        monitor_object_id: String(objectId)
+      };
       const data = await getMonitorPolicy('', params, {
         signal: abortController.signal
       });
@@ -291,7 +318,17 @@ const Strategy: React.FC = () => {
       });
       setObjects(data);
       const _treeData = getTreeData(cloneDeep(data));
-      setDefaultSelectObj(objId ? +objId : data[0]?.id);
+      setDefaultSelectObj(
+        resolveMonitorObjectTreeKey(
+          data,
+          resolveMonitorObjectQueryId({
+            searchParams,
+            objects: data,
+            fallback: data[0]?.id
+          }),
+          data[0]?.id
+        )
+      );
       setTreeData(_treeData);
     } finally {
       setTreeLoading(false);
@@ -345,15 +382,14 @@ const Strategy: React.FC = () => {
   const linkToStrategyDetail = (type: string, row = { id: '', name: '' }) => {
     const monitorObjId = objectId as string;
     const monitorName = findLabelById(treeData, monitorObjId) as string;
-    const params = new URLSearchParams({
-      monitorObjId,
-      monitorName,
-      type,
-      id: row.id,
-      name: row.name
-    });
-    const targetUrl = `/monitor/event/strategy/detail?${params.toString()}`;
-    router.push(targetUrl);
+    router.push(
+      buildMonitorStrategyDetailUrl(type, {
+        monitorObjId,
+        monitorName,
+        id: row.id,
+        name: row.name
+      })
+    );
   };
 
   return (

@@ -7,7 +7,7 @@ import React, {
   useEffect,
 } from 'react';
 import { Button, Popconfirm, message, Input } from 'antd';
-import OperateModal from '@/app/log/components/operate-drawer';
+import OperateModal from '@/components/operate-drawer';
 import { useTranslation } from '@/utils/i18n';
 import useApiClient from '@/utils/request';
 import {
@@ -165,7 +165,7 @@ const ConditionList = forwardRef<ModalRef, ModalConfig>(
           title={title}
           visible={visible}
           width={600}
-          destroyOnClose
+          destroyOnHidden
           onClose={handleCancel}
           footer={
             <div>

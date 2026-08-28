@@ -13,23 +13,36 @@ Tech Plan参考：
 - 5.3 导入执行流程
 """
 
+from copy import deepcopy
+
 from django.db import transaction
 
 from apps.core.logger import operation_analysis_logger as logger
-from apps.operation_analysis.constants.import_export import RENAME_SUFFIX, SENSITIVE_PLACEHOLDER, ConflictAction, ImportStatus, ObjectType
+from apps.operation_analysis.common.datasource_security import LEGACY_RAW_MONITOR_QUERY_ERROR, is_legacy_raw_monitor_query
+from apps.operation_analysis.constants.canvas_refresh import CANVAS_REFRESH_OBJECT_TYPES, normalize_canvas_refresh_interval
+from apps.operation_analysis.constants.import_export import (
+    RENAME_SUFFIX,
+    SENSITIVE_PLACEHOLDER,
+    ConflictAction,
+    ImportStatus,
+    ObjectType,
+    is_sensitive_field_name,
+)
 from apps.operation_analysis.models.datasource_models import DataSourceAPIModel, DataSourceTag, NameSpace
-from apps.operation_analysis.models.models import Architecture, Dashboard, Directory, Report, Screen, Topology
+from apps.operation_analysis.models.models import Architecture, Dashboard, Directory, NetworkTopology, Report, Screen, Topology
 from apps.operation_analysis.schemas.import_export_schema import (
     ArchitectureItem,
     DashboardItem,
     DatasourceItem,
     NamespaceItem,
+    NetworkTopologyItem,
     ReportItem,
     ScreenItem,
     TopologyItem,
     YAMLDocument,
 )
-from apps.operation_analysis.services.import_export.view_sets import normalize_canvas_view_sets_for_storage, rewrite_canvas_view_sets_refs_for_storage
+from apps.operation_analysis.services.import_export.view_sets import rewrite_canvas_view_sets_refs_for_storage
+from apps.operation_analysis.services.string_param_multiple_migrate import migrate_filters_payload, migrate_param_items
 
 
 class ImportService:
@@ -49,6 +62,7 @@ class ImportService:
         ObjectType.ARCHITECTURE: Architecture,
         ObjectType.SCREEN: Screen,
         ObjectType.REPORT: Report,
+        ObjectType.NETWORK_TOPOLOGY: NetworkTopology,
         ObjectType.DATASOURCE: DataSourceAPIModel,
         ObjectType.NAMESPACE: NameSpace,
     }
@@ -62,6 +76,8 @@ class ImportService:
         created_by: str = "",
         updated_by: str = "",
         groups: list[int] | None = None,
+        existing_canvas_ids: dict[tuple[str, str], int] | None = None,
+        preserve_existing_canvas_groups: bool = False,
     ):
         """
         初始化导入服务
@@ -74,6 +90,8 @@ class ImportService:
             created_by: 创建者
             updated_by: 更新者
             groups: 导入对象所属的组织ID列表
+            existing_canvas_ids: 由受信调用方按（对象类型，稳定键）解析的存量画布 ID
+            preserve_existing_canvas_groups: 覆盖存量画布时保留其组织可见性配置
         """
         self.doc = doc
         self.target_directory_id = target_directory_id
@@ -82,10 +100,13 @@ class ImportService:
         self.created_by = created_by
         self.updated_by = updated_by
         self.groups = groups or []
+        self.existing_canvas_ids = existing_canvas_ids or {}
+        self.preserve_existing_canvas_groups = preserve_existing_canvas_groups
 
         # 导入过程中的映射表：YAML key -> DB ID
         self.namespace_key_to_id: dict[str, int] = {}
         self.datasource_key_to_id: dict[str, int] = {}
+        self.tag_name_to_id: dict[str, int] = {}
 
         # 导入结果统计
         self.results: list[dict] = []
@@ -99,16 +120,103 @@ class ImportService:
         supplements = self.secret_supplements.get(object_key, {})
         return supplements.get(field, default)
 
+    @staticmethod
+    def _nested_value(value, path):
+        current = value
+        for item in path:
+            if isinstance(item, str) and isinstance(current, dict):
+                current = current.get(item)
+            elif isinstance(item, int) and isinstance(current, list) and item < len(current):
+                current = current[item]
+            else:
+                return None
+        return current
+
+    def _normalize_transform_config(self, ds_item) -> dict:
+        config = getattr(ds_item, "transform_config", None)
+        if not isinstance(config, dict):
+            return {}
+        enabled = bool(config.get("enabled"))
+        script = config.get("script") if isinstance(config.get("script"), str) else ""
+        if enabled and not script.strip():
+            return {"enabled": False, "language": "python", "script": ""}
+        return {
+            "enabled": enabled,
+            "language": "python",
+            "script": script,
+        }
+
+    def _resolve_config_placeholders(self, object_key: str, field: str, config: dict, existing: dict | None = None):
+        """用显式补密值或覆盖目标中的原值替换连接器配置里的脱敏占位符。"""
+        resolved = deepcopy(config)
+        missing = []
+        supplements = self.secret_supplements.get(object_key, {})
+
+        def visit(value, path, display_path):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    item_path = (*path, key)
+                    item_display_path = f"{display_path}.{key}"
+                    if item == SENSITIVE_PLACEHOLDER and is_sensitive_field_name(key):
+                        replacement = supplements.get(item_display_path, supplements.get(str(key)))
+                        if replacement in (None, "", SENSITIVE_PLACEHOLDER) and existing is not None:
+                            replacement = self._nested_value(existing, item_path)
+                        if replacement in (None, "", SENSITIVE_PLACEHOLDER):
+                            missing.append(item_display_path)
+                        else:
+                            value[key] = replacement
+                    else:
+                        visit(item, item_path, item_display_path)
+            elif isinstance(value, list):
+                for index, item in enumerate(value):
+                    visit(item, (*path, index), f"{display_path}[{index}]")
+
+        visit(resolved, (), field)
+        return resolved, missing
+
+    def _prepare_datasource_configs(self, ds_item: DatasourceItem, existing: DataSourceAPIModel | None = None):
+        connection_config, missing_connection = self._resolve_config_placeholders(
+            ds_item.key,
+            "connection_config",
+            ds_item.connection_config,
+            existing.connection_config if existing else None,
+        )
+        query_config, missing_query = self._resolve_config_placeholders(
+            ds_item.key,
+            "query_config",
+            ds_item.query_config,
+            existing.query_config if existing else None,
+        )
+        return connection_config, query_config, missing_connection + missing_query
+
+    def _reset_excel_materialization_if_needs_upload(self, existing: DataSourceAPIModel, query_config: dict) -> None:
+        """新格式 Excel（无 imported_items）覆盖时清空旧槽，强制 needs_upload。"""
+        imported = query_config.get("imported_items") if isinstance(query_config, dict) else None
+        if isinstance(imported, list) and imported:
+            return
+        if existing.source_type != DataSourceAPIModel.SOURCE_TYPE_EXCEL:
+            return
+
+        from apps.operation_analysis.services.excel_materialize import abandon_excel_materialization
+
+        abandon_excel_materialization(existing, clear_excel_query_keys=False)
+
     def _generate_rename_name(self, original_name: str, model) -> str:
         """
         生成重命名后的名称
 
         规则：{original_name}_copy，若仍冲突则继续追加_copy
         """
-        new_name = f"{original_name}{RENAME_SUFFIX}"
-        while model.objects.filter(name=new_name).exists():
-            new_name = f"{new_name}{RENAME_SUFFIX}"
-        return new_name
+        name_max_length = model._meta.get_field("name").max_length
+        max_suffixes = (name_max_length - len(original_name)) // len(RENAME_SUFFIX)
+        candidates = [f"{original_name}{RENAME_SUFFIX * count}" for count in range(1, max_suffixes + 1)]
+        existing_names = set(model.objects.filter(name__in=candidates).values_list("name", flat=True))
+
+        for candidate in candidates:
+            if candidate not in existing_names:
+                return candidate
+
+        raise ValueError(f"名称 {original_name} 已无可用的重命名空间")
 
     def _record_result(
         self,
@@ -256,24 +364,33 @@ class ImportService:
         existing = DataSourceAPIModel.objects.filter(name=ds_item.name, rest_api=ds_item.rest_api).first()
         action = self._get_conflict_action(ds_item.key)
 
+        targets_legacy_route = is_legacy_raw_monitor_query(
+            source_type=ds_item.source_type,
+            rest_api=ds_item.rest_api,
+        )
+        preserves_existing_legacy_route = bool(
+            existing
+            and is_legacy_raw_monitor_query(
+                source_type=existing.source_type,
+                rest_api=existing.rest_api,
+            )
+            and action in {ConflictAction.SKIP.value, ConflictAction.OVERWRITE.value}
+        )
+        skips_existing_route = bool(existing and action == ConflictAction.SKIP.value)
+        if targets_legacy_route and not (preserves_existing_legacy_route or skips_existing_route):
+            self._record_result(
+                ds_item.key,
+                ObjectType.DATASOURCE.value,
+                ImportStatus.FAILED.value,
+                LEGACY_RAW_MONITOR_QUERY_ERROR,
+            )
+            return None
+
         # 解析关联的命名空间ID
-        namespace_ids = []
-        for ns_key in ds_item.namespace_keys:
-            ns_id = self.namespace_key_to_id.get(ns_key)
-            if ns_id:
-                namespace_ids.append(ns_id)
-            else:
-                # 尝试从数据库查找
-                ns = NameSpace.objects.filter(name=ns_key).first()
-                if ns:
-                    namespace_ids.append(ns.id)
+        namespace_ids = [self.namespace_key_to_id[ns_key] for ns_key in ds_item.namespace_keys if ns_key in self.namespace_key_to_id]
 
         # 解析tags
-        tag_ids = []
-        for tag_name in ds_item.tags:
-            tag = DataSourceTag.objects.filter(name=tag_name).first()
-            if tag:
-                tag_ids.append(tag.id)
+        tag_ids = [self.tag_name_to_id[tag_name] for tag_name in ds_item.tags if tag_name in self.tag_name_to_id]
 
         if existing:
             if action == ConflictAction.SKIP.value:
@@ -287,14 +404,36 @@ class ImportService:
                 return existing.id
 
             elif action == ConflictAction.OVERWRITE.value:
+                connection_config, query_config, missing_secrets = self._prepare_datasource_configs(ds_item, existing)
+                if missing_secrets:
+                    self._record_result(
+                        ds_item.key,
+                        ObjectType.DATASOURCE.value,
+                        ImportStatus.FAILED.value,
+                        f"数据源缺少敏感配置: {', '.join(missing_secrets)}",
+                    )
+                    return None
+                previous_source_type = existing.source_type
                 existing.desc = ds_item.desc
+                existing.source_type = ds_item.source_type
+                existing.connection = None
+                existing.connection_overrides = {}
+                existing.connection_config = connection_config
+                existing.query_config = query_config
+                existing.transform_config = self._normalize_transform_config(ds_item)
                 # [内部预留] is_active 字段仅内部使用，无产品功能依赖
                 existing.is_active = ds_item.is_active
-                existing.params = ds_item.params
+                existing.params = migrate_param_items(ds_item.params)[0]
                 existing.chart_type = ds_item.chart_type
                 existing.field_schema = ds_item.field_schema
                 existing.updated_by = self.updated_by
                 existing.save()
+                if previous_source_type == DataSourceAPIModel.SOURCE_TYPE_EXCEL and existing.source_type != DataSourceAPIModel.SOURCE_TYPE_EXCEL:
+                    from apps.operation_analysis.services.excel_materialize import abandon_excel_materialization
+
+                    abandon_excel_materialization(existing, clear_excel_query_keys=False)
+                elif existing.source_type == DataSourceAPIModel.SOURCE_TYPE_EXCEL:
+                    self._reset_excel_materialization_if_needs_upload(existing, query_config)
                 existing.namespaces.set(namespace_ids)
                 existing.tag.set(tag_ids)
                 self._record_result(
@@ -307,14 +446,29 @@ class ImportService:
                 return existing.id
 
             else:  # rename
+                connection_config, query_config, missing_secrets = self._prepare_datasource_configs(ds_item)
+                if missing_secrets:
+                    self._record_result(
+                        ds_item.key,
+                        ObjectType.DATASOURCE.value,
+                        ImportStatus.FAILED.value,
+                        f"数据源缺少敏感配置: {', '.join(missing_secrets)}",
+                    )
+                    return None
                 new_name = self._generate_rename_name(ds_item.name, DataSourceAPIModel)
                 ds = DataSourceAPIModel.objects.create(
                     name=new_name,
                     rest_api=ds_item.rest_api,
+                    source_type=ds_item.source_type,
+                    connection=None,
+                    connection_overrides={},
+                    connection_config=connection_config,
+                    query_config=query_config,
+                    transform_config=self._normalize_transform_config(ds_item),
                     desc=ds_item.desc,
                     # [内部预留] is_active 字段仅内部使用，无产品功能依赖
                     is_active=ds_item.is_active,
-                    params=ds_item.params,
+                    params=migrate_param_items(ds_item.params)[0],
                     chart_type=ds_item.chart_type,
                     field_schema=ds_item.field_schema,
                     created_by=self.created_by,
@@ -333,13 +487,28 @@ class ImportService:
                 return ds.id
         else:
             # 新建
+            connection_config, query_config, missing_secrets = self._prepare_datasource_configs(ds_item)
+            if missing_secrets:
+                self._record_result(
+                    ds_item.key,
+                    ObjectType.DATASOURCE.value,
+                    ImportStatus.FAILED.value,
+                    f"数据源缺少敏感配置: {', '.join(missing_secrets)}",
+                )
+                return None
             ds = DataSourceAPIModel.objects.create(
                 name=ds_item.name,
                 rest_api=ds_item.rest_api,
+                source_type=ds_item.source_type,
+                connection=None,
+                connection_overrides={},
+                connection_config=connection_config,
+                query_config=query_config,
+                transform_config=self._normalize_transform_config(ds_item),
                 desc=ds_item.desc,
                 # [内部预留] is_active 字段仅内部使用，无产品功能依赖
                 is_active=ds_item.is_active,
-                params=ds_item.params,
+                params=migrate_param_items(ds_item.params)[0],
                 chart_type=ds_item.chart_type,
                 field_schema=ds_item.field_schema,
                 created_by=self.created_by,
@@ -359,7 +528,7 @@ class ImportService:
 
     def _import_canvas(
         self,
-        canvas_item: DashboardItem | TopologyItem | ArchitectureItem | ScreenItem | ReportItem,
+        canvas_item: DashboardItem | TopologyItem | ArchitectureItem | ScreenItem | ReportItem | NetworkTopologyItem,
         object_type: ObjectType,
         model,
     ) -> int | None:
@@ -369,7 +538,11 @@ class ImportService:
         Returns:
             新建或已存在的画布ID
         """
-        existing = model.objects.filter(name=canvas_item.name).first()
+        stable_existing_id = self.existing_canvas_ids.get((object_type.value, canvas_item.key))
+        if stable_existing_id is not None:
+            existing = model.objects.filter(pk=stable_existing_id).first()
+        else:
+            existing = model.objects.filter(name=canvas_item.name).first()
         action = self._get_conflict_action(canvas_item.key)
 
         # 获取目标目录
@@ -382,19 +555,44 @@ class ImportService:
         # 构建基础数据
         canvas_data = {
             "desc": canvas_item.desc,
-            "other": canvas_item.other,
             "view_sets": rewrite_canvas_view_sets_refs_for_storage(
-                normalize_canvas_view_sets_for_storage(canvas_item.view_sets, object_type),
+                canvas_item.view_sets,
                 object_type,
                 self.datasource_key_to_id,
             ),
             "directory": directory,
-            "groups": canvas_groups,
         }
+        if existing is None or not (stable_existing_id is not None and self.preserve_existing_canvas_groups):
+            canvas_data["groups"] = canvas_groups
+
+        if stable_existing_id is not None:
+            name_conflict = model.objects.filter(name=canvas_item.name).exclude(pk=stable_existing_id).exists()
+            if name_conflict:
+                logger.warning(
+                    "[CanvasImport] 内置%s稳定键 %s 的目标名称 %s 已被占用，保留原名称",
+                    object_type.value,
+                    canvas_item.key,
+                    canvas_item.name,
+                )
+            else:
+                canvas_data["name"] = canvas_item.name
+
+        if object_type == ObjectType.NETWORK_TOPOLOGY:
+            canvas_data["base_url"] = canvas_item.base_url
+            token = self._get_secret_value(canvas_item.key, "token")
+            if not token and canvas_item.token != SENSITIVE_PLACEHOLDER:
+                token = canvas_item.token
+            if token and token != SENSITIVE_PLACEHOLDER:
+                canvas_data["token"] = token
+        else:
+            canvas_data["other"] = canvas_item.other
 
         # Dashboard有额外的filters字段
         if object_type == ObjectType.DASHBOARD and hasattr(canvas_item, "filters"):
-            canvas_data["filters"] = canvas_item.filters
+            canvas_data["filters"] = migrate_filters_payload(canvas_item.filters)[0]
+
+        if object_type in CANVAS_REFRESH_OBJECT_TYPES:
+            canvas_data["refresh_interval"] = normalize_canvas_refresh_interval(getattr(canvas_item, "refresh_interval", 0))
 
         if existing:
             if action == ConflictAction.SKIP.value:
@@ -472,7 +670,7 @@ class ImportService:
             }
         """
         logger.info(
-            "[CanvasImport] 开始导入：命名空间 %s、数据源 %s、仪表盘 %s、拓扑 %s、架构 %s、大屏 %s、报表 %s",
+            "[CanvasImport] 开始导入：命名空间 %s、数据源 %s、仪表盘 %s、拓扑 %s、架构 %s、大屏 %s、报表 %s、网络拓扑 %s",
             len(self.doc.namespaces),
             len(self.doc.datasources),
             len(self.doc.dashboards),
@@ -480,6 +678,7 @@ class ImportService:
             len(self.doc.architectures),
             len(self.doc.screens),
             len(self.doc.reports),
+            len(self.doc.network_topologies),
         )
 
         try:
@@ -494,6 +693,12 @@ class ImportService:
                 return rollback_result
 
             # Step 2: 导入数据源
+            namespace_keys = {
+                ns_key for ds_item in self.doc.datasources for ns_key in ds_item.namespace_keys if ns_key not in self.namespace_key_to_id
+            }
+            self.namespace_key_to_id.update(NameSpace.objects.filter(name__in=namespace_keys).values_list("name", "id"))
+            tag_names = {tag_name for ds_item in self.doc.datasources for tag_name in ds_item.tags}
+            self.tag_name_to_id.update(DataSourceTag.objects.filter(name__in=tag_names).values_list("name", "id"))
             for ds_item in self.doc.datasources:
                 ds_id = self._import_datasource(ds_item)
                 if ds_id:
@@ -518,6 +723,9 @@ class ImportService:
 
             for report in self.doc.reports:
                 self._import_canvas(report, ObjectType.REPORT, Report)
+
+            for network_topology in self.doc.network_topologies:
+                self._import_canvas(network_topology, ObjectType.NETWORK_TOPOLOGY, NetworkTopology)
 
             rollback_result = self._rollback_on_failure()
             if rollback_result:

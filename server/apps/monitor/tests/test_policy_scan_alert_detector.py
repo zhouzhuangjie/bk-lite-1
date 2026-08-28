@@ -43,6 +43,7 @@ def _mq(metric=None, **kwargs):
         format_aggregation_metrics=lambda data: kwargs.get("formatted", {}),
         get_display_unit=lambda: kwargs.get("display_unit", ""),
         get_enum_value_map=lambda: kwargs.get("enum_map", {}),
+        convert_thresholds=lambda thresholds: thresholds,
     )
     return m
 
@@ -90,6 +91,65 @@ class TestDetectThresholdAlerts:
         ids = {a["metric_instance_id"] for a in alerts}
         assert ids == {"('h1',)"}
 
+    def test_derivative_instance_template_exposes_child_and_parent_names(self):
+        agg = {"data": {"result": [
+            {"metric": {"pod": "orders-7f9"}, "values": [[100, "95"]]},
+        ]}}
+        parent = SimpleNamespace(id=10, instance_id_keys=["instance_id"])
+        monitor_object = SimpleNamespace(
+            name="K3SPod",
+            level="derivative",
+            instance_id_keys=["instance_id", "pod"],
+            parent=parent,
+            parent_id=parent.id,
+        )
+        detector = AlertDetector(
+            _policy(
+                monitor_object=monitor_object,
+                group_by=["pod"],
+                alert_name="$parent_resource_name/$resource_name 超阈值",
+            ),
+            {"('cluster-a', 'orders-7f9')": "orders-7f9"},
+            {},
+            [],
+            _mq(agg=agg),
+            parent_instances_map={"('cluster-a',)": "生产集群"},
+        )
+
+        alerts, _ = detector.detect_threshold_alerts()
+
+        assert alerts[0]["monitor_instance_id"] == "('cluster-a', 'orders-7f9')"
+        assert alerts[0]["content"] == "生产集群/orders-7f9 超阈值"
+        assert detector._build_metric_resource_context("('orders-7f9',)") == {
+            "monitor_instance_id": "('cluster-a', 'orders-7f9')",
+            "resource_id": "('cluster-a', 'orders-7f9')",
+            "resource_name": "orders-7f9",
+            "parent_resource_id": "('cluster-a',)",
+            "parent_resource_name": "生产集群",
+        }
+
+    def test_derivative_instance_does_not_guess_ambiguous_child_name(self):
+        parent = SimpleNamespace(id=10, instance_id_keys=["instance_id"])
+        monitor_object = SimpleNamespace(
+            name="K3SPod",
+            level="derivative",
+            instance_id_keys=["instance_id", "pod"],
+            parent=parent,
+            parent_id=parent.id,
+        )
+        detector = AlertDetector(
+            _policy(monitor_object=monitor_object, group_by=["pod"]),
+            {
+                "('cluster-a', 'api')": "api",
+                "('cluster-b', 'api')": "api",
+            },
+            {},
+            [],
+            _mq(),
+        )
+
+        assert detector._match_scoped_monitor_instance("('api',)") == ""
+
 
 class TestGetMetricDisplayName:
     def test_uses_metric_display_name(self):
@@ -135,6 +195,35 @@ class TestDetectNoDataAlerts:
         events = detector.detect_no_data_alerts()
         assert events == []
 
+    def test_derivative_instance_no_data_template_uses_child_name(self):
+        parent = SimpleNamespace(id=10, instance_id_keys=["instance_id"])
+        monitor_object = SimpleNamespace(
+            name="K3SPod",
+            level="derivative",
+            instance_id_keys=["instance_id", "pod"],
+            parent=parent,
+            parent_id=parent.id,
+        )
+        child_id = "('cluster-a', 'orders-7f9')"
+        detector = AlertDetector(
+            _policy(
+                monitor_object=monitor_object,
+                group_by=["instance_id", "pod", "container"],
+                no_data_alert_name="$parent_resource_name/$resource_name 无数据",
+            ),
+            {child_id: "orders-7f9"},
+            # 兼容历史错误基准：曾把子对象归属记录成父实例。
+            {"('cluster-a', 'orders-7f9', 'api')": "('cluster-a',)"},
+            [],
+            _mq(formatted={}),
+            parent_instances_map={"('cluster-a',)": "生产集群"},
+        )
+
+        events = detector.detect_no_data_alerts()
+
+        assert events[0]["monitor_instance_id"] == child_id
+        assert events[0]["content"] == "生产集群/orders-7f9 无数据"
+
 
 class TestBuildDimensionNameMap:
     def test_no_metric_returns_empty(self):
@@ -177,7 +266,9 @@ class TestCountEvents:
 
 @pytest.mark.django_db
 class TestRecoverThresholdAlerts:
-    def test_recovers_when_info_count_reaches_condition(self, mocker):
+    def test_recovers_when_info_count_reaches_condition(
+        self, mocker, django_capture_on_commit_callbacks
+    ):
         notifier = mocker.patch(
             "apps.monitor.tasks.services.policy_scan.alert_detector.AlertLifecycleNotifier"
         )
@@ -186,7 +277,8 @@ class TestRecoverThresholdAlerts:
             status="new", info_event_count=5,
         )
         detector = AlertDetector(_policy(recovery_condition=2), {}, {}, [alert], _mq())
-        detector.recover_threshold_alerts()
+        with django_capture_on_commit_callbacks(execute=True):
+            detector.recover_threshold_alerts()
         alert.refresh_from_db()
         assert alert.status == "recovered"
         assert alert.operator == "system"
@@ -221,7 +313,9 @@ class TestRecoverNoDataAlerts:
         # 不应抛错，直接返回
         assert detector.recover_no_data_alerts() is None
 
-    def test_recovers_no_data_alert_when_data_returns(self, mocker):
+    def test_recovers_no_data_alert_when_data_returns(
+        self, mocker, django_capture_on_commit_callbacks
+    ):
         notifier = mocker.patch(
             "apps.monitor.tasks.services.policy_scan.alert_detector.AlertLifecycleNotifier"
         )
@@ -233,7 +327,8 @@ class TestRecoverNoDataAlerts:
             _policy(), {}, {}, [alert],
             _mq(formatted={"('h1',)": {"value": 1.0}}),
         )
-        detector.recover_no_data_alerts()
+        with django_capture_on_commit_callbacks(execute=True):
+            detector.recover_no_data_alerts()
         alert.refresh_from_db()
         assert alert.status == "recovered"
         notifier.return_value.notify_alerts.assert_called_once()
@@ -250,3 +345,33 @@ class TestRecoverNoDataAlerts:
         detector.recover_no_data_alerts()
         alert.refresh_from_db()
         assert alert.status == "new"
+
+    def test_aggregated_alert_waits_until_all_instance_baselines_have_data(
+        self, mocker
+    ):
+        notifier = mocker.patch(
+            "apps.monitor.tasks.services.policy_scan.alert_detector.AlertLifecycleNotifier"
+        )
+        alert = MonitorAlert.objects.create(
+            policy_id=1,
+            monitor_instance_id="pod-1",
+            metric_instance_id="('pod-1', 'api')",
+            alert_type="no_data",
+            status="new",
+        )
+        detector = AlertDetector(
+            _policy(),
+            {"pod-1": "orders-7f9"},
+            {
+                "('pod-1', 'api')": "pod-1",
+                "('pod-1', 'worker')": "pod-1",
+            },
+            [alert],
+            _mq(formatted={"('pod-1', 'api')": {"value": 1.0}}),
+        )
+
+        detector.recover_no_data_alerts()
+
+        alert.refresh_from_db()
+        assert alert.status == "new"
+        notifier.return_value.notify_alerts.assert_not_called()

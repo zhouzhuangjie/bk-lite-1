@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Tree, Spin, Input, Empty } from 'antd';
 import { TreeItem, TableDataItem, TreeSortData } from '@/app/monitor/types';
 import { useTranslation } from '@/utils/i18n';
@@ -7,6 +7,7 @@ import { cloneDeep } from 'lodash';
 import ObjectIcon from '@/app/monitor/components/objectIcon';
 import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
 import styles from './index.module.scss';
+import { shouldNotifyTreeNodeSelect } from './selectionNotify';
 
 const { Search } = Input;
 
@@ -16,6 +17,8 @@ interface TreeComponentProps {
   loading?: boolean;
   draggable?: boolean;
   showAllMenu?: boolean;
+  /** 允许选中带 children 的一级分类（如「数据库」），用于按分类展示全部能力 */
+  allowParentSelect?: boolean;
   onNodeSelect?: (key: string) => void;
   onNodeDrag?: (sortNodes: TreeSortData[], nodes: TreeDataNode[]) => void;
 }
@@ -26,6 +29,7 @@ const TreeComponent: React.FC<TreeComponentProps> = ({
   loading = false,
   draggable = false,
   showAllMenu = false,
+  allowParentSelect = false,
   onNodeSelect,
   onNodeDrag
 }) => {
@@ -35,12 +39,20 @@ const TreeComponent: React.FC<TreeComponentProps> = ({
   const [treeSearchValue, setTreeSearchValue] = useState<string>('');
   const [originalTreeData, setOriginalTreeData] = useState<TreeItem[]>([]);
   const [treeData, setTreeData] = useState<TreeItem[]>([]);
+  const lastNotifiedKeyRef = useRef('');
+
+  const notifyNodeSelect = (key: React.Key) => {
+    if (!shouldNotifyTreeNodeSelect(lastNotifiedKeyRef.current, key)) {
+      return;
+    }
+    lastNotifiedKeyRef.current = String(key);
+    onNodeSelect?.(String(key));
+  };
 
   useEffect(() => {
-    if (defaultSelectedKey) {
-      setSelectedKeys([defaultSelectedKey]);
-      onNodeSelect?.(defaultSelectedKey as string);
-    }
+    if (!defaultSelectedKey) return;
+    setSelectedKeys([defaultSelectedKey]);
+    notifyNodeSelect(defaultSelectedKey);
   }, [defaultSelectedKey]);
 
   useEffect(() => {
@@ -61,10 +73,11 @@ const TreeComponent: React.FC<TreeComponentProps> = ({
   };
 
   const handleSelect = (selectedKeys: React.Key[], info: any) => {
-    const isFirstLevel = !!info.node?.children?.length;
-    if (!isFirstLevel && selectedKeys?.length) {
+    const hasChildren = !!info.node?.children?.length;
+    // 默认仅叶子可选；allowParentSelect 时一级分类也可选（如点「数据库」看该类全部能力）
+    if ((!hasChildren || allowParentSelect) && selectedKeys?.length) {
       setSelectedKeys(selectedKeys);
-      onNodeSelect?.(selectedKeys[0] as string);
+      notifyNodeSelect(selectedKeys[0]);
     }
   };
 

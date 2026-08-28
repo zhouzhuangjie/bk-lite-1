@@ -1,18 +1,24 @@
 name: kingbase
-version: "1.0.0"
+version: 1.0.0
 category: database
 metadata:
-  display_name: "人大金仓 KingbaseES"
-  description: "KingbaseES 数据库协议采集插件（PG 兼容）"
-  author: "WeOps"
-  tags: [database, kingbase]
+  display_name: 人大金仓 KingbaseES
+  description: KingbaseES 数据库协议采集插件（PG 兼容）
+  author: WeOps
+  tags:
+  - database
+  - kingbase
   cloud_protocol: false
   model_id: kingbase
 executors:
   protocol:
     type: protocol
-    timeout: 30
+    execution_mode: async
+    capacity_group: default
     collector:
       module: plugins.inputs.kingbase.kingbase_info
       class: KingbaseInfo
+    target_policy:
+      mode: tcp
+      port: 5432
 default_executor: protocol

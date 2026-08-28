@@ -161,6 +161,50 @@ class TestBuildQueryWithLogGroups:
         out = _scan(collect_type=ct, log_groups=[])._build_query_with_log_groups("error")
         assert out == '(error) AND collect_type:"nginx"'
 
+    def test_maps_logical_message_to_storage_field(self):
+        out = _scan(collect_type=None, log_groups=[])._build_query_with_log_groups(
+            'message:"日志类型:本机安全" AND source_ip:10.54.38.109'
+        )
+        assert out == '_msg:"日志类型:本机安全" AND source_ip:10.54.38.109'
+
+    def test_keeps_physical_msg_filter(self):
+        out = _scan(collect_type=None, log_groups=[])._build_query_with_log_groups(
+            '_msg:"日志类型:本机安全" AND source_ip:10.54.38.109'
+        )
+        assert out == '_msg:"日志类型:本机安全" AND source_ip:10.54.38.109'
+
+    def test_maps_message_before_collect_type(self):
+        ct = SimpleNamespace(name="syslog")
+        out = _scan(collect_type=ct, log_groups=[])._build_query_with_log_groups('message:"error"')
+        assert out == '(_msg:"error") AND collect_type:"syslog"'
+
+    def test_completes_empty_message_filter(self):
+        out = _scan(collect_type=None, log_groups=[])._build_query_with_log_groups("message:")
+        assert out == "_msg:*"
+
+    def test_maps_message_added_by_log_group(self, mocker):
+        mocker.patch(
+            "apps.log.services.search.LogGroupQueryBuilder.build_query_with_groups",
+            return_value=('message:"failed" AND host:*', [{"id": "g1", "name": "g"}]),
+        )
+        out = _scan(collect_type=None, log_groups=["g1"])._build_query_with_log_groups("*")
+        assert out == '_msg:"failed" AND host:*'
+
+    def test_keyword_detection_sends_mapped_message_query(self, mocker):
+        scan = _scan(alert_condition={"query": 'message:"error"', "limit": 3})
+        query_mock = mocker.patch.object(
+            scan.vlogs_api,
+            "query",
+            side_effect=[[{"_msg": "error A"}], [{"total_count": "1"}]],
+        )
+
+        events = scan.keyword_alert_detection()
+
+        assert events
+        assert query_mock.call_args_list[0].kwargs["query"] == '_msg:"error"'
+        assert query_mock.call_args_list[1].kwargs["query"] == '_msg:"error" | stats count() as total_count'
+        assert events[0]["raw_data"] == [{"message": "error A"}]
+
 
 class TestAggregationQuery:
     def test_count_with_group_by(self):
@@ -246,28 +290,6 @@ class TestRenderAlertName:
     def test_none_value_renders_empty(self):
         scan = _scan(alert_name="${host}x")
         assert scan._render_alert_name({"host": None}, ["host"]) == "x"
-
-
-class TestBuildGroupKey:
-    def test_empty_group_by(self):
-        assert _scan()._build_group_key({}, []) == ""
-
-    def test_scalar_values(self):
-        assert _scan()._build_group_key({"host": "h1"}, ["host"]) == "host=h1"
-
-    def test_list_value_joined(self):
-        out = _scan()._build_group_key({"tags": ["a", "b"]}, ["tags"])
-        assert out == "tags=a,b"
-
-    def test_dict_value_stringified(self):
-        out = _scan()._build_group_key({"meta": {"x": 1}}, ["meta"])
-        assert "meta=" in out
-
-    def test_none_value_null(self):
-        assert _scan()._build_group_key({"host": None}, ["host"]) == "host=null"
-
-    def test_missing_field_unknown(self):
-        assert _scan()._build_group_key({}, ["host"]) == "host=unknown"
 
 
 class TestCheckRuleConditions:

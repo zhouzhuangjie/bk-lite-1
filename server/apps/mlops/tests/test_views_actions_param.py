@@ -7,6 +7,7 @@ external boundaries: ``mlflow_service`` (MLflow tracking server),
 ``WebhookClient`` (webhookd / docker), ``requests`` (predict HTTP call) and the
 config helpers (env vars).
 """
+import asyncio
 import importlib
 import types
 from io import BytesIO
@@ -20,11 +21,15 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 
 from apps.base.tests.factories import UserFactory
 from apps.mlops.constants import DatasetReleaseStatus, MLflowRunStatus, TrainJobStatus
-from apps.mlops.utils.webhook_client import WebhookError
+from apps.mlops.utils.webhook_client import WebhookError, WebhookTimeoutError, WebhookConnectionError
 
 pytestmark = [pytest.mark.django_db, pytest.mark.integration]
 
 factory = APIRequestFactory()
+
+
+async def _consume_streaming_response(response):
+    return b"".join([chunk async for chunk in response])
 
 
 # Each tuple: (module suffix, MLflow prefix, model module, class basename)
@@ -52,8 +57,7 @@ PREDICT_PARAM = {
 }
 
 # Algorithms whose DatasetReleaseViewSet exposes archive/unarchive.
-HAS_ARCHIVE = {"anomaly_detection", "log_clustering", "timeseries_predict",
-               "image_classification", "object_detection"}
+HAS_ARCHIVE = set(ALGO_IDS)
 
 # Algorithms whose archive/unarchive also mutate ``description`` (prepend /
 # strip the "[已归档] " marker). image/object only flip ``status``.
@@ -133,12 +137,20 @@ def _patch_mlflow(monkeypatch, suffix, **overrides):
     """Patch the module-level ``mlflow_service`` reference for a view module."""
     mod = _view_module(suffix)
     ms = mod.mlflow_service
+
+    def run_belongs_to_experiment(experiment_id, run_id):
+        runs = ms.get_experiment_runs(experiment_id)
+        if runs is None or runs.empty:
+            return False
+        return str(run_id) in {str(value) for value in runs["run_id"]}
+
     defaults = {
         "build_experiment_name": lambda **kw: "exp-name",
         "build_model_name": lambda **kw: "model-name",
         "build_job_id": lambda **kw: "job-id",
         "get_experiment_by_name": lambda name: None,
         "get_experiment_runs": lambda eid, **kw: pd.DataFrame({"run_id": []}),
+        "run_belongs_to_experiment": run_belongs_to_experiment,
         "get_model_versions": lambda name: [],
         "resolve_model_uri": lambda name, version: "models:/model-name/1",
         "delete_run": lambda run_id: None,
@@ -174,7 +186,7 @@ def test_train_rejects_already_running(monkeypatch, superuser, suffix, prefix, m
     request = factory.post(f"/{suffix}_train_jobs/x/train/")
     resp = _call(view, request, superuser, pk=tj.id)
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
-    assert "运行中" in resp.data["error"]
+    assert "running" in resp.data["error"]
 
 
 @pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
@@ -192,7 +204,7 @@ def test_train_config_error_returns_500(monkeypatch, superuser, suffix, prefix, 
     request = factory.post(f"/{suffix}_train_jobs/x/train/")
     resp = _call(view, request, superuser, pk=tj.id)
     assert resp.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
-    assert "系统配置错误" in resp.data["error"]
+    assert "configuration" in resp.data["error"]
 
 
 @pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
@@ -209,9 +221,9 @@ def test_train_missing_dataset_file(monkeypatch, superuser, suffix, prefix, mode
     view = getattr(mod, f"{basename}TrainJobViewSet").as_view({"post": "train"})
     request = factory.post(f"/{suffix}_train_jobs/x/train/")
     resp = _call(view, request, superuser, pk=tj.id)
-    # no dataset_version -> 数据集文件不存在
+    # no dataset_version -> Dataset file was not found
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
-    assert "数据集文件不存在" in resp.data["error"]
+    assert "Dataset file was not found" in resp.data["error"]
 
 
 @pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
@@ -230,7 +242,7 @@ def test_train_missing_config_url(monkeypatch, superuser, suffix, prefix, model_
     request = factory.post(f"/{suffix}_train_jobs/x/train/")
     resp = _call(view, request, superuser, pk=tj.id)
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
-    assert "训练配置文件不存在" in resp.data["error"]
+    assert "Training configuration file was not found" in resp.data["error"]
 
 
 @pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
@@ -276,6 +288,7 @@ def test_train_happy_path(monkeypatch, superuser, suffix, prefix, model_module, 
     request = factory.post(f"/{suffix}_train_jobs/x/train/")
     resp = _call(view, request, superuser, pk=tj.id)
     assert resp.status_code == status.HTTP_200_OK
+    assert resp.data["message"] == "Training task started"
     assert "train_job_id" in resp.data
     train_mock.assert_called_once()
     delay_mock.assert_called_once()
@@ -296,7 +309,7 @@ def test_stop_not_running_rejected(monkeypatch, superuser, suffix, prefix, model
     request = factory.post(f"/{suffix}_train_jobs/x/stop/")
     resp = _call(view, request, superuser, pk=tj.id)
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
-    assert "未在运行中" in resp.data["error"]
+    assert "Training task is not running" in resp.data["error"]
 
 
 @pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
@@ -310,6 +323,7 @@ def test_stop_running_success(monkeypatch, superuser, suffix, prefix, model_modu
     request = factory.post(f"/{suffix}_train_jobs/x/stop/")
     resp = _call(view, request, superuser, pk=tj.id)
     assert resp.status_code == status.HTTP_200_OK
+    assert resp.data["message"] == "Training task stopped"
     assert resp.data["webhook_response"] == {"ok": True}
     tj.refresh_from_db()
     assert tj.status == TrainJobStatus.PENDING
@@ -335,6 +349,44 @@ def test_stop_webhook_error_returns_500(monkeypatch, superuser, suffix, prefix, 
     assert tj.status == TrainJobStatus.RUNNING
 
 
+@pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
+def test_stop_webhook_timeout_returns_english_error(monkeypatch, superuser, suffix, prefix, model_module, basename):
+    superuser.locale = "en"
+    tj = _make_train_job(model_module, basename, status_value=TrainJobStatus.RUNNING)
+    mod = _view_module(suffix)
+    _patch_mlflow(monkeypatch, suffix)
+
+    def raise_timeout(job_id):
+        raise WebhookTimeoutError("请求 webhookd 服务超时，请检查服务是否正常运行")
+
+    monkeypatch.setattr(mod.WebhookClient, "stop", staticmethod(raise_timeout))
+    view = getattr(mod, f"{basename}TrainJobViewSet").as_view({"post": "stop"})
+    request = factory.post(f"/{suffix}_train_jobs/x/stop/")
+    resp = _call(view, request, superuser, pk=tj.id)
+    assert resp.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+    assert resp.data["error"] == "Request to the webhookd service timed out. Please check whether the service is running"
+    assert resp.data["error"] != "请求 webhookd 服务超时，请检查服务是否正常运行"
+
+
+@pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
+def test_stop_webhook_connection_returns_english_error(monkeypatch, superuser, suffix, prefix, model_module, basename):
+    superuser.locale = "en"
+    tj = _make_train_job(model_module, basename, status_value=TrainJobStatus.RUNNING)
+    mod = _view_module(suffix)
+    _patch_mlflow(monkeypatch, suffix)
+
+    def raise_conn(job_id):
+        raise WebhookConnectionError("无法连接到 webhookd 服务: refused")
+
+    monkeypatch.setattr(mod.WebhookClient, "stop", staticmethod(raise_conn))
+    view = getattr(mod, f"{basename}TrainJobViewSet").as_view({"post": "stop"})
+    request = factory.post(f"/{suffix}_train_jobs/x/stop/")
+    resp = _call(view, request, superuser, pk=tj.id)
+    assert resp.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+    assert resp.data["error"] == "Unable to connect to the webhookd service"
+    assert "refused" not in resp.data["error"]
+
+
 # =========================================================================
 # TrainJob: runs_data_list action
 # =========================================================================
@@ -351,7 +403,7 @@ def test_runs_data_list_no_experiment(monkeypatch, superuser, suffix, prefix, mo
     assert resp.status_code == status.HTTP_200_OK
     assert resp.data["count"] == 0
     assert resp.data["items"] == []
-    assert "未找到对应的MLflow实验" in resp.data["message"]
+    assert resp.data["message"] == "MLflow experiment was not found"
 
 
 @pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
@@ -368,7 +420,7 @@ def test_runs_data_list_empty_runs(monkeypatch, superuser, suffix, prefix, model
     resp = _call(view, request, superuser, pk=tj.id)
     assert resp.status_code == status.HTTP_200_OK
     assert resp.data["count"] == 0
-    assert "未找到训练运行记录" in resp.data["message"]
+    assert resp.data["message"] == "No training run records were found"
 
 
 @pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
@@ -424,6 +476,7 @@ def test_delete_run_not_found(monkeypatch, superuser, suffix, prefix, model_modu
     resp = _call(view, request, superuser, pk=tj.id, run_id="missing")
     assert resp.status_code == status.HTTP_404_NOT_FOUND
     assert resp.data["code"] == "run_not_found"
+    assert resp.data["error"] == "Training run record was not found"
 
 
 @pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
@@ -440,6 +493,7 @@ def test_delete_run_blocked_active_latest(monkeypatch, superuser, suffix, prefix
     resp = _call(view, request, superuser, pk=tj.id, run_id="r1")
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
     assert resp.data["code"] == "active_latest_run"
+    assert resp.data["error"] == "The current training run record cannot be deleted"
 
 
 @pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
@@ -595,17 +649,25 @@ def test_download_model_run_not_found(monkeypatch, superuser, suffix, prefix, mo
 def test_download_model_success(monkeypatch, superuser, suffix, prefix, model_module, basename):
     tj = _make_train_job(model_module, basename)
     mod = _view_module(suffix)
+    archive = BytesIO(b"zipdata")
     _patch_mlflow(
         monkeypatch, suffix,
         get_experiment_by_name=lambda name: types.SimpleNamespace(experiment_id="1"),
         get_experiment_runs=lambda eid, **kw: _runs_frame([{"run_id": "r1"}]),
-        download_model_artifact=lambda run_id, artifact_path=None: BytesIO(b"zipdata"),
+        download_model_artifact=lambda run_id, artifact_path=None: archive,
     )
     view = getattr(mod, f"{basename}TrainJobViewSet").as_view({"get": "download_model"})
     request = factory.get(f"/{suffix}_train_jobs/x/runs/r1/download_model/")
     resp = _call(view, request, superuser, pk=tj.id, run_id="r1")
     assert resp.status_code == status.HTTP_200_OK
     assert resp["Content-Type"] == "application/zip"
+    assert resp["Content-Length"] == "7"
+    assert ".zip" in resp["Content-Disposition"]
+    assert resp.streaming
+    assert resp.is_async
+    assert asyncio.run(_consume_streaming_response(resp)) == b"zipdata"
+    resp.close()
+    assert archive.closed
 
 
 # =========================================================================
@@ -623,6 +685,7 @@ def test_release_archive_success(monkeypatch, superuser, suffix, prefix, model_m
     request = factory.post(f"/{suffix}_dataset_releases/x/archive/")
     resp = _call(view, request, superuser, pk=rel.id)
     assert resp.status_code == status.HTTP_200_OK
+    assert resp.data == {"message": "Archived successfully", "release_id": rel.id}
     rel.refresh_from_db()
     assert rel.status == DatasetReleaseStatus.ARCHIVED
     if suffix in ARCHIVE_TOUCHES_DESCRIPTION:
@@ -639,6 +702,7 @@ def test_release_archive_already_archived(monkeypatch, superuser, suffix, prefix
     request = factory.post(f"/{suffix}_dataset_releases/x/archive/")
     resp = _call(view, request, superuser, pk=rel.id)
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert resp.data == {"error": "Dataset release is already archived"}
 
 
 @pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
@@ -651,6 +715,7 @@ def test_release_unarchive_success(monkeypatch, superuser, suffix, prefix, model
     request = factory.post(f"/{suffix}_dataset_releases/x/unarchive/")
     resp = _call(view, request, superuser, pk=rel.id)
     assert resp.status_code == status.HTTP_200_OK
+    assert resp.data == {"message": "Restored successfully", "release_id": rel.id}
     rel.refresh_from_db()
     assert rel.status == DatasetReleaseStatus.PUBLISHED
     if suffix in ARCHIVE_TOUCHES_DESCRIPTION:
@@ -667,6 +732,7 @@ def test_release_unarchive_not_archived(monkeypatch, superuser, suffix, prefix, 
     request = factory.post(f"/{suffix}_dataset_releases/x/unarchive/")
     resp = _call(view, request, superuser, pk=rel.id)
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert resp.data == {"error": "Only archived dataset releases can be restored"}
 
 
 # =========================================================================
@@ -684,6 +750,7 @@ def test_serving_stop_success(monkeypatch, superuser, suffix, prefix, model_modu
     request = factory.post(f"/{suffix}_servings/x/stop/")
     resp = _call(view, request, superuser, pk=serving.id)
     assert resp.status_code == status.HTTP_200_OK
+    assert resp.data["message"] == "Service stopped and deleted"
     assert resp.data["serving_id"] == f"{prefix}_Serving_{serving.id}"
     stop_mock.assert_called_once()
 
@@ -720,9 +787,7 @@ def test_serving_predict_empty_data(monkeypatch, superuser, suffix, prefix, mode
     request = factory.post(f"/{suffix}_servings/x/predict/", {}, format="json")
     resp = _call(view, request, superuser, pk=serving.id)
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
-    # message mentions the missing param name (不能为空 / 缺少参数)
-    err = resp.data["error"]
-    assert PREDICT_PARAM[suffix] in err or "不能为空" in err or "缺少参数" in err
+    assert resp.data["error"] == f"{PREDICT_PARAM[suffix]} is required"
 
 
 @pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
@@ -741,7 +806,7 @@ def test_serving_predict_non_list_data(monkeypatch, superuser, suffix, prefix, m
     request = factory.post(f"/{suffix}_servings/x/predict/", {param: {"a": 1}}, format="json")
     resp = _call(view, request, superuser, pk=serving.id)
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
-    assert "数组格式" in resp.data["error"]
+    assert resp.data["error"] == f"{PREDICT_PARAM[suffix]} must be an array"
 
 
 @pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
@@ -844,13 +909,89 @@ def test_serving_predict_connection_error(monkeypatch, superuser, suffix, prefix
 
 
 @pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
+def test_serving_predict_timeout_returns_english_error(monkeypatch, superuser, suffix, prefix, model_module, basename):
+    import requests as _rq
+
+    from apps.mlops.utils.i18n import mlops_message_for_locale
+
+    superuser.locale = "en"
+    serving = _make_serving(
+        model_module, basename,
+        container_info={"state": "running", "port": "9000"}, port=9000,
+    )
+    mod = _view_module(suffix)
+    monkeypatch.setattr(mod, "build_predict_url", lambda serving_id, container_info: "http://predict.local/invocations")
+    monkeypatch.setattr(mod.requests, "post", Mock(side_effect=_rq.exceptions.Timeout()))
+    view = getattr(mod, f"{basename}ServingViewSet").as_view({"post": "predict"})
+    param = PREDICT_PARAM[suffix]
+    request = factory.post(f"/{suffix}_servings/x/predict/", {param: ["a"]}, format="json")
+    resp = _call(view, request, superuser, pk=serving.id)
+    assert resp.status_code == status.HTTP_504_GATEWAY_TIMEOUT
+    error = resp.data["error"]
+    assert not any("\u4e00" <= ch <= "\u9fff" for ch in error)
+    if suffix == "object_detection":
+        expected = mlops_message_for_locale("en", "error.serving_inference_timeout")
+    elif suffix == "image_classification":
+        expected = mlops_message_for_locale("en", "error.serving_prediction_timeout")
+    elif suffix == "timeseries_predict":
+        from apps.mlops.views.timeseries_predict import get_timeseries_predict_timeout_seconds
+
+        expected = mlops_message_for_locale(
+            "en",
+            "error.serving_prediction_timeout_exceeded",
+            seconds=get_timeseries_predict_timeout_seconds(),
+        )
+    else:
+        expected = mlops_message_for_locale("en", "error.serving_prediction_timeout_exceeded", seconds=60)
+    assert error == expected
+
+
+@pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
+def test_serving_predict_timeout_returns_english_error(monkeypatch, superuser, suffix, prefix, model_module, basename):
+    import requests as _rq
+
+    from apps.mlops.utils.i18n import mlops_message_for_locale
+
+    superuser.locale = "en"
+    serving = _make_serving(
+        model_module, basename,
+        container_info={"state": "running", "port": "9000"}, port=9000,
+    )
+    mod = _view_module(suffix)
+    monkeypatch.setattr(mod, "build_predict_url", lambda serving_id, container_info: "http://predict.local/invocations")
+    monkeypatch.setattr(mod.requests, "post", Mock(side_effect=_rq.exceptions.Timeout()))
+    view = getattr(mod, f"{basename}ServingViewSet").as_view({"post": "predict"})
+    param = PREDICT_PARAM[suffix]
+    request = factory.post(f"/{suffix}_servings/x/predict/", {param: ["a"]}, format="json")
+    resp = _call(view, request, superuser, pk=serving.id)
+    assert resp.status_code == status.HTTP_504_GATEWAY_TIMEOUT
+    error = resp.data["error"]
+    assert not any("\u4e00" <= ch <= "\u9fff" for ch in error)
+    if suffix == "object_detection":
+        expected = mlops_message_for_locale("en", "error.serving_inference_timeout")
+    elif suffix == "image_classification":
+        expected = mlops_message_for_locale("en", "error.serving_prediction_timeout")
+    elif suffix == "timeseries_predict":
+        from apps.mlops.views.timeseries_predict import get_timeseries_predict_timeout_seconds
+
+        expected = mlops_message_for_locale(
+            "en",
+            "error.serving_prediction_timeout_exceeded",
+            seconds=get_timeseries_predict_timeout_seconds(),
+        )
+    else:
+        expected = mlops_message_for_locale("en", "error.serving_prediction_timeout_exceeded", seconds=60)
+    assert error == expected
+
+
+@pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
 def test_serving_predict_invalid_container_info(monkeypatch, superuser, suffix, prefix, model_module, basename):
     # build_predict_url raises ValueError when container info lacks a usable port.
-    serving = _make_serving(model_module, basename, container_info={})
+    serving = _make_serving(model_module, basename, container_info={"state": "running"})
     mod = _view_module(suffix)
 
     def bad_url(serving_id, container_info):
-        raise ValueError("无法解析服务地址")
+        raise ValueError("error.serving_port_not_configured")
 
     monkeypatch.setattr(mod, "build_predict_url", bad_url)
     view = getattr(mod, f"{basename}ServingViewSet").as_view({"post": "predict"})
@@ -858,7 +999,7 @@ def test_serving_predict_invalid_container_info(monkeypatch, superuser, suffix, 
     request = factory.post(f"/{suffix}_servings/x/predict/", {param: ["a"]}, format="json")
     resp = _call(view, request, superuser, pk=serving.id)
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
-    assert "error" in resp.data
+    assert resp.data["error"] == "Service port is not configured. Please confirm the service has started"
 
 
 @pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
@@ -886,8 +1027,10 @@ def test_serving_start_config_error(monkeypatch, superuser, suffix, prefix, mode
     request = factory.post(f"/{suffix}_servings/x/start/")
     resp = _call(view, request, superuser, pk=serving.id)
     assert resp.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
-    # Config-related error: either explicit env-var message or generic config error.
-    assert ("MLFLOW_TRACKER_URL" in resp.data["error"]) or ("配置" in resp.data["error"])
+    assert resp.data["error"] in {
+        "System configuration error. Please contact an administrator.",
+        "MLFLOW_TRACKER_URL environment variable is not configured",
+    }
 
 
 def _allow_team_one(monkeypatch):
@@ -1153,6 +1296,7 @@ def test_serving_start_container_already_exists_syncs(monkeypatch, superuser, su
     # re-raise to the generic handler (covered by the generic-error test).
     if suffix in ("image_classification", "object_detection"):
         pytest.skip(f"{suffix} start has no CONTAINER_ALREADY_EXISTS sync branch")
+    superuser.locale = "en"
     serving = _make_serving(model_module, basename)
     mod = _view_module(suffix)
     _patch_mlflow(monkeypatch, suffix)
@@ -1172,9 +1316,10 @@ def test_serving_start_container_already_exists_syncs(monkeypatch, superuser, su
     request = factory.post(f"/{suffix}_servings/x/start/")
     resp = _call(view, request, superuser, pk=serving.id)
     assert resp.status_code == status.HTTP_200_OK
-    # container info synced from get_status
     serving.refresh_from_db()
     assert serving.container_info["state"] == "running"
+    assert resp.data["warning"] == "Container already exists"
+    assert resp.data["message"] == "Existing container detected; status was synchronized"
 
 
 @pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)

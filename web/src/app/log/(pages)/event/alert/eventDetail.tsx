@@ -9,7 +9,7 @@ import React, {
   useRef
 } from 'react';
 import { Button } from 'antd';
-import OperateModal from '@/app/log/components/operate-drawer';
+import OperateModal from '@/components/operate-drawer';
 import { useTranslation } from '@/utils/i18n';
 import {
   ModalRef,
@@ -125,7 +125,7 @@ const EventDetail = forwardRef<ModalRef, ModalConfig>(({}, ref) => {
         title={title}
         visible={visible}
         width={800}
-        destroyOnClose
+        destroyOnHidden
         onClose={handleCancel}
         footer={
           <div>

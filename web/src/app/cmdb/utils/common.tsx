@@ -1,5 +1,4 @@
-import { BUILD_IN_MODEL, CREDENTIAL_LIST } from '@/app/cmdb/constants/asset';
-import { getSvgIcon } from './utils';
+import { CREDENTIAL_LIST } from '@/app/cmdb/constants/asset';
 import dayjs from 'dayjs';
 import { AttrFieldType } from '@/app/cmdb/types/assetManage';
 import {
@@ -23,7 +22,6 @@ import UserAvatar from '@/components/user-avatar';
 import React from 'react';
 import { useTranslation } from '@/utils/i18n';
 import {
-  ModelIconItem,
   ColumnItem,
   UserItem,
   SubGroupItem,
@@ -43,7 +41,7 @@ import {
 } from '@/app/cmdb/utils/collectTask';
 import TableFieldEditor from './tableFieldEditor';
 import TagCascaderEditor from './tagCascaderEditor';
-import TagCapsuleGroup from '@/app/cmdb/components/tag-capsule-group';
+import TagCapsuleGroup from '@/components/tag-capsule-group';
 import { getTagDisplayText } from '@/app/cmdb/utils/tag';
 import {
   FileFieldUpload,
@@ -363,45 +361,7 @@ export const OrganizationField: React.FC<{ value: any; hideUserAvatar?: boolean 
   return getOrganizationDisplayText(value, flatGroups);
 };
 
-export const iconList = getSvgIcon();
-// 图标套切换点：'/assets/icons'（扁平蓝块） | '/assets/icons-realistic'（写实立体）
-const CMDB_ICON_DIR = '/assets/icons-realistic';
-export function getIconUrl(tex: ModelIconItem) {
-  try {
-    const icn = tex.icn || '';
-
-    // 查找显示的图标：
-    // 1) icn 直接是完整文件名（后端配置形如 cc-switch2_交换机）
-    // 2) 兼容历史 'icon-xxx' 前缀，并按图标 key（文件名首个下划线前的部分）匹配
-    let showIcon = icn ? iconList.find((item) => item.url === icn) : undefined;
-    if (!showIcon && icn) {
-      const raw = icn.includes('icon-') ? icn.split('icon-')[1] : icn;
-      const key = raw?.split('_')[0];
-      showIcon = iconList.find((item) => item.key === key);
-    }
-
-    // 如果显示图标存在，直接返回相应的图标路径
-    if (showIcon) {
-      return `${CMDB_ICON_DIR}/${showIcon.url}.svg`;
-    }
-
-    // 查找内置模型和对应图标
-    const isBuilt = BUILD_IN_MODEL.find((item) => item.key === tex.model_id);
-    const builtIcon = isBuilt
-      ? iconList.find((item) => item.key === isBuilt.icon)
-      : null;
-
-    // 使用内置模型图标或者默认图标
-    const iconUrl = builtIcon?.url || 'cc-default_默认';
-
-    // 返回图标路径
-    return `${CMDB_ICON_DIR}/${iconUrl}.svg`;
-  } catch (e) {
-    // 记录错误日志并返回默认图标
-    console.error('Error in getIconUrl:', e);
-    return `${CMDB_ICON_DIR}/cc-default_默认.svg`;
-  }
-}
+export { getIconUrl, iconList } from '@/app/cmdb/utils/modelIcon';
 
 // 深克隆
 export const deepClone = (obj: any, hash = new WeakMap()) => {
@@ -671,18 +631,17 @@ export const getAssetColumns = (config: {
         return {
           ...columnItem,
           render: (_: unknown, record: any) => {
-            const cloudOptions = useAssetDataStore.getState().cloud_list;
             const modelId = record.model_id;
-            if (attrId === 'cloud' && modelId === 'host') {
-              const cloudId = +record[attrId];
-              const cloudName = cloudOptions.find(
-                (option: any) => option.proxy_id === cloudId
-              );
-              const displayText = cloudName ? cloudName.proxy_name : (cloudName || '--');
+            const displayText = getCloudRegionDisplayName(
+              attrId,
+              modelId,
+              record[attrId],
+            );
+            if (displayText !== null) {
               return (
                 <EllipsisWithTooltip
                   className="whitespace-nowrap overflow-hidden text-ellipsis"
-                  text={displayText as string}
+                  text={displayText}
                 ></EllipsisWithTooltip>
               );
             }
@@ -703,6 +662,32 @@ export const getAssetColumns = (config: {
   });
 };
 
+const getCloudRegionDisplayName = (
+  attrId: string,
+  modelId: string,
+  value: unknown,
+) => {
+  const cloudOptions = useAssetDataStore.getState().cloud_list || [];
+  const normalizedValue = String(value ?? '').trim();
+  if (!normalizedValue) {
+    return '--';
+  }
+
+  if (
+    !(
+      (attrId === 'cloud' && modelId === 'host') ||
+      (attrId === 'cloud_id' && modelId === 'subnet')
+    )
+  ) {
+    return null;
+  }
+
+  const matched = cloudOptions.find(
+    (option: any) => String(option.proxy_id) === normalizedValue,
+  );
+  return matched?.proxy_name || normalizedValue;
+};
+
 
 export const getFieldItem = (config: {
   fieldItem: AttrFieldType;
@@ -718,6 +703,31 @@ export const getFieldItem = (config: {
 }) => {
   const { disabled, placeholder } = config;
   if (config.isEdit) {
+    if (
+      (config.fieldItem.attr_id === 'cloud' && config.modelId === 'host') ||
+      (config.fieldItem.attr_id === 'cloud_id' && config.modelId === 'subnet')
+    ) {
+      const cloudOptions = useAssetDataStore.getState().cloud_list || [];
+      return (
+        <Select
+          showSearch
+          disabled={disabled}
+          placeholder={placeholder}
+          filterOption={(input, opt: any) => {
+            if (typeof opt?.children === 'string') {
+              return opt.children.toLowerCase().includes(input.toLowerCase());
+            }
+            return true;
+          }}
+        >
+          {cloudOptions.map((opt: any) => (
+            <Select.Option key={String(opt.proxy_id)} value={String(opt.proxy_id)}>
+              {opt.proxy_name}
+            </Select.Option>
+          ))}
+        </Select>
+      );
+    }
     if (config.fieldItem.attr_id === 'collect_task') {
       return (
         <CollectTaskTreeSelect
@@ -914,6 +924,16 @@ export const getFieldItem = (config: {
         '--'
       );
     case 'str':
+      if (config.modelId) {
+        const cloudDisplayName = getCloudRegionDisplayName(
+          config.fieldItem.attr_id,
+          config.modelId,
+          config.value,
+        );
+        if (cloudDisplayName !== null) {
+          return cloudDisplayName;
+        }
+      }
       if (config.fieldItem.attr_id === 'collect_task') {
         // Given 详情页字段为只读展示，When collect_task 可解析路由，Then 渲染可点击新标签链接。
         const meta = getCollectTaskLinkMeta(config.value);
