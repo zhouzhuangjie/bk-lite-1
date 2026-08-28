@@ -114,3 +114,19 @@ def test_top_queries_formats_duration_and_missing_extension():
         err = json.loads(tracing_mod.get_top_queries.invoke({"config": CONFIG}))
     assert "pg_stat_statements" in err["error"]
     assert "suggestion" in err
+
+
+def test_analyze_connection_pool_idle_recommendation():
+    by_state = [{"state": "idle", "connection_count": 8, "avg_duration_seconds": 12}, {"state": "active", "connection_count": 2, "avg_duration_seconds": 1}]
+    by_app = [{"application_name": "app", "username": "u", "connection_count": 10, "active_count": 2, "idle_count": 8}]
+    idle = [{"pid": 1, "idle_duration": "00:12:00", "query": "SELECT 1"}]
+    calls = [by_state, by_app, idle]
+
+    def fake_query(*args, **kwargs):
+        return calls.pop(0)
+
+    with patch.object(analysis_mod, "execute_readonly_query", side_effect=fake_query):
+        out = json.loads(analysis_mod.analyze_connection_pool_usage.invoke({"config": CONFIG}))
+    assert out["total_connections"] == 10
+    assert out["idle_percent"] == 80.0
+    assert any(r and "连接池" in r for r in out["recommendations"] if r)

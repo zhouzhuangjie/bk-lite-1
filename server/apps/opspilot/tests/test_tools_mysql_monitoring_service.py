@@ -119,3 +119,27 @@ def test_get_innodb_stats_hit_ratio():
     assert out["buffer_pool_hit_ratio"].endswith("%")
     assert out["buffer_pool_usage"].endswith("%")
     assert conn.closed is True
+
+
+def test_get_io_stats_formats_bytes():
+    rows = [
+        {
+            "FILE_NAME": "/var/lib/mysql/ibdata1",
+            "COUNT_READ": 10,
+            "COUNT_WRITE": 4,
+            "SUM_NUMBER_OF_BYTES_READ": 2048,
+            "SUM_NUMBER_OF_BYTES_WRITE": 1024,
+            "read_latency_ms": 12,
+            "write_latency_ms": 8,
+        }
+    ]
+    conn = FakeConn([])
+    with (
+        patch.object(mon, "build_mysql_normalized_from_runnable", return_value=NORMALIZED),
+        patch.object(mon, "get_mysql_connection_from_item", return_value=conn),
+        patch.object(mon, "execute_readonly_query", return_value=rows),
+    ):
+        out = json.loads(mon.get_io_stats.invoke({"config": {"configurable": {}}}))
+    assert out["io_file_count"] == 1
+    assert out["io_stats"][0]["file_name"].endswith("ibdata1")
+    assert conn.closed is True
