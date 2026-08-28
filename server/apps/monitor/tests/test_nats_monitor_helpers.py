@@ -74,6 +74,10 @@ class TestNormalizeTimeValue:
         with pytest.raises(ValueError):
             nm._normalize_time_value("01/01/2026", "t")
 
+    def test_unsupported_type_raises(self):
+        with pytest.raises(ValueError, match="时间格式错误"):
+            nm._normalize_time_value(["x"], "t")
+
 
 class TestNormalizeFilterValues:
     def test_empty(self):
@@ -145,6 +149,17 @@ class TestPaginateItems:
         assert out["count"] == 5
         assert out["items"] == [3, 4]
         assert out["page"] == 2
+
+
+class TestNormalizeNatsCreatePayload:
+    def test_requires_dict_and_copies(self):
+        with pytest.raises(ValueError, match="必须是字典"):
+            nm._normalize_nats_create_payload(["x"])
+        src = {"a": 1}
+        out = nm._normalize_nats_create_payload(src)
+        assert out == {"a": 1}
+        out["a"] = 2
+        assert src["a"] == 1
 
 
 class TestResolveNatsActor:
