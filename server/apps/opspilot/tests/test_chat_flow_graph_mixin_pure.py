@@ -64,3 +64,18 @@ def test_bfs_finds_agents_and_stops_at_intent():
     target, path = lonely._find_agent_node_via_bfs({"id": "start", "type": "openai"})
     assert target is None
     assert path == []
+
+
+def test_find_agent_by_intent_matches_source_handle():
+    nodes = [
+        {"id": "intent", "type": "intent_classification"},
+        {"id": "alarm", "type": "agents"},
+        {"id": "other", "type": "agents"},
+    ]
+    edges = [
+        {"source": "intent", "sourceHandle": "alarm_helper", "target": "alarm"},
+        {"source": "intent", "sourceHandle": "other", "target": "other"},
+    ]
+    g = _Graph(nodes, edges)
+    assert g._find_agent_by_intent("intent", "alarm_helper")["id"] == "alarm"
+    assert g._find_agent_by_intent("intent", "missing") is None
