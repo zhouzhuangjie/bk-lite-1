@@ -143,6 +143,63 @@ def test_http_post_put_delete_patch_success_and_errors():
     assert patch_err["status_code"] == 500
 
 
+def test_http_methods_invalid_timeout_and_generic_exception():
+    ok = _resp("ok")
+    with (
+        patch.object(h, "validate_url", side_effect=lambda u: u),
+        patch.object(h, "safe_post", return_value=ok) as post,
+    ):
+        assert h._http_post_impl("https://example.com", timeout="bad")["success"] is True
+        assert post.call_args.kwargs["timeout"] == 30
+    with (
+        patch.object(h, "validate_url", side_effect=lambda u: u),
+        patch.object(h, "safe_put", return_value=ok) as put,
+    ):
+        assert h._http_put_impl("https://example.com", timeout="bad")["success"] is True
+        assert put.call_args.kwargs["timeout"] == 30
+    with (
+        patch.object(h, "validate_url", side_effect=lambda u: u),
+        patch.object(h, "safe_delete", return_value=ok) as delete,
+    ):
+        assert h._http_delete_impl("https://example.com", timeout="bad")["success"] is True
+        assert delete.call_args.kwargs["timeout"] == 30
+    with (
+        patch.object(h, "validate_url", side_effect=lambda u: u),
+        patch.object(h, "safe_patch", return_value=ok) as patch_fn,
+    ):
+        assert h._http_patch_impl("https://example.com", timeout="bad")["success"] is True
+        assert patch_fn.call_args.kwargs["timeout"] == 30
+
+    with (
+        patch.object(h, "validate_url", side_effect=lambda u: u),
+        patch.object(h, "safe_post", side_effect=RuntimeError("down")),
+    ):
+        assert h._http_post_impl("https://example.com")["error"] == "down"
+    with (
+        patch.object(h, "validate_url", side_effect=lambda u: u),
+        patch.object(h, "safe_put", side_effect=RuntimeError("down")),
+    ):
+        assert h._http_put_impl("https://example.com")["error"] == "down"
+    with (
+        patch.object(h, "validate_url", side_effect=lambda u: u),
+        patch.object(h, "safe_delete", side_effect=RuntimeError("down")),
+    ):
+        assert h._http_delete_impl("https://example.com")["error"] == "down"
+    with (
+        patch.object(h, "validate_url", side_effect=lambda u: u),
+        patch.object(h, "safe_patch", side_effect=RuntimeError("down")),
+    ):
+        assert h._http_patch_impl("https://example.com")["error"] == "down"
+
+    err = requests.exceptions.HTTPError("gone")
+    err.response = None
+    with (
+        patch.object(h, "validate_url", side_effect=lambda u: u),
+        patch.object(h, "safe_post", side_effect=err),
+    ):
+        assert h._http_post_impl("https://example.com")["status_code"] == 0
+
+
 def test_http_tool_wrappers_delegate_to_impl():
     with patch.object(h, "_http_get_impl", return_value={"success": True, "content": "g"}):
         assert h.http_get.invoke({"url": "https://example.com"})["content"] == "g"

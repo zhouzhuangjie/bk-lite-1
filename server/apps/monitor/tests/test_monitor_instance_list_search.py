@@ -97,3 +97,18 @@ def test_monitor_instance_search_attaches_default_permission_and_metrics():
     body = json.loads(resp.content)
     assert body["data"]["results"][0]["permission"] == PermissionConstants.DEFAULT_PERMISSION
     assert converted == [(obj.id, ["s1"])]
+
+
+def test_list_by_primary_object_rejects_missing_and_child_object():
+    user = _superuser()
+    request = factory.post("/999999882/list_by_primary_object", {}, format="json")
+    force_authenticate(request, user=user)
+    with pytest.raises(BaseAppException, match="does not exist"):
+        MonitorInstanceViewSet().list_by_primary_object(request, "999999882")
+
+    parent = MonitorObject.objects.create(name="PrimaryObj882", level="base")
+    child = MonitorObject.objects.create(name="ChildObj882", level="derivative", parent=parent)
+    request = factory.post(f"/{child.id}/list_by_primary_object", {}, format="json")
+    force_authenticate(request, user=user)
+    with pytest.raises(BaseAppException, match="Only primary"):
+        MonitorInstanceViewSet().list_by_primary_object(request, str(child.id))

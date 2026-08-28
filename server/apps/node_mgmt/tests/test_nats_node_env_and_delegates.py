@@ -130,3 +130,16 @@ def test_install_collector_and_managed_component_return_task_id():
     assert install.call_count == 2
     assert delay.call_count == 2
     delay.assert_called_with("tid-881")
+
+
+def test_update_config_content_requires_payload_and_existing_row():
+    from apps.core.exceptions.base_app_exception import BaseAppException
+
+    with pytest.raises(BaseAppException, match="must be provided"):
+        n.NatsService().update_child_config_content(1, None, None)
+    with pytest.raises(BaseAppException, match="not found"):
+        n.NatsService().update_child_config_content(999881001, "x", None)
+    with pytest.raises(BaseAppException, match="must be provided"):
+        n.NatsService().update_config_content(1, None, None)
+    with pytest.raises(BaseAppException, match="not found"):
+        n.NatsService().update_config_content("missing-cfg-881", "x", None)
