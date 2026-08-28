@@ -4,6 +4,7 @@
 """
 
 import json
+from datetime import timedelta
 
 import pytest
 from rest_framework import status
@@ -393,4 +394,12 @@ def test_daily_event_stats(superuser):
     response = AlertSourceModelViewSet.as_view({"get": "daily_event_stats"})(request)
     payload = _render(response)
     assert response.status_code == status.HTTP_200_OK
-    assert "today" in json.dumps(payload, ensure_ascii=False) or payload["data"] is not None
+    assert payload["result"] is True
+    now = timezone.now()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_start = today_start - timedelta(days=1)
+    assert payload["data"]["today_count"] == Event.objects.filter(received_at__gte=today_start).count()
+    assert payload["data"]["yesterday_count"] == Event.objects.filter(
+        received_at__gte=yesterday_start,
+        received_at__lt=today_start,
+    ).count()

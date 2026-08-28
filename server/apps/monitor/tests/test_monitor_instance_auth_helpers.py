@@ -53,3 +53,18 @@ def test_ensure_target_organizations_rejects_unowned_and_bad_values(monkeypatch)
     with pytest.raises(UnauthorizedException):
         _ensure_target_organizations([1, 2], {"is_superuser": False})
     _ensure_target_organizations([1], {"is_superuser": False})
+
+
+def test_ensure_instance_scope_rejects_cross_org(monkeypatch):
+    from apps.monitor.models import MonitorInstance, MonitorInstanceOrganization, MonitorObject
+
+    obj = MonitorObject.objects.create(name="ScopeObj881", level="base")
+    inst = MonitorInstance.objects.create(id="scope-inst-881", name="i", monitor_object=obj)
+    MonitorInstanceOrganization.objects.create(monitor_instance=inst, organization=9)
+    monkeypatch.setattr(
+        "apps.monitor.views.monitor_instance._get_authorized_scope_groups",
+        lambda ctx: {1},
+    )
+    with pytest.raises(UnauthorizedException, match="跨组织"):
+        _ensure_instance_scope(["scope-inst-881"], {"is_superuser": False})
+    assert _ensure_instance_scope(["scope-inst-881"], {"is_superuser": True}) == ["scope-inst-881"]

@@ -170,7 +170,10 @@ def test_alert_related_action(superuser):
     response = AlertModelViewSet.as_view({"get": "related"})(request, pk=str(base.id))
     payload = _render(response)
     assert response.status_code == status.HTTP_200_OK
-    assert "items" in json.dumps(payload, ensure_ascii=False) or payload["data"] is not None
+    assert payload["result"] is True
+    assert payload["data"]["related_count"] == 0
+    assert payload["data"]["items"] == []
+    assert "current_incidents" in payload["data"]
 
 
 @pytest.mark.django_db

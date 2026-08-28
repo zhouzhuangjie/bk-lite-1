@@ -64,8 +64,7 @@ def test_login_rejects_disabled_user(monkeypatch):
     monkeypatch.setenv("SECRET_KEY", "test-secret")
     _user(username="off-user", disabled=True)
     result = nats_api.login("off-user", "secret-pass")
-    assert result["result"] is False
-    assert "disabled" in result["message"].lower() or "禁用" in result["message"]
+    assert result == {"result": False, "message": "User is disabled"}
 
 
 def test_login_expired_password_blocks_non_admin(monkeypatch):
@@ -81,8 +80,10 @@ def test_login_expired_password_blocks_non_admin(monkeypatch):
         },
     )
     result = nats_api.login("expired-user", "secret-pass")
-    assert result["result"] is False
-    assert "expir" in result["message"].lower() or "过期" in result["message"]
+    assert result == {
+        "result": False,
+        "message": "Your password has expired. Please contact the administrator to reset your password.",
+    }
 
 
 def test_login_otp_enabled_returns_challenge_not_token(monkeypatch):

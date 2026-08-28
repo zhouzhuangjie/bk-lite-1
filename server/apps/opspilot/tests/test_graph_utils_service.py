@@ -66,9 +66,17 @@ def test_get_graph_and_delete_paths():
         rag = MagicMock()
         rag_cls.return_value = rag
         assert GraphUtils.delete_graph(graph) is None
-        assert GraphUtils.delete_graph_chunk(graph, ["c1", "c2"]) is None
         rag.delete_index.assert_called_once()
+        index_req = rag.delete_index.call_args.args[0]
+        assert index_req.group_id == "graph-12"
+        assert run_async.call_args_list[0].args[0] is rag.delete_index.return_value
+
+        assert GraphUtils.delete_graph_chunk(graph, ["c1", "c2"]) is None
         rag.delete_document.assert_called_once()
+        doc_req = rag.delete_document.call_args.args[0]
+        assert doc_req.group_id == "graph-12"
+        assert list(doc_req.uuids) == ["c1", "c2"]
+        assert run_async.call_args_list[1].args[0] is rag.delete_document.return_value
         assert run_async.call_count == 2
 
     with patch.object(GraphUtils, "_run_async", side_effect=RuntimeError("boom")), patch(
@@ -95,7 +103,8 @@ def test_get_documents_flattens_es_chunks():
 
 def test_callback_swallows_progress_errors():
     with patch("apps.opspilot.tasks.update_graph_task", side_effect=RuntimeError("ignore")) as update:
-        GraphUtils.callback(1, 10, 99)
+        result = GraphUtils.callback(1, 10, 99)
+    assert result is None
     update.assert_called_once_with(1, 10, 99)
 
 

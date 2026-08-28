@@ -92,7 +92,9 @@ class TestMonitorObjectActions:
             f"{BASE}/api/monitor_object/{obj.id}/visibility/", {}, format="json",
         )
         body = resp.json()
-        assert body.get("result") is False or resp.status_code != 200
+        assert resp.status_code == 400
+        assert body["result"] is False
+        assert body["data"] == "is_visible is required"
 
 
 class TestMonitorObjectTypeList:

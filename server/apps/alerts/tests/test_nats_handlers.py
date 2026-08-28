@@ -130,7 +130,7 @@ def test_authorized_queryset_no_team():
 def test_authorized_queryset_no_permission():
     qs, err = N._get_authorized_alert_queryset({"team": 1, "is_superuser": False, "permission": {}})
     assert qs is None
-    assert "permission" in err["message"].lower() or err["result"] is False
+    assert err == {"result": False, "data": [], "message": "Insufficient permissions"}
 
 
 @pytest.mark.django_db

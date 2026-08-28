@@ -55,7 +55,8 @@ def test_fetch_json_parses_and_rejects_invalid():
     with patch.object(f, "_http_get_impl", return_value=_ok("not-json", content_type="text/plain")):
         bad = f.fetch_json.invoke({"url": "https://api.example/bad"})
     assert bad["success"] is False
-    assert "JSON" in bad["error"] or "Content-Type" in bad["error"]
+    assert bad["error"] == "响应的Content-Type不是JSON: text/plain"
+    assert bad["url"] == "https://example.com"
 
 
 def test_fetch_batch_counts_success_and_failure():

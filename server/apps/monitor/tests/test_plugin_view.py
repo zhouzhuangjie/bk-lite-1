@@ -42,7 +42,9 @@ class TestGetAccessGuide:
         plugin = MonitorPlugin.objects.create(name="snmpp", template_type="snmp", template_id="t1")
         resp = api_client.get(f"{BASE}/api/monitor_plugin/{plugin.id}/access_guide/")
         body = resp.json()
-        assert body.get("result") is False or resp.status_code != 200
+        assert resp.status_code == 400
+        assert body["result"] is False
+        assert body["message"] == "当前模板不是自建API模板"
 
     def test_api_template_returns_document(self, api_client, mocker):
         obj = MonitorObject.objects.create(name="AGObj", level="base", instance_id_keys=["instance_id"])
