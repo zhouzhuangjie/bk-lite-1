@@ -217,3 +217,78 @@ def test_process_documents_pipeline_preview_does_not_store(rag, monkeypatch):
     assert persist["status"] == "success"
     assert persist["chunks_size"] >= 1
     assert stored and stored[0]["knowledge_base_id"] == "kb"
+
+
+def test_search_by_type_sets_is_doc_and_swallows_errors(rag, monkeypatch):
+    captured = {}
+
+    def fake_perform(req):
+        captured["filter"] = dict(req.metadata_filter)
+        captured["k"] = req.k
+        return [Document(page_content="hit", metadata={"embedding": [1]})]
+
+    monkeypatch.setattr(rag, "_perform_search", fake_perform)
+    req = DocumentRetrieverRequest(index_name="kb", qa_size=3, enable_rerank=False, rag_recall_mode="chunk")
+    naive = rag._search_by_type(req, "naive")
+    assert captured["filter"]["is_doc"] == "1"
+    assert naive[0].page_content == "hit"
+    qa = rag._search_by_type(req, "qa")
+    assert captured["filter"]["is_doc"] == "0"
+    assert captured["k"] == 3
+    monkeypatch.setattr(rag, "_perform_search", lambda req: (_ for _ in ()).throw(RuntimeError("down")))
+    assert rag._search_by_type(req, "naive") == []
+
+
+def test_similarity_and_mmr_search_attach_scores(rag):
+    scored = Document(page_content="alpha-doc extra", metadata={})
+    store = MagicMock()
+    store.similarity_search_with_relevance_scores.return_value = [(scored, 0.88)]
+    store.max_marginal_relevance_search.return_value = [scored]
+    req = DocumentRetrieverRequest(index_name="kb", search_query="q", k=2, search_type="similarity_score_threshold")
+    sim = rag._execute_similarity_search(store, req, {"k": 2, "filter": {"is_doc": {"$eq": "1"}}})
+    assert sim[0].metadata["search_method"] == "similarity"
+    assert sim[0].metadata["similarity_score"] == pytest.approx(0.88)
+    mmr_req = DocumentRetrieverRequest(index_name="kb", search_query="q", k=1, search_type="mmr")
+    mmr = rag._execute_mmr_search(store, mmr_req, {"k": 1})
+    assert mmr[0].metadata["search_method"] == "mmr"
+    assert mmr[0].metadata["similarity_score"] == pytest.approx(0.88)
+
+
+def test_list_index_document_maps_rows_and_missing_index(rag):
+    rag._db_manager.execute_query.return_value = [{"id": "c1", "document": "body", "cmetadata": {"k": "v"}, "qa_count": 1}]
+    docs = rag.list_index_document(DocumentListRequest(index_name="kb", page=1, size=10, query="body", metadata_filter={}))
+    assert docs[0].metadata["chunk_id"] == "c1"
+    rag._db_manager.execute_query.side_effect = RuntimeError('relation "langchain_pg_embedding" does not exist')
+    assert rag.list_index_document(DocumentListRequest(index_name="kb", page=1, size=10, query="", metadata_filter={})) == []
+    rag._db_manager.execute_query.side_effect = RuntimeError("permission denied")
+    with pytest.raises(RuntimeError, match="permission denied"):
+        rag.list_index_document(DocumentListRequest(index_name="kb", page=1, size=10, query="", metadata_filter={}))
+
+
+def test_custom_content_ingest_preview_and_store(rag, monkeypatch):
+    stored = []
+    monkeypatch.setattr(rag, "store_documents_to_pg", lambda **kwargs: stored.append(kwargs))
+    params = {
+        "is_preview": True,
+        "chunk_mode": "full",
+        "knowledge_id": "k1",
+        "knowledge_base_id": "kb",
+        "embed_model_base_url": "",
+        "embed_model_api_key": "",
+        "embed_model_name": "m",
+        "metadata": {"source": "manual"},
+    }
+    preview = rag.custom_content_ingest("hello", params)
+    assert preview["status"] == "success"
+    assert stored == []
+    params["is_preview"] = False
+    persisted = rag.custom_content_ingest("hello", params)
+    assert persisted["status"] == "success"
+    assert persisted["chunks_size"] >= 1
+    assert stored and stored[0]["metadata"]["source"] == "manual"
+
+
+def test_file_ingest_rejects_unknown_type(rag):
+    out = rag.file_ingest("/tmp/a.bin", "a.bin", {"is_preview": True})
+    assert out["status"] == "error"
+    assert "不支持的文件类型" in out["message"]
