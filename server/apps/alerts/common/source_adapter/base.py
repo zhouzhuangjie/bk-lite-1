@@ -140,8 +140,8 @@ class AlertSourceAdapter(ABC):
             raise ValueError("Missing events.")
         return events
 
-    def get_integration_guide(self, base_url: str) -> Dict[str, Any]:
-        """返回源类型对接说明与模板"""
+    def get_integration_guide(self, base_url: str, language: str | None = None) -> Dict[str, Any]:
+        """返回源类型对接说明与模板。language 由接入指南接口统一传入，子类可选用。"""
         # 对于 snmp_trap 这类内置 source，接入地址可能不是通用 receiver_data，
         # 因此这里优先读取 source 自身配置的 url，避免说明文档和真实入口不一致。
         webhook_path = self.alert_source.config.get("url") or "/api/v1/alerts/api/receiver_data/"

@@ -474,6 +474,8 @@ class AuthViewSet(MaintainerViewSet):
 
     def retrieve(self, request, *args, **kwargs):
         serializer = self.get_detail(request, *args, **kwargs)
+        if isinstance(serializer, JsonResponse):
+            return serializer
         return Response(serializer.data)
 
     def get_detail(self, request, *args, **kwargs):

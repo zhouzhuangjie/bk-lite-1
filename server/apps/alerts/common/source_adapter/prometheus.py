@@ -88,7 +88,7 @@ class PrometheusAdapter(AlertSourceAdapter):
 
         return normalized_events
 
-    def get_integration_guide(self, base_url: str) -> Dict[str, Any]:
+    def get_integration_guide(self, base_url: str, language: str | None = None) -> Dict[str, Any]:
         webhook_url = f"{base_url}/api/v1/alerts/api/source/{self.alert_source.source_id}/webhook/"
         custom_payload_template = f"""
 route:

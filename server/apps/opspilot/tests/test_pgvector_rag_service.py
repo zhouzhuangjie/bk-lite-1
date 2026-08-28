@@ -190,3 +190,30 @@ def test_convert_results_to_documents_and_search_kwargs(rag):
     kwargs = rag._build_search_kwargs(req)
     assert kwargs["k"] == 4
     assert kwargs["filter"]["k"] == {"$eq": "v"}
+
+
+def test_process_documents_pipeline_preview_does_not_store(rag, monkeypatch):
+    stored = []
+    monkeypatch.setattr(rag, "store_documents_to_pg", lambda **kwargs: stored.append(kwargs))
+    docs = [Document(page_content="hello world " * 20, metadata={})]
+    params = {
+        "is_preview": True,
+        "chunk_mode": "full",
+        "knowledge_id": "k1",
+        "knowledge_base_id": "kb",
+        "embed_model_base_url": "",
+        "embed_model_api_key": "",
+        "embed_model_name": "m",
+        "metadata": {},
+    }
+    result = rag._process_documents_pipeline(docs, "title", params, "自定义内容")
+    assert result["status"] == "success"
+    assert result["chunks_size"] >= 1
+    assert result["documents"][0]["page_content"]
+    assert stored == []
+
+    params["is_preview"] = False
+    persist = rag._process_documents_pipeline(docs, "title", params, "自定义内容")
+    assert persist["status"] == "success"
+    assert persist["chunks_size"] >= 1
+    assert stored and stored[0]["knowledge_base_id"] == "kb"

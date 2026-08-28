@@ -68,7 +68,8 @@ def test_get_allowed_team_ids_no_group_list_empty():
 # ---------- validate_requested_teams ----------
 
 def test_validate_requested_teams_normalizes():
-    assert gs.validate_requested_teams(_req(), [1, "2", 3]) == [1, 2, 3]
+    user = SimpleNamespace(is_superuser=True)
+    assert gs.validate_requested_teams(_req(user=user), [1, "2", 3]) == [1, 2, 3]
 
 
 def test_validate_requested_teams_empty_raises():
