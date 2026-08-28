@@ -20,7 +20,7 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 
 from apps.base.tests.factories import UserFactory
 from apps.mlops.constants import DatasetReleaseStatus, MLflowRunStatus, TrainJobStatus
-from apps.mlops.utils.webhook_client import WebhookError
+from apps.mlops.utils.webhook_client import WebhookError, WebhookTimeoutError
 
 pytestmark = [pytest.mark.django_db, pytest.mark.integration]
 
@@ -283,6 +283,48 @@ def test_train_happy_path(monkeypatch, superuser, suffix, prefix, model_module, 
     assert tj.status == TrainJobStatus.RUNNING
 
 
+@pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
+def test_train_webhook_timeout_restores_status(monkeypatch, superuser, suffix, prefix, model_module, basename):
+    TrainJob = _model(model_module, basename, "TrainJob")
+    Dataset = _model(model_module, basename, "Dataset")
+    Release = _model(model_module, basename, "DatasetRelease")
+    ds = Dataset.objects.create(name="ds-timeout", description="", team=[1])
+    dv = Release.objects.create(
+        name="r", description="", dataset=ds, version="v1",
+        dataset_file="path/data.zip", status=DatasetReleaseStatus.PUBLISHED,
+        metadata={}, file_size=10,
+    )
+    tj = TrainJob.objects.create(
+        name="job-timeout", description="", team=[1], status=TrainJobStatus.PENDING,
+        algorithm="demo-algo", dataset_version=dv, hyperopt_config={},
+    )
+    TrainJob.objects.filter(pk=tj.pk).update(config_url="path/config.json")
+    tj.refresh_from_db()
+
+    mod = _view_module(suffix)
+    monkeypatch.setattr(
+        mod, "get_mlflow_train_config",
+        lambda: types.SimpleNamespace(
+            bucket="b", minio_endpoint="e", mlflow_tracking_uri="u",
+            minio_access_key="ak", minio_secret_key="sk",
+        ),
+    )
+    monkeypatch.setattr(mod, "get_image_by_prefix", lambda p, algo: "repo/train:1")
+    _patch_mlflow(monkeypatch, suffix)
+
+    def raise_timeout(*args, **kwargs):
+        raise WebhookTimeoutError("timed out")
+
+    monkeypatch.setattr(mod.WebhookClient, "stop", staticmethod(Mock()))
+    monkeypatch.setattr(mod.WebhookClient, "train", staticmethod(raise_timeout))
+    view = getattr(mod, f"{basename}TrainJobViewSet").as_view({"post": "train"})
+    request = factory.post(f"/{suffix}_train_jobs/x/train/")
+    resp = _call(view, request, superuser, pk=tj.id)
+    assert resp.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+    tj.refresh_from_db()
+    assert tj.status == TrainJobStatus.PENDING
+
+
 # =========================================================================
 # TrainJob: stop action
 # =========================================================================
@@ -403,6 +445,34 @@ def test_runs_data_list_with_runs_and_pagination(monkeypatch, superuser, suffix,
     assert item["duration_minutes"] == pytest.approx(10.0)
     # completed job -> all deletable
     assert item["can_delete_run"] is True
+
+
+@pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
+def test_runs_data_list_running_duration_and_bad_row(monkeypatch, superuser, suffix, prefix, model_module, basename):
+    tj = _make_train_job(model_module, basename, status_value=TrainJobStatus.RUNNING)
+    mod = _view_module(suffix)
+    t0 = pd.Timestamp("2020-01-01 00:00:00", tz="UTC")
+    runs = pd.DataFrame(
+        [
+            {"run_id": "running", "status": "RUNNING", "start_time": t0, "end_time": pd.NaT,
+             "tags.mlflow.runName": pd.NA},
+            {"run_id": pd.NA, "status": "FINISHED", "start_time": t0, "end_time": t0,
+             "tags.mlflow.runName": "bad"},
+        ]
+    )
+    _patch_mlflow(
+        monkeypatch, suffix,
+        get_experiment_by_name=lambda name: types.SimpleNamespace(experiment_id="1"),
+        get_experiment_runs=lambda eid, **kw: runs,
+    )
+    view = getattr(mod, f"{basename}TrainJobViewSet").as_view({"get": "get_run_data_list"})
+    request = factory.get(f"/{suffix}_train_jobs/x/runs_data_list/")
+    resp = _call(view, request, superuser, pk=tj.id)
+    assert resp.status_code == status.HTTP_200_OK
+    running = next(item for item in resp.data["items"] if item["run_id"] == "running")
+    assert running["end_time"] is None
+    assert running["duration_minutes"] >= 0
+    assert running["run_name"] == ""
 
 
 # =========================================================================

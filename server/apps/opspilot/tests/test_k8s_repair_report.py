@@ -110,3 +110,25 @@ class TestTargetNamesFilter:
         report = events["config_diff_report"]
         names = {item["workload_name"] for item in report["items"]}
         assert names == {"payment"}
+
+
+def _cache_probe_and_replica_issues():
+    return {
+        "cluster_name": "prod-cluster",
+        "deployments": [
+            {"name": "api", "namespace": "prod", "issues": ["未配置存活探针", "未配置就绪探针"], "config_analysis": {}},
+            {"name": "web", "namespace": "prod", "issues": ["使用 latest 标签", "单副本存在单点风险"], "config_analysis": {}},
+        ],
+    }
+
+
+@pytest.mark.asyncio
+class TestProbeAndReplicaFixCommands:
+    async def test_probe_and_replica_issues_generate_kubectl_commands(self):
+        result, events = await _invoke(_cache_probe_and_replica_issues(), expected_target_count=2)
+        assert "已生成修复对比报告" in result
+        commands = events["repair_commands"]["commands_markdown"]
+        assert "livenessProbe" in commands or "healthz" in commands
+        assert "readinessProbe" in commands or "/ready" in commands
+        assert "kubectl scale" in commands or "replicas" in commands
+        assert "set image" in commands or "latest" in commands.lower() or "<specific-tag>" in commands
