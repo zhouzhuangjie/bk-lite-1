@@ -5,6 +5,7 @@ from unittest.mock import patch
 import pytest
 
 from apps.opspilot.metis.llm.tools.mysql import monitoring as mon
+from apps.opspilot.metis.llm.tools.mysql.utils import calculate_percentage, format_duration, format_size
 
 pytestmark = pytest.mark.unit
 
@@ -63,7 +64,9 @@ def test_get_database_metrics_computes_qps_tps():
         out = json.loads(mon.get_database_metrics.invoke({"config": {"configurable": {}}}))
     assert out["QPS"] == 10.0
     assert out["TPS"] == 2.0
+    assert out["Bytes_received_formatted"] == format_size(2048)
     assert out["Bytes_received_formatted"] == "2.00 KB"
+    assert out["Bytes_sent_formatted"] == format_size(4096)
     assert out["Bytes_sent_formatted"] == "4.00 KB"
     assert conn.closed is True
 
@@ -91,8 +94,19 @@ def test_get_table_metrics_formats_fragmentation():
         out = json.loads(mon.get_table_metrics.invoke({"config": {"configurable": {}}}))
     assert out["database"] == "app"
     assert out["table_count"] == 1
-    assert out["tables"][0]["table_name"] == "hosts"
-    assert out["tables"][0]["fragmentation_ratio"].endswith("%")
+    table = out["tables"][0]
+    assert table["table_name"] == "hosts"
+    assert table["data_length"] == format_size(1024)
+    assert table["data_length"] == "1.00 KB"
+    assert table["index_length"] == format_size(512)
+    assert table["index_length"] == "512.00 B"
+    assert table["total_size"] == format_size(1536)
+    assert table["total_size"] == "1.50 KB"
+    assert table["data_free"] == format_size(256)
+    assert table["data_free"] == "256.00 B"
+    expected_frag = f"{calculate_percentage(256, 1536)}%"
+    assert table["fragmentation_ratio"] == expected_frag
+    assert table["fragmentation_ratio"] == "16.67%"
     assert conn.closed is True
 
 
@@ -117,8 +131,11 @@ def test_get_innodb_stats_hit_ratio():
         patch.object(mon, "get_mysql_connection_from_item", return_value=conn),
     ):
         out = json.loads(mon.get_innodb_stats.invoke({"config": {"configurable": {}}}))
-    assert out["buffer_pool_hit_ratio"].endswith("%")
-    assert out["buffer_pool_usage"].endswith("%")
+    assert out["buffer_pool_hit_ratio"] == f"{calculate_percentage(90, 100)}%"
+    assert out["buffer_pool_hit_ratio"] == "90.0%"
+    assert out["buffer_pool_usage"] == f"{calculate_percentage(80, 100)}%"
+    assert out["buffer_pool_usage"] == "80.0%"
+    assert out["Innodb_row_lock_time_formatted"] == format_duration(0)
     assert conn.closed is True
 
 
@@ -141,6 +158,15 @@ def test_get_io_stats_formats_bytes():
         patch.object(mon, "execute_readonly_query", return_value=rows),
     ):
         out = json.loads(mon.get_io_stats.invoke({"config": {"configurable": {}}}))
+    stat = out["io_stats"][0]
     assert out["io_file_count"] == 1
-    assert out["io_stats"][0]["file_name"].endswith("ibdata1")
+    assert stat["file_name"] == "/var/lib/mysql/ibdata1"
+    assert stat["bytes_read"] == format_size(2048)
+    assert stat["bytes_read"] == "2.00 KB"
+    assert stat["bytes_write"] == format_size(1024)
+    assert stat["bytes_write"] == "1.00 KB"
+    assert stat["read_latency"] == format_duration(12)
+    assert stat["read_latency"] == "12.00ms"
+    assert stat["write_latency"] == format_duration(8)
+    assert stat["write_latency"] == "8.00ms"
     assert conn.closed is True

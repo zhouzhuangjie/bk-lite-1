@@ -20,7 +20,7 @@ import pydantic.root_model  # noqa  预热避免 cov 竞态
 import pytest
 from rest_framework.test import APIRequestFactory, force_authenticate
 
-from apps.opspilot.models import LLMModel, LLMSkill, ModelVendor, SkillRequestLog
+from apps.opspilot.models import LLMModel, LLMSkill, ModelVendor, SkillRequestLog, SkillTools
 from apps.opspilot.viewsets.llm_view import (
     LLMModelViewSet,
     LLMViewSet,
@@ -182,6 +182,20 @@ class TestLLMModelViewSet:
         assert resp.status_code == 204
         assert not LLMModel.objects.filter(id=m.id).exists()
 
+    def test_update_成功记录操作(self, mocker):
+        log = mocker.patch(f"{LLM_MOD}.log_operation")
+        vendor = _vendor()
+        m = LLMModel.objects.create(name="old-m", team=[1], vendor=vendor, model="a")
+        data = {"name": "new-m", "team": [1], "vendor": vendor.id, "model": "b"}
+        resp = _dispatch(LLMModelViewSet, "update", "put", data=data, pk=m.id)
+        assert resp.status_code == 200
+        body = _body(resp)
+        assert body.get("name") == "new-m" or (isinstance(body.get("data"), dict) and body["data"].get("name") == "new-m")
+        m.refresh_from_db()
+        assert m.name == "new-m"
+        log.assert_called_once()
+        assert "new-m" in log.call_args.args[-1]
+
     def test_update_重名返回false(self, mocker):
         mocker.patch(f"{LLM_MOD}.log_operation")
         vendor = _vendor()
@@ -319,7 +333,97 @@ class TestConnectionActions:
         norm.assert_not_called()
 
 
-class TestGetMcpTools:
+class TestConnectionFailureReturns:
+    def test_mysql_探测失败返回400(self, mocker):
+        mocker.patch(f"{LLM_MOD}.SSRFValidator.validate", return_value=None)
+        mocker.patch(f"{LLM_MOD}.normalize_mysql_instance", return_value="inst")
+        mocker.patch(f"{LLM_MOD}.test_mysql_instance", return_value=False)
+        resp = _dispatch(SkillToolsViewSet, "test_mysql_connection", "post", data={"host": "db.example.com"})
+        assert resp.status_code == 400
+        assert _body(resp)["result"] is False
+        assert "MySQL connection test failed" in _body(resp)["message"]
+
+    def test_oracle_postgres_mssql_es_jenkins_k8s_探测失败(self, mocker):
+        mocker.patch(f"{LLM_MOD}.SSRFValidator.validate", return_value=None)
+        cases = [
+            ("test_oracle_connection", f"{LLM_MOD}.normalize_oracle_instance", f"{LLM_MOD}.test_oracle_instance", {"host": "ora.example.com"}, "Oracle"),
+            ("test_postgres_connection", f"{LLM_MOD}.normalize_postgres_instance", f"{LLM_MOD}.test_postgres_instance", {"host": "pg.example.com"}, "PostgreSQL"),
+            (
+                "test_mssql_connection",
+                "apps.opspilot.metis.llm.tools.mssql.connection.normalize_mssql_instance",
+                "apps.opspilot.metis.llm.tools.mssql.connection.test_mssql_instance",
+                {"host": "mssql.example.com"},
+                "MSSQL",
+            ),
+            ("test_es_connection", f"{LLM_MOD}.normalize_es_instance", f"{LLM_MOD}.test_es_instance", {"url": "https://es.example.com"}, "Elasticsearch"),
+            (
+                "test_jenkins_connection",
+                f"{LLM_MOD}.normalize_jenkins_instance",
+                f"{LLM_MOD}.test_jenkins_instance",
+                {"jenkins_url": "https://ci.example.com"},
+                "Jenkins",
+            ),
+            (
+                "test_kubernetes_connection",
+                f"{LLM_MOD}.normalize_kubernetes_instance",
+                f"{LLM_MOD}.test_kubernetes_instance",
+                {"kubeconfig_data": "apiVersion: v1\nclusters: []\n"},
+                "Kubernetes",
+            ),
+        ]
+        for action, norm_path, test_path, data, label in cases:
+            mocker.patch(norm_path, return_value="inst")
+            mocker.patch(test_path, return_value=False)
+            resp = _dispatch(SkillToolsViewSet, action, "post", data=data)
+            assert resp.status_code == 400, action
+            body = _body(resp)
+            assert body["result"] is False
+            assert label in body["message"]
+
+
+class TestGuardConnectionHost:
+    def test_strips_scheme_before_ssrf_validate(self, mocker):
+        validate = mocker.patch(f"{LLM_MOD}.SSRFValidator.validate")
+        SkillToolsViewSet._guard_connection_host("https://db.example.com", 3306)
+        validate.assert_called_once_with("http://db.example.com:3306")
+
+    def test_host_without_port(self, mocker):
+        validate = mocker.patch(f"{LLM_MOD}.SSRFValidator.validate")
+        SkillToolsViewSet._guard_connection_host("db.example.com")
+        validate.assert_called_once_with("http://db.example.com")
+
+    def test_kubeconfig_invalid_yaml_skips_validate(self, mocker):
+        validate = mocker.patch(f"{LLM_MOD}.SSRFValidator.validate")
+        SkillToolsViewSet._guard_kubeconfig(":::not-yaml")
+        SkillToolsViewSet._guard_kubeconfig("- just a list")
+        SkillToolsViewSet._guard_kubeconfig("")
+        validate.assert_not_called()
+
+
+class TestSkillToolsCrudLogs:
+    def test_create_update_destroy_log_operation(self, mocker):
+        log = mocker.patch(f"{LLM_MOD}.log_operation")
+        data = {"name": "tool-a", "description": "desc", "team": [1], "params": {}, "tags": []}
+        created = _dispatch(SkillToolsViewSet, "create", "post", data=data)
+        assert created.status_code == 201
+        obj = SkillTools.objects.get(name="tool-a")
+        assert any("新增工具" in str(c.args[-1]) and "tool-a" in str(c.args[-1]) for c in log.call_args_list)
+
+        log.reset_mock()
+        updated = _dispatch(SkillToolsViewSet, "update", "put", data={**data, "name": "tool-b", "description": "d2"}, pk=obj.id)
+        assert updated.status_code in (200, 201)
+        obj.refresh_from_db()
+        assert obj.name == "tool-b"
+        assert any("编辑工具" in str(c.args[-1]) and "tool-b" in str(c.args[-1]) for c in log.call_args_list)
+
+        log.reset_mock()
+        deleted = _dispatch(SkillToolsViewSet, "destroy", "delete", pk=obj.id)
+        assert deleted.status_code == 204
+        assert not SkillTools.objects.filter(id=obj.id).exists()
+        assert any("删除工具" in str(c.args[-1]) for c in log.call_args_list)
+
+
+class TestGetMcpToolsFetch:
     def test_缓存命中(self, mocker):
         mocker.patch(f"{LLM_MOD}.SSRFValidator.validate", return_value=None)
         mocker.patch(f"{LLM_MOD}.get_cached_mcp_tools", return_value=[{"name": "tool"}])
@@ -343,6 +447,46 @@ class TestGetMcpTools:
             data={"server_url": "https://mcp.example.com", "enable_auth": True, "auth_token": ""},
         )
         assert _body(resp)["result"] is False
+
+    def test_缓存未命中拉取并写入(self, mocker):
+        mocker.patch(f"{LLM_MOD}.SSRFValidator.validate", return_value=None)
+        mocker.patch(f"{LLM_MOD}.get_cached_mcp_tools", return_value=None)
+
+        class FakeMCP:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def get_tools(self):
+                return [{"name": "remote-tool"}]
+
+        mocker.patch(f"{LLM_MOD}.MCPClient", FakeMCP)
+        cache_set = mocker.patch(f"{LLM_MOD}.set_cached_mcp_tools")
+        resp = _dispatch(
+            SkillToolsViewSet,
+            "get_mcp_tools",
+            "post",
+            data={"server_url": "https://mcp.example.com", "enable_auth": True, "auth_token": "tok"},
+        )
+        body = _body(resp)
+        assert body["result"] is True
+        assert body["cached"] is False
+        assert body["data"] == [{"name": "remote-tool"}]
+        cache_set.assert_called_once()
+
+    def test_mcp客户端异常返回false(self, mocker):
+        mocker.patch(f"{LLM_MOD}.SSRFValidator.validate", return_value=None)
+        mocker.patch(f"{LLM_MOD}.get_cached_mcp_tools", return_value=None)
+        mocker.patch(f"{LLM_MOD}.MCPClient", side_effect=RuntimeError("mcp down"))
+        resp = _dispatch(SkillToolsViewSet, "get_mcp_tools", "post", data={"server_url": "https://mcp.example.com"})
+        body = _body(resp)
+        assert body["result"] is False
+        assert "mcp down" in body["message"]
 
 
 class TestImportZip:

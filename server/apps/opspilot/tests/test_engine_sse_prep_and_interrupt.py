@@ -1,6 +1,6 @@
 """ChatFlowEngine：流程校验失败、中断契约、SSE 准备与 agents 输入。"""
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from django.http import StreamingHttpResponse
@@ -190,3 +190,233 @@ def test_resolve_sse_target_agent_intent_routing_failure():
     record.assert_called_once()
     assert record.call_args.args[1]["error"] == "未找到可执行的agents节点（意图路由失败）"
     assert record.call_args.args[2] is False
+
+
+def _collect_sse(resp):
+    import asyncio
+
+    async def _run():
+        chunks = []
+        async for part in resp.streaming_content:
+            chunks.append(part.decode() if isinstance(part, bytes) else part)
+        return "".join(chunks)
+
+    return asyncio.run(_run())
+
+
+def _sse_engine_ready():
+    agent = {
+        "id": "a1",
+        "type": "agents",
+        "data": {"label": "智能体", "config": {"inputParams": "last_message", "outputParams": "last_message"}},
+    }
+    start = {"id": "s1", "type": "openai", "data": {"config": {}}}
+    engine = _engine([start, agent], start_node_id="s1", entry_type="openai")
+    return engine, start, agent
+
+
+def test_sse_execute_generate_stream_accumulates_json_skips_invalid_and_saves_browser_steps():
+    engine, start, agent = _sse_engine_ready()
+
+    def execute_method(_node_id, _node, _input):
+        async def gen():
+            yield 'data: {"type": "TEXT_MESSAGE_CONTENT", "delta": "hello"}\n\n'
+            yield "data: {not-json\n\n"
+            yield "plain-chunk\n"
+            yield (
+                'data: {"type": "CUSTOM", "name": "browser_step_progress", '
+                '"value": {"step_number": 1, "next_goal": "打开页面", "evaluation": "完成"}}\n\n'
+            )
+            yield 'data: {"choices": [{"delta": {"content": " world"}}], "object": "chat.completion.chunk"}\n\n'
+
+        return gen()
+
+    recorded = {}
+
+    async def capture_result(_input, result, success, _entry):
+        recorded["result"] = result
+        recorded["success"] = success
+
+    with (
+        patch.object(
+            engine,
+            "_prepare_sse_execution",
+            return_value=(start, agent, "u1", "openai", "sess", "s1", False, True, None),
+        ),
+        patch.object(engine, "_resolve_sse_target_agent", return_value=(agent, {"last_message": "hi", "user_id": "u1"}, None)),
+        patch.object(engine, "_resolve_sse_execute_method", return_value=(execute_method, None)),
+        patch.object(engine, "_record_node_execution_result_async", new=AsyncMock()),
+        patch.object(engine, "_record_execution_result_async", side_effect=capture_result),
+        patch.object(engine, "_record_conversation_history_async", new=AsyncMock()),
+        patch.object(engine, "_execute_subsequent_nodes_async", new=AsyncMock()) as subsequent,
+        patch.object(engine, "_check_interrupt_requested_async", new=AsyncMock(return_value=False)),
+        patch.object(engine, "_get_next_nodes", return_value=[]),
+    ):
+        resp = engine.sse_execute({"last_message": "hi"})
+        assert isinstance(resp, StreamingHttpResponse)
+        text = _collect_sse(resp)
+
+    assert "hello" in text
+    assert "plain-chunk" in text
+    assert recorded["success"] is True
+    assert recorded["result"] == "hello world"
+    ctx = engine.execution_contexts["a1"]
+    assert ctx.status == NodeStatus.COMPLETED
+    assert ctx.output_data["last_message"] == "hello world"
+    assert ctx.output_data["browser_steps"] == ["步骤1 打开页面", "最终结果: 完成"]
+    subsequent.assert_awaited_once()
+
+
+def test_sse_execute_generate_stream_interrupts_mid_chunk():
+    engine, start, agent = _sse_engine_ready()
+
+    def execute_method(_node_id, _node, _input):
+        async def gen():
+            yield 'data: {"type": "TEXT_MESSAGE_CONTENT", "delta": "first"}\n\n'
+            yield 'data: {"type": "TEXT_MESSAGE_CONTENT", "delta": "second"}\n\n'
+
+        return gen()
+
+    checks = {"n": 0}
+
+    async def interrupt_after_first():
+        checks["n"] += 1
+        return checks["n"] >= 2
+
+    recorded = {}
+
+    async def capture_result(_input, result, success, _entry):
+        recorded["result"] = result
+        recorded["success"] = success
+
+    with (
+        patch.object(
+            engine,
+            "_prepare_sse_execution",
+            return_value=(start, agent, "u1", "openai", "sess", "s1", False, True, None),
+        ),
+        patch.object(engine, "_resolve_sse_target_agent", return_value=(agent, {"last_message": "hi"}, None)),
+        patch.object(engine, "_resolve_sse_execute_method", return_value=(execute_method, None)),
+        patch.object(engine, "_record_node_execution_result_async", new=AsyncMock()),
+        patch.object(engine, "_record_execution_result_async", side_effect=capture_result),
+        patch.object(engine, "_record_conversation_history_async", new=AsyncMock()),
+        patch.object(engine, "_execute_subsequent_nodes_async", new=AsyncMock()),
+        patch.object(engine, "_check_interrupt_requested_async", side_effect=interrupt_after_first),
+        patch.object(engine, "_get_next_nodes", return_value=[]),
+    ):
+        text = _collect_sse(engine.sse_execute({"last_message": "hi"}))
+
+    assert "INTERRUPTED" in text
+    assert "second" not in text
+    assert recorded["success"] is False
+    assert recorded["result"]["interrupted"] is True
+
+
+def test_sse_execute_generate_stream_interrupt_after_complete_skips_success_record():
+    engine, start, agent = _sse_engine_ready()
+
+    def execute_method(_node_id, _node, _input):
+        async def gen():
+            yield 'data: {"type": "TEXT_MESSAGE_CONTENT", "delta": "done"}\n\n'
+
+        return gen()
+
+    checks = {"n": 0}
+
+    async def interrupt_after_stream():
+        checks["n"] += 1
+        return checks["n"] > 1
+
+    recorded = []
+
+    async def capture_result(_input, result, success, _entry):
+        recorded.append((result, success))
+
+    with (
+        patch.object(
+            engine,
+            "_prepare_sse_execution",
+            return_value=(start, agent, "u1", "openai", "sess", "s1", False, True, None),
+        ),
+        patch.object(engine, "_resolve_sse_target_agent", return_value=(agent, {"last_message": "hi"}, None)),
+        patch.object(engine, "_resolve_sse_execute_method", return_value=(execute_method, None)),
+        patch.object(engine, "_record_node_execution_result_async", new=AsyncMock()),
+        patch.object(engine, "_record_execution_result_async", side_effect=capture_result),
+        patch.object(engine, "_record_conversation_history_async", new=AsyncMock()),
+        patch.object(engine, "_execute_subsequent_nodes_async", new=AsyncMock()),
+        patch.object(engine, "_check_interrupt_requested_async", side_effect=interrupt_after_stream),
+        patch.object(engine, "_get_next_nodes", return_value=["n2"]),
+    ):
+        text = _collect_sse(engine.sse_execute({"last_message": "hi"}))
+
+    assert "done" in text
+    assert recorded
+    assert recorded[0][1] is False
+    assert recorded[0][0]["interrupted"] is True
+
+
+def test_sse_execute_generate_stream_yields_error_on_exception():
+    engine, start, agent = _sse_engine_ready()
+
+    def execute_method(_node_id, _node, _input):
+        async def gen():
+            yield 'data: {"type": "TEXT_MESSAGE_CONTENT", "delta": "partial"}\n\n'
+            raise RuntimeError("stream boom")
+
+        return gen()
+
+    recorded = {}
+
+    async def capture_result(_input, result, success, _entry):
+        recorded["result"] = result
+        recorded["success"] = success
+
+    with (
+        patch.object(
+            engine,
+            "_prepare_sse_execution",
+            return_value=(start, agent, "u1", "openai", "sess", "s1", False, True, None),
+        ),
+        patch.object(engine, "_resolve_sse_target_agent", return_value=(agent, {"last_message": "hi"}, None)),
+        patch.object(engine, "_resolve_sse_execute_method", return_value=(execute_method, None)),
+        patch.object(engine, "_record_node_execution_result_async", new=AsyncMock()),
+        patch.object(engine, "_record_execution_result_async", side_effect=capture_result),
+        patch.object(engine, "_record_conversation_history_async", new=AsyncMock()),
+        patch.object(engine, "_execute_subsequent_nodes_async", new=AsyncMock()),
+        patch.object(engine, "_check_interrupt_requested_async", new=AsyncMock(return_value=False)),
+        patch.object(engine, "_get_next_nodes", return_value=[]),
+    ):
+        text = _collect_sse(engine.sse_execute({"last_message": "hi"}))
+
+    assert "ERROR" in text
+    assert "stream boom" in text
+    assert recorded["success"] is False
+    assert recorded["result"]["error"] == "stream boom"
+    assert engine.execution_contexts["a1"].status == NodeStatus.FAILED
+    assert engine.execution_contexts["a1"].error_message == "stream boom"
+
+
+def test_sse_execute_returns_prep_error_without_opening_stream():
+    engine, start, agent = _sse_engine_ready()
+    with (
+        patch.object(engine, "_prepare_sse_execution", return_value=(None, None, "u", "openai", "", "s1", False, True, "prep-err")),
+        patch.object(engine, "_resolve_sse_target_agent") as resolve,
+    ):
+        assert engine.sse_execute({"last_message": "hi"}) == "prep-err"
+    resolve.assert_not_called()
+
+
+def test_sse_execute_returns_target_error_without_opening_stream():
+    engine, start, agent = _sse_engine_ready()
+    with (
+        patch.object(
+            engine,
+            "_prepare_sse_execution",
+            return_value=(start, agent, "u", "openai", "", "s1", False, True, None),
+        ),
+        patch.object(engine, "_resolve_sse_target_agent", return_value=(None, {}, "target-err")),
+        patch.object(engine, "_resolve_sse_execute_method") as resolve_method,
+    ):
+        assert engine.sse_execute({"last_message": "hi"}) == "target-err"
+    resolve_method.assert_not_called()
+
