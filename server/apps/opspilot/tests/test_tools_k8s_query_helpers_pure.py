@@ -2,7 +2,7 @@
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -76,3 +76,24 @@ def test_external_and_node_ips():
     assert q._get_node_internal_ip(node) == "10.0.0.5"
     assert q._get_node_external_ip(node) == "8.8.8.8"
     assert q._get_node_internal_ip(SimpleNamespace(status=SimpleNamespace(addresses=None))) == "<none>"
+
+
+def test_get_pods_json_and_table():
+    pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="web-0", namespace="prod", creation_timestamp=None),
+        status=SimpleNamespace(
+            phase="Running",
+            pod_ip="10.0.0.8",
+            container_statuses=[SimpleNamespace(ready=True, restart_count=0)],
+        ),
+        spec=SimpleNamespace(node_name="n1"),
+    )
+    core = MagicMock()
+    core.list_pod_for_all_namespaces.return_value = SimpleNamespace(items=[pod])
+    with patch.object(q.client, "CoreV1Api", return_value=core):
+        js = json.loads(q._get_pods(None, None, None, "json"))
+        table = q._get_pods(None, None, None, "table")
+    assert js["total"] == 1
+    assert js["items"][0]["name"] == "web-0"
+    assert js["items"][0]["ready"] == "1/1"
+    assert "web-0" in table and "Running" in table

@@ -18,9 +18,11 @@ def _req(team=None, superuser=False, group_list=None):
     request = APIRequestFactory().get("/")
     if team is not None:
         request._api_current_team = team
+        request.COOKIES = {**getattr(request, "COOKIES", {}), "current_team": str(team)}
+    resolved_groups = group_list if group_list is not None else ([int(team)] if team else [])
     request.user = SimpleNamespace(
         is_superuser=superuser,
-        group_list=group_list if group_list is not None else ([int(team)] if team else []),
+        group_list=resolved_groups,
     )
     return request
 

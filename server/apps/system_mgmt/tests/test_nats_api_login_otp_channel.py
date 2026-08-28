@@ -308,3 +308,115 @@ def test_get_pilot_permission_admin_allows(monkeypatch):
     result = nats_api.get_pilot_permission_by_token(token, bot_id=99, group_list=[1])
     assert result["result"] is True
     assert result["data"]["username"] == "pilot-admin"
+
+
+def test_get_user_rules_by_module_user_not_found():
+    result = nats_api.get_user_rules_by_module(1, "ghost", "domain.com", "opspilot", "bot")
+    assert result == {"result": False, "message": "User not found"}
+
+
+def test_get_user_rules_by_module_admin_gets_all_permission():
+    group = Group.objects.create(name="mod-admin-g", parent_id=0)
+    admin_role, _ = Role.objects.get_or_create(name="admin", app="")
+    admin = _user(username="mod-admin", role_list=[admin_role.id], group_list=[group.id])
+    result = nats_api.get_user_rules_by_module(group.id, admin.username, "domain.com", "opspilot", "bot")
+    assert result["result"] is True
+    assert result["data"] == {"all": {"instance": [], "team": [group.id]}}
+    assert group.id in result["team"]
+
+
+def test_get_user_rules_by_module_nested_and_flat_rules():
+    group = Group.objects.create(name="mod-user-g", parent_id=0)
+    user = _user(username="mod-user", group_list=[group.id], role_list=[])
+    gdr = GroupDataRule.objects.create(
+        name="mod-rule",
+        app="opspilot",
+        group_id=group.id,
+        group_name=group.name,
+        rules={
+            "provider": {"llm_model": [{"id": 7, "permission": ["View"]}]},
+            "bot": [{"id": 88, "permission": ["View"]}],
+        },
+    )
+    UserRule.objects.create(username=user.username, domain="domain.com", group_rule=gdr)
+    nested = nats_api.get_user_rules_by_module(group.id, user.username, "domain.com", "opspilot", "provider")
+    assert nested["result"] is True
+    assert 7 in [item["id"] if isinstance(item, dict) else item for item in nested["data"]["llm_model"]["instance"]]
+
+
+def test_get_user_rules_by_module_empty_rules_returns_empty_data():
+    group = Group.objects.create(name="mod-empty-g", parent_id=0)
+    user = _user(username="mod-empty", group_list=[group.id], role_list=[])
+    result = nats_api.get_user_rules_by_module(group.id, user.username, "domain.com", "opspilot", "bot")
+    assert result["result"] is True
+    assert result["data"] == {}
+
+
+def test_send_msg_unknown_channel_and_unsupported_type():
+    assert nats_api.send_msg_with_channel(999999, "t", "c", [1]) == {"result": False, "message": "Channel not found"}
+    channel = Channel.objects.create(name="weird", channel_type="unknown-type", config={}, description="", team=[1])
+    out = nats_api.send_msg_with_channel(channel.id, "t", "c", [1])
+    assert out == {"result": False, "message": "Unsupported channel type"}
+
+
+def test_send_msg_email_requires_recipients():
+    channel = Channel.objects.create(
+        name="mail",
+        channel_type=ChannelChoices.EMAIL,
+        config={"smtp_host": "localhost"},
+        description="",
+        team=[1],
+    )
+    out = nats_api.send_msg_with_channel(channel.id, "t", "c", [999999])
+    assert out["result"] is False
+    assert "No valid recipients" in out["message"]
+
+
+def test_send_msg_nats_passthrough_and_normalize():
+    channel = Channel.objects.create(
+        name="nats-raw",
+        channel_type=ChannelChoices.NATS,
+        config={"method_name": "receive_alert_events"},
+        description="",
+        team=[1],
+    )
+    payload = {"source_id": 1, "events": [{"id": 2}]}
+    with patch("apps.system_mgmt.nats_api.send_nats_message", return_value={"result": True}) as send:
+        ok = nats_api.send_msg_with_channel(channel.id, "", payload, [])
+    assert ok == {"result": True}
+    send.assert_called_once_with(channel, payload)
+
+    normal = Channel.objects.create(
+        name="nats-norm",
+        channel_type=ChannelChoices.NATS,
+        config={"method_name": "trigger_workflow_by_nats"},
+        description="",
+        team=[1],
+    )
+    with patch("apps.system_mgmt.nats_api._normalize_nats_content", return_value=(None, {"result": False, "message": "bad"})):
+        bad = nats_api.send_msg_with_channel(normal.id, "", {"x": 1}, [])
+    assert bad["result"] is False
+    assert bad["message"] == "bad"
+
+
+def test_search_opspilot_nats_channels_filters_source():
+    Channel.objects.create(
+        name="owned",
+        channel_type=ChannelChoices.NATS,
+        config={"source": nats_api.OPSPILOT_CHANNEL_SOURCE, "bot_id": "11", "node_id": "n1"},
+        description="d",
+        team=[1],
+    )
+    Channel.objects.create(
+        name="other",
+        channel_type=ChannelChoices.NATS,
+        config={"source": "manual", "bot_id": "11"},
+        description="",
+        team=[1],
+    )
+    result = nats_api.search_opspilot_nats_channels(bot_id=11)
+    assert result["result"] is True
+    names = [item["name"] for item in result["data"]]
+    assert names == ["owned"]
+    assert result["data"][0]["node_id"] == "n1"
+

@@ -137,3 +137,221 @@ def test_jobs_report_completions_and_api_error():
     with patch.object(a, "prepare_context"), patch.object(a.client, "BatchV1Api", return_value=batch):
         err = json.loads(a.check_kubernetes_jobs.invoke({"config": {}}))
     assert "error" in err
+
+
+def test_ingress_extracts_hosts_backends_and_lb():
+    ingress = SimpleNamespace(
+        metadata=SimpleNamespace(name="web", namespace="prod"),
+        spec=SimpleNamespace(
+            ingress_class_name="nginx",
+            tls=["secret"],
+            rules=[
+                SimpleNamespace(
+                    host="app.example",
+                    http=SimpleNamespace(
+                        paths=[
+                            SimpleNamespace(
+                                path="/",
+                                path_type="Prefix",
+                                backend=SimpleNamespace(
+                                    service=SimpleNamespace(
+                                        name="web-svc",
+                                        port=SimpleNamespace(number=80),
+                                    )
+                                ),
+                            )
+                        ]
+                    ),
+                )
+            ],
+        ),
+        status=SimpleNamespace(
+            load_balancer=SimpleNamespace(ingress=[SimpleNamespace(ip="1.1.1.1", hostname=None)])
+        ),
+    )
+    net = MagicMock()
+    net.list_ingress_for_all_namespaces.return_value = _items([ingress])
+    with patch.object(a, "prepare_context"), patch.object(a.client, "NetworkingV1Api", return_value=net):
+        out = json.loads(a.check_kubernetes_ingress.invoke({"config": {}}))
+    assert out[0]["hosts"] == ["app.example"]
+    assert out[0]["backends"][0]["service_name"] == "web-svc"
+    assert out[0]["load_balancers"][0]["value"] == "1.1.1.1"
+    assert out[0]["tls"] == 1
+
+
+def test_endpoints_ready_and_not_ready():
+    endpoint = SimpleNamespace(
+        metadata=SimpleNamespace(name="web-svc", namespace="prod"),
+        subsets=[
+            SimpleNamespace(
+                addresses=[
+                    SimpleNamespace(
+                        ip="10.0.0.2",
+                        hostname=None,
+                        target_ref=SimpleNamespace(kind="Pod", name="web-0"),
+                    )
+                ],
+                not_ready_addresses=[
+                    SimpleNamespace(ip="10.0.0.3", hostname=None, target_ref=None)
+                ],
+                ports=[SimpleNamespace(name="http", port=80, protocol="TCP")],
+            )
+        ],
+    )
+    core = MagicMock()
+    core.list_endpoints_for_all_namespaces.return_value = _items([endpoint])
+    with patch.object(a, "prepare_context"), patch.object(a.client, "CoreV1Api", return_value=core):
+        out = json.loads(a.check_kubernetes_endpoints.invoke({"config": {}}))
+    assert out[0]["ready_count"] == 1
+    assert out[0]["not_ready_count"] == 1
+    assert out[0]["ready_addresses"][0]["target_ref"] == "Pod/web-0"
+
+
+def test_hpa_reports_replicas_and_metrics():
+    hpa = SimpleNamespace(
+        metadata=SimpleNamespace(name="web-hpa", namespace="prod"),
+        spec=SimpleNamespace(
+            min_replicas=1,
+            max_replicas=5,
+            scale_target_ref=SimpleNamespace(kind="Deployment", name="web"),
+            metrics=[
+                SimpleNamespace(
+                    type="Resource",
+                    resource=SimpleNamespace(
+                        name="cpu",
+                        target=SimpleNamespace(average_value=None, average_utilization=70),
+                    ),
+                )
+            ],
+        ),
+        status=SimpleNamespace(
+            current_replicas=2,
+            desired_replicas=3,
+            current_metrics=[
+                SimpleNamespace(
+                    type="Resource",
+                    resource=SimpleNamespace(
+                        name="cpu",
+                        current=SimpleNamespace(average_value=None, average_utilization=80),
+                    ),
+                )
+            ],
+            conditions=[SimpleNamespace(type="AbleToScale", status="True", reason="ok", message="")],
+        ),
+    )
+    auto = MagicMock()
+    auto.list_horizontal_pod_autoscaler_for_all_namespaces.return_value = _items([hpa])
+    with patch.object(a, "prepare_context"), patch.object(a.client, "AutoscalingV2Api", return_value=auto):
+        out = json.loads(a.check_kubernetes_hpa_status.invoke({"config": {}}))
+    assert out[0]["target_ref"] == "Deployment/web"
+    assert out[0]["desired_replicas"] == 3
+    assert out[0]["current_metrics"][0]["current_value"] == 80
+
+
+def _deployment(name="web", ns="prod", replicas=1, image="web:latest"):
+    container = SimpleNamespace(
+        name="app",
+        image=image,
+        resources=None,
+        liveness_probe=None,
+        readiness_probe=None,
+        security_context=None,
+    )
+    return SimpleNamespace(
+        metadata=SimpleNamespace(name=name, namespace=ns),
+        spec=SimpleNamespace(
+            replicas=replicas,
+            strategy=SimpleNamespace(type="RollingUpdate"),
+            selector=SimpleNamespace(match_labels={"app": name}),
+            template=SimpleNamespace(
+                spec=SimpleNamespace(
+                    containers=[container],
+                    affinity=None,
+                )
+            ),
+        ),
+    )
+
+
+def test_analyze_deployment_flags_single_replica_and_missing_guards():
+    apps = MagicMock()
+    core = MagicMock()
+    apps.list_deployment_for_all_namespaces.return_value = _items([_deployment()])
+    core.list_namespaced_pod_disruption_budget.side_effect = RuntimeError("no pdb api")
+    with (
+        patch.object(a, "prepare_context"),
+        patch.object(a.client, "AppsV1Api", return_value=apps),
+        patch.object(a.client, "CoreV1Api", return_value=core),
+        patch.object(a, "get_current_cluster_name", return_value="prod-cluster"),
+    ):
+        out = json.loads(a.analyze_deployment_configurations.invoke({"config": {}}))
+    assert out["cluster_name"] == "prod-cluster"
+    assert out["problematic"] == 1
+    issues = {item["issue"] for item in out["issues_detail"]}
+    assert any("单副本" in i for i in issues)
+    assert any("资源限制" in i for i in issues)
+    assert any("存活探针" in i for i in issues)
+    assert any("latest" in i or "标签" in i for i in issues)
+    full = out["_deployments_full"][0]
+    assert full["config_analysis"]["replicas"] == 1
+
+
+def test_analyze_deployment_not_found_and_scope_too_large():
+    apps = MagicMock()
+    core = MagicMock()
+    apps.list_namespaced_deployment.return_value = _items([_deployment("other")])
+    with (
+        patch.object(a, "prepare_context"),
+        patch.object(a.client, "AppsV1Api", return_value=apps),
+        patch.object(a.client, "CoreV1Api", return_value=core),
+        patch.object(a, "get_current_cluster_name", return_value="c"),
+    ):
+        missing = json.loads(
+            a.analyze_deployment_configurations.invoke({"namespace": "prod", "name": "web", "config": {}})
+        )
+    assert missing["error"] == "deployment_not_found"
+
+    crowded = [_deployment(name=f"d{i}", ns="ns-a" if i < 60 else "ns-b") for i in range(101)]
+    apps.list_deployment_for_all_namespaces.return_value = _items(crowded)
+    with (
+        patch.object(a, "prepare_context"),
+        patch.object(a.client, "AppsV1Api", return_value=apps),
+        patch.object(a.client, "CoreV1Api", return_value=core),
+        patch.object(a, "get_current_cluster_name", return_value="c"),
+    ):
+        huge = json.loads(a.analyze_deployment_configurations.invoke({"config": {}}))
+    assert huge["error"] == "scope_too_large"
+    assert huge["total"] == 101
+
+
+def test_daemonset_and_statefulset_status():
+    ds = SimpleNamespace(
+        metadata=SimpleNamespace(name="agent", namespace="kube-system"),
+        status=SimpleNamespace(
+            desired_number_scheduled=3,
+            current_number_scheduled=3,
+            number_ready=2,
+            updated_number_scheduled=3,
+            number_available=2,
+        ),
+        spec=SimpleNamespace(template=SimpleNamespace(spec=SimpleNamespace(node_selector={"pool": "sys"}))),
+    )
+    sts = SimpleNamespace(
+        metadata=SimpleNamespace(name="pg", namespace="db"),
+        spec=SimpleNamespace(replicas=3, service_name="pg", volume_claim_templates=[1, 2]),
+        status=SimpleNamespace(ready_replicas=3, current_replicas=3, updated_replicas=3),
+    )
+    apps = MagicMock()
+    apps.list_daemon_set_for_all_namespaces.return_value = _items([ds])
+    apps.list_stateful_set_for_all_namespaces.return_value = _items([sts])
+    with (
+        patch.object(a, "prepare_context"),
+        patch.object(a.client, "AppsV1Api", return_value=apps),
+        patch.object(a, "get_current_cluster_name", return_value="c1"),
+    ):
+        daemon = json.loads(a.check_kubernetes_daemonsets.invoke({"config": {}}))
+        stateful = json.loads(a.check_kubernetes_statefulsets.invoke({"config": {}}))
+    assert daemon["daemonsets"][0]["ready"] == 2
+    assert daemon["daemonsets"][0]["node_selector"] == {"pool": "sys"}
+    assert stateful["statefulsets"][0]["volume_claim_templates"] == 2
+    assert stateful["statefulsets"][0]["ready_replicas"] == 3

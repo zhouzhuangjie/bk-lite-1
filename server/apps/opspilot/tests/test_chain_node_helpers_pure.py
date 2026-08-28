@@ -218,3 +218,32 @@ def test_tools_nodes_description_and_k8s_loop_filter():
     done = ToolsNodes._build_basic_k8s_analysis_done_message(AIMessage(content=""), {"deployments": [1, 2], "cluster_name": "prod"})
     assert "prod" in done.content
     assert "2 个工作负载" in done.content
+
+
+def test_rewrite_query_uses_isolated_llm_and_reraises():
+    node = BasicNode()
+    request = SimpleNamespace(user_message="原始", chat_history=[])
+    with (
+        patch(
+            "apps.opspilot.metis.llm.chain.node.TemplateLoader.render_template",
+            return_value="rewrite-prompt",
+        ),
+        patch(
+            "apps.opspilot.metis.llm.chain.node.LLMClientFactory.invoke_isolated",
+            return_value="  改写后  ",
+        ),
+    ):
+        assert node._rewrite_query(request, {}) == "改写后"
+
+    with (
+        patch(
+            "apps.opspilot.metis.llm.chain.node.TemplateLoader.render_template",
+            return_value="p",
+        ),
+        patch(
+            "apps.opspilot.metis.llm.chain.node.LLMClientFactory.invoke_isolated",
+            side_effect=RuntimeError("llm down"),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="llm down"):
+            node._rewrite_query(request, {})

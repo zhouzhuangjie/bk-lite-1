@@ -189,8 +189,28 @@ def test_generate_time_periods_week():
     assert len(weeks) >= 2
 
 
+def test_get_authorized_team_ids_admin_and_normal(monkeypatch):
+    admin = SimpleNamespace(group_list=[1], role_list=[9])
+    monkeypatch.setattr(
+        N.Role.objects,
+        "filter",
+        lambda **kwargs: SimpleNamespace(only=lambda *a: [SimpleNamespace(app="", name="admin")]),
+    )
+    monkeypatch.setattr(N.GroupUtils, "get_group_with_descendants", lambda team: [team, 2])
+    assert N._get_authorized_team_ids(admin, 1, include_children=True) == [1, 2]
+
+    user = SimpleNamespace(group_list=[{"id": 3}], role_list=[])
+    monkeypatch.setattr(
+        N.GroupUtils,
+        "get_user_authorized_child_groups",
+        lambda **kwargs: [3],
+    )
+    assert N._get_authorized_team_ids(user, 3, include_children=False) == [3]
+
+
 def test_get_cmdb_module_data_unknown_and_missing_user():
     with pytest.raises(ValueError, match="Invalid module type"):
         N.get_cmdb_module_data("nope", "x", 1, 10, 1, user_info=None)
     empty = N.get_cmdb_module_data("instances", "host", 1, 10, 1, user_info=None)
     assert empty == {"count": 0, "items": []}
+

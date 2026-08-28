@@ -28,6 +28,9 @@ def _build_instance(groups=(1,), rest_api="monitor/query_latest_active_alerts"):
         name="test-datasource",
         groups=list(groups),
         rest_api=rest_api,
+        source_type="nats",
+        connection_config={},
+        query_config={},
         params=[
             {"name": "limit", "type": "number", "value": 10, "filterType": "params"},
             {"name": "time_range", "type": "timeRange", "value": 10080, "filterType": "params"},
@@ -319,6 +322,9 @@ def test_get_source_data_rejects_unassociated_namespace(authenticated_user, monk
             name="test-datasource",
             groups=[1],
             rest_api="monitor/query_latest_active_alerts",
+            source_type="nats",
+            connection_config={},
+            query_config={},
             params=[
                 {"name": "limit", "type": "number", "value": 10, "filterType": "params"},
                 {"name": "time_range", "type": "timeRange", "value": 10080, "filterType": "params"},

@@ -136,3 +136,18 @@ def test_get_execution_phase_and_build_step():
     assert step["action"] == "download"
     assert step["status"] == "running"
     assert step["message"] == "start"
+
+
+def test_batch_add_and_advance_and_update_steps():
+    n1 = _DummyNode(result={"steps": []})
+    n2 = _DummyNode(result={"steps": []})
+    installer_tasks._batch_add_step([n1, n2], "download_package", "running", "start")
+    assert n1.result["steps"][-1]["action"] == "download_package"
+    assert n2.result["steps"][-1]["status"] == "running"
+    installer_tasks._batch_advance_step([n1, n2], "success", "done")
+    assert n1.result["steps"][-1]["status"] == "success"
+    n3 = _DummyNode(result={"steps": [{"action": "install", "status": "running", "message": "go"}]})
+    installer_tasks._batch_update_step_status([n3], "failed", "boom")
+    assert n3.result["steps"][-1]["status"] == "failed"
+    assert "boom" in n3.result["steps"][-1]["message"] or n3.result["steps"][-1].get("message") == "boom"
+
