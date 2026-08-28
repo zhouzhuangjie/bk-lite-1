@@ -88,7 +88,8 @@ class TestOracleOptimization:
         users = next(ts for ts in out["tablespaces"] if ts["tablespace_name"] == "USERS")
         assert users["usage_percent"] == 95.0
         assert out["warning_count"] == 1
-        assert out["warnings"][0]["severity"] == "warning" or out["warnings"][0]["usage_percent"] == 95.0
+        assert out["warnings"][0]["severity"] == "warning"
+        assert out["warnings"][0]["usage_percent"] == 95.0
         assert fc.closed is True
 
     def test_tablespace_usage_error_is_wrapped(self):

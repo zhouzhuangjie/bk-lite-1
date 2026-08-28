@@ -55,7 +55,8 @@ def test_dataset_list_create_retrieve_destroy(superuser, suffix, prefix, model_m
 
     retrieved = _call(vs.as_view({"get": "retrieve"}), factory.get("/x/"), superuser, pk=ds.id)
     assert retrieved.status_code == status.HTTP_200_OK
-    assert retrieved.data["id"] == ds.id or retrieved.data.get("name") == "ds-list"
+    assert retrieved.data["id"] == ds.id
+    assert retrieved.data["name"] == "ds-list"
 
     created = _call(
         vs.as_view({"post": "create"}),

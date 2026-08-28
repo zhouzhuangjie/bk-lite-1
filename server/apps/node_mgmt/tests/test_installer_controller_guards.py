@@ -45,26 +45,28 @@ def test_install_controller_marks_running_and_dispatches():
 
 
 def test_install_controller_for_node_early_returns():
-    assert installer_tasks.install_controller_for_node(999999, 1) is None
-    region = _region()
-    task = ControllerTask.objects.create(cloud_region=region, type="install", status="running", package_version_id=1)
-    node = ControllerTaskNode.objects.create(
-        task=task,
-        ip="10.0.0.1",
-        os="linux",
-        port=22,
-        username="root",
-        password="p",
-        status="running",
-        result={InstallerConstants.EXECUTION_ATTEMPT_KEY: 2},
-    )
-    assert installer_tasks.install_controller_for_node(node.id, attempt=1) is None
-    node.result = {
-        InstallerConstants.EXECUTION_ATTEMPT_KEY: 1,
-        "execution_phase": "other",
-    }
-    node.save()
-    assert installer_tasks.install_controller_for_node(node.id, attempt=1) is None
+    with patch.object(installer_tasks, "install_controller_on_nodes") as remote:
+        assert installer_tasks.install_controller_for_node(999999, 1) is None
+        region = _region()
+        task = ControllerTask.objects.create(cloud_region=region, type="install", status="running", package_version_id=1)
+        node = ControllerTaskNode.objects.create(
+            task=task,
+            ip="10.0.0.1",
+            os="linux",
+            port=22,
+            username="root",
+            password="p",
+            status="running",
+            result={InstallerConstants.EXECUTION_ATTEMPT_KEY: 2},
+        )
+        assert installer_tasks.install_controller_for_node(node.id, attempt=1) is None
+        node.result = {
+            InstallerConstants.EXECUTION_ATTEMPT_KEY: 1,
+            "execution_phase": "other",
+        }
+        node.save()
+        assert installer_tasks.install_controller_for_node(node.id, attempt=1) is None
+        remote.assert_not_called()
 
 
 def test_install_controller_for_node_missing_package_records_error():

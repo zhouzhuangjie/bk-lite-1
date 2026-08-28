@@ -62,9 +62,14 @@ def test_get_graph_and_delete_paths():
         empty = GraphUtils.get_graph(12)
     assert empty["result"] is False
 
-    with patch.object(GraphUtils, "_run_async", return_value=True), patch("apps.opspilot.utils.graph_utils.GraphitiRAG"):
-        GraphUtils.delete_graph(graph)
-        GraphUtils.delete_graph_chunk(graph, ["c1", "c2"])
+    with patch.object(GraphUtils, "_run_async", return_value=True) as run_async, patch("apps.opspilot.utils.graph_utils.GraphitiRAG") as rag_cls:
+        rag = MagicMock()
+        rag_cls.return_value = rag
+        assert GraphUtils.delete_graph(graph) is None
+        assert GraphUtils.delete_graph_chunk(graph, ["c1", "c2"]) is None
+        rag.delete_index.assert_called_once()
+        rag.delete_document.assert_called_once()
+        assert run_async.call_count == 2
 
     with patch.object(GraphUtils, "_run_async", side_effect=RuntimeError("boom")), patch(
         "apps.opspilot.utils.graph_utils.GraphitiRAG"
@@ -89,8 +94,9 @@ def test_get_documents_flattens_es_chunks():
 
 
 def test_callback_swallows_progress_errors():
-    with patch("apps.opspilot.tasks.update_graph_task", side_effect=RuntimeError("ignore")):
+    with patch("apps.opspilot.tasks.update_graph_task", side_effect=RuntimeError("ignore")) as update:
         GraphUtils.callback(1, 10, 99)
+    update.assert_called_once_with(1, 10, 99)
 
 
 def test_create_graph_success_and_missing_mapping():

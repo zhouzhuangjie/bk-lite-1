@@ -196,5 +196,6 @@ def test_user_login_log_export_excel_rejects_invalid_filters(super_client):
     )
     assert resp.status_code == 400
     payload = resp.json()
-    data = payload.get("data") or payload
-    assert data.get("result") is False or payload.get("result") is False
+    blob = str(payload.get("message") or payload)
+    assert "Invalid filter parameters" in blob
+    assert "login_time_start" in blob

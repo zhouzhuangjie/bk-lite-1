@@ -13,11 +13,14 @@ def _ok(content, url="https://example.com", content_type="text/html"):
 
 
 def test_fetch_html_extracts_main_and_truncates():
-    html = "<html><body><nav>nav</nav><article><p>hello world</p></article></body></html>"
+    html = "<html><body><nav>nav</nav><article><p>hello world from the main article body</p></article></body></html>"
     with patch.object(f, "_http_get_impl", return_value=_ok(html)):
         out = f.fetch_html.invoke({"url": "https://example.com", "extract_main": True, "max_length": 20})
     assert out["success"] is True
-    assert out["truncated"] is True or len(out["content"]) <= 20 or "hello" in out["content"]
+    assert out["truncated"] is True
+    assert len(out["content"]) == 20
+    assert out["content"].startswith("<article>")
+    assert "nav" not in out["content"]
     assert out["url"] == "https://example.com"
 
 

@@ -63,7 +63,8 @@ def test_get_database_metrics_computes_qps_tps():
         out = json.loads(mon.get_database_metrics.invoke({"config": {"configurable": {}}}))
     assert out["QPS"] == 10.0
     assert out["TPS"] == 2.0
-    assert "KB" in out["Bytes_received_formatted"] or "B" in out["Bytes_received_formatted"]
+    assert out["Bytes_received_formatted"] == "2.00 KB"
+    assert out["Bytes_sent_formatted"] == "4.00 KB"
     assert conn.closed is True
 
 

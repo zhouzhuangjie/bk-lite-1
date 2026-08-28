@@ -68,25 +68,26 @@ def test_update_graph_success():
 
 
 def test_chat_flow_celery_task_requires_online_bot_and_workflow():
-    with patch.object(tasks, "_run_in_native_thread", side_effect=_run_inline):
-        tasks.chat_flow_celery_task(999999, "n1", "hi")
-
-    bot = Bot.objects.create(name="flow-bot", team=[1], online=False)
-    with patch.object(tasks, "_run_in_native_thread", side_effect=_run_inline):
-        tasks.chat_flow_celery_task(bot.id, "n1", "hi")
-
-    bot.online = True
-    bot.save()
-    with patch.object(tasks, "_run_in_native_thread", side_effect=_run_inline):
-        tasks.chat_flow_celery_task(bot.id, "n1", "hi")
-
-    BotWorkFlow.objects.create(bot=bot, flow_json={"nodes": []})
-    engine = MagicMock()
-    engine.execute.return_value = {"content": "ok"}
     with (
         patch.object(tasks, "_run_in_native_thread", side_effect=_run_inline),
-        patch("apps.opspilot.tasks.create_chat_flow_engine", return_value=engine),
+        patch("apps.opspilot.tasks.create_chat_flow_engine") as create_engine,
     ):
+        tasks.chat_flow_celery_task(999999, "n1", "hi")
+        create_engine.assert_not_called()
+
+        bot = Bot.objects.create(name="flow-bot", team=[1], online=False)
+        tasks.chat_flow_celery_task(bot.id, "n1", "hi")
+        create_engine.assert_not_called()
+
+        bot.online = True
+        bot.save()
+        tasks.chat_flow_celery_task(bot.id, "n1", "hi")
+        create_engine.assert_not_called()
+
+        BotWorkFlow.objects.create(bot=bot, flow_json={"nodes": []})
+        engine = MagicMock()
+        engine.execute.return_value = {"content": "ok"}
+        create_engine.return_value = engine
         tasks.chat_flow_celery_task(bot.id, "n1", "hi")
     engine.execute.assert_called_once()
     assert engine.execute.call_args.args[0]["last_message"] == "hi"

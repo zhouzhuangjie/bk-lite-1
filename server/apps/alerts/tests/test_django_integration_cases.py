@@ -2746,7 +2746,8 @@ class AlertPermissionScopeTestCase(TestCase):
 
         response = IncidentModelViewSet.as_view({"get": "retrieve"})(request, pk=incident.pk)
         payload = json.loads(response.content)
-        self.assertTrue(response.status_code in (403, 404) or payload.get("result") is False)
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(payload.get("result"), False)
 
     def test_incident_create_rejects_unscoped_alert_ids(self):
         user = self._build_user("incident-editor", [1], ["Alarms-Edit"])
@@ -3047,7 +3048,8 @@ class AlertPermissionScopeTestCase(TestCase):
 
         response = EventModelViewSet.as_view({"get": "retrieve"})(request, pk=hidden_event.pk)
         payload = json.loads(response.content)
-        self.assertTrue(response.status_code in (403, 404) or payload.get("result") is False)
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(payload.get("result"), False)
 
     def test_operator_log_list_hides_cross_team_alert_history(self):
         user = self._build_user("log-reader", [1], ["operation_log-View"])

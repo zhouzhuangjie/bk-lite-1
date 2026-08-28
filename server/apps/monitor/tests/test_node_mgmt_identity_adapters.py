@@ -15,12 +15,16 @@ def test_should_use_identity_adapters_by_object_name():
 
 
 def test_prepare_host_identity_rewrites_instance_id():
+    from apps.monitor.utils.dimension import normalize_instance_identity
+
     instances = [{"instance_id": "1.2.3.4", "instance_name": "h1", "group_ids": [1]}]
     out = SVC._prepare_host_identity_instances(instances)
+    expected_key = normalize_instance_identity("1.2.3.4")["storage_instance_key"]
     assert len(out) == 1
-    assert out[0]["raw_instance_id"]
-    assert out[0]["storage_instance_key"]
-    assert out[0]["instance_id"] == out[0]["storage_instance_key"]
+    assert out[0]["raw_instance_id"] == "1.2.3.4"
+    assert out[0]["storage_instance_key"] == expected_key
+    assert out[0]["instance_id"] == expected_key
+    assert out[0]["instance_id"] != "1.2.3.4"
     assert out[0]["instance_name"] == "h1"
 
 

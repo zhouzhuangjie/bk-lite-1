@@ -14,10 +14,12 @@ def test_parse_message_empty_and_text_event():
     assert WechatChatFlowUtils.parse_message("") is None
     xml = """<xml><MsgType>text</MsgType><Content>hi</Content><FromUserName>u1</FromUserName></xml>"""
     msg = WechatChatFlowUtils.parse_message(xml)
-    assert msg is not None
+    assert msg.content == "hi"
+    assert msg.source == "u1"
     event_xml = """<xml><MsgType>event</MsgType><Event>subscribe</Event><FromUserName>u1</FromUserName></xml>"""
     event = WechatChatFlowUtils.parse_message(event_xml)
-    assert event is not None
+    assert event.event == "subscribe"
+    assert event.source == "u1"
 
 
 def test_get_wechat_node_config_missing_node_and_params():

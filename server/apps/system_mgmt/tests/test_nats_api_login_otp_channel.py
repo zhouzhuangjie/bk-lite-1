@@ -258,7 +258,7 @@ def test_get_user_rules_by_app_admin_and_instance_scope():
     )
     UserRule.objects.create(username=normal.username, domain="domain.com", group_rule=gdr)
     scoped = nats_api.get_user_rules_by_app(group.id, normal.username, "domain.com", "opspilot", "bot")
-    assert 88 in [item["id"] if isinstance(item, dict) else item for item in scoped["instance"]] or scoped["instance"]
+    assert [item["id"] for item in scoped["instance"]] == [88]
 
 
 def test_get_login_module_domain_list_always_includes_default():
@@ -276,7 +276,7 @@ def test_verify_token_success_returns_user_context(monkeypatch):
         with patch("apps.system_mgmt.nats_api.set_cached_token_info"):
             result = nats_api.verify_token(token)
     assert result["result"] is True
-    assert result["data"]["username"] == "jwt-ok" or result.get("username") == "jwt-ok" or "data" in result
+    assert result["data"]["username"] == "jwt-ok"
 
 
 def test_wechat_user_register_issues_token_and_guest_group(monkeypatch):
