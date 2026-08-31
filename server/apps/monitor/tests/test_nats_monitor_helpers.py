@@ -308,3 +308,23 @@ class TestExecuteNatsCreate:
         assert child.level == "derivative"
         assert child.default_metric == "any({instance_type='cpu'}) by (instance_id, cpu)"
         assert not MonitorObject.objects.filter(display_name="skip-empty").exists()
+
+    def test_create_policy_requires_schedule(self):
+        out = nm._execute_nats_create(
+            nm._create_monitor_policy_payload,
+            {"name": "no-sched"},
+            user_info={"user": SimpleNamespace(username="a", domain="domain.com")},
+        )
+        assert out["result"] is False
+        assert "schedule" in out["message"]
+
+    def test_execute_nats_create_wraps_generic_exception(self):
+        def boom(*args, **kwargs):
+            raise RuntimeError("db down")
+
+        out = nm._execute_nats_create(
+            boom,
+            {},
+            user_info={"user": SimpleNamespace(username="a", domain="domain.com")},
+        )
+        assert out == {"result": False, "data": [], "message": "db down"}
