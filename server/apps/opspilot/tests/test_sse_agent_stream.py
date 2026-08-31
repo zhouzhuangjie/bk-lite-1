@@ -89,3 +89,67 @@ def test_log_and_update_tokens_sync_writes_history_and_swallows(monkeypatch):
         True,
         history_log=history,
     )
+
+
+@pytest.mark.asyncio
+async def test_generate_agent_stream_flushes_think_buffer_when_hidden():
+    graph = _Graph(
+        [
+            'data: {"type": "TEXT_MESSAGE_CONTENT", "delta": "可见"}\n\n',
+        ]
+    )
+    chunks = [item async for item in sse_chat._generate_agent_stream(graph, object(), "skill-d", False)]
+    payloads = [json.loads(c[6:]) for c in chunks if isinstance(c, str) and c.startswith("data: ")]
+    contents = [p["choices"][0]["delta"]["content"] for p in payloads if p.get("choices")]
+    assert "可见" in contents
+    assert chunks[-1] == ("STATS", "可见")
+
+
+def _sync_to_async(func, thread_sensitive=True):
+    async def wrapper(*args, **kwargs):
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
+@pytest.mark.asyncio
+async def test_create_stream_generator_yields_chunks_and_persists(monkeypatch):
+    graph = _Graph(['data: {"type": "TEXT_MESSAGE_CONTENT", "delta": "答案"}\n\n'])
+    monkeypatch.setattr(sse_chat, "_prepare_stream_prerequisites", lambda params: ("qa", {}))
+    monkeypatch.setattr(sse_chat, "create_agent_instance", lambda skill_type, chat_kwargs: (graph, object()))
+    logged = {}
+
+    def _log(*args, **kwargs):
+        logged["args"] = args
+
+    monkeypatch.setattr(sse_chat, "_log_and_update_tokens_sync", _log)
+    monkeypatch.setattr(sse_chat, "sync_to_async", _sync_to_async)
+    gen = sse_chat.create_stream_generator({"llm_model": 1, "show_think": True}, "skill-e", {}, "1.1.1.1", "q", skill_id=8)
+    chunks = [item async for item in gen]
+    payloads = [json.loads(c[6:]) for c in chunks if isinstance(c, str) and c.startswith("data: ")]
+    contents = [p["choices"][0]["delta"]["content"] for p in payloads if p.get("choices")]
+    assert "答案" in contents
+    assert logged["args"][1] == "skill-e"
+    assert logged["args"][2] == 8
+
+
+@pytest.mark.asyncio
+async def test_create_stream_generator_error_emits_chat_error(monkeypatch):
+    async def boom(*a, **k):
+        raise RuntimeError("prep failed")
+
+    monkeypatch.setattr(sse_chat, "sync_to_async", lambda func, thread_sensitive=True: boom)
+    gen = sse_chat.create_stream_generator({"llm_model": 1}, "skill-f", {}, None, "q")
+    chunks = [item async for item in gen]
+    assert len(chunks) == 1
+    payload = json.loads(chunks[0][6:])
+    assert "聊天错误: prep failed" in payload["choices"][0]["delta"]["content"]
+    assert payload["id"] == "skill-f"
+
+
+def test_stream_chat_sets_sse_headers(monkeypatch):
+    monkeypatch.setattr(sse_chat, "create_stream_generator", lambda *a, **k: iter(()))
+    monkeypatch.setattr(sse_chat, "create_sse_response_headers", lambda: {"X-Test": "1"})
+    resp = sse_chat.stream_chat({}, "s", {}, "ip", "msg")
+    assert resp["X-Test"] == "1"
+    assert resp["Content-Type"].startswith("text/event-stream")

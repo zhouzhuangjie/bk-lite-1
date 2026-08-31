@@ -74,3 +74,28 @@ def test_normalize_downstream_result_wraps_non_dict_payload():
     assert dv._normalize_downstream_result({"result": False, "data": 1})["result"] is False
     wrapped = dv._normalize_downstream_result([1, 2])
     assert wrapped == {"result": True, "data": [1, 2], "message": ""}
+
+
+def test_classify_runtime_exception_maps_known_messages():
+    assert dv._classify_runtime_exception(RuntimeError("未找到可用的命名空间")) == (
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
+        "未找到可用命名空间",
+    )
+    assert dv._classify_runtime_exception(RuntimeError("数据源未关联命名空间"))[0] == status.HTTP_400_BAD_REQUEST
+    assert dv._classify_runtime_exception(RuntimeError("数据源未关联所选命名空间"))[1] == "数据源未关联所选命名空间"
+    assert dv._classify_runtime_exception(RuntimeError("命名空间参数无效"))[0] == status.HTTP_400_BAD_REQUEST
+    assert dv._classify_runtime_exception(RuntimeError("未配置服务器连接: ns1")) == (
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
+        "命名空间未配置连接信息",
+    )
+    assert dv._classify_runtime_exception(RuntimeError("Module not found func foo"))[1] == "数据源配置异常"
+    assert dv._classify_runtime_exception(RuntimeError("other")) == (
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
+        "数据查询失败",
+    )
+
+
+def test_downstream_failure_status_empty_and_invalid_code():
+    assert dv._get_downstream_failure_status({"code": "x", "message": ""}) == status.HTTP_502_BAD_GATEWAY
+    assert dv._get_downstream_failure_status({"code": 200}) == status.HTTP_502_BAD_GATEWAY
+    assert dv._get_downstream_failure_status({}) == status.HTTP_502_BAD_GATEWAY

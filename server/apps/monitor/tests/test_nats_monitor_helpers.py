@@ -283,3 +283,28 @@ class TestExecuteNatsCreate:
         )
         assert out["result"] is False
         assert out["message"]
+
+    def test_create_monitor_object_with_children(self):
+        from apps.monitor.models.monitor_object import MonitorObject, MonitorObjectType
+
+        MonitorObjectType.objects.create(id="nats-host", name="主机")
+        out = nm.create_monitor_object(
+            {
+                "name": "NatsHost",
+                "type": "nats-host",
+                "level": "base",
+                "icon": "host.png",
+                "children": [
+                    {"id": "cpu", "name": "CPU"},
+                    {"id": "", "name": "skip-empty"},
+                ],
+            },
+            user_info={"user": SimpleNamespace(username="a", domain="domain.com")},
+        )
+        assert out["result"] is True
+        parent = MonitorObject.objects.get(name="NatsHost")
+        child = MonitorObject.objects.get(name="cpu")
+        assert child.parent_id == parent.id
+        assert child.level == "derivative"
+        assert child.default_metric == "any({instance_type='cpu'}) by (instance_id, cpu)"
+        assert not MonitorObject.objects.filter(display_name="skip-empty").exists()

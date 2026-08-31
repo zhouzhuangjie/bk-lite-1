@@ -132,3 +132,229 @@ class TestProbeAndReplicaFixCommands:
         assert "readinessProbe" in commands or "/ready" in commands
         assert "kubectl scale" in commands or "replicas" in commands
         assert "set image" in commands or "latest" in commands.lower() or "<specific-tag>" in commands
+
+
+def _cache_container_and_request_issues():
+    return {
+        "cluster_name": "cache-cluster",
+        "deployments": [
+            {
+                "name": "pay",
+                "namespace": "prod",
+                "issues": [],
+                "config_analysis": {
+                    "containers": [
+                        {"name": "pay", "issues": ["未设置资源请求", "资源配置不足"]},
+                    ]
+                },
+            },
+            {
+                "name": "healthy",
+                "namespace": "prod",
+                "issues": [],
+                "config_analysis": {"containers": [{"name": "healthy", "issues": []}]},
+            },
+        ],
+    }
+
+
+@pytest.mark.asyncio
+class TestEmptyItemsAndCacheFill:
+    async def test_empty_items_and_empty_cache_returns_no_items(self):
+        result, events = await _invoke({"deployments": []}, items=[])
+        assert result == "未提供任何修复项。"
+        assert "config_diff_report" not in events
+
+    async def test_container_issues_and_resource_request_commands(self):
+        result, events = await _invoke(_cache_container_and_request_issues(), expected_target_count=1)
+        assert "共 2 项修复" in result
+        report = events["config_diff_report"]
+        names = {item["workload_name"] for item in report["items"]}
+        assert names == {"pay"}
+        commands = events["repair_commands"]["commands_markdown"]
+        assert "requests" in commands
+        assert "kubectl patch deployment pay" in commands
+
+    async def test_incomplete_items_are_merged_from_cache(self):
+        items = [
+            {
+                "target_name": "payment",
+                "namespace": "prod",
+                "summary": "未设置资源限制",
+                "severity": "高危",
+                "fix_command": "kubectl patch deployment payment -n prod --type=strategic -p '{\"spec\":{}}'",
+            }
+        ]
+        result, events = await _invoke(
+            _cache_two_deployments(),
+            items=items,
+            expected_target_count=2,
+            context_name="",
+        )
+        assert "共 2 项修复" in result
+        report = events["config_diff_report"]
+        names = {item["workload_name"] for item in report["items"]}
+        assert names == {"payment", "auth"}
+        assert events["config_diff_report"]["cluster_name"] == "test-cluster"
+
+    async def test_provided_items_keep_context_from_cache(self):
+        items = [
+            {
+                "target_name": "only",
+                "namespace": "ns",
+                "summary": "镜像使用 latest 标签",
+                "severity": "警告",
+                "before": "image: x:latest",
+                "after": "image: x:1.0",
+                "fix_command": (
+                    "# 请手动更新镜像标签为具体版本\n"
+                    "kubectl set image deployment/only -n ns only=<image>:<specific-tag>"
+                ),
+            }
+        ]
+        result, events = await _invoke(
+            {"cluster_name": "from-cache", "deployments": []},
+            items=items,
+            expected_target_count=1,
+            context_name="",
+        )
+        assert "共 1 项修复" in result
+        assert events["config_diff_report"]["cluster_name"] == "from-cache"
+
+    async def test_pydantic_item_and_chinese_severity_and_coverage_note(self):
+        tool = ToolsNodes()._build_bulk_repair_tool(_analysis_cache={"cluster_name": "c1"})
+        item_cls = tool.args_schema.model_fields["items"].annotation.__args__[0]
+        item = item_cls(
+            target_name="api",
+            namespace="prod",
+            summary="配置优化项",
+            severity="提示",
+            category="配置优化",
+        )
+        result, events = await _invoke(
+            {"cluster_name": "c1", "deployments": []},
+            items=[item],
+            expected_target_count=3,
+            group_by="target",
+        )
+        assert "注意：本报告覆盖了 1/3 个有问题的目标" in result
+        report = events["config_diff_report"]
+        assert report["items"][0]["severity"] == "info"
+        assert "# (当前配置存在问题)" in report["items"][0]["before_yaml"]
+
+    async def test_group_by_category_and_all(self):
+        items = [
+            {
+                "target_name": "a",
+                "namespace": "ns1",
+                "target_type": "Deployment",
+                "category": "资源配置",
+                "summary": "未设置资源限制",
+                "severity": "high",
+                "fix_command": (
+                    "kubectl patch deployment a -n ns1 --type=strategic -p "
+                    '\'{"spec":{"template":{"spec":{"containers":[{"name":"a","resources":{"limits":{"cpu":"500m"}}}]}}}}\''
+                ),
+            },
+            {
+                "target_name": "b",
+                "namespace": "ns2",
+                "target_type": "Deployment",
+                "category": "资源配置",
+                "summary": "未设置资源限制",
+                "severity": "high",
+                "fix_command": (
+                    "kubectl patch deployment b -n ns2 --type=strategic -p "
+                    '\'{"spec":{"template":{"spec":{"containers":[{"name":"b","resources":{"limits":{"cpu":"500m"}}}]}}}}\''
+                ),
+            },
+        ]
+        result, events = await _invoke({}, items=items, group_by="category")
+        assert "共 2 项修复" in result
+        cat_item = events["config_diff_report"]["items"][0]
+        assert cat_item["workload_type"] == "Multiple"
+        assert "资源配置" in cat_item["summary"]
+        commands = events["repair_commands"]["commands_markdown"]
+        assert "PATCH=" in commands
+
+        result_all, events_all = await _invoke({}, items=items, group_by="all")
+        assert "全部（2 个目标）" in events_all["config_diff_report"]["items"][0]["workload_name"]
+        assert events_all["config_diff_report"]["items"][0]["workload_type"] == "All"
+
+    async def test_batch_scale_and_image_commands_same_namespace(self):
+        items = [
+            {
+                "target_name": "web1",
+                "namespace": "prod",
+                "summary": "单副本存在单点风险",
+                "severity": "high",
+                "fix_command": "kubectl scale deployment web1 -n prod --replicas=3",
+            },
+            {
+                "target_name": "web2",
+                "namespace": "prod",
+                "summary": "单副本存在单点风险",
+                "severity": "high",
+                "fix_command": "kubectl scale deployment web2 -n prod --replicas=3",
+            },
+            {
+                "target_name": "img1",
+                "namespace": "prod",
+                "summary": "使用 latest 标签",
+                "severity": "warning",
+                "fix_command": "# 请手动更新镜像标签为具体版本\nkubectl set image deployment/img1 -n prod img1=x:1",
+            },
+            {
+                "target_name": "img2",
+                "namespace": "prod",
+                "summary": "使用 latest 标签",
+                "severity": "warning",
+                "fix_command": "# 请手动更新镜像标签为具体版本\nkubectl set image deployment/img2 -n prod img2=x:1",
+            },
+            {
+                "target_name": "empty",
+                "namespace": "prod",
+                "summary": "无命令项",
+                "severity": "info",
+                "fix_command": "",
+            },
+        ]
+        result, events = await _invoke({}, items=items, group_by="target")
+        commands = events["repair_commands"]["commands_markdown"]
+        assert "for dep in web1 web2" in commands
+        assert "kubectl scale deployment $dep" in commands
+        assert "请为以下工作负载更新镜像标签" in commands
+        assert "empty" not in commands
+        assert "修复命令已直接展示给用户" in result
+
+    async def test_dispatch_and_docx_failures_do_not_block_report(self, monkeypatch):
+        import asyncio
+
+        async def boom_wait(*a, **k):
+            raise asyncio.TimeoutError()
+
+        monkeypatch.setattr(
+            "apps.opspilot.metis.llm.chain.node.asyncio.wait_for",
+            boom_wait,
+        )
+        captured = []
+
+        def _capture(name, payload, *args, **kwargs):
+            if name == "config_diff_report":
+                raise RuntimeError("dispatch-fail")
+            if name == "repair_commands":
+                raise RuntimeError("cmd-fail")
+            captured.append((name, payload))
+
+        tool = ToolsNodes()._build_bulk_repair_tool(_analysis_cache=_cache_two_deployments())
+        with patch("apps.opspilot.metis.llm.chain.node.dispatch_custom_event", _capture):
+            result = await tool.coroutine(
+                title="t",
+                context_name="",
+                items=[],
+                group_by="target",
+                expected_target_count=2,
+                target_names=[],
+            )
+        assert "已生成修复对比报告" in result
+        assert "共 2 项修复" in result

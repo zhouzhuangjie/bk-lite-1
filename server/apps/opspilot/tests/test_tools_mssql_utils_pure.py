@@ -90,3 +90,88 @@ class TestMssqlSafeJsonDumps:
     def test_enriches_and_serializes(self):
         out = ms_utils.safe_json_dumps({"size_bytes": 1024})
         assert '"size_bytes_display": "1.00 KB"' in out
+
+    def test_serializes_datetime_via_default_handler(self):
+        from datetime import datetime
+
+        out = ms_utils.safe_json_dumps({"ts": datetime(2026, 1, 2, 3, 4, 5)})
+        assert "2026-01-02T03:04:05" in out
+
+
+class TestMssqlDriverAndConnection:
+    def test_get_available_driver_prefers_18(self, monkeypatch):
+        monkeypatch.setattr(
+            ms_utils.pyodbc,
+            "drivers",
+            lambda: ["SQL Server", "ODBC Driver 18 for SQL Server"],
+            raising=False,
+        )
+        assert ms_utils.get_available_driver() == "ODBC Driver 18 for SQL Server"
+
+    def test_get_available_driver_raises_when_empty(self, monkeypatch):
+        monkeypatch.setattr(ms_utils.pyodbc, "drivers", lambda: ["Other"], raising=False)
+        with pytest.raises(RuntimeError, match="未找到可用的SQL Server ODBC驱动"):
+            ms_utils.get_available_driver()
+
+    def test_get_available_driver_raises_when_list_fails(self, monkeypatch):
+        def boom():
+            raise RuntimeError("odbc missing")
+
+        monkeypatch.setattr(ms_utils.pyodbc, "drivers", boom, raising=False)
+        with pytest.raises(RuntimeError, match="未找到可用的SQL Server ODBC驱动"):
+            ms_utils.get_available_driver()
+
+    def test_get_db_connection_uses_driver_18_and_database_override(self, monkeypatch):
+        captured = {}
+
+        def fake_connect(conn_str, timeout=0):
+            captured["conn_str"] = conn_str
+            captured["timeout"] = timeout
+            return "conn"
+
+        monkeypatch.setattr(ms_utils, "get_available_driver", lambda: "ODBC Driver 18 for SQL Server")
+        monkeypatch.setattr(ms_utils.pyodbc, "connect", fake_connect)
+        conn = ms_utils.get_db_connection({"configurable": {"host": "h", "port": 1433, "database": "master", "user": "u", "password": "p"}}, database="appdb")
+        assert conn == "conn"
+        assert "DATABASE=appdb" in captured["conn_str"]
+        assert "TrustServerCertificate=yes" in captured["conn_str"]
+        assert captured["timeout"] == 10
+
+    def test_get_db_connection_instance_id_switches_database(self, monkeypatch):
+        class FakeConn:
+            def __init__(self):
+                self.executed = []
+
+            def execute(self, sql):
+                self.executed.append(sql)
+
+        fake = FakeConn()
+        monkeypatch.setattr(
+            "apps.opspilot.metis.llm.tools.mssql.connection.get_mssql_connection",
+            lambda config, instance_name=None, instance_id=None: fake,
+        )
+        conn = ms_utils.get_db_connection({}, database="sales", instance_id="i1")
+        assert conn is fake
+        assert fake.executed == ["USE [sales]"]
+
+    def test_parse_mssql_version_success_and_failure(self, monkeypatch):
+        monkeypatch.setattr(
+            ms_utils,
+            "execute_readonly_query",
+            lambda *a, **k: [{"version": "Microsoft SQL Server 2019", "product_version": "15.0.2000"}],
+        )
+        info = ms_utils.parse_mssql_version()
+        assert info == {"full_version": "Microsoft SQL Server 2019", "version_number": "15.0.2000", "major_version": 15}
+
+        def boom(*a, **k):
+            raise RuntimeError("down")
+
+        monkeypatch.setattr(ms_utils, "execute_readonly_query", boom)
+        assert ms_utils.parse_mssql_version()["major_version"] == 0
+
+    def test_format_duration_units(self):
+        assert ms_utils.format_duration(None) == "0ms"
+        assert ms_utils.format_duration(0.5) == "500.00μs"
+        assert ms_utils.format_duration(1500) == "1.50s"
+        assert ms_utils.format_duration(120000) == "2.00min"
+        assert ms_utils.format_duration(7200000) == "2.00h"

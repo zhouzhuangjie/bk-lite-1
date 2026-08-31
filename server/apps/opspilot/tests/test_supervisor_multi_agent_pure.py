@@ -84,3 +84,49 @@ def test_build_supervisor_prompt_renders_agents():
     data = render.call_args.args[1]
     assert "k8s" in data["agents_desc"]
     assert "mysql" in data["executed_desc"]
+
+
+def test_select_context_messages_window_and_human_pair():
+    node = SupervisorMultiAgentNode()
+    assert node._select_context_messages([], 3) == []
+    msgs = [HumanMessage(content=str(i)) for i in range(3)]
+    assert node._select_context_messages(msgs, None) == msgs
+    assert node._select_context_messages(msgs, 8) == msgs
+    long_msgs = [
+        HumanMessage(content="h0"),
+        AIMessage(content="a0"),
+        HumanMessage(content="h1"),
+        AIMessage(content="a1"),
+        AIMessage(content="a2"),
+    ]
+    selected = node._select_context_messages(long_msgs, 2)
+    assert selected[0].content == "h1"
+    assert [m.content for m in selected[-2:]] == ["a1", "a2"]
+
+
+@pytest.mark.asyncio
+async def test_setup_agents_builds_tools_map(monkeypatch):
+    setups = []
+
+    class FakeTools:
+        def __init__(self):
+            self.tools = ["t1"]
+
+        async def setup(self, request):
+            setups.append(request.system_message_prompt)
+
+    monkeypatch.setattr("apps.opspilot.metis.llm.agent.supervisor_multi_agent.ToolsNodes", FakeTools)
+    node = SupervisorMultiAgentNode()
+    from apps.opspilot.metis.llm.agent.supervisor_multi_agent import AgentConfig, SupervisorMultiAgentRequest
+
+    req = SupervisorMultiAgentRequest(
+        openai_api_base="http://llm.local",
+        openai_api_key="k",
+        model="gpt",
+        user_message="x",
+        agents=[AgentConfig(name="k8s", description="集群", system_message_prompt="专属", temperature=0.1)],
+    )
+    await node.setup_agents(req)
+    assert list(node.agent_tools_map) == ["k8s"]
+    assert setups == ["专属"]
+    assert node.agent_tools_map["k8s"].tools == ["t1"]
