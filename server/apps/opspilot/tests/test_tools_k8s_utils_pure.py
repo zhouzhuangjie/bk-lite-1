@@ -118,6 +118,109 @@ class TestPreprocessKubeconfig:
         assert "certificate-authority" not in cluster
         assert cluster["certificate-authority-data"] == base64.standard_b64encode(b"CA").decode()
 
+    def test_empty_user_skipped_and_client_certs_inlined(self, tmp_path):
+        cert = tmp_path / "c.crt"
+        cert.write_bytes(b"CERT")
+        key = tmp_path / "c.key"
+        key.write_bytes(b"KEY")
+        token = tmp_path / "tok"
+        token.write_text("secret-token\n")
+        cfg = {
+            "users": [
+                {"user": {}},
+                {
+                    "user": {
+                        "client-certificate": str(cert),
+                        "client-key": str(key),
+                        "tokenFile": str(token),
+                    }
+                },
+            ]
+        }
+        parsed = yaml.safe_load(k8s._preprocess_kubeconfig(yaml.safe_dump(cfg)))
+        empty, filled = parsed["users"]
+        assert empty["user"] == {}
+        user = filled["user"]
+        assert "client-certificate" not in user
+        assert "client-key" not in user
+        assert "tokenFile" not in user
+        assert user["client-certificate-data"] == base64.standard_b64encode(b"CERT").decode()
+        assert user["client-key-data"] == base64.standard_b64encode(b"KEY").decode()
+        assert user["token"] == "secret-token"
+
+    def test_resolve_file_read_error_keeps_path(self, tmp_path, monkeypatch):
+        target = tmp_path / "ca.crt"
+        target.write_bytes(b"CA")
+        obj = {"certificate-authority": str(target)}
+        real_open = open
+
+        def _open(path, *a, **k):
+            if str(path) == str(target):
+                raise OSError("perm")
+            return real_open(path, *a, **k)
+
+        monkeypatch.setattr("builtins.open", _open)
+        k8s._resolve_file_to_inline_data(obj, "certificate-authority", "certificate-authority-data")
+        assert obj == {"certificate-authority": str(target)}
+
+
+class TestValidateKubeconfigApiServers:
+    def test_empty_invalid_yaml_and_non_dict_are_noop(self):
+        k8s.validate_kubeconfig_api_servers("")
+        k8s.validate_kubeconfig_api_servers("   ")
+        k8s.validate_kubeconfig_api_servers(":[")
+        k8s.validate_kubeconfig_api_servers("- a\n- b\n")
+
+    def test_validates_server_urls(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(k8s.SSRFValidator, "validate", lambda url: seen.append(url) or url)
+        k8s.validate_kubeconfig_api_servers(
+            yaml.safe_dump(
+                {
+                    "clusters": [
+                        "skip",
+                        {"cluster": {"server": " https://k8s.example.com "}},
+                        {"cluster": {}},
+                    ]
+                }
+            )
+        )
+        assert seen == ["https://k8s.example.com"]
+
+
+class TestPrepareContext:
+    def test_legacy_kubeconfig_data_loads_client(self, monkeypatch):
+        loaded = []
+        monkeypatch.setattr(
+            k8s.config,
+            "load_kube_config",
+            lambda config_file=None: loaded.append(config_file.read()),
+        )
+        monkeypatch.setattr(k8s.SSRFValidator, "validate", lambda url: url)
+        monkeypatch.setattr(
+            k8s.config,
+            "list_kube_config_contexts",
+            lambda: ([], {"name": "ctx", "context": {"cluster": "prod"}}),
+        )
+        cfg = yaml.safe_dump({"clusters": [{"cluster": {"server": "https://k8s.example.com"}}]})
+        k8s.prepare_context({"configurable": {"kubeconfig_data": cfg.replace("\n", "\\n")}})
+        assert "https://k8s.example.com" in loaded[0]
+        assert k8s.get_current_cluster_name() == "prod"
+
+    def test_default_then_incluster_fallback(self, monkeypatch):
+        monkeypatch.setattr(k8s.config, "load_kube_config", lambda: (_ for _ in ()).throw(RuntimeError("no file")))
+        called = []
+        monkeypatch.setattr(k8s.config, "load_incluster_config", lambda: called.append("incluster"))
+        monkeypatch.setattr(k8s, "get_current_cluster_name", lambda: "already")
+        k8s.prepare_context({"configurable": {}})
+        assert called == ["incluster"]
+
+    def test_load_failure_wraps_message(self, monkeypatch):
+        monkeypatch.setattr(k8s.config, "load_kube_config", lambda: (_ for _ in ()).throw(RuntimeError("no file")))
+        monkeypatch.setattr(k8s.config, "load_incluster_config", lambda: (_ for _ in ()).throw(RuntimeError("no sa")))
+        with pytest.raises(Exception, match="无法加载 Kubernetes 配置"):
+            k8s.prepare_context({"configurable": {}})
+
 
 class TestRepresentStrNoFold:
     def test_long_string_quoted(self):

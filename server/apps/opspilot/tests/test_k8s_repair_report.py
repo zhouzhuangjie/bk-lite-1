@@ -340,10 +340,87 @@ class TestEmptyItemsAndCacheFill:
         result, events = await _invoke({}, items=items, group_by="target")
         commands = events["repair_commands"]["commands_markdown"]
         assert "for dep in web1 web2" in commands
-        assert "kubectl scale deployment $dep" in commands
-        assert "请为以下工作负载更新镜像标签" in commands
+        assert "kubectl scale deployment $dep -n prod --replicas=3" in commands
+        assert (
+            "# 示例：kubectl set image deployment/<name> -n prod <container>=<image>:<tag>"
+        ) in commands
         assert "empty" not in commands
         assert "修复命令已直接展示给用户" in result
+
+    async def test_batch_probe_patch_json_pins_healthz_ready_request_and_security(self):
+        items = [
+            {
+                "target_name": "api1",
+                "namespace": "prod",
+                "summary": "未配置存活探针",
+                "severity": "high",
+                "fix_command": "kubectl patch deployment api1 -n prod --type=strategic -p '{}'",
+            },
+            {
+                "target_name": "api2",
+                "namespace": "prod",
+                "summary": "未配置存活探针",
+                "severity": "high",
+                "fix_command": "kubectl patch deployment api2 -n prod --type=strategic -p '{}'",
+            },
+            {
+                "target_name": "web1",
+                "namespace": "prod",
+                "summary": "未配置就绪探针",
+                "severity": "high",
+                "fix_command": "kubectl patch deployment web1 -n prod --type=strategic -p '{}'",
+            },
+            {
+                "target_name": "web2",
+                "namespace": "prod",
+                "summary": "未配置就绪探针",
+                "severity": "high",
+                "fix_command": "kubectl patch deployment web2 -n prod --type=strategic -p '{}'",
+            },
+            {
+                "target_name": "pay1",
+                "namespace": "prod",
+                "summary": "未设置资源请求",
+                "severity": "high",
+                "fix_command": "kubectl patch deployment pay1 -n prod --type=strategic -p '{}'",
+            },
+            {
+                "target_name": "pay2",
+                "namespace": "prod",
+                "summary": "未设置资源请求",
+                "severity": "high",
+                "fix_command": "kubectl patch deployment pay2 -n prod --type=strategic -p '{}'",
+            },
+            {
+                "target_name": "sec1",
+                "namespace": "prod",
+                "summary": "容器以 root 用户运行",
+                "severity": "critical",
+                "fix_command": "kubectl patch deployment sec1 -n prod --type=strategic -p '{}'",
+            },
+            {
+                "target_name": "sec2",
+                "namespace": "prod",
+                "summary": "容器以 root 用户运行",
+                "severity": "critical",
+                "fix_command": "kubectl patch deployment sec2 -n prod --type=strategic -p '{}'",
+            },
+        ]
+        result, events = await _invoke({}, items=items, group_by="target")
+        commands = events["repair_commands"]["commands_markdown"]
+        assert (
+            '"livenessProbe":{"httpGet":{"path":"/healthz","port":8080},\n'
+            '      "initialDelaySeconds":30,"periodSeconds":10}'
+        ) in commands
+        assert (
+            '"readinessProbe":{"httpGet":{"path":"/ready","port":8080},\n'
+            '      "initialDelaySeconds":5,"periodSeconds":5}'
+        ) in commands
+        assert '"resources":{"requests":{"cpu":"100m","memory":"128Mi"}}' in commands
+        assert '"securityContext":{"runAsNonRoot":true,"runAsUser":1000}' in commands
+        assert "for dep in api1 api2" in commands
+        assert "kubectl patch deployment $dep -n prod" in commands
+        assert "共 8 项修复" in result
 
     async def test_dispatch_and_docx_failures_do_not_block_report(self, monkeypatch):
         import asyncio
