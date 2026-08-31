@@ -105,6 +105,39 @@ def test_toggle_flips_enabled_when_manage_allowed():
     assert _body(resp)["data"]["is_enabled"] is False
 
 
+def test_retrieve_create_and_destroy_success_paths():
+    actor = _actor()
+    rule = _rule(name="shown")
+    with patch(f"{VIEWS}.GroupUtils.get_group_with_descendants", staticmethod(lambda gid: [1])):
+        resp = SubscriptionViewSet.as_view({"get": "retrieve"})(_req("get", actor), pk=rule.id)
+    assert resp.status_code == 200
+    assert _body(resp)["data"]["name"] == "shown"
+
+    payload = {
+        "name": "created-rule",
+        "organization": 1,
+        "model_id": "host",
+        "filter_type": "instances",
+        "instance_filter": {"instance_ids": [1]},
+        "trigger_types": ["attribute_change"],
+        "trigger_config": {"attribute_change": {"fields": ["name"]}},
+        "recipients": {"users": ["u1"], "groups": []},
+        "channel_ids": [1],
+        "is_enabled": True,
+    }
+    resp = SubscriptionViewSet.as_view({"post": "create"})(_req("post", actor, payload))
+    assert resp.status_code == 200
+    created = _body(resp)["data"]
+    assert created["name"] == "created-rule"
+    assert created["created_by"] == actor.username
+    assert SubscriptionRule.objects.filter(id=created["id"]).exists()
+
+    with patch.object(SubscriptionViewSet, "_check_manage_permission", return_value=True):
+        resp = SubscriptionViewSet.as_view({"delete": "destroy"})(_req("delete", actor), pk=created["id"])
+    assert resp.status_code == 200
+    assert not SubscriptionRule.objects.filter(id=created["id"]).exists()
+
+
 def test_check_manage_permission_delegates_to_subscription_utils(monkeypatch):
     captured = {}
 
