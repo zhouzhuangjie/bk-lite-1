@@ -77,6 +77,85 @@ def test_copy_model_ok_no_attributes(fake_graph, patch_side_effects, monkeypatch
 
 
 @pytest.mark.django_db
+def test_copy_model_copies_relationships_and_skips_conflicts(fake_graph, patch_side_effects, monkeypatch):
+    created = []
+
+    def _search(mid):
+        if mid == "ghost":
+            return {}
+        return {
+            "model_id": mid,
+            "model_name": mid,
+            "classification_id": "net",
+            "group": [1],
+            "icn": "icon",
+            "attrs": "[]",
+            "_id": {"host": 1, "hostrel": 9, "switch": 2, "rack": 3}[mid],
+        }
+
+    monkeypatch.setattr(f"{MODULE}.ModelManage.search_model_info", _search)
+    monkeypatch.setattr(
+        f"{MODULE}.ClassificationManage.search_model_classification_info",
+        lambda cid: {"_id": 50},
+    )
+    monkeypatch.setattr(
+        f"{MODULE}.ModelManage.model_association_search",
+        lambda mid: [
+            {"src_model_id": "host", "dst_model_id": "host", "asst_id": "self", "asst_name": "自关联"},
+            {"src_model_id": "host", "dst_model_id": "switch", "asst_id": "conn", "asst_name": "连接"},
+            {"src_model_id": "rack", "dst_model_id": "host", "asst_id": "contain", "asst_name": "包含"},
+            {"src_model_id": "ghost", "dst_model_id": "host", "asst_id": "x", "asst_name": "缺失"},
+        ],
+    )
+
+    def _create(**kwargs):
+        if kwargs["asst_id"] == "conn":
+            raise BaseAppException("关联已存在")
+        created.append(kwargs["model_asst_id"])
+        return {"_id": 100}
+
+    monkeypatch.setattr(f"{MODULE}.ModelManage.model_association_create", _create)
+
+    def _create_entity(label, data, check, exist):
+        return {"_id": 9, "model_id": data["model_id"], "model_name": data["model_name"],
+                "classification_id": data["classification_id"]}
+
+    fake_graph(MODULE, query_entity=([], 0), query_edge=[], create_entity=_create_entity, create_edge={"_id": 1})
+    out = ModelManage.copy_model(
+        "host", "hostrel", "关系主机", copy_attributes=False, copy_relationships=True,
+    )
+    assert out["model_id"] == "hostrel"
+    assert "hostrel_self_hostrel" in created
+    assert "rack_contain_hostrel" in created
+    assert "hostrel_conn_switch" not in created
+
+
+@pytest.mark.django_db
+def test_copy_model_deletes_new_model_when_later_step_fails(fake_graph, patch_side_effects, monkeypatch):
+    monkeypatch.setattr(
+        f"{MODULE}.ModelManage.search_model_info",
+        lambda mid: {"model_id": mid, "model_name": "主机", "classification_id": "net",
+                     "group": [1], "icn": "icon", "attrs": "[]", "_id": 1},
+    )
+    monkeypatch.setattr(
+        f"{MODULE}.ClassificationManage.search_model_classification_info",
+        lambda cid: {"_id": 50},
+    )
+    deleted = []
+    monkeypatch.setattr(f"{MODULE}.ModelManage.delete_model", lambda mid: deleted.append(mid))
+    monkeypatch.setattr(f"{MODULE}.create_change_record", lambda **k: (_ for _ in ()).throw(RuntimeError("audit down")))
+
+    def _create_entity(label, data, check, exist):
+        return {"_id": 11, "model_id": data["model_id"], "model_name": data["model_name"],
+                "classification_id": data["classification_id"]}
+
+    fake_graph(MODULE, query_entity=([], 0), query_edge=[], create_entity=_create_entity, create_edge={"_id": 1})
+    with pytest.raises(RuntimeError, match="audit down"):
+        ModelManage.copy_model("host", "hostfail", "失败主机", copy_attributes=False, copy_relationships=True)
+    assert deleted == [11]
+
+
+@pytest.mark.django_db
 def test_copy_model_copies_attributes_and_field_groups(fake_graph, patch_side_effects, monkeypatch):
     src_attrs = [
         {"attr_id": "ip", "attr_name": "IP", "attr_type": "str", "is_required": True},

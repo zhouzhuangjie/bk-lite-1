@@ -32,6 +32,8 @@ def test_tool_call_signature_is_stable_for_dict_and_falls_back():
     )
     assert _tool_call_signature("echo", None).startswith("echo:")
     assert _tool_call_signature("custom", {"k": object()}).startswith("custom:")
+    non_str_keys = {object(): 1}
+    assert _tool_call_signature("x", non_str_keys) == f"x:{repr(non_str_keys)}"
 
 
 def test_normalize_messages_for_llm_merges_system_messages_to_front():

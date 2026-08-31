@@ -128,10 +128,28 @@ class TestProbeAndReplicaFixCommands:
         result, events = await _invoke(_cache_probe_and_replica_issues(), expected_target_count=2)
         assert "已生成修复对比报告" in result
         commands = events["repair_commands"]["commands_markdown"]
-        assert "livenessProbe" in commands or "healthz" in commands
-        assert "readinessProbe" in commands or "/ready" in commands
-        assert "kubectl scale" in commands or "replicas" in commands
-        assert "set image" in commands or "latest" in commands.lower() or "<specific-tag>" in commands
+        assert (
+            "kubectl patch deployment api -n prod --type=strategic -p "
+            '\'{"spec":{"template":{"spec":{"containers":[{"name":"api",'
+            '"livenessProbe":{"httpGet":{"path":"/healthz","port":8080},'
+            '"initialDelaySeconds":30,"periodSeconds":10}}]}}}}\''
+        ) in commands
+        assert (
+            "kubectl patch deployment api -n prod --type=strategic -p "
+            '\'{"spec":{"template":{"spec":{"containers":[{"name":"api",'
+            '"readinessProbe":{"httpGet":{"path":"/ready","port":8080},'
+            '"initialDelaySeconds":5,"periodSeconds":5}}]}}}}\''
+        ) in commands
+        assert "kubectl scale deployment web -n prod --replicas=3" in commands
+        assert (
+            "# 请手动更新镜像标签为具体版本\n"
+            "kubectl set image deployment/web -n prod web=<image>:<specific-tag>"
+        ) in commands
+        report = {item["workload_name"]: item for item in events["config_diff_report"]["items"]}
+        assert "livenessProbe: null  # 未配置" in report["api"]["before_yaml"]
+        assert "readinessProbe: null  # 未配置" in report["api"]["before_yaml"]
+        assert "replicas: 1  # 单副本" in report["web"]["before_yaml"]
+        assert "image: xxx:latest  # 使用了 latest 标签" in report["web"]["before_yaml"]
 
 
 def _cache_container_and_request_issues():
@@ -357,4 +375,65 @@ class TestEmptyItemsAndCacheFill:
                 target_names=[],
             )
         assert "已生成修复对比报告" in result
+        assert "共 2 项修复" in result
+
+
+def _cache_request_and_unknown():
+    return {
+        "cluster_name": "req-cluster",
+        "deployments": [
+            {"name": "pay", "namespace": "prod", "issues": ["未设置资源请求"], "config_analysis": {}},
+            {"name": "misc", "namespace": "prod", "issues": ["未知配置漂移"], "config_analysis": {}},
+        ],
+    }
+
+
+@pytest.mark.asyncio
+class TestRequestAndFallbackCommands:
+    async def test_resource_request_patch_and_unknown_issue_fallback(self):
+        result, events = await _invoke(_cache_request_and_unknown(), expected_target_count=2)
+        assert "共 2 项修复" in result
+        commands = events["repair_commands"]["commands_markdown"]
+        assert (
+            "kubectl patch deployment pay -n prod --type=strategic -p "
+            '\'{"spec":{"template":{"spec":{"containers":[{"name":"pay",'
+            '"resources":{"requests":{"cpu":"100m","memory":"128Mi"}}}]}}}}\''
+        ) in commands
+        assert "# 未知配置漂移\n# 请根据实际情况手动修复" in commands
+        report = {item["workload_name"]: item for item in events["config_diff_report"]["items"]}
+        assert "resources: {}  # 未设置请求" in report["pay"]["before_yaml"]
+        assert "# (当前配置存在问题)" in report["misc"]["before_yaml"]
+
+    async def test_empty_cache_with_no_items_returns_no_items(self):
+        result, events = await _invoke({"cluster_name": "empty"}, items=[])
+        assert result == "未提供任何修复项。"
+        assert "config_diff_report" not in events
+
+    async def test_multi_namespace_batch_lists_each_target(self):
+        items = [
+            {
+                "target_name": "a",
+                "namespace": "ns1",
+                "summary": "未设置资源限制",
+                "severity": "high",
+                "fix_command": (
+                    "kubectl patch deployment a -n ns1 --type=strategic -p "
+                    '\'{"spec":{"template":{"spec":{"containers":[{"name":"a","resources":{"limits":{"cpu":"500m"}}}]}}}}\''
+                ),
+            },
+            {
+                "target_name": "b",
+                "namespace": "ns2",
+                "summary": "未设置资源限制",
+                "severity": "high",
+                "fix_command": (
+                    "kubectl patch deployment b -n ns2 --type=strategic -p "
+                    '\'{"spec":{"template":{"spec":{"containers":[{"name":"b","resources":{"limits":{"cpu":"500m"}}}]}}}}\''
+                ),
+            },
+        ]
+        result, events = await _invoke({}, items=items, group_by="target")
+        commands = events["repair_commands"]["commands_markdown"]
+        assert "PATCH=" in commands
+        assert "a" in commands and "b" in commands
         assert "共 2 项修复" in result

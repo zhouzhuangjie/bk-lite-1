@@ -42,7 +42,7 @@ def test_verify_token_legacy_expired_and_user_missing(monkeypatch):
     token = jwt.encode({"user_id": 999999, "login_time": 1}, "test-secret", algorithm="HS256")
     result = nats_api.verify_token(token)
     assert result["result"] is False
-    assert "Token is invalid" in result["message"] or "not found" in result["message"].lower() or "User" in result["message"]
+    assert result["message"] == "Token is invalid"
 
 
 def test_get_pilot_permission_by_token_rejects_bad_token():

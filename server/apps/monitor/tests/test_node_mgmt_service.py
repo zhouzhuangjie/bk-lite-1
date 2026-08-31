@@ -57,6 +57,35 @@ class TestValidateNodesAgainstSelector:
         assert SVC._validate_nodes_against_selector(nodes, {"is_container": True}) is None
 
 
+class TestValidateInstancesWithPluginSelector:
+    def test_no_selector_or_no_nodes_returns(self):
+        plugin = MonitorPlugin.objects.create(name="SelNone", node_selector={})
+        assert SVC._validate_instances_with_plugin_selector([{"node_ids": ["n1"]}], plugin.id) is None
+        plugin2 = MonitorPlugin.objects.create(name="SelCont", node_selector={"is_container": True})
+        assert SVC._validate_instances_with_plugin_selector([{"node_ids": []}], plugin2.id) is None
+
+    def test_container_selector_queries_authorized_nodes(self, mocker):
+        from apps.node_mgmt.constants.controller import ControllerConstants
+
+        plugin = MonitorPlugin.objects.create(name="SelNeed", node_selector={"is_container": True})
+        node = mocker.patch("apps.monitor.services.node_mgmt.NodeMgmt")
+        node.return_value.get_authorized_nodes_by_ids.return_value = [
+            {"id": "c1", "node_type": ControllerConstants.NODE_TYPE_CONTAINER}
+        ]
+        SVC._validate_instances_with_plugin_selector(
+            [{"node_ids": ["c1"]}],
+            plugin.id,
+            actor_context={"username": "u", "domain": "d", "current_team": 1},
+        )
+        node.return_value.get_authorized_nodes_by_ids.assert_called_once()
+        perm = node.return_value.get_authorized_nodes_by_ids.call_args.args[1]
+        assert perm["username"] == "u"
+
+        node.return_value.get_authorized_nodes_by_ids.return_value = [{"id": "h1", "node_type": "host"}]
+        with pytest.raises(BaseAppException, match="仅允许选择容器节点"):
+            SVC._validate_instances_with_plugin_selector([{"node_ids": ["h1"]}], plugin.id)
+
+
 class TestGetDefaultGroupMetric:
     def test_prefers_configured_metric(self):
         obj = MonitorObject.objects.create(name="Pod", level="derivative")
@@ -199,6 +228,29 @@ class TestCreateDefaultRule:
         assert rule.monitor_object_id == child.id
         assert rule.organizations == [5]
         assert rule.rule["filter"][0]["value"] == "h1"
+
+    def test_skips_child_without_metric(self):
+        parent = MonitorObject.objects.create(name="CDRSkipP", level="base")
+        MonitorObject.objects.create(name="CDRSkipC", level="derivative", parent=parent)
+        assert SVC.create_default_rule(parent.id, "('h1',)", [1]) == []
+
+    def test_batch_create_rules_for_children_and_skips_no_metric(self):
+        from apps.monitor.models import MonitorObjectOrganizationRule
+
+        parent = MonitorObject.objects.create(name="BatchP", level="base")
+        child = MonitorObject.objects.create(name="BatchC", level="derivative", parent=parent)
+        MonitorObject.objects.create(name="BatchEmpty", level="derivative", parent=parent)
+        plugin = MonitorPlugin.objects.create(name="BatchPlugin")
+        group = MetricGroup.objects.create(monitor_object=child, monitor_plugin=plugin, name="g")
+        Metric.objects.create(monitor_object=child, monitor_plugin=plugin, metric_group=group, name="m")
+        rule_ids = SVC._batch_create_default_rules(
+            [{"instance_id": "('h1',)", "group_ids": [8]}, {"instance_id": "('h2',)", "group_ids": [9]}],
+            parent.id,
+        )
+        assert len(rule_ids) == 2
+        rules = list(MonitorObjectOrganizationRule.objects.filter(id__in=rule_ids).order_by("name"))
+        assert {r.organizations[0] for r in rules} == {8, 9}
+        assert all(r.monitor_object_id == child.id for r in rules)
 
 
 class TestGetAuthorizedMonitorInstancesSuperuser:

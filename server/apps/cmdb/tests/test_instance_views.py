@@ -323,6 +323,27 @@ def test_destroy_ok(superuser, monkeypatch):
     assert response.status_code == status.HTTP_200_OK
 
 
+@pytest.mark.django_db
+def test_destroy_forbidden_without_org_or_operate(superuser, monkeypatch):
+    monkeypatch.setattr(
+        f"{VIEWS}.InstanceManage.query_entity_by_id",
+        lambda pk: {"_id": 5, "model_id": "host", "inst_name": "h", "organization": [1]},
+    )
+    monkeypatch.setattr(f"{VIEWS}.InstanceViewSet.check_creator_and_organizations", lambda self, r, i: False)
+    monkeypatch.setattr(f"{VIEWS}.InstanceViewSet.organizations", lambda self, r, i: [])
+    request = _req("delete", superuser)
+    response = _call({"delete": "destroy"}, request, pk=5)
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert "没有此实例的权限" in str(_body(response))
+
+    monkeypatch.setattr(f"{VIEWS}.InstanceViewSet.organizations", lambda self, r, i: [1])
+    monkeypatch.setattr(f"{VIEWS}.InstanceViewSet.check_instance_permission", lambda self, r, i, operator=None: False)
+    request = _req("delete", superuser)
+    response = _call({"delete": "destroy"}, request, pk=5)
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert "没有此实例的权限" in str(_body(response))
+
+
 # --------------------------------------------------------------------------
 # instance_batch_delete
 # --------------------------------------------------------------------------
@@ -346,6 +367,19 @@ def test_batch_delete_ok(superuser, monkeypatch):
     request = _req("post", superuser, data=[1])
     response = _call({"post": "instance_batch_delete"}, request)
     assert response.status_code == status.HTTP_200_OK
+
+
+@pytest.mark.django_db
+def test_batch_delete_forbidden_without_org(superuser, monkeypatch):
+    monkeypatch.setattr(
+        f"{VIEWS}.InstanceManage.query_entity_by_ids",
+        lambda data: [{"_id": 1, "model_id": "host", "inst_name": "h", "organization": [1]}],
+    )
+    monkeypatch.setattr(f"{VIEWS}.InstanceViewSet.organizations", lambda self, r, i: [])
+    request = _req("post", superuser, data=[1])
+    response = _call({"post": "instance_batch_delete"}, request)
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert "没有此实例的权限" in str(_body(response))
 
 
 # --------------------------------------------------------------------------
