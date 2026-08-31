@@ -41,20 +41,25 @@ def test_compress_png_keeps_alpha_and_palette_converts_to_jpeg():
     png = _png_rgba_bytes((400, 400))
     out = OlmOcr._compress_image_from_bytes(png, max_size_kb=5)
     img = Image.open(io.BytesIO(out))
-    assert img.format in {"PNG", "JPEG"}
+    assert img.format == "PNG"
+    assert img.mode == "RGBA"
 
     pal = Image.new("P", (300, 300))
     pal.putpalette([i % 256 for i in range(768)])
     pal_buf = io.BytesIO()
     pal.save(pal_buf, format="PNG")
     converted = OlmOcr._compress_image_from_bytes(pal_buf.getvalue(), max_size_kb=8)
-    Image.open(io.BytesIO(converted)).verify()
+    pal_img = Image.open(io.BytesIO(converted))
+    assert pal_img.format == "PNG"
+    assert pal_img.mode == "P"
 
-    gray = Image.new("L", (400, 400), 80)
+    gray = Image.new("L", (1200, 1200), 80)
     gray_buf = io.BytesIO()
     gray.save(gray_buf, format="PNG")
-    gray_out = OlmOcr._compress_image_from_bytes(gray_buf.getvalue(), max_size_kb=8)
-    Image.open(io.BytesIO(gray_out)).verify()
+    gray_out = OlmOcr._compress_image_from_bytes(gray_buf.getvalue(), max_size_kb=1)
+    gray_img = Image.open(io.BytesIO(gray_out))
+    assert gray_img.format == "JPEG"
+    assert gray_img.mode == "RGB"
 
 
 def test_predict_paths_and_perform_ocr_empty_or_error(tmp_path):

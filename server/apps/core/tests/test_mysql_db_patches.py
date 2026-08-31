@@ -37,8 +37,19 @@ def test_patch_migrate_driver_mysql_other_and_missing_engine():
 
 
 def test_patch_migrate_skips_when_cornerstone_missing():
-    with patch.dict(sys.modules, {"cw_cornerstone.migrate_patch": None, "cw_cornerstone.migrate_patch.management": None}):
+    with (
+        patch.dict(
+            sys.modules,
+            {"cw_cornerstone.migrate_patch": None, "cw_cornerstone.migrate_patch.management": None},
+        ),
+        patch("apps.core.db_patches.mysql.logger") as mock_logger,
+    ):
         mysql_patch._patch_migrate_patch_mysql_support()
+        mock_logger.warning.assert_called_once_with(
+            "cw_cornerstone.migrate_patch not installed, skipping MySQL migrate patch support"
+        )
+        assert sys.modules.get("cw_cornerstone.migrate_patch.management") is None
+        assert not hasattr(sys.modules.get("cw_cornerstone.migrate_patch"), "get_db_driver")
 
 
 def test_json_contains_lookup_uses_mysql_json_contains_then_restores_postgres():

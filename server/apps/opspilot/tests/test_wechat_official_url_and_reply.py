@@ -1,6 +1,6 @@
 """微信公众号：URL 验签、空回复、重复消息与签名失败。"""
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from wechatpy.exceptions import InvalidSignatureException

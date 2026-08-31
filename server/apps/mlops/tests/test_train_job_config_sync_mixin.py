@@ -56,3 +56,23 @@ def test_sync_config_to_minio_deletes_old_file_after_upload():
     storage.delete.assert_called_once_with("old.json")
     assert file_field.name.startswith("config_10_")
     assert file_field.name.endswith(".json")
+
+
+def test_sync_config_to_minio_swallows_old_file_delete_error():
+    job = LogClusteringTrainJob(name="lc-del-fail", algorithm="drain", max_evals=3, hyperopt_config={"a": 1}, team=[1])
+    job.pk = 11
+    storage = MagicMock()
+    storage.delete.side_effect = OSError("minio delete")
+    file_field = MagicMock()
+    file_field.name = "old.json"
+    file_field.storage = storage
+
+    def _save(filename, content, save=False):
+        file_field.name = filename
+
+    file_field.save.side_effect = _save
+    job.config_url = file_field
+    job._sync_config_to_minio()
+    storage.delete.assert_called_once_with("old.json")
+    assert file_field.name.startswith("config_11_")
+
