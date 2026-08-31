@@ -432,3 +432,183 @@ def test_sse_execute_returns_target_error_without_opening_stream():
         assert engine.sse_execute({"last_message": "hi"}) == "target-err"
     resolve_method.assert_not_called()
 
+
+def _ready_execute_engine():
+    engine = _engine([{"id": "n1", "type": "openai", "data": {}}], start_node_id="n1")
+    engine.validate_flow = lambda: []
+    return engine
+
+
+def test_execute_success_returns_last_message_and_records():
+    engine = _ready_execute_engine()
+
+    def _chain(*args, **kwargs):
+        engine.variable_manager.set_variable("last_message", "done")
+        return {"success": True}
+
+    with (
+        patch.object(engine, "_ensure_execution_result_started"),
+        patch.object(engine, "_raise_if_interrupted"),
+        patch.object(engine, "_record_conversation_history") as history,
+        patch.object(engine, "_execute_node_chain", side_effect=_chain),
+        patch.object(engine, "_check_interrupt_requested", return_value=False),
+        patch.object(engine, "_check_chain_result", return_value=(True, {})),
+        patch.object(engine, "_record_execution_result") as record,
+    ):
+        out = engine.execute({"last_message": "hi", "user_id": "u1", "session_id": "s1", "node_id": "n1"})
+    assert out == "done"
+    assert history.call_count == 2
+    assert history.call_args_list[0].args[:4] == ("u1", "hi", "user", "openai")
+    assert history.call_args_list[1].args[:4] == ("u1", "done", "bot", "openai")
+    record.assert_called_once()
+    assert record.call_args.args[1] == "done"
+    assert record.call_args.args[2] is True
+
+
+def test_execute_chain_failure_uses_partial_output_or_error_dict():
+    engine = _ready_execute_engine()
+    ctx = NodeExecutionContext(node_id="n1")
+    ctx.output_data = {"partial": True, "answer": "half"}
+    engine.execution_contexts = {"n1": ctx}
+    error_info = {"node_id": "n1", "error": "tool failed", "node_type": "agents"}
+    with (
+        patch.object(engine, "_ensure_execution_result_started"),
+        patch.object(engine, "_raise_if_interrupted"),
+        patch.object(engine, "_record_conversation_history") as history,
+        patch.object(engine, "_execute_node_chain", return_value={"success": False}),
+        patch.object(engine, "_check_interrupt_requested", return_value=False),
+        patch.object(engine, "_check_chain_result", return_value=(False, error_info)),
+        patch.object(engine, "_record_execution_result") as record,
+    ):
+        out = engine.execute({"last_message": "hi", "user_id": "u1"})
+    assert out == {"partial": True, "answer": "half"}
+    assert history.call_args_list[-1].args[1] == "工作流执行失败: tool failed"
+    record.assert_called_once()
+    assert record.call_args.args[1]["success"] is False
+    assert record.call_args.args[1]["failed_node_id"] == "n1"
+    assert record.call_args.args[2] is False
+
+    engine.execution_contexts = {}
+    with (
+        patch.object(engine, "_ensure_execution_result_started"),
+        patch.object(engine, "_raise_if_interrupted"),
+        patch.object(engine, "_record_conversation_history"),
+        patch.object(engine, "_execute_node_chain", return_value={"success": False}),
+        patch.object(engine, "_check_interrupt_requested", return_value=False),
+        patch.object(engine, "_check_chain_result", return_value=(False, error_info)),
+        patch.object(engine, "_record_execution_result"),
+    ):
+        missing = engine.execute({"last_message": "hi", "user_id": "u1"})
+    assert missing == {"error": "tool failed", "failed_node_id": "n1", "failed_node_type": "agents"}
+
+
+def test_execute_returns_interrupt_after_chain_and_on_interrupted_error():
+    engine = _ready_execute_engine()
+    with (
+        patch.object(engine, "_ensure_execution_result_started"),
+        patch.object(engine, "_raise_if_interrupted"),
+        patch.object(engine, "_record_conversation_history"),
+        patch.object(engine, "_execute_node_chain", return_value={"success": True}),
+        patch.object(engine, "_check_interrupt_requested", return_value=True),
+        patch.object(engine, "_record_execution_result") as record,
+    ):
+        after_chain = engine.execute({"last_message": "hi"})
+    assert after_chain == {
+        "success": False,
+        "interrupted": True,
+        "error": "执行已中断",
+        "execution_id": "exec-sse",
+    }
+    record.assert_called_once()
+    assert record.call_args.args[2] is False
+
+    with (
+        patch.object(engine, "_ensure_execution_result_started"),
+        patch.object(engine, "_raise_if_interrupted"),
+        patch.object(engine, "_record_conversation_history"),
+        patch.object(engine, "_execute_node_chain", side_effect=InterruptedError("stop now")),
+        patch.object(engine, "_record_execution_result") as record_exc,
+    ):
+        interrupted = engine.execute({"last_message": "hi"})
+    assert interrupted["interrupted"] is True
+    assert interrupted["error"] == "stop now"
+    assert interrupted["execution_id"] == "exec-sse"
+    record_exc.assert_called_once()
+    assert record_exc.call_args.args[1]["interrupted"] is True
+
+
+def test_execute_generic_exception_records_redacted_error():
+    engine = _ready_execute_engine()
+    with (
+        patch.object(engine, "_ensure_execution_result_started"),
+        patch.object(engine, "_raise_if_interrupted"),
+        patch.object(engine, "_record_conversation_history"),
+        patch.object(engine, "_execute_node_chain", side_effect=RuntimeError("explode")),
+        patch.object(engine, "_record_execution_result") as record,
+    ):
+        out = engine.execute({"last_message": "secret-user-text", "user_id": "u1"})
+    assert out["success"] is False
+    assert out["error"] == "explode"
+    assert "secret-user-text" not in str(out["variable_keys"])
+    record.assert_called_once()
+    assert record.call_args.args[1]["error"] == "explode"
+    assert record.call_args.args[2] is False
+
+
+def test_build_execution_output_data_counts_running_and_pending():
+    engine = _engine([{"id": "n1", "type": "openai", "data": {}}])
+    running = NodeExecutionContext(node_id="n1")
+    running.status = NodeStatus.RUNNING
+    pending = NodeExecutionContext(node_id="n2")
+    pending.status = NodeStatus.PENDING
+    engine.execution_contexts = {"n1": running, "n2": pending}
+    engine.variable_manager.set_variable("node_n1_index", 1)
+    engine.variable_manager.set_variable("node_n1_type", "openai")
+    engine.variable_manager.set_variable("node_n1_name", "入口")
+    engine.variable_manager.set_variable("node_n2_index", 2)
+    engine.variable_manager.set_variable("node_n2_type", "agents")
+    engine.variable_manager.set_variable("node_n2_name", "智能体")
+    summary = engine._build_execution_output_data()["summary"]
+    assert summary["running_nodes"] == 1
+    assert summary["pending_nodes"] == 1
+    assert summary["completed_nodes"] == 0
+    assert summary["failed_node"] is None
+    assert summary["final_node"] == {
+        "node_id": "n2",
+        "node_name": "智能体",
+        "node_type": "agents",
+        "node_index": 2,
+    }
+
+
+def test_check_chain_result_walks_current_and_next_nodes():
+    engine = _engine([])
+    assert engine._check_chain_result("not-a-dict") == (True, {})
+    current_fail = {
+        "success": True,
+        "current_node": {"success": False, "node_id": "c1", "node_type": "agents", "error": "bad current"},
+    }
+    ok, info = engine._check_chain_result(current_fail)
+    assert ok is False
+    assert info == {"node_id": "c1", "node_type": "agents", "error": "bad current"}
+
+    next_fail = {
+        "success": True,
+        "next_nodes": {"n2": {"success": False, "node_id": "n2", "node_type": "http", "error": "down"}},
+    }
+    ok, info = engine._check_chain_result(next_fail)
+    assert ok is False
+    assert info == {"node_id": "n2", "node_type": "http", "error": "down"}
+    assert engine._check_chain_result({"success": True, "next_nodes": {"n2": {"success": True}}}) == (True, {})
+
+
+def test_execute_node_recursive_timeout_cycle_and_missing_node():
+    engine = _engine([{"id": "n1", "type": "openai", "data": {}}])
+    with pytest.raises(TimeoutError, match="节点执行超时: n1"):
+        engine._execute_node_recursive("n1", {}, set(), 0)
+    skipped = engine._execute_node_recursive("n1", {}, {"n1"}, 10)
+    assert skipped == {"success": True, "message": "节点 n1 已访问，跳过执行"}
+    missing = engine._execute_single_node("ghost", {})
+    assert missing["success"] is False
+    assert "节点不存在: ghost" in missing["error"]
+

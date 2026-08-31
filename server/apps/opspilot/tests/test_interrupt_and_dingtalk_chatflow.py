@@ -1,11 +1,13 @@
-"""ChatFlow 中断与钉钉入口：缺参 400、无执行 404、GET 健康检查。"""
+"""ChatFlow 中断与钉钉入口：缺参 400、无执行 404、成功中断、GET 健康检查。"""
 import json
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from django.test import RequestFactory
 
 from apps.opspilot import views as opspilot_views
+from apps.opspilot.enum import WorkFlowTaskStatus
 
 pytestmark = pytest.mark.django_db
 factory = RequestFactory()
@@ -41,6 +43,52 @@ def test_interrupt_chat_flow_not_found_for_other_team(monkeypatch):
     resp = opspilot_views.interrupt_chat_flow_execution(req)
     assert resp.status_code == 404
     assert json.loads(resp.content)["result"] is False
+
+
+def test_interrupt_chat_flow_marks_running_and_skips_finished(monkeypatch):
+    monkeypatch.setattr(opspilot_views, "get_loader", lambda request: SimpleNamespace(get=lambda key, default=None: default))
+    monkeypatch.setattr(opspilot_views, "extract_api_token", lambda request: "tok")
+    monkeypatch.setattr(opspilot_views, "get_current_team", lambda request: 1)
+    monkeypatch.setattr(
+        opspilot_views,
+        "validate_openai_token",
+        lambda token, team: (True, SimpleNamespace(team=1)),
+    )
+    requested = MagicMock()
+    monkeypatch.setattr(opspilot_views, "request_interrupt", requested)
+
+    running = SimpleNamespace(status=WorkFlowTaskStatus.RUNNING, save=MagicMock(), finished_at=None)
+    qs = MagicMock()
+    qs.filter.return_value = qs
+    qs.order_by.return_value = qs
+    qs.first.return_value = running
+    monkeypatch.setattr(opspilot_views.WorkFlowTaskResult.objects, "filter", lambda **k: qs)
+
+    req = factory.post(
+        "/interrupt/",
+        data=json.dumps({"execution_id": "exec-run", "reason": "stop"}),
+        content_type="application/json",
+    )
+    resp = opspilot_views.interrupt_chat_flow_execution(req)
+    body = json.loads(resp.content)
+    assert body == {
+        "result": True,
+        "data": {
+            "execution_id": "exec-run",
+            "status": WorkFlowTaskStatus.INTERRUPTED,
+            "interrupt_requested": True,
+        },
+    }
+    requested.assert_called_once_with("exec-run", reason="stop")
+    assert running.status == WorkFlowTaskStatus.INTERRUPTED
+    running.save.assert_called_once_with(update_fields=["status", "finished_at"])
+
+    done = SimpleNamespace(status=WorkFlowTaskStatus.SUCCESS, save=MagicMock())
+    qs.first.return_value = done
+    finished = opspilot_views.interrupt_chat_flow_execution(req)
+    assert json.loads(finished.content)["data"]["status"] == WorkFlowTaskStatus.INTERRUPTED
+    done.save.assert_not_called()
+    assert done.status == WorkFlowTaskStatus.SUCCESS
 
 
 def test_execute_chat_flow_dingtalk_get_health():
