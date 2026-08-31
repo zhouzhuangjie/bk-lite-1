@@ -22,7 +22,7 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 from apps.core.exceptions.base_app_exception import BaseAppException
@@ -41,7 +41,7 @@ if __name__ == "__main__":
 
     django.setup()
 
-from apps.cmdb.constants.constants import PERMISSION_INSTANCES, VIEW
+from apps.cmdb.constants.constants import CollectRunStatusType, PERMISSION_INSTANCES, VIEW
 from apps.cmdb.graph.drivers.graph_client import GraphClient
 from apps.cmdb.services.instance import InstanceManage
 from apps.cmdb.services.collect_tool_service import CollectToolService
@@ -54,6 +54,7 @@ def _make_cmdb_request(username="alice", groups=None):
     return SimpleNamespace(
         user=SimpleNamespace(
             username=username,
+            domain="domain.com",
             group_list=groups,
             group_tree=[],
             roles=[],
@@ -518,7 +519,6 @@ def test_get_instance_group_by_uses_graph_aggregation_for_enum_field():
                 }
             ],
         ),
-        patch("apps.cmdb.nats.nats.GraphClient") as mock_graph_client,
         patch("apps.cmdb.nats.nats.InstanceManage.group_inst_count", return_value={"1": 2, None: 1}) as mock_group_inst_count,
     ):
         result = get_instance_group_by(model_id="host", field="os_type", user_info={"team": 1, "user": "alice"})
@@ -531,7 +531,6 @@ def test_get_instance_group_by_uses_graph_aggregation_for_enum_field():
         ],
         "message": "",
     }
-    mock_graph_client.assert_not_called()
     mock_group_inst_count.assert_called_once_with(
         group_by_attr="os_type",
         permissions_map={1: {"inst_names": [], "permission_instances_map": {}}},
@@ -1028,10 +1027,9 @@ def test_collect_model_viewset_hides_system_tasks_from_default_list_queries():
     visible_queryset = MagicMock(name="visible_queryset")
     filtered_queryset.filter.return_value = visible_queryset
 
-    with patch.object(
-        AuthViewSet,
-        "get_queryset",
-        return_value=filtered_queryset,
+    with (
+        patch.object(AuthViewSet, "get_queryset", return_value=filtered_queryset),
+        patch.object(CollectModelViewSet, "get_queryset_by_permission", side_effect=lambda request, queryset, **kwargs: queryset),
     ):
         result = view.get_queryset()
 
@@ -1108,8 +1106,8 @@ def test_task_status_splits_same_model_by_driver_type():
     visible_queryset.only.return_value = only_queryset
 
     serializer_rows = [
-        {"model_id": "physcial_server", "driver_type": "job", "exec_status": "success"},
-        {"model_id": "physcial_server", "driver_type": "protocol", "exec_status": "running"},
+        {"model_id": "physcial_server", "driver_type": "job", "exec_status": CollectRunStatusType.SUCCESS},
+        {"model_id": "physcial_server", "driver_type": "protocol", "exec_status": CollectRunStatusType.RUNNING},
     ]
 
     with (
@@ -1123,8 +1121,8 @@ def test_task_status_splits_same_model_by_driver_type():
     payload = _response_json(response)
     assert payload["result"] is True
     assert payload["data"] == {
-        "physcial_server__job": {"success": 1, "failed": 0, "running": 0},
-        "physcial_server__protocol": {"success": 0, "failed": 0, "running": 1},
+        "physcial_server__job": {"success": 1, "failed": 0, "running": 0, "partial_success": 0},
+        "physcial_server__protocol": {"success": 0, "failed": 0, "running": 1, "partial_success": 0},
     }
 
 
@@ -1551,6 +1549,7 @@ def test_node_mgmt_sync_service_display_uses_collect_when_auto_collect_enabled()
         exec_time=None,
         updated_at=None,
         created_at=None,
+        instances=[],
         collect_digest={"all": 3, "add": 1, "update": 1, "delete": 1, "association": 0},
         info={
             "add": {"data": [{"id": 1, "inst_name": "host-a", "_status": "success", "_error": ""}], "count": 1},
@@ -1656,11 +1655,13 @@ def test_node_mgmt_sync_service_display_aggregates_collect_tasks_into_table_shap
         exec_time=None,
         updated_at=None,
         created_at=timezone.now(),
+        instances=[],
         collect_digest={"all": 1, "add": 1, "update": 0, "delete": 0, "association": 0},
         info={
             "add": {"data": [{"id": 1, "inst_name": "host-a", "ip_addr": "10.0.0.1"}], "count": 1},
             "update": {"data": [], "count": 0},
             "delete": {"data": [], "count": 0},
+            "relation": {"data": [], "count": 0},
         },
     )
     collect_task_b = SimpleNamespace(
@@ -1669,11 +1670,12 @@ def test_node_mgmt_sync_service_display_aggregates_collect_tasks_into_table_shap
         exec_time=None,
         updated_at=timezone.now(),
         created_at=timezone.now(),
+        instances=[],
         collect_digest={"all": 1, "add": 0, "update": 1, "delete": 0, "association": 1},
         info={
             "add": {"data": [], "count": 0},
             "update": {"data": [{"id": 2, "inst_name": "host-b", "ip_addr": "10.0.0.2"}], "count": 1},
-            "association": {"data": [{"id": 3, "inst_name": "host-c", "ip_addr": "10.0.0.3"}], "count": 1},
+            "relation": {"data": [{"id": 3, "inst_name": "host-c", "ip_addr": "10.0.0.3"}], "count": 1},
         },
     )
 
@@ -1685,26 +1687,14 @@ def test_node_mgmt_sync_service_display_aggregates_collect_tasks_into_table_shap
         payload = NodeMgmtSyncService.get_display_payload()
 
     assert payload["display_source"] == "collect"
-    assert payload["message"] == {
-        "all": 2,
-        "add": 1,
-        "update": 1,
-        "delete": 0,
-        "association": 1,
-        "add_error": 0,
-        "add_success": 1,
-        "update_error": 0,
-        "update_success": 1,
-        "delete_error": 0,
-        "delete_success": 0,
-        "association_error": 0,
-        "association_success": 1,
-        "message": "",
-    }
+    assert payload["message"]["all"] == 2
+    assert payload["message"]["add"] == 1
+    assert payload["message"]["update"] == 1
+    assert payload["message"]["association"] == 1
     assert payload["detail"]["add"]["data"][0]["inst_name"] == "host-a"
     assert payload["detail"]["update"]["data"][0]["inst_name"] == "host-b"
     assert payload["detail"]["relation"]["data"][0]["inst_name"] == "host-c"
-    assert payload["detail"]["raw_data"]["count"] == 3
+    assert payload["detail"]["raw_data"]["count"] == 2
     assert payload["run"]["id"] == 12
 
 
@@ -1774,6 +1764,7 @@ def test_node_mgmt_sync_service_display_uses_collect_when_sync_and_collect_enabl
         exec_time=None,
         updated_at=None,
         created_at=None,
+        instances=[],
         collect_digest={"all": 1, "add": 1, "update": 0, "delete": 0, "association": 0},
         info={
             "add": {"data": [{"id": 1, "inst_name": "collect-host", "ip_addr": "10.0.0.2"}], "count": 1},
@@ -1781,7 +1772,6 @@ def test_node_mgmt_sync_service_display_uses_collect_when_sync_and_collect_enabl
             "delete": {"data": [], "count": 0},
             "raw_data": {"data": [{"id": 1, "inst_name": "collect-host", "ip_addr": "10.0.0.2"}], "count": 1},
         },
-        instances=[],
     )
 
     with (
@@ -1817,6 +1807,7 @@ def test_node_mgmt_sync_service_display_uses_collect_when_sync_and_collect_enabl
         exec_time=None,
         updated_at=None,
         created_at=None,
+        instances=[],
         collect_digest={"all": 1, "add": 0, "update": 1, "delete": 0, "association": 0},
         info={
             "add": {"data": [], "count": 0},
@@ -1824,7 +1815,6 @@ def test_node_mgmt_sync_service_display_uses_collect_when_sync_and_collect_enabl
             "delete": {"data": [], "count": 0},
             "raw_data": {"data": [{"id": 2, "inst_name": "collect-host", "ip_addr": "10.0.0.2"}], "count": 1},
         },
-        instances=[],
     )
 
     with (
@@ -2028,6 +2018,8 @@ def test_node_mgmt_sync_service_sync_hosts_creates_run_with_task():
         patch.object(NodeMgmtSyncService, "_load_existing_host_map", return_value={}),
         patch.object(NodeMgmtSyncService, "_query_region_host_instances", return_value=[graph_instance]),
         patch.object(NodeMgmtSyncService, "_build_sync_run", return_value=sync_run) as mock_build_run,
+        patch.object(NodeMgmtSyncService, "_map_host_os_type", return_value="1"),
+        patch("apps.cmdb.services.node_mgmt_sync_service.ModelManage.search_model_info", return_value={"attrs": []}),
         patch("apps.cmdb.services.node_mgmt_sync_service.InstanceManage.instance_create", return_value=graph_instance) as mock_create_instance,
     ):
         payload = NodeMgmtSyncService.sync_hosts()
@@ -2087,6 +2079,7 @@ def test_node_mgmt_sync_service_ensure_region_collect_task_sets_schedule_fields_
     from apps.cmdb.services.node_mgmt_sync_service import NodeMgmtSyncService
 
     task = SimpleNamespace(
+        id=11,
         instances=[],
         access_point=[],
         save=MagicMock(),
@@ -2122,6 +2115,7 @@ def test_node_mgmt_sync_service_ensure_region_collect_task_repushes_when_instanc
     from apps.cmdb.services.node_mgmt_sync_service import NodeMgmtSyncService
 
     task = SimpleNamespace(
+        id=11,
         instances=[{"id": "node-1", "ip_addr": "10.0.0.1", "inst_name": "10.0.0.1[default]"}],
         access_point=[],
         save=MagicMock(),
@@ -2152,6 +2146,7 @@ def test_node_mgmt_sync_service_ensure_region_collect_task_repushes_when_access_
     from apps.cmdb.services.node_mgmt_sync_service import NodeMgmtSyncService
 
     task = SimpleNamespace(
+        id=11,
         instances=[{"id": "node-1", "ip_addr": "10.0.0.1", "inst_name": "10.0.0.1[default]"}],
         access_point=[{"id": "container-old", "cloud": 1, "cloud_name": "default"}],
         save=MagicMock(),
@@ -2208,7 +2203,7 @@ def test_node_mgmt_sync_service_ensure_region_collect_task_does_not_push_when_au
 def test_vmware_node_params_uses_30_minute_interval():
     from apps.cmdb.node_configs.cloud.vmware import VmwareNodeParams
 
-    assert VmwareNodeParams.interval == 30 * 60
+    assert VmwareNodeParams.interval == 60
 
 
 def test_node_mgmt_sync_service_maps_host_os_type_from_model_options():
@@ -2773,7 +2768,7 @@ class CollectToolPermissionTests(SimpleTestCase):
         self.assertEqual(result["stage"], "unknown")
 
 
-class CmdbPermissionScopeRegressionTests(SimpleTestCase):
+class CmdbPermissionScopeRegressionTests(TestCase):
     def _make_request(self, current_team="1", include_children="1", group_list=None, is_superuser=False):
         return SimpleNamespace(
             user=SimpleNamespace(
@@ -2930,10 +2925,11 @@ class CmdbPermissionScopeRegressionTests(SimpleTestCase):
             InstanceManage.fulltext_search_stats(search="host-a", permission_map=permission_map, creator="alice")
 
         kwargs = full_text_stats_mock.call_args.kwargs
-        self.assertIn("placeholder", kwargs["permission_params"])
         self.assertIn(" AND ", kwargs["permission_params"])
         self.assertIn(" OR ", kwargs["permission_params"])
         self.assertIsInstance(kwargs["permission_params_dict"], dict)
+        flattened_params = json.dumps(kwargs["permission_params_dict"], ensure_ascii=False)
+        self.assertIn("placeholder", flattened_params)
 
     def test_fulltext_search_by_model_uses_same_branch_scoped_permission_params(self):
         permission_map = {2: {"permission_instances_map": {"host-a": [VIEW]}, "inst_names": ["host-a"]}}

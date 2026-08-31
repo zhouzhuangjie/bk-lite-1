@@ -2,6 +2,9 @@
 requires = ["setuptools>=45", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+py-modules = ["pytest_env_setup"]
+
 [tool.setuptools.packages.find]
 include = ["apps*", "config*", "nats_client*"]
 exclude = ["envs*", "locale*", "assets*", "templates*", "scripts*", "support-files*", "mlruns*", "coverage_html*"]
@@ -125,6 +128,7 @@ opspilot = [
     "langchain-postgres==0.0.16",
     "langgraph-checkpoint-postgres==3.0.1",
     "langchain-mcp-adapters==0.1.12",
+    "mcp>=1.9.0,<2",
     "langchain-community==0.4.1",
     "langgraph-supervisor==0.0.30",
     "langchain-experimental==0.4.0",
@@ -149,6 +153,9 @@ dev = [
     "factory-boy>=3.3.3",
     "pytest-bdd>=8.1.0",
 ]
+
+[project.entry-points.pytest11]
+pytest_env_setup = "pytest_env_setup"
 
 [tool.black]
 line-length = 150

@@ -74,6 +74,10 @@ class TestNormalizeTimeValue:
         with pytest.raises(ValueError):
             nm._normalize_time_value("01/01/2026", "t")
 
+    def test_unsupported_type_raises(self):
+        with pytest.raises(ValueError, match="时间格式错误"):
+            nm._normalize_time_value(["x"], "t")
+
 
 class TestNormalizeFilterValues:
     def test_empty(self):
@@ -145,6 +149,17 @@ class TestPaginateItems:
         assert out["count"] == 5
         assert out["items"] == [3, 4]
         assert out["page"] == 2
+
+
+class TestNormalizeNatsCreatePayload:
+    def test_requires_dict_and_copies(self):
+        with pytest.raises(ValueError, match="必须是字典"):
+            nm._normalize_nats_create_payload(["x"])
+        src = {"a": 1}
+        out = nm._normalize_nats_create_payload(src)
+        assert out == {"a": 1}
+        out["a"] = 2
+        assert src["a"] == 1
 
 
 class TestResolveNatsActor:
@@ -268,3 +283,48 @@ class TestExecuteNatsCreate:
         )
         assert out["result"] is False
         assert out["message"]
+
+    def test_create_monitor_object_with_children(self):
+        from apps.monitor.models.monitor_object import MonitorObject, MonitorObjectType
+
+        MonitorObjectType.objects.create(id="nats-host", name="主机")
+        out = nm.create_monitor_object(
+            {
+                "name": "NatsHost",
+                "type": "nats-host",
+                "level": "base",
+                "icon": "host.png",
+                "children": [
+                    {"id": "cpu", "name": "CPU"},
+                    {"id": "", "name": "skip-empty"},
+                ],
+            },
+            user_info={"user": SimpleNamespace(username="a", domain="domain.com")},
+        )
+        assert out["result"] is True
+        parent = MonitorObject.objects.get(name="NatsHost")
+        child = MonitorObject.objects.get(name="cpu")
+        assert child.parent_id == parent.id
+        assert child.level == "derivative"
+        assert child.default_metric == "any({instance_type='cpu'}) by (instance_id, cpu)"
+        assert not MonitorObject.objects.filter(display_name="skip-empty").exists()
+
+    def test_create_policy_requires_schedule(self):
+        out = nm._execute_nats_create(
+            nm._create_monitor_policy_payload,
+            {"name": "no-sched"},
+            user_info={"user": SimpleNamespace(username="a", domain="domain.com")},
+        )
+        assert out["result"] is False
+        assert "schedule" in out["message"]
+
+    def test_execute_nats_create_wraps_generic_exception(self):
+        def boom(*args, **kwargs):
+            raise RuntimeError("db down")
+
+        out = nm._execute_nats_create(
+            boom,
+            {},
+            user_info={"user": SimpleNamespace(username="a", domain="domain.com")},
+        )
+        assert out == {"result": False, "data": [], "message": "db down"}

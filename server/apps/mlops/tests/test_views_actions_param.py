@@ -20,7 +20,7 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 
 from apps.base.tests.factories import UserFactory
 from apps.mlops.constants import DatasetReleaseStatus, MLflowRunStatus, TrainJobStatus
-from apps.mlops.utils.webhook_client import WebhookError
+from apps.mlops.utils.webhook_client import WebhookError, WebhookTimeoutError
 
 pytestmark = [pytest.mark.django_db, pytest.mark.integration]
 
@@ -49,6 +49,26 @@ PREDICT_PARAM = {
     "classification": "texts",
     "image_classification": "images",
     "object_detection": "images",
+}
+
+# Empty-payload error is algorithm-specific (object_detection uses 缺少参数).
+PREDICT_EMPTY_ERROR = {
+    "anomaly_detection": "data 参数不能为空",
+    "log_clustering": "data 参数不能为空",
+    "timeseries_predict": "data 参数不能为空",
+    "classification": "texts 参数不能为空",
+    "image_classification": "images 参数不能为空",
+    "object_detection": "缺少参数: images",
+}
+
+# Non-list payload error is keyed by the request param name.
+PREDICT_NON_LIST_ERROR = {
+    "anomaly_detection": "data 必须是数组格式",
+    "log_clustering": "data 必须是数组格式",
+    "timeseries_predict": "data 必须是数组格式",
+    "classification": "texts 必须是数组格式",
+    "image_classification": "images 必须是数组格式",
+    "object_detection": "images 必须是数组格式",
 }
 
 # Algorithms whose DatasetReleaseViewSet exposes archive/unarchive.
@@ -283,6 +303,48 @@ def test_train_happy_path(monkeypatch, superuser, suffix, prefix, model_module, 
     assert tj.status == TrainJobStatus.RUNNING
 
 
+@pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
+def test_train_webhook_timeout_restores_status(monkeypatch, superuser, suffix, prefix, model_module, basename):
+    TrainJob = _model(model_module, basename, "TrainJob")
+    Dataset = _model(model_module, basename, "Dataset")
+    Release = _model(model_module, basename, "DatasetRelease")
+    ds = Dataset.objects.create(name="ds-timeout", description="", team=[1])
+    dv = Release.objects.create(
+        name="r", description="", dataset=ds, version="v1",
+        dataset_file="path/data.zip", status=DatasetReleaseStatus.PUBLISHED,
+        metadata={}, file_size=10,
+    )
+    tj = TrainJob.objects.create(
+        name="job-timeout", description="", team=[1], status=TrainJobStatus.PENDING,
+        algorithm="demo-algo", dataset_version=dv, hyperopt_config={},
+    )
+    TrainJob.objects.filter(pk=tj.pk).update(config_url="path/config.json")
+    tj.refresh_from_db()
+
+    mod = _view_module(suffix)
+    monkeypatch.setattr(
+        mod, "get_mlflow_train_config",
+        lambda: types.SimpleNamespace(
+            bucket="b", minio_endpoint="e", mlflow_tracking_uri="u",
+            minio_access_key="ak", minio_secret_key="sk",
+        ),
+    )
+    monkeypatch.setattr(mod, "get_image_by_prefix", lambda p, algo: "repo/train:1")
+    _patch_mlflow(monkeypatch, suffix)
+
+    def raise_timeout(*args, **kwargs):
+        raise WebhookTimeoutError("timed out")
+
+    monkeypatch.setattr(mod.WebhookClient, "stop", staticmethod(Mock()))
+    monkeypatch.setattr(mod.WebhookClient, "train", staticmethod(raise_timeout))
+    view = getattr(mod, f"{basename}TrainJobViewSet").as_view({"post": "train"})
+    request = factory.post(f"/{suffix}_train_jobs/x/train/")
+    resp = _call(view, request, superuser, pk=tj.id)
+    assert resp.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+    tj.refresh_from_db()
+    assert tj.status == TrainJobStatus.PENDING
+
+
 # =========================================================================
 # TrainJob: stop action
 # =========================================================================
@@ -403,6 +465,34 @@ def test_runs_data_list_with_runs_and_pagination(monkeypatch, superuser, suffix,
     assert item["duration_minutes"] == pytest.approx(10.0)
     # completed job -> all deletable
     assert item["can_delete_run"] is True
+
+
+@pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
+def test_runs_data_list_running_duration_and_bad_row(monkeypatch, superuser, suffix, prefix, model_module, basename):
+    tj = _make_train_job(model_module, basename, status_value=TrainJobStatus.RUNNING)
+    mod = _view_module(suffix)
+    t0 = pd.Timestamp("2020-01-01 00:00:00", tz="UTC")
+    runs = pd.DataFrame(
+        [
+            {"run_id": "running", "status": "RUNNING", "start_time": t0, "end_time": pd.NaT,
+             "tags.mlflow.runName": pd.NA},
+            {"run_id": pd.NA, "status": "FINISHED", "start_time": t0, "end_time": t0,
+             "tags.mlflow.runName": "bad"},
+        ]
+    )
+    _patch_mlflow(
+        monkeypatch, suffix,
+        get_experiment_by_name=lambda name: types.SimpleNamespace(experiment_id="1"),
+        get_experiment_runs=lambda eid, **kw: runs,
+    )
+    view = getattr(mod, f"{basename}TrainJobViewSet").as_view({"get": "get_run_data_list"})
+    request = factory.get(f"/{suffix}_train_jobs/x/runs_data_list/")
+    resp = _call(view, request, superuser, pk=tj.id)
+    assert resp.status_code == status.HTTP_200_OK
+    running = next(item for item in resp.data["items"] if item["run_id"] == "running")
+    assert running["end_time"] is None
+    assert running["duration_minutes"] >= 0
+    assert running["run_name"] == ""
 
 
 # =========================================================================
@@ -720,9 +810,7 @@ def test_serving_predict_empty_data(monkeypatch, superuser, suffix, prefix, mode
     request = factory.post(f"/{suffix}_servings/x/predict/", {}, format="json")
     resp = _call(view, request, superuser, pk=serving.id)
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
-    # message mentions the missing param name (不能为空 / 缺少参数)
-    err = resp.data["error"]
-    assert PREDICT_PARAM[suffix] in err or "不能为空" in err or "缺少参数" in err
+    assert resp.data["error"] == PREDICT_EMPTY_ERROR[suffix]
 
 
 @pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
@@ -741,7 +829,7 @@ def test_serving_predict_non_list_data(monkeypatch, superuser, suffix, prefix, m
     request = factory.post(f"/{suffix}_servings/x/predict/", {param: {"a": 1}}, format="json")
     resp = _call(view, request, superuser, pk=serving.id)
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
-    assert "数组格式" in resp.data["error"]
+    assert resp.data["error"] == PREDICT_NON_LIST_ERROR[suffix]
 
 
 @pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
@@ -886,8 +974,12 @@ def test_serving_start_config_error(monkeypatch, superuser, suffix, prefix, mode
     request = factory.post(f"/{suffix}_servings/x/start/")
     resp = _call(view, request, superuser, pk=serving.id)
     assert resp.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
-    # Config-related error: either explicit env-var message or generic config error.
-    assert ("MLFLOW_TRACKER_URL" in resp.data["error"]) or ("配置" in resp.data["error"])
+    expected = (
+        "环境变量 MLFLOW_TRACKER_URL 未配置"
+        if suffix in {"anomaly_detection", "log_clustering"}
+        else "系统配置错误，请联系管理员"
+    )
+    assert resp.data["error"] == expected
 
 
 def _allow_team_one(monkeypatch):
@@ -993,12 +1085,14 @@ def test_serving_create_config_error_keeps_record(monkeypatch, superuser, suffix
     Serving = _model(model_module, basename, "Serving")
     view = getattr(mod, f"{basename}ServingViewSet").as_view({"post": "create"})
     resp = _call(view, _serving_create_request(suffix, train_job), superuser)
-    # The serving record is created up-front (super().create runs first); only the
-    # auto-start fails. Different views surface this as 200 (with error
-    # container_info) or 500 (config error response). Either way a record exists.
-    assert resp.status_code in (
-        status.HTTP_200_OK, status.HTTP_201_CREATED, status.HTTP_500_INTERNAL_SERVER_ERROR
-    )
+    # log_clustering 在 URI 为空时直接 500，不回写 container_info；其余算法保记录并返回启动失败文案。
+    if suffix == "log_clustering":
+        assert resp.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        assert resp.data["error"] == "系统配置错误，请联系管理员"
+    else:
+        assert resp.status_code in (status.HTTP_200_OK, status.HTTP_201_CREATED)
+        assert resp.data["message"] == "服务已创建但启动失败：环境变量未配置"
+        assert resp.data["container_info"]["message"] == "环境变量 MLFLOW_TRACKER_URL 未配置"
     assert Serving.objects.count() == 1
 
 

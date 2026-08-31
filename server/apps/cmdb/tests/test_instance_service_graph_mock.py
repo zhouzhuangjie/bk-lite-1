@@ -41,6 +41,24 @@ def test_query_entity_by_id(fake_graph):
 
 
 @pytest.mark.django_db
+def test_query_entity_by_identity_empty_unique_and_typed(fake_graph):
+    assert InstanceManage.query_entity_by_identity("host", {}) == {}
+    fake_graph(
+        "apps.cmdb.services.instance",
+        query_entity=([{"_id": 1, "inst_name": "h1"}], 1),
+    )
+    out = InstanceManage.query_entity_by_identity("host", {"inst_name": "h1", "rack": 3, "online": True})
+    assert out["_id"] == 1
+
+    fake_graph(
+        "apps.cmdb.services.instance",
+        query_entity=([{"_id": 1}, {"_id": 2}], 2),
+    )
+    with pytest.raises(BaseAppException, match="identity 查询结果不唯一"):
+        InstanceManage.query_entity_by_identity("host", {"inst_name": "dup"})
+
+
+@pytest.mark.django_db
 def test_query_entity_by_ids(fake_graph):
     fake_graph("apps.cmdb.services.instance", query_entity_by_ids=[{"_id": 1}, {"_id": 2}])
     out = InstanceManage.query_entity_by_ids([1, 2])

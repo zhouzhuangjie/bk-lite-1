@@ -199,6 +199,48 @@ class TestQueryMonitorDataByMetric:
         # 只保留有权限实例 ('h1',)
         assert ids == {"('h1',)"}
 
+    def test_empty_query_and_unauthorized_instances_and_exception(self, mocker):
+        obj, metric = self._setup()
+        metric.query = ""
+        metric.save(update_fields=["query"])
+        mocker.patch("apps.monitor.nats.monitor.get_permission_rules", return_value={"team": [1]})
+        mocker.patch(
+            "apps.monitor.nats.monitor.permission_filter",
+            side_effect=lambda model, perm, **kw: model.objects.all(),
+        )
+        empty = nm.query_monitor_data_by_metric(
+            {"monitor_obj_id": obj.id, "metric": "cpu", "start": 1, "end": 2},
+            user_info={"user": SimpleNamespace(username="u", domain="d"), "team": 1},
+        )
+        assert empty["result"] is False
+        assert empty["message"] == "指标查询语句为空"
+
+        metric.query = "cpu{__$labels__}"
+        metric.save(update_fields=["query"])
+        denied = nm.query_monitor_data_by_metric(
+            {
+                "monitor_obj_id": obj.id,
+                "metric": "cpu",
+                "start": 1,
+                "end": 2,
+                "instance_ids": ["('ghost',)"],
+            },
+            user_info={"user": SimpleNamespace(username="u", domain="d"), "team": 1},
+        )
+        assert denied["result"] is False
+        assert denied["message"] == "没有权限访问指定的实例"
+
+        mocker.patch(
+            "apps.monitor.nats.monitor.Metrics.get_metrics_range",
+            side_effect=RuntimeError("vm down"),
+        )
+        failed = nm.query_monitor_data_by_metric(
+            {"monitor_obj_id": obj.id, "metric": "cpu", "start": 1, "end": 2},
+            user_info={"user": SimpleNamespace(username="u", domain="d"), "team": 1},
+        )
+        assert failed["result"] is False
+        assert failed["message"] == "查询指标数据失败: vm down"
+
 
 class TestMonitorInstanceMetrics:
     def test_missing_field(self):
@@ -256,6 +298,45 @@ class TestMonitorInstanceMetrics:
         )
         assert out["result"] is False
 
+    def test_only_with_data_skips_empty_and_keeps_series(self, mocker):
+        obj = MonitorObject.objects.create(name="MIMObj3", level="base")
+        plugin = MonitorPlugin.objects.create(name="MIMPlugin3")
+        group = MetricGroup.objects.create(monitor_object=obj, monitor_plugin=plugin, name="g")
+        Metric.objects.create(
+            monitor_object=obj, monitor_plugin=plugin, metric_group=group,
+            name="empty", display_name="E", query="",
+        )
+        Metric.objects.create(
+            monitor_object=obj, monitor_plugin=plugin, metric_group=group,
+            name="cpu", display_name="CPU", query="cpu{}",
+        )
+        Metric.objects.create(
+            monitor_object=obj, monitor_plugin=plugin, metric_group=group,
+            name="disk", display_name="DISK", query="disk{}",
+        )
+        MonitorInstance.objects.create(
+            id="('h1',)", name="h1", monitor_object=obj, is_active=True, is_deleted=False,
+        )
+        mocker.patch("apps.monitor.nats.monitor.get_permission_rules", return_value={"team": [1]})
+        mocker.patch(
+            "apps.monitor.nats.monitor.permission_filter",
+            side_effect=lambda model, perm, **kw: model.objects.all(),
+        )
+
+        class _VM:
+            def query_range(self, query, start, end, step):
+                if "cpu" in query:
+                    return {"status": "success", "data": {"result": [{"values": [[1, "1"]]}]}}
+                raise RuntimeError("vm timeout")
+
+        mocker.patch("apps.monitor.nats.monitor.VictoriaMetricsAPI", return_value=_VM())
+        out = nm.monitor_instance_metrics(
+            {"monitor_obj_id": obj.id, "instance_id": "('h1',)", "only_with_data": True, "lookback": "5m"},
+            user_info={"user": SimpleNamespace(username="u", domain="d"), "team": 1},
+        )
+        assert out["result"] is True
+        assert [item["metric"] for item in out["data"]["items"]] == ["cpu"]
+
 
 class TestQueryMonitorAlertSegments:
     def test_missing_field(self):
@@ -304,6 +385,37 @@ class TestQueryMonitorAlertSegments:
         }, user_info={"user": SimpleNamespace(username="u", domain="d"), "team": 1})
         assert out["result"] is True
         assert out["data"]["count"] == 1
+
+    def test_page_size_and_instance_ids_guards(self, mocker):
+        too_big = nm.query_monitor_alert_segments({
+            "monitor_obj_id": 1, "start": "2026-01-01 00:00:00", "end": "2026-01-02 00:00:00",
+            "page_size": 501,
+        })
+        assert too_big["result"] is False
+        assert "page_size" in too_big["message"]
+
+        not_list = nm.query_monitor_alert_segments({
+            "monitor_obj_id": 1, "start": "2026-01-01 00:00:00", "end": "2026-01-02 00:00:00",
+            "instance_ids": "h1",
+        })
+        assert not_list["result"] is False
+        assert not_list["message"] == "instance_ids 必须是列表"
+
+        obj = MonitorObject.objects.create(name="QMASObj3", level="base")
+        MonitorInstance.objects.create(
+            id="('h1',)", name="h1", monitor_object=obj, is_active=True, is_deleted=False,
+        )
+        mocker.patch("apps.monitor.nats.monitor.get_permission_rules", return_value={"team": [1]})
+        mocker.patch(
+            "apps.monitor.nats.monitor.permission_filter",
+            side_effect=lambda model, perm, **kw: model.objects.all(),
+        )
+        denied = nm.query_monitor_alert_segments({
+            "monitor_obj_id": obj.id, "start": "2026-01-01 00:00:00", "end": "2026-01-02 00:00:00",
+            "instance_ids": ["('ghost',)"],
+        }, user_info={"user": SimpleNamespace(username="u", domain="d"), "team": 1})
+        assert denied["result"] is False
+        assert denied["message"] == "没有权限访问指定的实例"
 
 
 class TestBuildMonitorAlertSegment:

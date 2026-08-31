@@ -113,3 +113,60 @@ class TestResolveAllowWrite:
 
     def test_default_false(self):
         assert cu._resolve_allow_write({}, allow_write=None) is False
+
+
+class TestGetUserFromConfigAndTeam:
+    def test_user_id_required_and_must_be_int(self):
+        with pytest.raises(ValueError, match="user_id is required"):
+            cu._get_user_from_config({})
+        with pytest.raises(ValueError, match="user_id must be an integer"):
+            cu._get_user_from_config({"configurable": {"user_id": "abc"}})
+
+    def test_user_id_not_found(self, monkeypatch):
+        class _QS:
+            def filter(self, **kwargs):
+                return self
+
+            def first(self):
+                return None
+
+        monkeypatch.setattr(cu, "get_user_model", lambda: SimpleNamespace(objects=_QS()))
+        with pytest.raises(ValueError, match="user_id not found"):
+            cu._get_user_from_config({"configurable": {"user_id": "9"}})
+
+    def test_resolve_team_from_group_or_default(self, monkeypatch):
+        team, include = cu._resolve_team_context(SimpleNamespace(group_list=[{"id": 7}]), {}, None, None)
+        assert team == 7
+        assert include is False
+        monkeypatch.setattr(cu, "get_default_group_id", lambda: [3])
+        team, include = cu._resolve_team_context(SimpleNamespace(group_list=[]), {}, None, True)
+        assert team == 3
+        assert include is True
+        team, include = cu._resolve_team_context(
+            SimpleNamespace(group_list=[]), {"configurable": {"team_id": 8, "include_children": True}}, None, None
+        )
+        assert team == 8
+        assert include is True
+
+
+class TestPermissionGuards:
+    def test_ensure_instance_permission_skips_creator(self):
+        cu.ensure_instance_permission(SimpleNamespace(username="alice"), {"_creator": "alice", "_id": 1}, {}, "View")
+
+    def test_ensure_instance_and_model_denied(self, monkeypatch):
+        monkeypatch.setattr(cu.CmdbRulesFormatUtil, "has_object_permission", staticmethod(lambda **k: False))
+        monkeypatch.setattr(cu, "get_default_group_id", lambda: [1])
+        with pytest.raises(ValueError, match="insufficient instance permission"):
+            cu.ensure_instance_permission(SimpleNamespace(username="bob"), {"_id": 9, "model_id": "host"}, {}, "View")
+        with pytest.raises(ValueError, match="insufficient model permission"):
+            cu.ensure_model_permission(SimpleNamespace(), {"model_id": "host"}, {}, "View")
+
+    def test_build_user_groups_falls_back_to_current_team(self, monkeypatch):
+        monkeypatch.setattr(cu, "_get_user_group_ids", lambda user: [])
+        monkeypatch.setattr(cu, "format_groups_params", lambda ids: [{"id": i} for i in ids])
+        assert cu.build_user_groups(SimpleNamespace(), 5, False) == [{"id": 5}]
+        monkeypatch.setattr(
+            cu.GroupUtils, "get_user_authorized_child_groups", staticmethod(lambda *a, **k: [5, 6])
+        )
+        monkeypatch.setattr(cu, "_get_user_group_ids", lambda user: [5])
+        assert cu.build_user_groups(SimpleNamespace(), 5, True) == [{"id": 5}, {"id": 6}]

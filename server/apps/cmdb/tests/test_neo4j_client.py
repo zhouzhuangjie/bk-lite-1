@@ -305,3 +305,109 @@ def test_create_node():
     edges = [{"src_inst_id": 1, "dst_inst_id": 2, "model_asst_id": "conn", "asst_id": "a1"}]
     node = c.create_node(entity, edges, entities, entity_is_src=True)
     assert node["children"][0]["_id"] == 2
+
+
+def test_query_entity_with_creator_or_permission_and_paging():
+    class CountRecord(dict):
+        pass
+
+    class PagingSession(FakeSession):
+        def run(self, query, *args, **kwargs):
+            self.last_query = query
+            self.last_params = kwargs
+            if "COUNT(n)" in query:
+                return FakeRunResult([CountRecord(count=2)])
+            return FakeRunResult(self._records)
+
+    node = FakeNode(1, ["instance"], {"inst_name": "h1"})
+    c = _client([(node,)])
+    c.session = PagingSession([(node,)])
+    result, count = c.query_entity(
+        label="instance",
+        params=[{"field": "model_id", "type": "str=", "value": "host"}],
+        page={"skip": 0, "limit": 10},
+        order="inst_name",
+        permission_or_creator_filter={"inst_names": ["h1"], "creator": "alice"},
+        permission_params="n.org = 1",
+    )
+    assert count == 2
+    assert result[0]["inst_name"] == "h1"
+    assert "n.inst_name IN" in c.session.last_query
+    assert "ORDER BY n.inst_name" in c.session.last_query
+    assert "SKIP 0 LIMIT 10" in c.session.last_query
+
+
+def test_query_entity_by_ids_and_inst_names():
+    n1 = FakeNode(1, ["instance"], {"inst_name": "h1"})
+    n2 = FakeNode(2, ["instance"], {"inst_name": "h2"})
+    c = _client([(n1,), (n2,)])
+    rows = c.query_entity_by_ids([1, 2])
+    assert [row["_id"] for row in rows] == [1, 2]
+
+    named = c.query_entity_by_inst_names(["h1"], model_id="host")
+    assert "inst_name" in c.session.last_query
+    assert named[0]["inst_name"] == "h1"
+
+
+def test_format_instance_permission_params_combines_model_and_creator():
+    clause = Neo4jClient.format_instance_permission_params(
+        [{"model_id": "host", "inst_names": ["h1", "h2"]}],
+        created="alice",
+    )
+    assert "n.model_id = 'host'" in clause
+    assert "h1" in clause
+    assert "n._creator = 'alice'" in clause
+    empty = Neo4jClient.format_instance_permission_params([], created="alice")
+    assert empty == ""
+
+
+def test_batch_update_node_properties_rejects_empty_and_sets_values():
+    c = _client()
+    with pytest.raises(BaseAppException):
+        c.batch_update_node_properties("instance", [1], {})
+    node = FakeNode(1, ["instance"], {"inst_name": "h1"})
+    c = _client([(node,)])
+    rows = list(c.batch_update_node_properties("instance", [1], {"inst_name": "h2", "count": 3}))
+    assert "SET" in c.session.last_query
+    assert rows
+
+
+def test_set_entity_properties_skips_check_when_disabled():
+    node = FakeNode(1, ["instance"], {"inst_name": "h1"})
+    c = _client([(node,)])
+    out = c.set_entity_properties(
+        "instance",
+        [1],
+        {"inst_name": "h1"},
+        check_attr_map={},
+        exist_items=[],
+        check=False,
+    )
+    assert out[0]["_id"] == 1
+
+
+def test_remove_entitys_properties_and_set_edge_properties():
+    c = _client()
+    c.remove_entitys_properties("instance", [{"field": "model_id", "type": "str=", "value": "host"}], ["stale"])
+    assert "REMOVE" in c.session.last_query
+
+    rel = FakeRel(5, "connects", {"model_asst_id": "conn"})
+    c = _client([(rel,)])
+    edge = c.set_edge_properties(5, {"weight": 1})
+    assert edge["_id"] == 5
+    with pytest.raises(BaseAppException):
+        c.set_edge_properties(5, {})
+
+
+def test_convert_to_cypher_match_uses_default_without_topo_config(monkeypatch):
+    c = _client()
+    monkeypatch.setattr(Neo4jClient, "get_topo_config", staticmethod(lambda: {}))
+    cypher = c.convert_to_cypher_match(":instance", "host", "AND n.org=1", dst=True)
+    assert "MATCH p=" in cypher
+    assert "RETURN p" in cypher
+
+
+def test_query_entity_by_id_missing_returns_empty():
+    c = _client([])
+    assert c.query_entity_by_id(1) == {}
+

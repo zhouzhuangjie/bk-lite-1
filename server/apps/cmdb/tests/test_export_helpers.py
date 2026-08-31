@@ -130,3 +130,114 @@ def test_export_inst_list_empty():
     stream = Export(_ATTRS, model_id="host").export_inst_list([])
     data = stream.read()
     assert data[:2] == b"PK"
+
+
+def test_generate_header_skips_file_attr_and_appends_association(mocker):
+    mocker.patch("apps.cmdb.utils.export.is_file_attr_type", side_effect=lambda t: t == "file")
+    mocker.patch(
+        "apps.cmdb.utils.export.ModelManage.search_model",
+        return_value=[{"model_id": "app", "model_name": "应用"}],
+    )
+    attrs = [
+        {"attr_id": "inst_name", "attr_name": "实例名", "attr_type": "str"},
+        {"attr_id": "blob", "attr_name": "附件", "attr_type": "file"},
+    ]
+    association = [
+        {"asst_id": "belong", "dst_model_id": "app", "src_model_id": "host", "model_asst_id": "host_belong_app"},
+    ]
+    wb = Export(attrs, model_id="host", association=association).generate_header()
+    names = [c.value for c in wb.active[1]]
+    ids = [c.value for c in wb.active[3]]
+    assert "附件" not in names
+    assert "关联-属于-应用" in names
+    assert "host_belong_app" in ids
+
+
+def test_export_inst_list_formats_user_org_tag_and_table():
+    attrs = [
+        {
+            "attr_id": "operator",
+            "attr_name": "维护人",
+            "attr_type": "user",
+            "option": [
+                {"id": "u1", "username": "alice", "display_name": "张三", "name": "张三"},
+                {"id": "u2", "username": "bob", "name": "bob"},
+            ],
+        },
+        {
+            "attr_id": "owner",
+            "attr_name": "负责人",
+            "attr_type": "user",
+            "option": [{"id": "u3", "username": "carol", "display_name": "李四", "name": "李四"}],
+        },
+        {
+            "attr_id": "org",
+            "attr_name": "组织",
+            "attr_type": "organization",
+            "option": [{"id": 1, "name": "运维部"}],
+        },
+        {"attr_id": "tags", "attr_name": "标签", "attr_type": "tag"},
+        {"attr_id": "meta", "attr_name": "元数据", "attr_type": "table"},
+        {"attr_id": "status", "attr_name": "状态", "attr_type": "enum", "option": [{"id": "1", "name": "运行"}]},
+    ]
+    inst_list = [
+        {
+            "_id": 1,
+            "operator": ["u1", "missing", ""],
+            "owner": "u3",
+            "org": [1],
+            "tags": "env:prod",
+            "meta": [{"k": "v"}],
+            "status": ["1"],
+        },
+        {
+            "_id": 2,
+            "operator": "u2",
+            "owner": "gone",
+            "org": [],
+            "tags": None,
+            "meta": "",
+            "status": "1",
+        },
+    ]
+    stream = Export(attrs, model_id="host").export_inst_list(inst_list)
+    wb = openpyxl.load_workbook(stream)
+    rows = list(wb.active.iter_rows(min_row=4, values_only=True))
+    assert rows[0][1] == "张三(alice),missing"
+    assert rows[0][2] == "李四"
+    assert rows[0][3] == "运维部"
+    assert rows[0][4] == "env:prod"
+    assert rows[0][5] == '[{"k": "v"}]'
+    assert rows[0][6] == "运行"
+    assert rows[1][1] == "bob"
+    assert rows[1][2] == "None"
+    assert not rows[1][3]
+    assert not rows[1][4]
+    assert not rows[1][5]
+    assert rows[1][6] == "运行"
+
+
+def test_format_inst_asst_name_appends_selected_associations(mocker):
+    mocker.patch(
+        "apps.cmdb.utils.export.ModelManage.search_model",
+        return_value=[{"model_id": "app", "model_name": "应用"}],
+    )
+    mocker.patch(
+        "apps.cmdb.services.instance.InstanceManage.instance_association_instance_list",
+        return_value=[{"model_asst_id": "host_belong_app", "inst_list": [{"inst_name": "app-1"}, {"inst_name": "app-2"}]}],
+    )
+    exporter = Export(
+        [{"attr_id": "inst_name", "attr_name": "实例名", "attr_type": "str"}],
+        model_id="host",
+        association=[{"asst_id": "belong", "dst_model_id": "app", "src_model_id": "host", "model_asst_id": "host_belong_app"}],
+    )
+    sheet_data = [""]
+    exporter.format_inst_asst_name({"_id": 9}, sheet_data)
+    assert sheet_data[-1] == "app-1,app-2"
+    sheet_empty = [""]
+    mocker.patch(
+        "apps.cmdb.services.instance.InstanceManage.instance_association_instance_list",
+        return_value=[],
+    )
+    exporter.format_inst_asst_name({"_id": 9}, sheet_empty)
+    assert sheet_empty[-1] == ""

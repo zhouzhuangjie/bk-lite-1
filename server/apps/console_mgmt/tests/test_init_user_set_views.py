@@ -66,7 +66,7 @@ class TestInitUserSetGroupNameRequired:
         )
         body = json.loads(resp.content)
         assert body["result"] is False
-        assert "group_name" in body.get("message", "").lower() or body["result"] is False
+        assert body["message"] == "group_name is required"
 
     def test_group_name为空字符串返回400(self):
         """group_name 存在但为空字符串，也属于无效值，应返回 400。"""
@@ -109,3 +109,28 @@ class TestInitUserSetGroupNameRequired:
         mock_rpc_instance.init_user_default_attributes.assert_called_once_with(99, "DevTeam", 1)
         body = json.loads(resp.content)
         assert body["result"] is True
+
+
+class TestInitUserSetGuards:
+    def test_invalid_json_returns_business_error(self):
+        factory = RequestFactory()
+        req = factory.post(INIT_URL, data="{not-json", content_type="application/json")
+        req.user = MagicMock(locale="en", group_list=[{"id": 1, "name": "OpsPilotGuest"}])
+        resp = init_user_set(req)
+        body = json.loads(resp.content)
+        assert body["result"] is False
+        assert body["message"] == "Invalid JSON format"
+
+    def test_not_first_login_when_multiple_groups(self):
+        req = _make_request({"group_name": "x"}, group_list=[{"id": 1, "name": "OpsPilotGuest"}, {"id": 2, "name": "other"}])
+        resp = init_user_set(req)
+        body = json.loads(resp.content)
+        assert body["result"] is False
+        assert "initialized" in body["message"].lower()
+
+    def test_not_guest_group_is_rejected(self):
+        req = _make_request({"group_name": "x"}, group_list=[{"id": 1, "name": "Dev"}])
+        resp = init_user_set(req)
+        body = json.loads(resp.content)
+        assert body["result"] is False
+

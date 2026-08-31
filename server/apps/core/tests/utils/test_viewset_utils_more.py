@@ -301,3 +301,58 @@ class TestFilterByGroup:
         assert include_children is True
         # org_field "team" 不在 Group 字段中 -> query 为空 Q（走 else 分支也可），仅断言不抛异常
         assert current_team == 1
+
+
+# ---------------------------------------------------------------------------
+# get_detail / destroy 权限
+# ---------------------------------------------------------------------------
+
+
+class TestAuthViewSetDetailAndDestroy:
+    def test_get_detail_returns_json_error_without_view_permission(self):
+        import json
+        from django.http import JsonResponse
+
+        vs = _auth_vs(permission_key="probe")
+        instance = SimpleNamespace(id=8, team=[1])
+        vs.get_object = lambda: instance
+        request = SimpleNamespace(
+            user=SimpleNamespace(is_superuser=False, group_list=[{"id": 1}]),
+            COOKIES={"include_children": "0"},
+        )
+        with (
+            patch.object(vs, "_parse_current_team_cookie", return_value=1),
+            patch.object(vs, "get_has_permission", return_value=False) as has_perm,
+        ):
+            resp = vs.get_detail(request)
+        has_perm.assert_called_once()
+        assert has_perm.call_args.kwargs["is_check"] is True
+        assert isinstance(resp, JsonResponse)
+        body = json.loads(resp.content)
+        assert body["result"] is False
+        assert body["message"] == "User does not have permission to view this instance"
+
+    def test_destroy_returns_json_error_without_operate_permission(self):
+        import json
+        from django.http import JsonResponse
+
+        vs = _auth_vs(permission_key="probe")
+        instance = SimpleNamespace(id=8, team=[1])
+        vs.get_object = lambda: instance
+        request = SimpleNamespace(
+            user=SimpleNamespace(is_superuser=False, group_list=[{"id": 1}]),
+            COOKIES={"include_children": "0"},
+        )
+        with (
+            patch.object(vs, "_parse_current_team_cookie", return_value=1),
+            patch.object(vs, "get_has_permission", return_value=False) as has_perm,
+            patch("rest_framework.viewsets.ModelViewSet.destroy") as super_destroy,
+        ):
+            resp = vs.destroy(request)
+        has_perm.assert_called_once()
+        assert "is_check" not in has_perm.call_args.kwargs
+        super_destroy.assert_not_called()
+        assert isinstance(resp, JsonResponse)
+        body = json.loads(resp.content)
+        assert body["result"] is False
+        assert body["message"] == "User does not have permission to delete this instance"

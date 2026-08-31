@@ -51,8 +51,8 @@ class KnowledgeGraphViewSet(MaintainerViewSet):
             data = response.data
             kb = KnowledgeBase.objects.filter(id=data.get("knowledge_base_id") or request.data.get("knowledge_base_id")).first()
             kb_name = kb.name if kb else str(request.data.get("knowledge_base_id"))
-            graph_name = data.get("name", request.data.get("name", ""))
-            log_operation(request, "create", "opspilot", f"创建知识库（{kb_name}）的知识图谱: {graph_name}")
+            graph_id = data.get("id", "")
+            log_operation(request, "create", "opspilot", f"创建知识库（{kb_name}）的知识图谱: #{graph_id}")
         return response
 
     @HasPermission("knowledge_document-Set")
@@ -61,7 +61,7 @@ class KnowledgeGraphViewSet(MaintainerViewSet):
         response = super().partial_update(request, *args, **kwargs)
         if response.status_code == 200:
             kb_name = obj.knowledge_base.name if obj.knowledge_base else str(obj.knowledge_base_id)
-            log_operation(request, "update", "opspilot", f"更新知识库（{kb_name}）的知识图谱: {obj.name}")
+            log_operation(request, "update", "opspilot", f"更新知识库（{kb_name}）的知识图谱: #{obj.id}")
         return response
 
     @action(methods=["GET"], detail=False)
@@ -121,10 +121,10 @@ class KnowledgeGraphViewSet(MaintainerViewSet):
             GraphUtils.delete_graph(instance)
         except Exception as e:
             return JsonResponse({"result": False, "message": str(e)}, status=500)
-        graph_name = instance.name
+        graph_id = instance.id
         kb_name = knowledge_base.name
         instance.delete()
-        log_operation(request, "delete", "opspilot", f"删除知识库（{kb_name}）的知识图谱: {graph_name}")
+        log_operation(request, "delete", "opspilot", f"删除知识库（{kb_name}）的知识图谱: #{graph_id}")
         return JsonResponse({"result": True})
 
     @action(methods=["POST"], detail=False)

@@ -818,6 +818,9 @@ def test_execute_query_invalidates_pool_after_graph_error(monkeypatch):
             raise ConnectionError("connection closed")
 
     class FakeFalkorDB:
+        def __init__(self, *args, **kwargs):
+            pass
+
         def select_graph(self, name):
             return FakeGraph(FakeResultSet([], []))
 
@@ -886,3 +889,59 @@ def test_format_properties_set_valid_key_passes():
     out = c.format_properties_set({"inst_name": "host2", "count": 3})
     assert "n.inst_name='host2'" in out
     assert "n.count=3" in out
+
+
+def test_convert_to_cypher_match_default_and_configured_path():
+    c = _client()
+    c.get_topo_config = lambda: {}
+    default = c.convert_to_cypher_match(":instance", "host", "AND n.org=1", dst=True)
+    assert "MATCH p=" in default
+    assert "RETURN p" in default
+
+    c.get_topo_config = lambda: {
+        "k8s_cluster": {
+            "dst": [{"self_obj": "k8s_cluster", "target_obj": "k8s_node", "assoc": "contains"}],
+            "src": [],
+        }
+    }
+    configured = c.convert_to_cypher_match(":instance", "k8s_cluster", "AND n.org=1", dst=True)
+    assert "contains" in configured
+    assert "k8s_node" in configured
+    empty_edge = c.convert_to_cypher_match(":instance", "k8s_cluster", "AND n.org=1", dst=False)
+    assert empty_edge.startswith("MATCH p=")
+
+
+def test_format_topo_lite_excludes_parent_and_self_edges():
+    class PathEl:
+        def __init__(self, nodes, edges):
+            self._nodes = nodes
+            self._edges = edges
+
+    n1 = FakeNode(1, ["instance"], {"name": "root", "model_id": "host"})
+    n2 = FakeNode(2, ["instance"], {"name": "child", "model_id": "nic"})
+    n3 = FakeNode(3, ["instance"], {"name": "skip", "model_id": "nic"})
+
+    class Rel:
+        def __init__(self, rid, src, dst):
+            self.id = rid
+            self.relation = "connect"
+            self.properties = {"src_inst_id": src, "dst_inst_id": dst}
+
+    objs = FakeResultSet(
+        [],
+        [
+            [
+                PathEl(
+                    [n1, n2, n3],
+                    [Rel(10, 1, 2), Rel(11, 1, 1), Rel(12, 1, 3)],
+                )
+            ]
+        ],
+    )
+    c = _client()
+    tree = c.format_topo_lite(1, objs, entity_is_src=True, depth=3, exclude_ids=[3, "x"])
+    assert tree["_id"] == 1
+    child_ids = [ch["_id"] for ch in tree["children"]]
+    assert 2 in child_ids
+    assert 3 not in child_ids
+

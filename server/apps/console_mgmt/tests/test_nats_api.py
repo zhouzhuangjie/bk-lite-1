@@ -48,3 +48,14 @@ def test_message恰好等于上限放行():
     msg = "y" * MAX_MESSAGE_LENGTH
     out = create_notification("cmdb", msg)
     assert out == {"result": True}
+
+
+def test_create_notification_wraps_unexpected_errors(monkeypatch):
+    monkeypatch.setattr(
+        "apps.console_mgmt.nats_api.Notification.objects.create",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("db down")),
+    )
+    out = create_notification("monitor", "x")
+    assert out["result"] is False
+    assert "db down" in out["message"]
+

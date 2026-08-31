@@ -129,3 +129,68 @@ class TestBuildNormalizedFromRunnable:
         out = kc.build_kubernetes_normalized_from_runnable(cfg, instance_name="B")
         assert out["mode"] == "single"
         assert out["items"][0]["name"] == "B"
+
+    def test_legacy_flat_config_when_no_instances(self, mocker):
+        mocked = mocker.patch(
+            "apps.opspilot.metis.llm.tools.kubernetes.connection.normalize_credentials",
+            return_value={"mode": "single", "legacy_single": True},
+        )
+        out = kc.build_kubernetes_normalized_from_runnable({"configurable": {"kubeconfig_data": "kc"}})
+        assert out == {"mode": "single", "legacy_single": True}
+        mocked.assert_called_once()
+
+
+class TestResolveKubeconfigFallbacks:
+    def test_skips_non_dict_kubeconfig_then_not_found(self):
+        instances = [{"id": "i1", "name": "Display", "kubeconfig_data": yaml.safe_dump(["not-a-map"])}]
+        with pytest.raises(ValueError, match="not found: ghost"):
+            kc.resolve_kubernetes_instance(instances, instance_name="ghost")
+
+    def test_skips_yaml_parse_error_then_not_found(self, mocker):
+        mocker.patch(
+            "apps.opspilot.metis.llm.tools.kubernetes.connection.yaml.safe_load",
+            side_effect=yaml.YAMLError("bad"),
+        )
+        instances = [{"id": "i1", "name": "Display", "kubeconfig_data": "not: [yaml"}]
+        with pytest.raises(ValueError, match="not found: ctx"):
+            kc.resolve_kubernetes_instance(instances, instance_name="ctx")
+
+
+class TestKubernetesCredentialAdapter:
+    def test_flat_item_validate_and_display_name(self):
+        adapter = kc.KubernetesCredentialAdapter()
+        assert adapter.build_from_flat_config({"kubeconfig_data": "kc"}) == {"kubeconfig_data": "kc"}
+        assert adapter.build_from_credential_item({"kubeconfig_data": "item-kc"}) == {"kubeconfig_data": "item-kc"}
+        assert adapter.validate({}) is None
+        assert adapter.get_display_name({"name": "prod"}, 0) == "prod"
+        assert adapter.get_display_name({}, 2) == "Kubernetes - 3"
+
+
+class TestKubernetesInstanceProbe:
+    def test_loads_provided_kubeconfig(self, mocker):
+        mocker.patch(
+            "apps.opspilot.metis.llm.tools.kubernetes.utils.validate_kubeconfig_api_servers"
+        )
+        mocker.patch(
+            "apps.opspilot.metis.llm.tools.kubernetes.utils._preprocess_kubeconfig",
+            return_value="apiVersion: v1",
+        )
+        kube_config = mocker.patch("kubernetes.config.load_kube_config")
+        v1 = mocker.MagicMock()
+        mocker.patch("kubernetes.client.CoreV1Api", return_value=v1)
+        assert kc.test_kubernetes_instance({"kubeconfig_data": "apiVersion: v1\\nkind: Config"}) is True
+        kube_config.assert_called_once()
+        v1.list_namespace.assert_called_once_with()
+
+    def test_falls_back_to_incluster_when_default_kubeconfig_missing(self, mocker):
+        kube_config = mocker.patch(
+            "kubernetes.config.load_kube_config",
+            side_effect=FileNotFoundError("no kubeconfig"),
+        )
+        incluster = mocker.patch("kubernetes.config.load_incluster_config")
+        v1 = mocker.MagicMock()
+        mocker.patch("kubernetes.client.CoreV1Api", return_value=v1)
+        assert kc.test_kubernetes_instance({}) is True
+        assert kube_config.call_count == 1
+        incluster.assert_called_once_with()
+        v1.list_namespace.assert_called_once_with()

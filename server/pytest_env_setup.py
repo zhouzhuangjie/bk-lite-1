@@ -1,23 +1,20 @@
 """Early pytest plugin to configure environment before Django setup.
 
-Registered as a pytest11 entry point in pyproject.toml.
-This ensures INSTALL_APPS is set before pytest-django calls django.setup(),
-excluding apps with heavy optional dependencies (e.g., mlops requires mlflow).
-Also patches django_minio_backend to avoid connecting to MinIO during tests.
+Registered as a pytest11 entry point in pyproject.toml so it loads before
+pytest-django calls django.setup(). Supplies dummy MinIO settings and skips
+bucket initialization so tests do not need a live object store.
 """
 import os
 
-os.environ.setdefault(
-    "INSTALL_APPS",
-    "system_mgmt,alerts,console_mgmt,job_mgmt,log,"
-    "monitor,node_mgmt,operation_analysis,opspilot,cmdb",
-)
+import django.core.management as mgmt
 
-# Prevent django_minio_backend.apps.ready() from calling
-# call_command('initialize_buckets') which connects to MinIO.
-# We hook into django.apps.AppConfig.ready via import-time patching:
-# override the management module's call_command before django.setup() runs.
-_original_call_command = None
+os.environ.setdefault("MINIO_ENDPOINT", "localhost:9000")
+os.environ.setdefault("MINIO_ACCESS_KEY", "test-access-key")
+os.environ.setdefault("MINIO_SECRET_KEY", "test-secret-key")
+os.environ.setdefault("MINIO_USE_HTTPS", "false")
+os.environ.setdefault("ENABLE_CELERY", "True")
+
+_original_call_command = mgmt.call_command
 
 
 def _noop_initialize_buckets(name, *args, **kwargs):
@@ -26,9 +23,5 @@ def _noop_initialize_buckets(name, *args, **kwargs):
     return _original_call_command(name, *args, **kwargs)
 
 
-def pytest_configure(config):
-    """Patch call_command before django.setup() to skip MinIO initialization."""
-    global _original_call_command
-    import django.core.management as mgmt
-    _original_call_command = mgmt.call_command
-    mgmt.call_command = _noop_initialize_buckets
+# Import-time patch: must run before django.setup() initializes MinIO buckets.
+mgmt.call_command = _noop_initialize_buckets

@@ -398,6 +398,103 @@ class TestQueryPatterns:
             out = json.loads(ana.analyze_query_patterns.invoke({"config": CONFIG}))
         assert "performance_schema 不可用" in out["error"]
 
+    def test_generic_error_passthrough(self):
+        conn = MagicMock()
+        cur = MagicMock()
+        cur.execute.side_effect = Error("access denied")
+        conn.cursor.return_value = cur
+        with _patch_conn(ana, conn):
+            out = json.loads(ana.analyze_query_patterns.invoke({"config": CONFIG}))
+        assert out["error"] == "access denied"
+        conn.close.assert_called_once()
+
+
+# ---------------- analysis.analyze_buffer_pool_usage error ----------------
+class TestBufferPoolAnalysisError:
+    def test_connector_error_passthrough_and_closes(self):
+        conn = MagicMock()
+        cur = MagicMock()
+        cur.execute.side_effect = Error("lost connection")
+        conn.cursor.return_value = cur
+        with _patch_conn(ana, conn):
+            out = json.loads(ana.analyze_buffer_pool_usage.invoke({"config": CONFIG}))
+        assert out["error"] == "lost connection"
+        conn.close.assert_called_once()
+
+
+# ---------------- analysis.analyze_table_statistics ----------------
+class TestTableStatistics:
+    def test_read_write_ratio_and_default_database(self):
+        desc = _desc(
+            "OBJECT_NAME",
+            "COUNT_READ",
+            "COUNT_WRITE",
+            "COUNT_FETCH",
+            "COUNT_INSERT",
+            "COUNT_UPDATE",
+            "COUNT_DELETE",
+        )
+        rows = [
+            ("hot", 20, 10, 20, 4, 3, 3),  # ratio 2.0
+            ("idle", 0, 0, 0, 0, 0, 0),  # ratio 0
+        ]
+        conn = FakeConn([(lambda s: "table_io_waits_summary_by_table" in s, (desc, rows))])
+        with _patch_conn(ana, conn):
+            out = json.loads(ana.analyze_table_statistics.invoke({"config": CONFIG}))
+        assert out["total_count"] == 2
+        assert out["tables"][0] == {
+            "table_name": "hot",
+            "count_read": 20,
+            "count_write": 10,
+            "count_fetch": 20,
+            "count_insert": 4,
+            "count_update": 3,
+            "count_delete": 3,
+            "total_ops": 30,
+            "read_write_ratio": 2.0,
+        }
+        assert out["tables"][1]["read_write_ratio"] == 0
+        # 未传 database 时默认查询 mysql schema
+        executed_params = [params for sql, params in conn.cursors[-1].executed if params]
+        assert executed_params[-1] == ("mysql",)
+        assert conn.closed is True
+
+    def test_read_only_table_ratio_is_infinity(self):
+        desc = _desc(
+            "OBJECT_NAME",
+            "COUNT_READ",
+            "COUNT_WRITE",
+            "COUNT_FETCH",
+            "COUNT_INSERT",
+            "COUNT_UPDATE",
+            "COUNT_DELETE",
+        )
+        rows = [("ro", 8, 0, 8, 0, 0, 0)]
+        conn = FakeConn([(lambda s: "table_io_waits_summary_by_table" in s, (desc, rows))])
+        with _patch_conn(ana, conn):
+            raw = ana.analyze_table_statistics.invoke({"database": "app", "config": CONFIG})
+        assert '"read_write_ratio": Infinity' in raw
+
+    def test_performance_schema_unavailable_translated(self):
+        conn = MagicMock()
+        cur = MagicMock()
+        cur.execute.side_effect = Error("performance_schema.table_io_waits missing")
+        conn.cursor.return_value = cur
+        with _patch_conn(ana, conn):
+            out = json.loads(ana.analyze_table_statistics.invoke({"config": CONFIG}))
+        assert out["error"] == "performance_schema 不可用，请确认已启用 performance_schema"
+        conn.close.assert_called_once()
+
+    def test_generic_error_passthrough(self):
+        conn = MagicMock()
+        cur = MagicMock()
+        cur.execute.side_effect = Error("lock wait timeout")
+        conn.cursor.return_value = cur
+        with _patch_conn(ana, conn):
+            out = json.loads(ana.analyze_table_statistics.invoke({"config": CONFIG}))
+        assert out["error"] == "lock wait timeout"
+        conn.close.assert_called_once()
+
 
 # ---------------- optimization.recommend_index_optimization ----------------
 class TestIndexOptimization:

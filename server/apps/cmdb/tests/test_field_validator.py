@@ -21,7 +21,7 @@ def test_identifier_valid():
 def test_identifier_invalid():
     assert IdentifierValidator.is_valid("") is False
     assert IdentifierValidator.is_valid(None) is False
-    assert IdentifierValidator.is_valid("1bad") is False or IdentifierValidator.is_valid("1bad") in (True, False)
+    assert IdentifierValidator.is_valid("1bad") is False
 
 
 def test_identifier_error_message():
@@ -269,3 +269,30 @@ def test_validate_field_by_attr_empty_attr():
 def test_validate_field_by_attr_organization():
     with pytest.raises(BaseAppException):
         FieldValidator.validate_field_by_attr(["x"], {"attr_type": "organization", "attr_id": "org"})
+
+
+def test_validate_field_by_attr_user_time_enum_and_float():
+    FieldValidator.validate_field_by_attr([7], {"attr_type": "user", "attr_id": "owner"})
+    FieldValidator.validate_field_by_attr("2024-01-02 03:04:05", {"attr_type": "time", "attr_id": "ts"})
+    FieldValidator.validate_field_by_attr(
+        "linux",
+        {"attr_type": "enum", "attr_id": "os", "enum_rule_type": "custom", "option": [{"id": "linux", "name": "Linux"}]},
+    )
+    FieldValidator.validate_field_by_attr(1.5, {"attr_type": "float", "attr_id": "ratio", "option": {"min_value": 0, "max_value": 10}})
+    with pytest.raises(BaseAppException):
+        FieldValidator.validate_field_by_attr("not-a-user", {"attr_type": "user", "attr_id": "owner"})
+
+
+def test_validate_instance_data_collects_field_errors_and_skips_missing():
+    attrs = [
+        {"attr_id": "ip", "attr_name": "IP", "attr_type": "str", "option": {"validation_type": "ipv4"}},
+        {"attr_id": "count", "attr_name": "数量", "attr_type": "int", "option": {"max_value": 3}},
+        {"attr_id": "unused", "attr_type": "str", "option": {"validation_type": "ipv4"}},
+    ]
+    errors = FieldValidator.validate_instance_data({"ip": "10.0.0.1", "count": 99}, attrs)
+    assert [e["field"] for e in errors] == ["count"]
+    assert errors[0]["field_name"] == "数量"
+    assert errors[0]["value"] == 99
+    assert "error" in errors[0]
+    ok = FieldValidator.validate_instance_data({"ip": "10.0.0.1", "count": 1}, attrs)
+    assert ok == []

@@ -167,3 +167,72 @@ class TestToolModulesRegistry:
 
     def test_monitor_刻意不在静态注册表(self):
         assert "monitor" not in ToolsLoader.TOOL_MODULES
+
+
+class TestDiscoverAllAndMetadata:
+    def test_discover_tools_skips_unresolved_and_empty(self, mocker, patch_structured_tool):
+        good = _make_module("good", t=_FakeStructuredTool("ping"))
+        empty = _make_module("empty")
+        mocker.patch.object(
+            ToolsLoader,
+            "TOOL_MODULES",
+            {
+                "good": (good, False),
+                "skip": ("no.such.module.path", False),
+                "empty": (empty, False),
+            },
+        )
+        out = ToolsLoader._discover_tools()
+        assert list(out.keys()) == ["good"]
+        assert out["good"][0]["func"].name == "ping"
+        assert ToolsLoader.load_all_tools() == out
+
+    def test_metadata_single_tool_includes_schema_and_constructor(self, mocker, patch_structured_tool):
+        class Schema:
+            def schema(self):
+                return {"properties": {"q": {"type": "string"}}}
+
+        tool = _FakeStructuredTool("only", description="solo desc")
+        tool.args_schema = Schema()
+        mod = _make_module("apps.opspilot.metis.llm.tools.solo", only=tool)
+        mod.__doc__ = "  Solo tools  "
+        mod.CONSTRUCTOR_PARAMS = {"host": "str"}
+        mocker.patch.object(ToolsLoader, "TOOL_MODULES", {"solo": (mod, False)})
+        meta = ToolsLoader.get_all_tools_metadata()
+        assert meta == [
+            {
+                "name": "solo",
+                "constructor": "apps.opspilot.metis.llm.tools.solo",
+                "constructor_description": "Solo tools",
+                "description": "solo desc",
+                "constructor_parameters": {"host": "str"},
+                "parameters": {"properties": {"q": {"type": "string"}}},
+            }
+        ]
+
+    def test_metadata_toolset_lists_subtools(self, mocker, patch_structured_tool):
+        class Schema:
+            def schema(self):
+                return {"type": "object"}
+
+        t1 = _FakeStructuredTool("a", description="A")
+        t1.args_schema = Schema()
+        t2 = _FakeStructuredTool("b", description="B")
+        mod = _make_module("apps.opspilot.metis.llm.tools.pack", a=t1, b=t2)
+        mod.__doc__ = "Pack tools"
+        mocker.patch.object(ToolsLoader, "TOOL_MODULES", {"pack": (mod, True)})
+        meta = ToolsLoader.get_all_tools_metadata()
+        assert meta[0]["name"] == "pack"
+        assert meta[0]["tools"] == [
+            {"name": "a", "description": "A", "parameters": {"type": "object"}},
+            {"name": "b", "description": "B"},
+        ]
+
+    def test_metadata_skips_unresolved_and_empty_modules(self, mocker, patch_structured_tool):
+        empty = _make_module("empty")
+        mocker.patch.object(
+            ToolsLoader,
+            "TOOL_MODULES",
+            {"ghost": ("no.such.module", False), "empty": (empty, False)},
+        )
+        assert ToolsLoader.get_all_tools_metadata() == []

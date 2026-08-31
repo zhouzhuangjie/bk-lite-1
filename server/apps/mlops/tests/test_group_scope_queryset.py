@@ -14,11 +14,16 @@ from apps.mlops.utils import group_scope as gs
 pytestmark = [pytest.mark.django_db, pytest.mark.integration]
 
 
-def _req(team=None, superuser=False):
+def _req(team=None, superuser=False, group_list=None):
     request = APIRequestFactory().get("/")
     if team is not None:
         request._api_current_team = team
-    request.user = SimpleNamespace(is_superuser=superuser)
+        request.COOKIES = {**getattr(request, "COOKIES", {}), "current_team": str(team)}
+    resolved_groups = group_list if group_list is not None else ([int(team)] if team else [])
+    request.user = SimpleNamespace(
+        is_superuser=superuser,
+        group_list=resolved_groups,
+    )
     return request
 
 

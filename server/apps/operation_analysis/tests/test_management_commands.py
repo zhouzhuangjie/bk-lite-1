@@ -195,12 +195,14 @@ def test_init_default_groups_uses_root_default_group_when_child_has_same_name():
 
 @pytest.mark.django_db
 def test_init_default_groups_without_default_group_returns_early():
-    # 没有名为 Default 的组织 → 捕获异常并提前返回，不抛出
+    # 没有名为 Default 的组织 → 捕获异常并提前返回，不抛出，也不改写目录 groups
     from apps.system_mgmt.models.user import Group
 
     Group.objects.filter(name="Default").delete()
+    obj = Directory.objects.create(name="无 Default 组织目录", groups=[], created_by="system")
     call_command("init_default_groups")
-    assert True
+    obj.refresh_from_db()
+    assert obj.groups == []
 
 
 # --------------------------------------------------------------------------
