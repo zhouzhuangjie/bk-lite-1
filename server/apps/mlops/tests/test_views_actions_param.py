@@ -61,6 +61,16 @@ PREDICT_EMPTY_ERROR = {
     "object_detection": "缺少参数: images",
 }
 
+# Non-list payload error is keyed by the request param name.
+PREDICT_NON_LIST_ERROR = {
+    "anomaly_detection": "data 必须是数组格式",
+    "log_clustering": "data 必须是数组格式",
+    "timeseries_predict": "data 必须是数组格式",
+    "classification": "texts 必须是数组格式",
+    "image_classification": "images 必须是数组格式",
+    "object_detection": "images 必须是数组格式",
+}
+
 # Algorithms whose DatasetReleaseViewSet exposes archive/unarchive.
 HAS_ARCHIVE = {"anomaly_detection", "log_clustering", "timeseries_predict",
                "image_classification", "object_detection"}
@@ -819,7 +829,7 @@ def test_serving_predict_non_list_data(monkeypatch, superuser, suffix, prefix, m
     request = factory.post(f"/{suffix}_servings/x/predict/", {param: {"a": 1}}, format="json")
     resp = _call(view, request, superuser, pk=serving.id)
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
-    assert "数组格式" in resp.data["error"]
+    assert resp.data["error"] == PREDICT_NON_LIST_ERROR[suffix]
 
 
 @pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)
