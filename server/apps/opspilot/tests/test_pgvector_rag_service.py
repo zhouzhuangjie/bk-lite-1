@@ -11,6 +11,7 @@ from apps.opspilot.metis.llm.rag.naive_rag.pgvector.pgvector_rag import Pgvector
 from apps.opspilot.metis.llm.rag.naive_rag_entity import (
     DocumentCountRequest,
     DocumentDeleteRequest,
+    DocumentIngestRequest,
     DocumentListRequest,
     DocumentMetadataUpdateRequest,
     DocumentRetrieverRequest,
@@ -292,3 +293,97 @@ def test_file_ingest_rejects_unknown_type(rag):
     out = rag.file_ingest("/tmp/a.bin", "a.bin", {"is_preview": True})
     assert out["status"] == "error"
     assert "不支持的文件类型" in out["message"]
+
+
+def test_perform_search_routes_mmr_and_swallows_errors(rag, monkeypatch):
+    req = DocumentRetrieverRequest(index_name="kb", search_query="q", search_type="mmr")
+    monkeypatch.setattr(rag, "_create_vector_store", lambda req: "store")
+    monkeypatch.setattr(rag, "_execute_mmr_search", lambda store, req, kwargs: [Document(page_content="mmr")])
+    monkeypatch.setattr(rag, "_execute_similarity_search", lambda store, req, kwargs: [Document(page_content="sim")])
+    assert rag._perform_search(req)[0].page_content == "mmr"
+    sim_req = DocumentRetrieverRequest(index_name="kb", search_query="q", search_type="similarity_score_threshold")
+    assert rag._perform_search(sim_req)[0].page_content == "sim"
+    monkeypatch.setattr(rag, "_create_vector_store", lambda req: (_ for _ in ()).throw(RuntimeError("bad")))
+    assert rag._perform_search(req) == []
+
+
+def test_create_vector_store_and_rerank_and_ingest(rag, monkeypatch):
+    embed = object()
+
+    class FakeEM:
+        def get_embed(self, *a, **k):
+            return embed
+
+    monkeypatch.setattr("apps.opspilot.metis.llm.rag.naive_rag.pgvector.pgvector_rag.EmbedManager", FakeEM)
+    added = []
+
+    class FakePG:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def add_documents(self, docs, ids):
+            added.append((docs, ids))
+
+    monkeypatch.setattr("apps.opspilot.metis.llm.rag.naive_rag.pgvector.pgvector_rag.PGVector", FakePG)
+    req = DocumentRetrieverRequest(index_name="kb-store", embed_model_name="m")
+    store = rag._create_vector_store(req)
+    assert store.kwargs["collection_name"] == "kb-store"
+    assert store.kwargs["embeddings"] is embed
+    assert store.kwargs["use_jsonb"] is True
+
+    docs = [Document(page_content="q", metadata={"chunk_id": "c1"})]
+    monkeypatch.setattr(
+        "apps.opspilot.metis.llm.rag.naive_rag.pgvector.pgvector_rag.ReRankManager.rerank_documents",
+        lambda **kwargs: [Document(page_content="ranked")],
+    )
+    rerank_req = DocumentRetrieverRequest(index_name="kb", search_query="q", enable_rerank=True)
+    assert rag._rerank_results(rerank_req, []) == []
+    ranked = rag._rerank_results(rerank_req, docs)
+    assert ranked[0].page_content == "ranked"
+
+    rag._db_manager.execute_update.return_value = 2
+    ids = rag.ingest(DocumentIngestRequest(index_name="kb-in", index_mode="overwrite", docs=docs))
+    assert ids == ["c1"]
+    rag._db_manager.execute_update.assert_called_once()
+    assert added[-1][1] == ["c1"]
+    added.clear()
+    ids = rag.ingest(DocumentIngestRequest(index_name="kb-in", docs=docs))
+    assert ids == ["c1"]
+    rag._db_manager.execute_update.assert_called_once()
+    monkeypatch.setattr(FakePG, "add_documents", lambda self, docs, ids: (_ for _ in ()).throw(RuntimeError("embed-fail")))
+    with pytest.raises(RuntimeError, match="embed-fail"):
+        rag.ingest(DocumentIngestRequest(index_name="kb-in", docs=docs))
+
+
+def test_store_documents_to_pg_and_website_file_ingest(rag, monkeypatch):
+    ingested = []
+    monkeypatch.setattr(PgvectorRag, "ingest", lambda self, req: ingested.append(req) or ["c1"])
+    docs = [Document(page_content="body", metadata={})]
+    PgvectorRag.store_documents_to_pg(docs, "kb-1", "", "", "embed", metadata={"src": "web"})
+    assert ingested[0].index_name == "kb-1"
+    assert docs[0].metadata["src"] == "web"
+    assert docs[0].metadata["created_time"]
+
+    chunked = PgvectorRag.perform_chunking([Document(page_content="hello world", metadata={})], "full", {}, True, "文本")
+    assert chunked[0].page_content
+
+    monkeypatch.setattr(
+        "apps.opspilot.metis.llm.rag.naive_rag.pgvector.pgvector_rag.OcrManager.load_ocr",
+        lambda **kwargs: "ocr",
+    )
+    loader = MagicMock()
+    loader.load.return_value = [Document(page_content="site", metadata={})]
+    monkeypatch.setattr("apps.opspilot.metis.llm.rag.naive_rag.pgvector.pgvector_rag.WebSiteLoader", lambda *a, **k: loader)
+    monkeypatch.setattr(rag, "_process_documents_pipeline", lambda docs, title, params, content_type: {"status": "success", "chunks_size": 1, "title": title})
+    web = rag.website_ingest("https://example.com", 1, {"is_preview": True})
+    assert web == {"status": "success", "chunks_size": 1, "title": "https://example.com"}
+
+    file_loader = MagicMock()
+    file_loader.load.return_value = [Document(page_content="file", metadata={})]
+    monkeypatch.setattr(rag, "get_file_loader", lambda *a, **k: file_loader)
+    file_out = rag.file_ingest("/tmp/a.md", "a.md", {"is_preview": True, "load_mode": "full"})
+    assert file_out["status"] == "success"
+    assert file_out["chunks_size"] == 1
+    monkeypatch.setattr(rag, "get_file_loader", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("load-fail")))
+    with pytest.raises(RuntimeError, match="load-fail"):
+        rag.file_ingest("/tmp/a.md", "a.md", {"is_preview": True})

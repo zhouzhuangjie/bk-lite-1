@@ -4,6 +4,7 @@
 AlertLifecycleNotifier / PolicyBaselineService 等外部边界 mock。
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -275,3 +276,26 @@ class TestUpdatePolicyOrganizations:
             PolicyOrganization.objects.filter(policy_id=policy.id).values_list("organization", flat=True)
         )
         assert orgs == {2, 3}
+
+
+class TestUpdateOrCreateTask:
+    def test_replaces_periodic_task_with_crontab(self):
+        from django_celery_beat.models import PeriodicTask
+
+        obj = MonitorObject.objects.create(name="TaskObj", level="base")
+        policy = MonitorPolicy.objects.create(
+            monitor_object=obj, name="p-task", algorithm="max",
+            query_condition={}, source={}, group_by=[],
+        )
+        PeriodicTask.objects.create(
+            name=f"scan_policy_task_{policy.id}",
+            task="old.task",
+            crontab=_vs().format_crontab({"type": "min", "value": 1}),
+            enabled=False,
+        )
+        _vs().update_or_create_task(policy.id, {"type": "min", "value": 5})
+        task = PeriodicTask.objects.get(name=f"scan_policy_task_{policy.id}")
+        assert task.task == "apps.monitor.tasks.monitor_policy.scan_policy_task"
+        assert json.loads(task.args) == [policy.id]
+        assert task.enabled is True
+        assert task.crontab.minute == "*/5"

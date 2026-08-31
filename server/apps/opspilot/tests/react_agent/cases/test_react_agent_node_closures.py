@@ -340,7 +340,11 @@ async def test_k8s_analysis_loop_clears_choice_and_returns_done_message():
     )
     assert llm_calls == 2
     last = str(getattr(messages[-1], "content", ""))
-    assert "基础配置检查" in last or "未启用" in last or "工作负载" in last
+    assert last == (
+        "已完成 Kubernetes - 1 的基础配置检查，已分析 1 个工作负载。"
+        "当前未启用 Kubernetes Specialist 技能包，因此不进入结构化报告、修复方式选择或修复对比流程。"
+        "请根据上方基础检查结果处理；如需专家报告和修复对比，请启用对应技能包后再测试。"
+    )
     assert not any(tc.get("name") == "request_user_choice" for m in messages for tc in (getattr(m, "tool_calls", None) or []))
 
 

@@ -30,6 +30,18 @@ def test_validate_flow_and_execute_reject_empty_graph():
     assert out["execution_time"] == 0
 
 
+def test_validate_flow_reports_missing_entry_and_unsupported_type():
+    cycled = _engine(
+        [{"id": "a", "type": "not-a-real-type", "data": {}}, {"id": "b", "type": "also-fake", "data": {}}],
+        edges=[{"source": "a", "target": "b"}, {"source": "b", "target": "a"}],
+    )
+    errors = cycled.validate_flow()
+    assert "流程中没有入口节点" in errors
+    assert "流程存在循环依赖" in errors
+    assert any("不支持的节点类型: not-a-real-type" in item for item in errors)
+    assert any("不支持的节点类型: also-fake" in item for item in errors)
+
+
 def test_interrupt_result_and_execute_type_from_entry():
     engine = _engine([], entry_type="web_chat")
     interrupted = engine._interrupt_result()

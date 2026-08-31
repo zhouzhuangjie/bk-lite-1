@@ -18,6 +18,7 @@ def test_fetch_html_extracts_main_and_truncates():
         out = f.fetch_html.invoke({"url": "https://example.com", "extract_main": True, "max_length": 20})
     assert out["success"] is True
     assert out["truncated"] is True
+    assert len(out["content"]) <= 20
     assert len(out["content"]) == 20
     assert out["content"].startswith("<article>")
     assert "nav" not in out["content"]

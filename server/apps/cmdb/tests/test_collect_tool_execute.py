@@ -52,9 +52,11 @@ def test_execute_access_point_failure_returns_error_result():
         resp = _call(_payload())
     body = _body(resp)
     assert resp.status_code == 200
-    data = body.get("data", body)
+    assert body["result"] is True
+    data = body["data"]
     assert data["status"] == "error"
-    assert "接入点解析失败" in data["result"]["summary"] or "接入点解析失败" in str(data)
+    assert data["result"]["summary"].startswith("接入点解析失败")
+    assert data["result"]["stage"] == "param"
 
 
 def test_execute_masked_password_without_task_id_returns_param_error():
@@ -64,10 +66,10 @@ def test_execute_masked_password_without_task_id_returns_param_error():
         return_value="stargazer-1",
     ):
         resp = _call(payload)
-    data = _body(resp).get("data", _body(resp))
+    data = _body(resp)["data"]
     assert data["status"] == "error"
-    blob = str(data)
-    assert "task_id" in blob
+    assert data["result"]["stage"] == "param"
+    assert data["result"]["summary"] == "密码字段为脱敏占位，需要传入 task_id 以恢复原始凭据"
 
 
 def test_execute_enqueues_debug_task_as_pending():
@@ -85,6 +87,6 @@ def test_execute_enqueues_debug_task_as_pending():
     enqueue.assert_called_once()
     assert enqueue.call_args.args[0] == "dbg-1"
     assert enqueue.call_args.args[2] == "stargazer-1"
-    data = _body(resp).get("data", _body(resp))
+    data = _body(resp)["data"]
     assert data["status"] == "pending"
-    assert data.get("debug_id") == "dbg-1" or "dbg-1" in str(data)
+    assert data["debug_id"] == "dbg-1"

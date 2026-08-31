@@ -21,7 +21,7 @@ def test_identifier_valid():
 def test_identifier_invalid():
     assert IdentifierValidator.is_valid("") is False
     assert IdentifierValidator.is_valid(None) is False
-    assert IdentifierValidator.is_valid("1bad") is False or IdentifierValidator.is_valid("1bad") in (True, False)
+    assert IdentifierValidator.is_valid("1bad") is False
 
 
 def test_identifier_error_message():

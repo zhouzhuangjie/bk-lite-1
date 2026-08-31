@@ -76,8 +76,10 @@ class TestPreThinkCandidate:
         lines = immediate + ([output] if output else [])
         assert lines
         payloads = _payloads(lines)
-        types = [p.get("type") for p in payloads]
-        assert "THINKING" in types or "TEXT_MESSAGE_CONTENT" in types
+        thinking = [p for p in payloads if p.get("type") == "THINKING"]
+        content = [p for p in payloads if p.get("type") == "TEXT_MESSAGE_CONTENT"]
+        assert [p["delta"] for p in thinking] == ["thinking"]
+        assert [p["delta"] for p in content] == ["最终答案"]
 
 
 class TestGenerateAguiStream:
