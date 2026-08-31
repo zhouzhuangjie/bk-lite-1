@@ -4,6 +4,8 @@ from apps.cmdb.collection.collect_plugin.topology.parse import (
     _index_devices,
     _index_ports,
     infer_topology,
+    is_l2_candidate_port,
+    winner_priority,
     LLDP_CHASSIS_SUBTYPE_MAC_ADDRESS,
     LLDP_CHASSIS_SUBTYPE_NETWORK_ADDRESS,
     LLDP_PORT_SUBTYPE_AGENT_CIRCUIT_ID,
@@ -156,3 +158,37 @@ def test_index_and_infer_unresolved_local_port():
     assert out["unresolved_neighbors"][0]["decision_reason"] == (
         "Could not map the local neighbor port to a normalized interface."
     )
+
+
+def test_is_l2_and_winner_priority_and_arp_infer():
+    vlan = NormalizedPort(device_id="sw1", port_id="v1", ifindex="10", ifname="Vlan100")
+    loop = NormalizedPort(device_id="sw1", port_id="lo", ifindex="11", ifname="LoopBack0")
+    gi = NormalizedPort(device_id="sw1", port_id="sw1:1", ifindex="1", ifname="Gi0/1", mac="aa:bb:cc:dd:ee:01")
+    assert is_l2_candidate_port(vlan) is False
+    assert is_l2_candidate_port(loop) is False
+    assert is_l2_candidate_port(gi) is True
+    assert winner_priority({"relationship_type": "authoritative"}) == (3, 0)
+    assert winner_priority({"relationship_type": "inferred", "evidence_source": "fdb+arp", "confidence": 40})[0] == 2
+    assert winner_priority({"relationship_type": "inferred", "evidence_source": "arp", "confidence": 50})[0] == 1
+
+    normalized = {
+        "ports": [
+            {"device_id": "sw1", "port_id": "sw1:1", "ifindex": "1", "ifname": "Gi0/1", "mac": "aa:bb:cc:dd:ee:01"},
+            {"device_id": "sw2", "port_id": "sw2:1", "ifindex": "1", "ifname": "Gi0/2", "mac": "aa:bb:cc:dd:ee:02"},
+        ],
+        "devices": [{"device_id": "sw1", "host": "10.0.0.1"}, {"device_id": "sw2", "host": "10.0.0.2"}],
+        "neighbor_observations": [],
+        "arp_observations": [
+            {"local_port_id": "sw1:1", "mac": "aa:bb:cc:dd:ee:02", "ip_address": "10.0.0.2", "evidence_key": "arp1"},
+            {"local_port_id": "sw1:1", "mac": "aa:bb:cc:dd:ee:01", "ip_address": "10.0.0.1", "evidence_key": "same"},
+        ],
+        "fdb_observations": [
+            {"local_port_id": "sw1:1", "mac": "aa:bb:cc:dd:ee:02", "status": "learned", "vlan": "10", "evidence_key": "f1"},
+            {"local_port_id": "sw1:1", "mac": "aa:bb:cc:dd:ee:02", "status": "other", "vlan": "10"},
+        ],
+    }
+    out = infer_topology(normalized)
+    sources = {item["evidence_source"] for item in out["inferred_links"]}
+    assert "arp" in sources
+    assert "fdb" in sources
+    assert all(item["source_device"] != item["target_device"] for item in out["inferred_links"])

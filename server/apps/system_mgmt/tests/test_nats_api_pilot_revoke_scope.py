@@ -182,3 +182,30 @@ def test_sync_opspilot_nats_channels_invalid_and_create_update_delete():
     cleared = nats_api.sync_opspilot_nats_channels(7, "告警Bot", [2], [])
     assert cleared["result"] is True
     assert not Channel.objects.filter(id=channel.id).exists()
+
+
+def test_delete_and_search_opspilot_nats_channels():
+    from apps.system_mgmt.models import Channel, Group
+    from apps.system_mgmt.models.channel import ChannelChoices
+
+    assert nats_api.delete_opspilot_nats_channels("x") == {"result": False, "message": "bot_id must be an integer"}
+    parent = Group.objects.create(name="nats-root", parent_id=0)
+    child = Group.objects.create(name="nats-child", parent_id=parent.id)
+    nats_api.sync_opspilot_nats_channels(8, "搜Bot", [child.id], [{"node_id": "s1", "name": "节点"}])
+    Channel.objects.create(
+        name="plain-nats",
+        channel_type=ChannelChoices.NATS,
+        config={"method_name": "other"},
+        team=[child.id],
+        description="",
+    )
+    found = nats_api.search_opspilot_nats_channels(teams=[parent.id], bot_id=8, include_children=True)
+    assert found["result"] is True
+    assert found["data"][0]["bot_id"] == 8
+    assert found["data"][0]["node_id"] == "s1"
+    skipped = nats_api.search_opspilot_nats_channels(teams=["bad"], include_children=False)
+    assert skipped["result"] is True
+    assert skipped["data"] == []
+    deleted = nats_api.delete_opspilot_nats_channels(8)
+    assert deleted == {"result": True, "data": {"deleted": 1}}
+    assert nats_api.search_opspilot_nats_channels(bot_id=8)["data"] == []
