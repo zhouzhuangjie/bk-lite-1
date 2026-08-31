@@ -1,4 +1,5 @@
 """node_mgmt 权限：节点鉴权、组织分配与请求用户解析。"""
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -46,7 +47,11 @@ def test_authorize_node_ids_validates_required_existence_and_operate():
     nodes, err = perm.authorize_node_ids(SimpleNamespace(), [])
     assert nodes is None
     assert err.status_code == 400
-    assert err.content  # JsonResponse
+    assert json.loads(err.content) == {
+        "data": {},
+        "result": False,
+        "message": "node_ids is required",
+    }
 
     missing_node = SimpleNamespace(id="n1")
     with (
@@ -103,3 +108,156 @@ def test_get_node_permissions_uses_instance_map_then_team_default():
     assert perm.get_node_permissions(node, {"instance": [{"id": "n1", "permission": ["View"]}]}) == ["View"]
     assert perm.get_node_permissions(node, {"team": [3]}) == NodeConstants.DEFAULT_PERMISSION
     assert perm.get_node_permissions(node, {"team": [9]}) == []
+
+
+def _assert_error(err, status, message, *, with_data=True):
+    assert err.status_code == status
+    body = json.loads(err.content)
+    expected = {"result": False, "message": message}
+    if with_data:
+        expected = {"data": {}, **expected}
+    assert body == expected
+
+
+def test_authorize_collector_configuration_ids_required_missing_forbidden_and_ok():
+    configs, err = perm.authorize_collector_configuration_ids(SimpleNamespace(), [])
+    assert configs is None
+    _assert_error(err, 400, "collector_configuration_ids is required")
+
+    cfg = SimpleNamespace(id="c1")
+    with (
+        patch.object(perm.CollectorConfiguration.objects, "filter") as flt,
+        patch.object(perm, "get_authorized_collector_configuration_queryset") as auth_qs,
+    ):
+        qs = MagicMock()
+        qs.distinct.return_value = []
+        flt.return_value = qs
+        configs, err = perm.authorize_collector_configuration_ids(SimpleNamespace(), ["c1"])
+        assert configs is None
+        _assert_error(err, 400, "collector configuration does not exist")
+
+        qs.distinct.return_value = [cfg]
+        inner = MagicMock()
+        inner.filter.return_value.distinct.return_value = []
+        auth_qs.return_value = inner
+        configs, err = perm.authorize_collector_configuration_ids(SimpleNamespace(), ["c1"])
+        assert configs is None
+        _assert_error(
+            err,
+            403,
+            "User does not have permission to operate this configuration",
+            with_data=False,
+        )
+
+        inner.filter.return_value.distinct.return_value = [cfg]
+        configs, err = perm.authorize_collector_configuration_ids(SimpleNamespace(), ["c1"])
+        assert err is None
+        assert [c.id for c in configs] == ["c1"]
+
+
+def test_authorize_mutable_collector_configuration_ids_required_missing_forbidden_and_ok():
+    configs, err = perm.authorize_mutable_collector_configuration_ids(SimpleNamespace(), [])
+    assert configs is None
+    _assert_error(err, 400, "collector_configuration_ids is required")
+
+    cfg = SimpleNamespace(id="c1")
+    with (
+        patch.object(perm.CollectorConfiguration.objects, "filter") as flt,
+        patch.object(perm, "get_mutable_collector_configuration_queryset") as mut_qs,
+    ):
+        qs = MagicMock()
+        qs.distinct.return_value = []
+        flt.return_value = qs
+        configs, err = perm.authorize_mutable_collector_configuration_ids(SimpleNamespace(), ["c1"])
+        assert configs is None
+        _assert_error(err, 400, "collector configuration does not exist")
+
+        qs.distinct.return_value = [cfg]
+        inner = MagicMock()
+        inner.filter.return_value.distinct.return_value = []
+        mut_qs.return_value = inner
+        configs, err = perm.authorize_mutable_collector_configuration_ids(SimpleNamespace(), ["c1"])
+        assert configs is None
+        _assert_error(
+            err,
+            403,
+            "User does not have permission to modify this configuration",
+            with_data=False,
+        )
+
+        inner.filter.return_value.distinct.return_value = [cfg]
+        configs, err = perm.authorize_mutable_collector_configuration_ids(SimpleNamespace(), ["c1"])
+        assert err is None
+        assert [c.id for c in configs] == ["c1"]
+
+
+def test_authorize_child_config_ids_required_missing_forbidden_and_ok():
+    configs, err = perm.authorize_child_config_ids(SimpleNamespace(), [])
+    assert configs is None
+    _assert_error(err, 400, "child_config_ids is required")
+
+    child = SimpleNamespace(id="ch1")
+    with (
+        patch.object(perm.ChildConfig.objects, "filter") as flt,
+        patch.object(perm, "get_authorized_child_config_queryset") as auth_qs,
+    ):
+        qs = MagicMock()
+        qs.select_related.return_value.distinct.return_value = []
+        flt.return_value = qs
+        configs, err = perm.authorize_child_config_ids(SimpleNamespace(), ["ch1"])
+        assert configs is None
+        _assert_error(err, 400, "child config does not exist")
+
+        qs.select_related.return_value.distinct.return_value = [child]
+        inner = MagicMock()
+        inner.filter.return_value.distinct.return_value = []
+        auth_qs.return_value = inner
+        configs, err = perm.authorize_child_config_ids(SimpleNamespace(), ["ch1"])
+        assert configs is None
+        _assert_error(
+            err,
+            403,
+            "User does not have permission to operate this child configuration",
+            with_data=False,
+        )
+
+        inner.filter.return_value.distinct.return_value = [child]
+        configs, err = perm.authorize_child_config_ids(SimpleNamespace(), ["ch1"])
+        assert err is None
+        assert [c.id for c in configs] == ["ch1"]
+
+
+def test_authorize_mutable_child_config_ids_required_missing_forbidden_and_ok():
+    configs, err = perm.authorize_mutable_child_config_ids(SimpleNamespace(), [])
+    assert configs is None
+    _assert_error(err, 400, "child_config_ids is required")
+
+    child = SimpleNamespace(id="ch1")
+    with (
+        patch.object(perm.ChildConfig.objects, "filter") as flt,
+        patch.object(perm, "get_mutable_child_config_queryset") as mut_qs,
+    ):
+        qs = MagicMock()
+        qs.select_related.return_value.distinct.return_value = []
+        flt.return_value = qs
+        configs, err = perm.authorize_mutable_child_config_ids(SimpleNamespace(), ["ch1"])
+        assert configs is None
+        _assert_error(err, 400, "child config does not exist")
+
+        qs.select_related.return_value.distinct.return_value = [child]
+        inner = MagicMock()
+        inner.filter.return_value.distinct.return_value = []
+        mut_qs.return_value = inner
+        configs, err = perm.authorize_mutable_child_config_ids(SimpleNamespace(), ["ch1"])
+        assert configs is None
+        _assert_error(
+            err,
+            403,
+            "User does not have permission to modify this child configuration",
+            with_data=False,
+        )
+
+        inner.filter.return_value.distinct.return_value = [child]
+        configs, err = perm.authorize_mutable_child_config_ids(SimpleNamespace(), ["ch1"])
+        assert err is None
+        assert [c.id for c in configs] == ["ch1"]

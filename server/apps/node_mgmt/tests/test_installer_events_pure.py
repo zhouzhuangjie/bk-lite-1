@@ -149,5 +149,5 @@ def test_batch_add_and_advance_and_update_steps():
     n3 = _DummyNode(result={"steps": [{"action": "install", "status": "running", "message": "go"}]})
     installer_tasks._batch_update_step_status([n3], "failed", "boom")
     assert n3.result["steps"][-1]["status"] == "failed"
-    assert "boom" in n3.result["steps"][-1]["message"] or n3.result["steps"][-1].get("message") == "boom"
+    assert n3.result["steps"][-1]["message"] == "boom"
 
