@@ -202,6 +202,96 @@ def test_search_model_filters_hidden_and_permissions(monkeypatch):
     assert {m["model_id"] for m in all_models} == {"host", "hidden", "bare"}
 
 
+def test_display_field_helpers_and_type_change():
+    attrs = [{"attr_id": "status", "attr_type": "str", "attr_name": "状态", "attr_group": "g"}]
+    assert ModelManage._add_display_field_to_attrs(attrs, {"attr_id": "cpu", "attr_type": "str"}, "host") is False
+    assert ModelManage._add_display_field_to_attrs(attrs, {"attr_id": "status", "attr_type": "enum", "attr_name": "状态"}, "host") is True
+    assert any(a["attr_id"] == "status_display" for a in attrs)
+    assert ModelManage._add_display_field_to_attrs(attrs, {"attr_id": "status", "attr_type": "enum"}, "host") is False
+
+    trimmed, removed = ModelManage._remove_display_field_from_attrs(attrs, "status")
+    assert removed is True
+    assert all(a["attr_id"] != "status_display" for a in trimmed)
+
+    calls = []
+
+    class _G:
+        def remove_entitys_properties(self, *a, **k):
+            calls.append(a)
+
+    attrs = [{"attr_id": "status", "attr_type": "enum"}, {"attr_id": "status_display", "attr_type": "str"}]
+    ModelManage._handle_attr_type_change(attrs, "status", "enum", "str", {"attr_id": "status"}, "host", _G())
+    assert calls
+    attrs2 = [{"attr_id": "cpu", "attr_type": "str"}]
+    ModelManage._handle_attr_type_change(attrs2, "cpu", "str", "enum", {"attr_id": "cpu", "attr_type": "enum", "attr_name": "CPU"}, "host", _G())
+    assert any(a["attr_id"] == "cpu_display" for a in attrs2)
+
+
+def test_resolve_runtime_enum_options_public_library_and_fallback(monkeypatch):
+    assert ModelManage.resolve_runtime_enum_options({"attr_type": "enum", "option": [{"id": "a"}]}) == [{"id": "a"}]
+    monkeypatch.setattr(
+        "apps.cmdb.services.public_enum_library.get_library_or_raise",
+        lambda lid: type("Lib", (), {"options": [{"id": "on"}]})(),
+    )
+    assert ModelManage.resolve_runtime_enum_options(
+        {"attr_type": "enum", "enum_rule_type": "public_library", "public_library_id": 3}
+    ) == [{"id": "on"}]
+    monkeypatch.setattr(
+        "apps.cmdb.services.public_enum_library.get_library_or_raise",
+        lambda lid: (_ for _ in ()).throw(RuntimeError("gone")),
+    )
+    assert ModelManage.resolve_runtime_enum_options(
+        {
+            "attr_type": "enum",
+            "enum_rule_type": "public_library",
+            "public_library_id": 3,
+            "option": [{"id": "snap"}],
+        }
+    ) == [{"id": "snap"}]
+
+
+def test_update_enum_instances_display_updates_and_swallows_errors(monkeypatch):
+    updates = []
+
+    class _G:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def query_entity(self, *a, **k):
+            return (
+                [
+                    {"_id": 1, "status": "on"},
+                    {"_id": 2},
+                    {"_id": 3, "status": ""},
+                ],
+                3,
+            )
+
+        def batch_update_node_properties(self, *a, **k):
+            updates.append(a)
+
+    monkeypatch.setattr(
+        "apps.cmdb.display_field.DisplayFieldConverter.convert_enum",
+        lambda value, options: f"disp-{value}",
+    )
+    with patch("apps.cmdb.services.model.GraphClient", return_value=_G()):
+        assert ModelManage.update_enum_instances_display("host", "status", [{"id": "on"}]) == 1
+    assert updates[0][2] == {"status_display": "disp-on"}
+
+    class _Boom:
+        def __enter__(self):
+            raise RuntimeError("graph down")
+
+        def __exit__(self, *a):
+            return False
+
+    with patch("apps.cmdb.services.model.GraphClient", return_value=_Boom()):
+        assert ModelManage.update_enum_instances_display("host", "status", []) == 0
+
+
 def test_delete_model_calls_batch_delete():
     graph = _Graph()
     called = []
