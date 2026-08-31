@@ -4629,7 +4629,7 @@ def test_trigger_converge_tasks_if_needed_schedules_legacy_install_task_without_
 
 
 @pytest.mark.django_db
-def test_converge_controller_install_connectivity_for_node_prefers_install_node_id_with_shared_ip():
+def test_converge_controller_install_connectivity_for_node_prefers_install_node_id_with_shared_ip(monkeypatch):
     cloud_region = CloudRegion.objects.create(
         name="shared-ip-converge-region",
         introduction="test",
@@ -4693,6 +4693,7 @@ def test_converge_controller_install_connectivity_for_node_prefers_install_node_
         created_by="tester",
         updated_by="tester",
     )
+    monkeypatch.setattr(installer_tasks.discover_node_versions, "delay", lambda: None)
 
     installer_tasks.converge_controller_install_connectivity_for_node("current-install-node")
 
@@ -4758,7 +4759,9 @@ def test_converge_controller_install_connectivity_triggers_version_discovery_whe
 
 
 @pytest.mark.django_db
-def test_converge_controller_install_connectivity_for_node_falls_back_for_legacy_task_without_install_node_id():
+def test_converge_controller_install_connectivity_for_node_falls_back_for_legacy_task_without_install_node_id(
+    monkeypatch,
+):
     cloud_region = CloudRegion.objects.create(
         name="legacy-converge-region",
         introduction="test",
@@ -4822,6 +4825,7 @@ def test_converge_controller_install_connectivity_for_node_falls_back_for_legacy
         created_by="tester",
         updated_by="tester",
     )
+    monkeypatch.setattr(installer_tasks.discover_node_versions, "delay", lambda: None)
 
     installer_tasks.converge_controller_install_connectivity_for_node("legacy-install-node")
 
@@ -4832,7 +4836,7 @@ def test_converge_controller_install_connectivity_for_node_falls_back_for_legacy
 
 
 @pytest.mark.django_db
-def test_install_connectivity_converge_matches_generated_node_id_not_ip():
+def test_install_connectivity_converge_matches_generated_node_id_not_ip(monkeypatch):
     cloud_region = CloudRegion.objects.create(
         name="connectivity-region",
         introduction="test",
@@ -4896,6 +4900,7 @@ def test_install_connectivity_converge_matches_generated_node_id_not_ip():
         created_by="tester",
         updated_by="tester",
     )
+    monkeypatch.setattr(installer_tasks.discover_node_versions, "delay", lambda: None)
 
     installer_tasks.converge_controller_install_connectivity_for_node("current-install-node")
 

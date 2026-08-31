@@ -35,8 +35,7 @@ def test_list_get_exists_and_create_index():
         client.indices.create.assert_called_once()
     with patch.object(idx, "get_es_client", side_effect=RuntimeError("down")):
         err = idx.es_get_index.invoke({"index": "x"})
-    assert err["success"] is False
-    assert err.get("error_type") == "not_found" or "down" in str(err)
+    assert err == {"success": False, "error": "down", "error_type": "not_found"}
 
 
 def test_delete_and_close_require_confirm():
