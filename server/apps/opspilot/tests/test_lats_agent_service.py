@@ -13,7 +13,8 @@ MultiDimensionalReflection 派生(normalized_score/as_message/create_default)、
 
 import asyncio
 import math
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pydantic.root_model  # noqa
 import pytest
@@ -23,6 +24,7 @@ from apps.opspilot.metis.llm.agent.lats_agent import (
     LATSConfig,
     LATSTreeNode,
     LatsAgentNode,
+    LatsAgentRequest,
     MultiDimensionalReflection,
     SearchPhase,
 )
@@ -372,3 +374,91 @@ class TestConfigDefaults:
     def test_search_phase_enum(self):
         assert SearchPhase.INITIALIZATION.value == "initialization"
         assert SearchPhase.COMPLETED.value == "completed"
+
+
+@pytest.mark.asyncio
+async def test_expand_attaches_children_and_marks_high_quality_solution():
+    node = LatsAgentNode()
+    root = LATSTreeNode(messages=[AIMessage(content="root")], reflection=make_reflection(6.0))
+    state = {"root": root, "messages": [], "search_config": LATSConfig(solution_threshold=8.0)}
+    cfg = {
+        "configurable": {"graph_request": LatsAgentRequest(user_message="如何修复")},
+        "progress_messages": ["old"],
+    }
+
+    async def _cands(_question, _messages, _config):
+        return [AIMessage(content="方案A")]
+
+    async def _eval(_cands, _question, _config, _search):
+        return [[AIMessage(content="方案A")]], [make_reflection(9.0, found_solution=True)]
+
+    node._generate_candidates = _cands
+    node._process_candidates_with_evaluation = _eval
+    out = await node.expand(state, cfg)
+    assert root.children
+    assert root.is_solved is True
+    assert out["root"] is root
+    assert cfg["progress_messages"] == []
+
+    empty = await node.expand({"root": None, "messages": []}, cfg)
+    assert empty["root"] is None
+
+
+@pytest.mark.asyncio
+async def test_generate_final_answer_uses_best_node_and_openai_client(monkeypatch):
+    node = LatsAgentNode()
+    node.llm = SimpleNamespace(model_name="gpt-test", temperature=0.2, extra_body={"k": 1})
+    client = MagicMock()
+    client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="综合答案"))]
+    )
+    node.structured_output_parser = SimpleNamespace(_get_openai_client=lambda: client)
+    root = LATSTreeNode(messages=[AIMessage(content="根方案")], reflection=make_reflection(6.0))
+    child = LATSTreeNode(messages=[AIMessage(content="子方案")], reflection=make_reflection(7.5), parent=root)
+    root.children = [child]
+    monkeypatch.setattr(
+        "apps.opspilot.metis.llm.agent.lats_agent.TemplateLoader.render_template",
+        lambda name, params=None: f"tpl:{name}",
+    )
+    cfg = {"configurable": {"graph_request": LatsAgentRequest(user_message="问题")}}
+    out = await node.generate_final_answer({"root": root, "messages": [HumanMessage(content="q")]}, cfg)
+    assert out["messages"][-1].content == "综合答案"
+    kwargs = client.chat.completions.create.call_args.kwargs
+    assert kwargs["model"] == "gpt-test"
+    assert kwargs["temperature"] == 0.2
+    assert kwargs["extra_body"] == {"k": 1}
+    assert kwargs["messages"][0]["content"] == "tpl:prompts/lats_agent/intelligent_assistant"
+
+
+@pytest.mark.asyncio
+async def test_generate_initial_response_marks_high_quality_and_keeps_low_quality(monkeypatch):
+    node = LatsAgentNode()
+    monkeypatch.setattr(
+        "apps.opspilot.metis.llm.agent.lats_agent.TemplateLoader.render_template",
+        lambda *_a, **_k: "sys",
+    )
+
+    async def _react(*_a, **_k):
+        return AIMessage(content="初答")
+
+    node.invoke_react_for_candidate = _react
+    high = make_reflection(9.0, confidence=0.9, found_solution=True)
+
+    async def _eval_high(*_a, **_k):
+        return high
+
+    node._evaluate_candidate = _eval_high
+    cfg = {"configurable": {"graph_request": LatsAgentRequest(user_message="q")}}
+    solved = await node.generate_initial_response({"messages": []}, cfg)
+    assert solved["root"].is_solved is True
+    assert [m.content for m in solved["messages"]] == ["初答"]
+
+    low = make_reflection(4.0, confidence=0.2, found_solution=False)
+
+    async def _eval_low(*_a, **_k):
+        return low
+
+    node._evaluate_candidate = _eval_low
+    pending = await node.generate_initial_response({"messages": []}, cfg)
+    assert pending["root"].is_solved is False
+    assert pending["messages"][-1].content == "\n\n*正在优化答案...*\n\n"
