@@ -120,6 +120,36 @@ def test_normalize_enum_public_binding_custom():
     assert out["public_library_id"] is None
 
 
+def test_normalize_enum_public_binding_requires_library_id():
+    with pytest.raises(BaseAppException, match="public_library_id 必填"):
+        ModelManage.normalize_enum_public_binding(
+            {"attr_type": "enum", "enum_rule_type": "public_library"}
+        )
+
+
+def test_normalize_enum_public_binding_loads_public_library(monkeypatch):
+    monkeypatch.setattr(
+        "apps.cmdb.services.public_enum_library.get_library_or_raise",
+        lambda lid: type("Lib", (), {"options": [{"id": "on", "name": "开"}]})(),
+    )
+    out = ModelManage.normalize_enum_public_binding(
+        {
+            "attr_type": "enum",
+            "attr_id": "status",
+            "option": {
+                "enum_rule_type": "public_library",
+                "public_library_id": 9,
+                "enum_select_mode": "multiple",
+                "option": [],
+            },
+        }
+    )
+    assert out["enum_rule_type"] == "public_library"
+    assert out["public_library_id"] == 9
+    assert out["enum_select_mode"] == "multiple"
+    assert out["option"] == [{"id": "on", "name": "开"}]
+
+
 # --------------------------------------------------------------------------
 # validate_enum_rule_immutable / select_mode
 # --------------------------------------------------------------------------

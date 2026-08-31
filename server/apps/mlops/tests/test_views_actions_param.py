@@ -956,8 +956,12 @@ def test_serving_start_config_error(monkeypatch, superuser, suffix, prefix, mode
     request = factory.post(f"/{suffix}_servings/x/start/")
     resp = _call(view, request, superuser, pk=serving.id)
     assert resp.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
-    # Config-related error: either explicit env-var message or generic config error.
-    assert ("MLFLOW_TRACKER_URL" in resp.data["error"]) or ("配置" in resp.data["error"])
+    expected = (
+        "环境变量 MLFLOW_TRACKER_URL 未配置"
+        if suffix in {"anomaly_detection", "log_clustering"}
+        else "系统配置错误，请联系管理员"
+    )
+    assert resp.data["error"] == expected
 
 
 def _allow_team_one(monkeypatch):
@@ -1063,12 +1067,14 @@ def test_serving_create_config_error_keeps_record(monkeypatch, superuser, suffix
     Serving = _model(model_module, basename, "Serving")
     view = getattr(mod, f"{basename}ServingViewSet").as_view({"post": "create"})
     resp = _call(view, _serving_create_request(suffix, train_job), superuser)
-    # The serving record is created up-front (super().create runs first); only the
-    # auto-start fails. Different views surface this as 200 (with error
-    # container_info) or 500 (config error response). Either way a record exists.
-    assert resp.status_code in (
-        status.HTTP_200_OK, status.HTTP_201_CREATED, status.HTTP_500_INTERNAL_SERVER_ERROR
-    )
+    # log_clustering 在 URI 为空时直接 500，不回写 container_info；其余算法保记录并返回启动失败文案。
+    if suffix == "log_clustering":
+        assert resp.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        assert resp.data["error"] == "系统配置错误，请联系管理员"
+    else:
+        assert resp.status_code in (status.HTTP_200_OK, status.HTTP_201_CREATED)
+        assert resp.data["message"] == "服务已创建但启动失败：环境变量未配置"
+        assert resp.data["container_info"]["message"] == "环境变量 MLFLOW_TRACKER_URL 未配置"
     assert Serving.objects.count() == 1
 
 

@@ -215,3 +215,42 @@ def test_non_superuser_denied_for_channels_and_authorize():
     with patch.object(BotViewSet, "get_has_permission", return_value=False):
         denied = BotViewSet.as_view({"post": "authorize_usage_team"})(auth_req, pk=bot.id)
     assert _body(denied)["result"] is False
+
+
+def test_bot_create_and_update_writes_audit_and_workflow(monkeypatch):
+    logs = []
+    monkeypatch.setattr(f"{MOD}.log_operation", lambda request, action, app, summary: logs.append((action, summary)))
+    monkeypatch.setattr(f"{MOD}.create_celery_task", lambda *a, **k: None)
+    monkeypatch.setattr(f"{MOD}.sync_opspilot_nats_channels_for_bot", lambda bot: None)
+    monkeypatch.setattr(f"{MOD}._schedule_memory_write_cache_flush", lambda *a, **k: None)
+    user = _su("bot-crud")
+    create_req = factory.post("/", {"name": "新工作台", "introduction": "i"}, format="json")
+    force_authenticate(create_req, user=user)
+    create_req.COOKIES["current_team"] = "1"
+    created = BotViewSet.as_view({"post": "create"})(create_req)
+    assert _body(created)["result"] is True
+    bot = Bot.objects.get(name="新工作台")
+    assert bot.team == [1]
+    assert BotWorkFlow.objects.filter(bot_id=bot.id).exists()
+    assert ("create", "新增工作台: 新工作台") in logs
+
+    update_req = factory.put(
+        f"/{bot.id}/",
+        {
+            "name": "改名工作台",
+            "introduction": "j",
+            "workflow_data": {"nodes": [{"id": "n1"}], "edges": []},
+            "is_publish": True,
+        },
+        format="json",
+    )
+    force_authenticate(update_req, user=user)
+    update_req.COOKIES["current_team"] = "1"
+    updated = BotViewSet.as_view({"put": "update"})(update_req, pk=bot.id)
+    assert _body(updated)["result"] is True
+    bot.refresh_from_db()
+    assert bot.name == "改名工作台"
+    assert bot.online is True
+    flow = BotWorkFlow.objects.get(bot_id=bot.id)
+    assert flow.flow_json["nodes"][0]["id"] == "n1"
+    assert ("update", "编辑工作台: 改名工作台") in logs
