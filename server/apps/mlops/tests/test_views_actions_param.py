@@ -51,6 +51,16 @@ PREDICT_PARAM = {
     "object_detection": "images",
 }
 
+# Empty-payload error is algorithm-specific (object_detection uses 缺少参数).
+PREDICT_EMPTY_ERROR = {
+    "anomaly_detection": "data 参数不能为空",
+    "log_clustering": "data 参数不能为空",
+    "timeseries_predict": "data 参数不能为空",
+    "classification": "texts 参数不能为空",
+    "image_classification": "images 参数不能为空",
+    "object_detection": "缺少参数: images",
+}
+
 # Algorithms whose DatasetReleaseViewSet exposes archive/unarchive.
 HAS_ARCHIVE = {"anomaly_detection", "log_clustering", "timeseries_predict",
                "image_classification", "object_detection"}
@@ -790,9 +800,7 @@ def test_serving_predict_empty_data(monkeypatch, superuser, suffix, prefix, mode
     request = factory.post(f"/{suffix}_servings/x/predict/", {}, format="json")
     resp = _call(view, request, superuser, pk=serving.id)
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
-    # message mentions the missing param name (不能为空 / 缺少参数)
-    err = resp.data["error"]
-    assert PREDICT_PARAM[suffix] in err or "不能为空" in err or "缺少参数" in err
+    assert resp.data["error"] == PREDICT_EMPTY_ERROR[suffix]
 
 
 @pytest.mark.parametrize("suffix,prefix,model_module,basename", ALGOS, ids=ALGO_IDS)

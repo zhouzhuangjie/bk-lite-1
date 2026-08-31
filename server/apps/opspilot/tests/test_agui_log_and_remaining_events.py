@@ -191,8 +191,11 @@ def test_log_and_update_tokens_agui_updates_history_and_creates_log(mocker):
 def test_log_and_update_tokens_agui_swallows_save_error(mocker):
     history = SimpleNamespace()
     history.save = MagicMock(side_effect=RuntimeError("db down"))
+    logger = mocker.patch("apps.opspilot.utils.agui_chat.logger")
     _log_and_update_tokens_agui({"content": ["x"]}, "s", 1, "1.1.1.1", {}, "hi", True, history_log=history)
     history.save.assert_called_once()
+    logger.error.assert_called_once()
+    assert logger.error.call_args.args[0] == "AGUI log update error: db down"
 
 
 def test_stream_agui_chat_fills_execution_id_and_exposes_header():

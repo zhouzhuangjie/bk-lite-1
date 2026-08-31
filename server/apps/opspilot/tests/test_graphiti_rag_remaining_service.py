@@ -85,11 +85,16 @@ def test_create_full_graphiti_wires_optional_clients(rag):
 
 @pytest.mark.asyncio
 async def test_safe_close_driver_swallows_sleep_error(rag):
-    with patch(
-        "apps.opspilot.metis.llm.rag.graph_rag.graphiti.graphiti_rag.asyncio.sleep",
-        new=AsyncMock(side_effect=RuntimeError("cancelled")),
+    with (
+        patch(
+            "apps.opspilot.metis.llm.rag.graph_rag.graphiti.graphiti_rag.asyncio.sleep",
+            new=AsyncMock(side_effect=RuntimeError("cancelled")),
+        ),
+        patch("apps.opspilot.metis.llm.rag.graph_rag.graphiti.graphiti_rag.logger") as mock_logger,
     ):
         await rag._safe_close_driver(SimpleNamespace())
+    mock_logger.debug.assert_called_once()
+    assert mock_logger.debug.call_args.args[0] == "等待后台任务时出现警告: cancelled"
 
 
 @pytest.mark.asyncio

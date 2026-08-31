@@ -167,8 +167,9 @@ def test_handle_dry_run_and_filters(monkeypatch):
     text = out.getvalue()
     assert "[dry-run]" in text
     assert "copy l-copy -> p-copy" in text
-    assert "missing" not in text or "[missing]" not in text
+    assert "[missing]" not in text
     assert "copied=0" in text
+    assert "missing=0" in text
 
 
 def test_handle_apply_copies_and_counts(monkeypatch):

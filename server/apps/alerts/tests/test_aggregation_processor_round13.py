@@ -92,8 +92,14 @@ def test_process_strategy_swallows_inner_exception():
         team=[1], dispatch_team=[1], params={"window_size": 60},
     )
     proc = AggregationProcessor()
-    with patch.object(proc, "get_events_for_strategy", side_effect=RuntimeError("query boom")):
+    with (
+        patch.object(proc, "get_events_for_strategy", side_effect=RuntimeError("query boom")),
+        patch("apps.alerts.aggregation.processor.aggregation_processor.logger") as mock_logger,
+    ):
         proc._process_strategy(strategy, timezone.now())
+    mock_logger.exception.assert_called_once()
+    assert mock_logger.exception.call_args.args[0] == "[AlertAggregation] 策略 %s 处理失败"
+    assert mock_logger.exception.call_args.args[1] == "降噪-r13"
 
 
 # --------------------------------------------------------------------------
@@ -150,9 +156,11 @@ def test_recover_missing_alert_returns_none_without_active():
 
 
 def test_calculate_deadline_invalid_cron_reraises():
+    from croniter.croniter import CroniterBadCronError
+
     strategy = _missing_strategy(cron_expr="not-a-cron")
     proc = AggregationProcessor()
-    with pytest.raises(Exception):
+    with pytest.raises(CroniterBadCronError):
         proc._calculate_deadline(strategy, strategy.params, timezone.now())
 
 

@@ -102,7 +102,7 @@ def test_create_user_rejects_empty_groups_invalid_role_and_phone():
     actor = _actor()
     empty = _req("create_user", "post", actor, data={"username": "n", "groups": []})
     assert _body(empty)["result"] is False
-    assert "group" in _body(empty)["message"].lower() or "组织" in _body(empty)["message"] or "At least one group" in _body(empty)["message"]
+    assert _body(empty)["message"] == "至少选择一个组织"
 
     group = Group.objects.create(name="uv-create")
     bad_role = _req(

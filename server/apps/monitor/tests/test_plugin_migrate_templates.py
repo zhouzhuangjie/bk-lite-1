@@ -29,7 +29,7 @@ def test_validate_template_identity_skips_dir_and_templated_collect_type(tmp_pat
     plugin_dir.mkdir()
     (plugin_dir / "dir.j2").mkdir()
     (plugin_dir / "ok.j2").write_text('collect_type = "{{ collect_type }}"\n', encoding="utf-8")
-    plugin_migrate._validate_template_identity(plugin_dir, "snmp")
+    assert plugin_migrate._validate_template_identity(plugin_dir, "snmp") is None
 
 
 def test_validate_template_identity_rejects_literal_mismatch(tmp_path):

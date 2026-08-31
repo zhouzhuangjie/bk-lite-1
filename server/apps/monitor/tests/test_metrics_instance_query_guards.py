@@ -155,4 +155,5 @@ def test_query_by_instance_denies_unauthorized_and_converts(monkeypatch):
     )
     out = _vs().query_by_instance(request)
     assert float(out["data"]["result"][0]["value"][1]) == pytest.approx(2.0)
-    assert out["data"]["unit"] == "kibibytes" or out["data"]["source_unit"] == "bytes"
+    assert out["data"]["unit"] == "kibibytes"
+    assert out["data"]["source_unit"] == "bytes"

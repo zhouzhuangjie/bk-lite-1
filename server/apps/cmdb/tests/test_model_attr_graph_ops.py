@@ -302,4 +302,4 @@ def test_delete_model_calls_batch_delete():
     graph.batch_delete_entity = batch_delete
     with patch("apps.cmdb.services.model.GraphClient", return_value=graph):
         ModelManage.delete_model(99)
-    assert called == [("model", [99])] or called[0][1] == [99]
+    assert called == [("model", [99])]
