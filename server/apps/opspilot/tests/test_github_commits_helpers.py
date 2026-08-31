@@ -60,3 +60,54 @@ def test_fetch_github_commits_status_and_network_errors():
         get.side_effect = requests.exceptions.ConnectionError("down")
         with pytest.raises(ValueError, match="连接失败"):
             fetch(url, {})
+        get.side_effect = requests.exceptions.RequestException("boom")
+        with pytest.raises(ValueError, match="请求失败"):
+            fetch(url, {})
+        get.side_effect = None
+        get.return_value = SimpleNamespace(
+            status_code=200,
+            text="",
+            json=lambda: (_ for _ in ()).throw(json.JSONDecodeError("msg", "doc", 0)),
+        )
+        with pytest.raises(ValueError, match="响应数据格式错误"):
+            fetch(url, {})
+
+
+def test_get_github_commits_validates_required_string_args():
+    fn = gh.get_github_commits.func
+    with pytest.raises(ValueError, match="owner参数不能为空"):
+        fn(owner="", repo="r", since="2025-09-08T00:00:00Z", until="2025-09-15T00:00:00Z")
+    with pytest.raises(ValueError, match="repo参数不能为空"):
+        fn(owner="o", repo="", since="2025-09-08T00:00:00Z", until="2025-09-15T00:00:00Z")
+    with pytest.raises(ValueError, match="since参数不能为空"):
+        fn(owner="o", repo="r", since="", until="2025-09-15T00:00:00Z")
+    with pytest.raises(ValueError, match="until参数不能为空"):
+        fn(owner="o", repo="r", since="2025-09-08T00:00:00Z", until="")
+
+
+def test_get_github_commits_pagination_validates_max_pages_and_token_header():
+    fn = gh.get_github_commits_with_pagination.func
+    with pytest.raises(ValueError, match="owner参数不能为空"):
+        fn(owner="", repo="r", since="2025-09-08T00:00:00Z", until="2025-09-15T00:00:00Z")
+    with pytest.raises(ValueError, match="repo参数不能为空"):
+        fn(owner="o", repo="", since="2025-09-08T00:00:00Z", until="2025-09-15T00:00:00Z")
+    with pytest.raises(ValueError, match="since参数不能为空"):
+        fn(owner="o", repo="r", since="", until="2025-09-15T00:00:00Z")
+    with pytest.raises(ValueError, match="until参数不能为空"):
+        fn(owner="o", repo="r", since="2025-09-08T00:00:00Z", until="")
+    with pytest.raises(ValueError, match="max_pages必须是正整数"):
+        fn(owner="o", repo="r", since="2025-09-08T00:00:00Z", until="2025-09-15T00:00:00Z", max_pages=0)
+
+    with (
+        patch.object(gh, "_fetch_github_commits", return_value=[]),
+        patch.object(gh, "_process_commits_data", return_value={}),
+    ):
+        out = fn(
+            owner="o",
+            repo="r",
+            since="2025-09-08T00:00:00Z",
+            until="2025-09-15T00:00:00Z",
+            token="tok",
+            max_pages=1,
+        )
+    assert json.loads(out) == {}

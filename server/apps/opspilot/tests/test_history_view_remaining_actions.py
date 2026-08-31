@@ -105,3 +105,35 @@ def test_set_tag_and_remove_tag_persist_manual_knowledge():
     removed = HistoryViewSet.as_view({"post": "remove_tag"})(rm)
     assert _body(removed)["result"] is True
     assert not ConversationTag.objects.filter(id=tag.id).exists()
+
+
+def test_get_log_by_page_falls_back_invalid_page_and_formats_ids():
+    from datetime import datetime, timezone as tz
+
+    stamp = datetime(2026, 1, 2, 3, 4, 5, 6000, tzinfo=tz.utc)
+    entries = [
+        {
+            "ids": [11, 12],
+            "channel_user__user_id": "u1",
+            "channel_user__name": "alice",
+            "channel_user__channel_type": "web",
+            "count": 2,
+            "earliest_created_at": stamp,
+            "last_updated_at": stamp,
+            "title": "hello",
+        }
+    ]
+    paginator, result = HistoryViewSet.get_log_by_page(entries, page=99, page_size=1)
+    assert paginator.count == 1
+    assert result == [
+        {
+            "sender_id": "u1",
+            "username": "alice",
+            "channel_type": "Web",
+            "count": 2,
+            "ids": [11, 12],
+            "created_at": "2026-01-02T03:04:05.006000Z",
+            "updated_at": "2026-01-02T03:04:05.006000Z",
+            "title": "hello",
+        }
+    ]

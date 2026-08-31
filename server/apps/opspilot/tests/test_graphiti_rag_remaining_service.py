@@ -92,7 +92,11 @@ async def test_safe_close_driver_swallows_sleep_error(rag):
         ),
         patch("apps.opspilot.metis.llm.rag.graph_rag.graphiti.graphiti_rag.logger") as mock_logger,
     ):
-        await rag._safe_close_driver(SimpleNamespace())
+        try:
+            result = await rag._safe_close_driver(SimpleNamespace())
+        except RuntimeError as exc:
+            pytest.fail(f"asyncio.sleep 异常不得外抛: {exc}")
+    assert result is None
     mock_logger.debug.assert_called_once()
     assert mock_logger.debug.call_args.args[0] == "等待后台任务时出现警告: cancelled"
 
