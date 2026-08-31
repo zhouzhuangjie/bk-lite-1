@@ -1,5 +1,5 @@
 """ModelManage 属性创建/更新/查询：GraphClient 边界 mock，钉死校验与回写。"""
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -294,12 +294,7 @@ def test_update_enum_instances_display_updates_and_swallows_errors(monkeypatch):
 
 def test_delete_model_calls_batch_delete():
     graph = _Graph()
-    called = []
-
-    def batch_delete(label, ids):
-        called.append((label, ids))
-
-    graph.batch_delete_entity = batch_delete
+    graph.batch_delete_entity = MagicMock()
     with patch("apps.cmdb.services.model.GraphClient", return_value=graph):
         ModelManage.delete_model(99)
-    assert called == [("model", [99])]
+    graph.batch_delete_entity.assert_called_once_with("model", [99])

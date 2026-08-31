@@ -39,9 +39,12 @@ def test_get_metrics_requires_query_and_converts_unit(monkeypatch):
     assert captured["query"] == "up"
     assert float(out["data"]["result"][0]["value"][1]) == pytest.approx(2.0)
     assert out["data"]["unit"] == "kibibytes"
+    assert out["data"]["source_unit"] == "bytes"
 
     auto = _vs().get_metrics(SimpleNamespace(GET={"query": "up", "source_unit": "bytes"}))
-    assert "unit" in auto["data"]
+    assert float(auto["data"]["result"][0]["value"][1]) == pytest.approx(2.0)
+    assert auto["data"]["unit"] == "kibibytes"
+    assert auto["data"]["source_unit"] == "bytes"
 
 
 def test_get_metrics_range_validates_window_and_step(monkeypatch):
@@ -82,6 +85,8 @@ def test_get_metrics_range_validates_window_and_step(monkeypatch):
         )
     )
     assert float(out["data"]["result"][0]["values"][0][1]) == pytest.approx(1.0)
+    assert out["data"]["unit"] == "kibibytes"
+    assert out["data"]["source_unit"] == "bytes"
 
 
 def _query_request(user, params=None):
