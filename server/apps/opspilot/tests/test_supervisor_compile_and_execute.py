@@ -195,3 +195,121 @@ def test_extract_final_message_modes():
     assert full == "a\n\n---\n\n" + "b"
     unknown = graph._extract_final_message({"messages": [AIMessage(content="a")]}, "other")
     assert unknown == "未知的 output_mode"
+
+
+class _TempGraph:
+    def __init__(self, result_factory):
+        self._result_factory = result_factory
+
+    def set_entry_point(self, name):
+        self.entry = name
+
+    def compile(self):
+        factory = self._result_factory
+
+        class Compiled:
+            async def ainvoke(self, state, config):
+                return factory(state)
+
+        return Compiled()
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_isolation_shared_and_empty_results(monkeypatch):
+    node = SupervisorMultiAgentNode()
+
+    class FakeTools:
+        async def build_react_nodes(self, **kwargs):
+            assert kwargs["composite_node_name"] == "k8s_react"
+            return "entry"
+
+    node.agent_tools_map["k8s"] = FakeTools()
+
+    def isolation_result(state):
+        return {"messages": state["messages"] + [AIMessage(content="集群正常")]}
+
+    monkeypatch.setattr(
+        "apps.opspilot.metis.llm.agent.supervisor_multi_agent.StateGraph",
+        lambda *_a, **_k: _TempGraph(isolation_result),
+    )
+    isolated = await node.agent_executor_node("k8s")
+    out = await isolated(
+        {"messages": [HumanMessage(content="查 Pod")], "executed_agents": []},
+        {"configurable": {"graph_request": _request()}},
+    )
+    assert out["active_agent"] == "k8s"
+    assert out["executed_agents"] == ["k8s"]
+    assert out["messages"][0].content.startswith("[Agent: k8s]")
+    assert "集群正常" in out["messages"][0].content
+
+    def echo_input(state):
+        return {"messages": state["messages"]}
+
+    monkeypatch.setattr(
+        "apps.opspilot.metis.llm.agent.supervisor_multi_agent.StateGraph",
+        lambda *_a, **_k: _TempGraph(echo_input),
+    )
+    no_new = await isolated(
+        {"messages": [HumanMessage(content="查 Pod")], "executed_agents": ["mysql"]},
+        {"configurable": {"graph_request": _request()}},
+    )
+    assert "未产生新的响应" in no_new["messages"][0].content
+    assert no_new["executed_agents"] == ["mysql", "k8s"]
+
+    def empty_result(_state):
+        return {"messages": []}
+
+    monkeypatch.setattr(
+        "apps.opspilot.metis.llm.agent.supervisor_multi_agent.StateGraph",
+        lambda *_a, **_k: _TempGraph(empty_result),
+    )
+    empty = await isolated(
+        {"messages": [HumanMessage(content="q")], "executed_agents": []},
+        {"configurable": {"graph_request": _request()}},
+    )
+    assert "未产生有效响应" in empty["messages"][0].content
+
+    def shared_result(state):
+        return {"messages": state["messages"] + [AIMessage(content="共享结论")]}
+
+    monkeypatch.setattr(
+        "apps.opspilot.metis.llm.agent.supervisor_multi_agent.StateGraph",
+        lambda *_a, **_k: _TempGraph(shared_result),
+    )
+    shared_req = _request(agents=[AgentConfig(name="k8s", description="集群", context_isolation=False)])
+    shared = await isolated(
+        {"messages": [HumanMessage(content="q")], "executed_agents": []},
+        {"configurable": {"graph_request": shared_req}},
+    )
+    assert any(isinstance(m, AIMessage) and "共享结论" in m.content for m in shared["messages"])
+    assert shared["executed_agents"] == ["k8s"]
+
+
+@pytest.mark.asyncio
+async def test_parallel_executor_merges_success_and_exception():
+    node = SupervisorMultiAgentNode()
+
+    async def ok_exec(state, config):
+        return {"messages": [AIMessage(content="[Agent: k8s]\nok")], "executed_agents": ["k8s"]}
+
+    async def boom_exec(state, config):
+        raise RuntimeError("timeout")
+
+    async def fake_executor(name):
+        return ok_exec if name == "k8s" else boom_exec
+
+    node.agent_executor_node = fake_executor
+    out = await node.parallel_executor_node(
+        {"parallel_agents": ["k8s", "mysql"], "executed_agents": ["prior"], "messages": []},
+        {"configurable": {"graph_request": _request(agents=[_agent(), _agent("mysql", "库")])}},
+    )
+    texts = [m.content for m in out["messages"]]
+    assert "[Agent: k8s]\nok" in texts
+    assert any("mysql" in t and "timeout" in t for t in texts)
+    assert "k8s" in out["executed_agents"]
+    assert "mysql" in out["executed_agents"]
+    assert "prior" in out["executed_agents"]
+
+    empty = await node.parallel_executor_node({"parallel_agents": [], "executed_agents": ["x"]}, {})
+    assert empty == {"messages": [], "executed_agents": ["x"]}
+

@@ -143,3 +143,82 @@ def test_windows_download_returns_artifact(monkeypatch):
     assert resp.status_code == 200
     assert captured["arch"] == ""
     assert "attachment" in resp["Content-Disposition"]
+
+
+def test_controller_install_and_uninstall_dispatch(monkeypatch):
+    monkeypatch.setattr(
+        "apps.node_mgmt.views.installer.authorize_node_ids",
+        lambda request, node_ids: (node_ids, None),
+    )
+    install = MagicMock(return_value=11)
+    uninstall = MagicMock(return_value=22)
+    delay_install = MagicMock()
+    delay_uninstall = MagicMock()
+    timeout = MagicMock()
+    monkeypatch.setattr("apps.node_mgmt.views.installer.InstallerService.install_controller", install)
+    monkeypatch.setattr("apps.node_mgmt.views.installer.InstallerService.uninstall_controller", uninstall)
+    monkeypatch.setattr("apps.node_mgmt.views.installer.install_controller.delay", delay_install)
+    monkeypatch.setattr("apps.node_mgmt.views.installer.uninstall_controller.delay", delay_uninstall)
+    monkeypatch.setattr("apps.node_mgmt.views.installer.timeout_controller_install_task.apply_async", timeout)
+
+    install_req = factory.post(
+        "/installer/controller/install/",
+        {
+            "cloud_region_id": 1,
+            "work_node": "worker-1",
+            "package_id": 9,
+            "cpu_architecture": NodeConstants.X86_64_ARCH,
+            "nodes": [
+                {
+                    "ip": "10.0.0.8",
+                    "node_id": "n-ctrl",
+                    "os": NodeConstants.LINUX_OS,
+                    "organizations": [1],
+                    "port": 22,
+                    "username": "root",
+                    "password": "secret",
+                }
+            ],
+        },
+        format="json",
+    )
+    _auth(install_req)
+    installed = InstallerViewSet.as_view({"post": "controller_install"})(install_req)
+    body = json.loads(installed.content)
+    assert body["result"] is True
+    assert body["data"]["task_id"] == 11
+    install.assert_called_once()
+    delay_install.assert_called_once_with(11)
+    timeout.assert_called_once()
+
+    uninstall_req = factory.post(
+        "/installer/controller/uninstall/",
+        {"cloud_region_id": 1, "work_node": "worker-1", "nodes": [{"node_id": "n-ctrl"}]},
+        format="json",
+    )
+    _auth(uninstall_req)
+    uninstalled = InstallerViewSet.as_view({"post": "controller_uninstall"})(uninstall_req)
+    assert json.loads(uninstalled.content)["data"]["task_id"] == 22
+    uninstall.assert_called_once()
+    delay_uninstall.assert_called_once_with(22)
+
+
+def test_controller_install_nodes_and_manual_status(monkeypatch):
+    monkeypatch.setattr(
+        "apps.node_mgmt.views.installer.InstallerService.install_controller_nodes",
+        lambda task_id: [{"node_id": "n1", "status": "success"}],
+    )
+    monkeypatch.setattr(
+        "apps.node_mgmt.views.installer.InstallerService.get_manual_install_status",
+        lambda node_ids: {"n1": "online"},
+    )
+    nodes_req = factory.post("/installer/controller/task/5/nodes/", {}, format="json")
+    _auth(nodes_req)
+    nodes = InstallerViewSet.as_view({"post": "controller_install_nodes"})(nodes_req, task_id="5")
+    assert json.loads(nodes.content)["data"] == [{"node_id": "n1", "status": "success"}]
+
+    status_req = factory.post("/installer/controller/manual_install_status/", {"node_ids": ["n1"]}, format="json")
+    _auth(status_req)
+    status_resp = InstallerViewSet.as_view({"post": "controller_manual_install_status"})(status_req)
+    assert json.loads(status_resp.content)["data"] == {"n1": "online"}
+
