@@ -247,3 +247,14 @@ def test_rewrite_query_uses_isolated_llm_and_reraises():
     ):
         with pytest.raises(RuntimeError, match="llm down"):
             node._rewrite_query(request, {})
+
+
+def test_get_llm_client_forwards_stream_and_isolated_flags():
+    node = BasicNode()
+    request = SimpleNamespace()
+    with patch(
+        "apps.opspilot.metis.llm.chain.node.LLMClientFactory.create_client",
+        return_value="client",
+    ) as create:
+        assert node.get_llm_client(request, disable_stream=True, isolated=True) == "client"
+    create.assert_called_once_with(request, disable_stream=True, isolated=True)
