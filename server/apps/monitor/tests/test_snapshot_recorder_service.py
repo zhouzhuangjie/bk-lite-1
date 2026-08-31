@@ -154,3 +154,73 @@ class TestBuildPreAlertSnapshot:
             clear=False,
         )
         assert rec._build_pre_alert_snapshot("('h1',)", now) is None
+
+    def test_method_exception_returns_none(self, mocker):
+        now = datetime.now(timezone.utc)
+        rec = SnapshotRecorder(_policy(), {}, [], _mq())
+        mocker.patch.dict(
+            "apps.monitor.tasks.services.policy_scan.snapshot_recorder.METHOD",
+            {"max": mocker.Mock(side_effect=RuntimeError("prom down"))},
+            clear=False,
+        )
+        assert rec._build_pre_alert_snapshot("('h1',)", now) is None
+
+
+class TestRecordSnapshotsRemaining:
+    def test_falls_back_to_query_when_no_event_raw_data(self, stub_s3):
+        alert = MonitorAlert.objects.create(
+            policy_id=1, monitor_instance_id="h1", metric_instance_id="('h1',)",
+            alert_type="alert", status="new",
+        )
+        raw = {"data": {"result": [{"metric": {"instance_id": "h1"}, "values": [[0, "3"]]}]}}
+        rec = SnapshotRecorder(_policy(), {}, [alert], _mq(raw=raw))
+        rec.record_snapshots_for_active_alerts()
+        snap = MonitorAlertMetricSnapshot.objects.get(alert_id=alert.id)
+        assert any(s["type"] == "info" for s in snap.snapshots)
+        assert snap.snapshots[0]["raw_data"]["metric"]["instance_id"] == "h1"
+
+    def test_records_event_snapshot_and_skips_duplicate(self, stub_s3):
+        alert = MonitorAlert.objects.create(
+            policy_id=1, monitor_instance_id="h1", metric_instance_id="('h1',)",
+            alert_type="alert", status="new",
+        )
+        event = SimpleNamespace(id=11, event_time=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc), metric_instance_id="('h1',)", monitor_instance_id="h1")
+        rec = SnapshotRecorder(_policy(), {}, [alert], _mq())
+        rec.record_snapshots_for_active_alerts(
+            info_events=[{"metric_instance_id": "('h1',)", "raw_data": {"v": 1}}],
+            event_objs=[event],
+        )
+        snap = MonitorAlertMetricSnapshot.objects.get(alert_id=alert.id)
+        event_snaps = [s for s in snap.snapshots if s["type"] == "event"]
+        assert event_snaps[0]["event_id"] == 11
+        rec.record_snapshots_for_active_alerts(
+            info_events=[{"metric_instance_id": "('h1',)", "raw_data": {"v": 1}}],
+            event_objs=[event],
+        )
+        snap.refresh_from_db()
+        assert len([s for s in snap.snapshots if s["type"] == "event"]) == 1
+
+    def test_merges_new_alerts_into_active_set(self, stub_s3, mocker):
+        mocker.patch.dict(
+            "apps.monitor.tasks.services.policy_scan.snapshot_recorder.METHOD",
+            {"max": mocker.Mock(return_value={"data": {"result": []}})},
+            clear=False,
+        )
+        existing = MonitorAlert.objects.create(
+            policy_id=1, monitor_instance_id="h1", metric_instance_id="('h1',)",
+            alert_type="alert", status="new",
+        )
+        new_alert = MonitorAlert.objects.create(
+            policy_id=1, monitor_instance_id="h2", metric_instance_id="('h2',)",
+            alert_type="alert", status="new",
+        )
+        rec = SnapshotRecorder(_policy(), {}, [existing], _mq())
+        rec.record_snapshots_for_active_alerts(
+            info_events=[
+                {"metric_instance_id": "('h1',)", "raw_data": {"v": 1}},
+                {"metric_instance_id": "('h2',)", "raw_data": {"v": 2}},
+            ],
+            new_alerts=[new_alert],
+        )
+        assert MonitorAlertMetricSnapshot.objects.filter(alert_id=existing.id).exists()
+        assert MonitorAlertMetricSnapshot.objects.filter(alert_id=new_alert.id).exists()

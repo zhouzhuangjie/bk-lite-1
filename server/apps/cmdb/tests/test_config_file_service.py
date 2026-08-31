@@ -206,6 +206,64 @@ def test_build_summary_error():
     task = _task(instances=[{"_id": "1"}])
     summary = S._build_summary(task, items={"1": {"instance_id": "1", "status": ConfigFileVersionStatus.ERROR, "changed": False, "version": "100", "error_message": "boom"}})
     assert summary["config_file_data"]["status"] == "error"
+    assert summary["collect_digest"]["message"] == "boom"
+
+
+def test_build_summary_partial_error_and_multi_unchanged():
+    mixed = S._build_summary(
+        _task(instances=[{"_id": "1"}, {"_id": "2"}]),
+        items={
+            "1": {"instance_id": "1", "status": ConfigFileVersionStatus.SUCCESS, "changed": True, "version": "100"},
+            "2": {"instance_id": "2", "status": ConfigFileVersionStatus.ERROR, "changed": False, "version": "100", "error_message": "fail"},
+        },
+    )
+    assert mixed["config_file_data"]["status"] == "error"
+    assert mixed["collect_digest"]["message"] == "配置文件采集完成，成功 1 台，失败 1 台"
+
+    unchanged = S._build_summary(
+        _task(instances=[{"_id": "1"}, {"_id": "2"}]),
+        items={
+            "1": {"instance_id": "1", "status": ConfigFileVersionStatus.SUCCESS, "changed": False, "version": "100"},
+            "2": {"instance_id": "2", "status": ConfigFileVersionStatus.SUCCESS, "changed": False, "version": "101"},
+        },
+    )
+    assert unchanged["config_file_data"]["status"] == "success"
+    assert unchanged["collect_digest"]["message"] == "配置文件采集完成，2 台主机内容无变化"
+
+
+def test_build_task_instance_name_variants():
+    assert S._build_task_instance_name("x") == ""
+    assert S._build_task_instance_name({"ip_addr": ""}) == ""
+    assert S._build_task_instance_name({"ip_addr": "1.1.1.1", "inst_name": "1.1.1.1[default]"}) == "1.1.1.1[default]"
+    assert S._build_task_instance_name({"host": "2.2.2.2", "cloud_id": "0"}) == "2.2.2.2[0]"
+    assert S._build_task_instance_name({"ip_addr": "3.3.3.3"}) == "3.3.3.3"
+
+
+def test_get_expected_instance_name_map_skips_invalid():
+    task = _task(instances=["x", {"ip_addr": ""}, {"ip_addr": "1.1.1.1", "cloud": "default"}])
+    out = S._get_expected_instance_name_map(task)
+    assert list(out) == ["1.1.1.1[default]"]
+
+
+def test_filter_queryset_by_task_permission(mocker):
+    qs = mocker.MagicMock()
+    qs.none.return_value = "NONE"
+    filtered = mocker.MagicMock()
+    qs.filter.return_value = filtered
+    req = SimpleNamespace(COOKIES={}, user=object())
+
+    mocker.patch("apps.cmdb.services.config_file_service.get_current_team", return_value="")
+    assert S.filter_queryset_by_task_permission(req, qs) == "NONE"
+
+    mocker.patch("apps.cmdb.services.config_file_service.get_current_team", return_value="abc")
+    assert S.filter_queryset_by_task_permission(req, qs) == "NONE"
+
+    mocker.patch("apps.cmdb.services.config_file_service.get_current_team", return_value="12")
+    mocker.patch("apps.cmdb.services.config_file_service.GroupUtils.get_group_with_descendants", return_value=[])
+    mocker.patch("apps.cmdb.services.config_file_service.get_permission_rules", return_value=None)
+    req.COOKIES = {"include_children": "1"}
+    assert S.filter_queryset_by_task_permission(req, qs) is filtered
+    qs.filter.assert_called()
 
 
 def test_build_pending_result():
