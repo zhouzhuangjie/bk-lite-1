@@ -47,4 +47,7 @@ def test_timeout_controller_marks_connectivity_waiting_as_error(monkeypatch):
     node.refresh_from_db()
     last = (node.result or {}).get("steps", [])[-1]
     assert last["action"] == "connectivity_check"
-    assert last["status"] in (InstallerConstants.STEP_STATUS_ERROR, "error") or node.status == "error"
+    assert last["status"] == InstallerConstants.STEP_STATUS_ERROR
+    assert last["message"] == "Connectivity check timeout"
+    assert node.status == "error"
+    assert (node.result or {}).get("final_message") == "Connectivity check timeout"

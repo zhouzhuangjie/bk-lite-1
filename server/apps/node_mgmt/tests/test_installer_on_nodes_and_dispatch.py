@@ -48,9 +48,13 @@ def test_install_controller_on_nodes_skips_missing_credentials():
     remote.assert_not_called()
     node.refresh_from_db()
     assert node.status == "error"
-    steps = (node.result or {}).get("steps") or (node.result or {}).get("step_list") or []
-    blob = str(node.result)
-    assert "Password or private key is required" in blob or any("credential" in str(s).lower() for s in steps)
+    steps = node.result["steps"]
+    assert steps[0]["action"] == "credential_check"
+    assert steps[0]["status"] == "error"
+    assert steps[0]["message"] == (
+        "No authentication method provided. Password or private key is required."
+    )
+    assert node.result["final_message"] == "Credential validation failed"
 
 
 def test_install_controller_on_nodes_runs_linux_stream_install():

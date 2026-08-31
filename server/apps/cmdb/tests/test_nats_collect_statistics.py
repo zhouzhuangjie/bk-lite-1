@@ -53,5 +53,9 @@ def test_collect_statistics_counts_team_tasks():
     assert data["error_count"] == 1
     other = N.get_cmdb_collect_statistics(user_info={"team": team_b})["data"]
     assert other["task_count"] == 1
+    assert other["interval_task_count"] == 0
     assert other["success_count"] == 1
     assert other["error_count"] == 0
+    # 跨团队：team_b 的成功任务不得计入 team_a
+    assert data["task_count"] + other["task_count"] == 3
+    assert data["success_count"] + other["success_count"] == 2

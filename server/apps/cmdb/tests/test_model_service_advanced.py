@@ -76,6 +76,61 @@ def test_copy_model_ok_no_attributes(fake_graph, patch_side_effects, monkeypatch
     assert FieldGroup.objects.filter(model_id="host2", group_name="default").exists()
 
 
+@pytest.mark.django_db
+def test_copy_model_copies_attributes_and_field_groups(fake_graph, patch_side_effects, monkeypatch):
+    src_attrs = [
+        {"attr_id": "ip", "attr_name": "IP", "attr_type": "str", "is_required": True},
+        {"attr_id": "hostname", "attr_name": "主机名", "attr_type": "str"},
+    ]
+    monkeypatch.setattr(
+        f"{MODULE}.ModelManage.search_model_info",
+        lambda mid: {
+            "model_id": mid,
+            "model_name": "主机",
+            "classification_id": "net",
+            "group": [1],
+            "icn": "icon",
+            "attrs": json.dumps(src_attrs),
+            "_id": 1,
+        },
+    )
+    monkeypatch.setattr(
+        f"{MODULE}.ClassificationManage.search_model_classification_info",
+        lambda cid: {"_id": 50},
+    )
+    copied_rules = []
+    monkeypatch.setattr(
+        f"{MODULE}.copy_unique_rules_to_model",
+        lambda src, dst, user: copied_rules.append((src, dst, user)) or [],
+    )
+    FieldGroup.objects.create(model_id="host", group_name="网络", attr_orders=["ip"], order=2)
+
+    def _create_entity(label, data, check, exist):
+        parsed = json.loads(data["attrs"])
+        assert [a["attr_id"] for a in parsed] == ["ip", "hostname"]
+        return {
+            "_id": 8,
+            "model_id": data["model_id"],
+            "model_name": data["model_name"],
+            "classification_id": data["classification_id"],
+        }
+
+    fake_graph(MODULE, query_entity=([], 0), query_edge=[], create_entity=_create_entity, create_edge={"_id": 1})
+    out = ModelManage.copy_model(
+        "host",
+        "hostcopyattr",
+        "复制主机",
+        copy_attributes=True,
+        copy_relationships=False,
+        username="copier",
+    )
+    assert out["model_id"] == "hostcopyattr"
+    copied = FieldGroup.objects.get(model_id="hostcopyattr", group_name="网络")
+    assert copied.attr_orders == ["ip"]
+    assert copied.order == 2
+    assert copied_rules == [("host", "hostcopyattr", "copier")]
+
+
 # --------------------------------------------------------------------------
 # save_model_auto_relation_rule
 # --------------------------------------------------------------------------

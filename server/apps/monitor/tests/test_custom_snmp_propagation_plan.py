@@ -85,4 +85,6 @@ def test_propagation_plan_renders_and_validates_toml(monkeypatch):
     assert len(plan) == 1
     assert plan[0]["id"] == "cfg-ok"
     assert plan[0]["rendered_content"] == "ok = 1\n"
-    assert "agents" in plan[0]["original_content"] or plan[0]["original_content"]
+    assert plan[0]["original_content"] == (
+        'config = { agents = ["10.0.0.1:161"], tags = { instance_id = "i1" } }'
+    )

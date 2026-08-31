@@ -37,9 +37,14 @@ def test_uninstall_controller_without_credentials_records_error():
     task.refresh_from_db()
     assert task.status == "finished"
     assert node.status == "error"
-    steps = node.result.get("steps") or node.result.get("step") or []
-    blob = str(node.result)
-    assert "Credential" in blob or "authentication" in blob.lower() or steps
+    steps = node.result["steps"]
+    assert steps[0]["action"] == "credential_check"
+    assert steps[0]["status"] == "error"
+    assert steps[0]["message"] == (
+        "No authentication method provided. Password or private key is required."
+    )
+    assert node.result["final_message"] == "Credential validation failed"
+    assert node.result["overall_status"] == "error"
 
 
 def test_uninstall_controller_success_deletes_node_and_clears_secrets():
