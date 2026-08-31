@@ -254,4 +254,4 @@ def test_flow_asset_unknown_field_raises():
     request = factory.post("/flow_asset", {"foo": 1}, format="json")
     force_authenticate(request, user=user)
     with pytest.raises(ValidationAppException, match="Unknown request fields"):
-        ManualCollect().flow_asset(request)
+        ManualCollect.as_view({"post": "flow_asset"})(request)

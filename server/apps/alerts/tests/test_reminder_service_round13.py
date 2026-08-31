@@ -255,9 +255,12 @@ def test_send_reminder_outer_exception_returns_false(monkeypatch):
     assignment.personnel = ["op1"]
     assignment.notify_channels = [{"id": 1, "channel_type": "email"}]
     assignment.save()
+    def _boom(alert):
+        raise RuntimeError("escalation down")
+
     monkeypatch.setattr(
         "apps.alerts.service.escalation_service.EscalationService.active_roster_for_reminder",
-        side_effect=RuntimeError("escalation down"),
+        staticmethod(_boom),
     )
     assert RS._send_reminder_notification(assignment=assignment, alert=alert) is False
 

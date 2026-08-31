@@ -152,16 +152,20 @@ def test_create_update_partial_update_validate_then_delegate(monkeypatch):
 
     request = factory.post("/organization_rule/", {"monitor_object": obj.id, "organizations": [1]}, format="json")
     force_authenticate(request, user=user)
-    resp = vs.create(request)
+    resp = org_view.MonitorObjectOrganizationRuleViewSet.as_view({"post": "create"})(request)
     assert json.loads(resp.content)["data"] == {"created": True}
 
     request = factory.put(f"/organization_rule/{rule.id}/", {"name": "r2"}, format="json")
     force_authenticate(request, user=user)
-    resp = vs.update(request)
+    vs.get_object = lambda: rule
+    # as_view 会新建实例，需继续 mock get_object / validate
+    with patch.object(org_view.MonitorObjectOrganizationRuleViewSet, "get_object", return_value=rule):
+        resp = org_view.MonitorObjectOrganizationRuleViewSet.as_view({"put": "update"})(request)
     assert json.loads(resp.content)["data"] == {"updated": True}
 
     request = factory.patch(f"/organization_rule/{rule.id}/", {"name": "r3"}, format="json")
     force_authenticate(request, user=user)
-    resp = vs.partial_update(request)
+    with patch.object(org_view.MonitorObjectOrganizationRuleViewSet, "get_object", return_value=rule):
+        resp = org_view.MonitorObjectOrganizationRuleViewSet.as_view({"patch": "partial_update"})(request)
     assert json.loads(resp.content)["data"] == {"patched": True}
     assert len(validated) == 3
