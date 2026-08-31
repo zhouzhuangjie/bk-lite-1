@@ -27,9 +27,26 @@ def _plugin(name="Vendor SNMP R13"):
 def test_validate_template_identity_skips_dir_and_templated_collect_type(tmp_path):
     plugin_dir = tmp_path / "p"
     plugin_dir.mkdir()
-    (plugin_dir / "dir.j2").mkdir()
-    (plugin_dir / "ok.j2").write_text('collect_type = "{{ collect_type }}"\n', encoding="utf-8")
-    assert plugin_migrate._validate_template_identity(plugin_dir, "snmp") is None
+    skipped_dir = plugin_dir / "dir.j2"
+    skipped_dir.mkdir()
+    templated = plugin_dir / "ok.j2"
+    templated.write_text('collect_type = "{{ collect_type }}"\n', encoding="utf-8")
+    read_paths = []
+    real_read = Path.read_text
+
+    def _read(self, *a, **k):
+        read_paths.append(self)
+        return real_read(self, *a, **k)
+
+    with patch.object(Path, "read_text", _read):
+        assert plugin_migrate._validate_template_identity(plugin_dir, "snmp") is None
+    assert all(getattr(p, "name", None) != "dir.j2" for p in read_paths)
+    assert any(getattr(p, "name", None) == "ok.j2" for p in read_paths)
+
+    dir_only = tmp_path / "only-dir"
+    dir_only.mkdir()
+    (dir_only / "nested.j2").mkdir()
+    assert plugin_migrate._validate_template_identity(dir_only, "snmp") is None
 
 
 def test_validate_template_identity_rejects_literal_mismatch(tmp_path):

@@ -86,20 +86,24 @@ def test_process_aggregation_reraises_and_closes_connection():
 
 
 def test_process_strategy_swallows_inner_exception():
-    """单策略异常只记日志，不得向外抛。"""
+    """单策略异常只记日志，不得向外抛；不标记已执行。"""
     strategy = AlarmStrategy.objects.create(
         name="降噪-r13", strategy_type="smart_denoise", is_active=True,
         team=[1], dispatch_team=[1], params={"window_size": 60},
     )
     proc = AggregationProcessor()
+    now = timezone.now()
     with (
         patch.object(proc, "get_events_for_strategy", side_effect=RuntimeError("query boom")),
         patch("apps.alerts.aggregation.processor.aggregation_processor.logger") as mock_logger,
     ):
-        proc._process_strategy(strategy, timezone.now())
+        result = proc._process_strategy(strategy, now)
+    assert result is None
     mock_logger.exception.assert_called_once()
     assert mock_logger.exception.call_args.args[0] == "[AlertAggregation] 策略 %s 处理失败"
     assert mock_logger.exception.call_args.args[1] == "降噪-r13"
+    strategy.refresh_from_db()
+    assert strategy.last_execute_time is None
 
 
 # --------------------------------------------------------------------------

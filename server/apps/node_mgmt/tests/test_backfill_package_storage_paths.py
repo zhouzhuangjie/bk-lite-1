@@ -165,11 +165,9 @@ def test_handle_dry_run_and_filters(monkeypatch):
         stdout=out,
     )
     text = out.getvalue()
-    assert "[dry-run]" in text
-    assert "copy l-copy -> p-copy" in text
+    assert f"[dry-run] {copyable.id}: copy l-copy -> p-copy" in text
     assert "[missing]" not in text
-    assert "copied=0" in text
-    assert "missing=0" in text
+    assert "Backfill finished: copied=0 already_ok=0 missing=0" in text
 
 
 def test_handle_apply_copies_and_counts(monkeypatch):
