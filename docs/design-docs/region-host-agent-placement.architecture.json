@@ -2,88 +2,83 @@
   "schema_version": 1,
   "diagram_type": "architecture",
   "meta": {
-    "title": "Celery dispatch, Sidecar / Ansible return",
+    "title": "作业平台：Sidecar / Ansible 落点",
     "quality_profile": "showcase",
     "views": [
       {
-        "id": "collect",
-        "label": "Collect",
-        "focus": ["fusion", "stargazer", "remote"],
-        "note": "fusion-collector scrapes the managed host. stargazer in the cloud region scrapes remote devices with no Agent."
+        "id": "local",
+        "label": "本机 Sidecar",
+        "focus": ["celery", "sidecarHost", "db"],
+        "note": "节点管理目标走 fusion-collector 里的 nats-executor 二进制。Celery 等 RPC 再写 JobExecution。"
       },
       {
-        "id": "sidecar-job",
-        "label": "Sidecar job",
-        "focus": ["celery", "sidecarHost", "sidecarRegion", "db"],
-        "note": "Celery waits nats-executor RPC reply, then finalize_execution writes JobExecution."
+        "id": "ssh",
+        "label": "SSH",
+        "focus": ["celery", "sidecarRegion", "remote", "db"],
+        "note": "MANUAL Linux SSH 走独立 compose nats-executor，INSTANCE_ID=default。"
       },
       {
-        "id": "ansible-job",
-        "label": "Ansible job",
-        "focus": ["celery", "ansible", "db"],
-        "note": "Celery only submits. ansible-executor runs when MANUAL driver=ansible: script adhoc or playbook."
+        "id": "ansible",
+        "label": "Ansible",
+        "focus": ["celery", "ansible", "remote", "db"],
+        "note": "ansible-executor 不是独立容器，是 fusion 容器节点上的默认采集器进程。"
       },
       {
         "id": "return",
-        "label": "Return",
+        "label": "回写",
         "focus": ["celery", "db", "ansible"],
-        "note": "Sidecar RPC is waited in Celery then finalize_execution. Ansible NATS callback writes the same JobExecution row."
+        "note": "Sidecar：Celery RPC wait 后 finalize_execution。Ansible：NATS callback 经 server 写同一 JobExecution。"
       }
     ]
   },
   "components": [
-    { "id": "server", "type": "frontend", "label": "Server", "sublabel": "NodeMgmt + JobMgmt", "pos": [36, 88], "size": [150, 56], "tag": "API + nats_api" },
-    { "id": "celery", "type": "backend", "label": "Celery", "sublabel": "ScriptExecutionRunner", "pos": [36, 172], "size": [150, 56], "tag": "waits Sidecar RPC" },
-    { "id": "db", "type": "database", "label": "JobExecution", "sublabel": "execution_results", "pos": [36, 360], "size": [150, 56], "tag": "platform DB" },
-    { "id": "fusion", "type": "cloud", "label": "fusion-collector", "sublabel": "telegraf / Vector", "pos": [260, 36], "size": [168, 56], "tag": "Node Sidecar" },
-    { "id": "sidecarHost", "type": "backend", "label": "Sidecar", "sublabel": "nats-executor local", "pos": [260, 172], "size": [168, 56], "tag": "Job on host" },
-    { "id": "stargazer", "type": "cloud", "label": "stargazer", "sublabel": "protocol collect", "pos": [560, 36], "size": [168, 56], "tag": "region service" },
-    { "id": "sidecarRegion", "type": "backend", "label": "Sidecar", "sublabel": "nats-executor SSH", "pos": [560, 172], "size": [168, 56], "tag": "region service" },
-    { "id": "ansible", "type": "cloud", "label": "Ansible", "sublabel": "ansible-executor", "pos": [560, 300], "size": [168, 56], "tag": "container node" },
-    { "id": "remote", "type": "external", "label": "Remote host", "sublabel": "no Agent", "pos": [800, 172], "size": [160, 56], "tag": "MANUAL / SNMP" }
+    { "id": "server", "type": "frontend", "label": "server", "sublabel": "job_mgmt", "pos": [36, 88], "size": [150, 56], "tag": "compose" },
+    { "id": "celery", "type": "backend", "label": "Celery", "sublabel": "ScriptExecutionRunner", "pos": [36, 172], "size": [150, 56], "tag": "in server" },
+    { "id": "db", "type": "database", "label": "JobExecution", "sublabel": "postgres table", "pos": [36, 360], "size": [150, 56], "tag": "platform DB" },
+    { "id": "sidecarHost", "type": "backend", "label": "nats-executor", "sublabel": "local bin", "pos": [280, 172], "size": [168, 56], "tag": "in fusion" },
+    { "id": "ansible", "type": "cloud", "label": "ansible-executor", "sublabel": "adhoc / playbook", "pos": [280, 300], "size": [168, 56], "tag": "in fusion" },
+    { "id": "sidecarRegion", "type": "backend", "label": "nats-executor", "sublabel": "INSTANCE_ID=default", "pos": [560, 172], "size": [168, 56], "tag": "compose 容器" },
+    { "id": "remote", "type": "external", "label": "Remote host", "sublabel": "no Agent", "pos": [800, 300], "size": [160, 56], "tag": "MANUAL" }
   ],
   "boundaries": [
-    { "kind": "region", "label": "Platform", "wraps": ["server", "celery", "db"] },
-    { "kind": "region", "label": "Managed host", "wraps": ["fusion", "sidecarHost"] },
-    { "kind": "region", "label": "Cloud region", "wraps": ["stargazer", "sidecarRegion", "ansible"] },
+    { "kind": "region", "label": "Platform / server", "wraps": ["server", "celery", "db"] },
+    { "kind": "region", "label": "fusion-collector 容器", "wraps": ["sidecarHost", "ansible"] },
+    { "kind": "region", "label": "默认云区域", "wraps": ["sidecarRegion"] },
     { "kind": "region", "label": "Remote / no Agent", "wraps": ["remote"] }
   ],
   "connections": [
     { "id": "srv-celery", "from": "server", "to": "celery", "label": "Job delay(id)", "variant": "emphasis", "labelDy": 24 },
-    { "id": "srv-fusion", "from": "server", "to": "fusion", "label": "sidecar config", "variant": "dashed" },
-    { "id": "srv-star", "from": "server", "to": "stargazer", "label": "collect", "variant": "dashed" },
     { "id": "cel-local", "from": "celery", "to": "sidecarHost", "label": "local job", "variant": "emphasis" },
-    { "id": "cel-ssh", "from": "celery", "to": "sidecarRegion", "label": "SSH job", "variant": "emphasis", "fromSide": "bottom", "toSide": "left", "via": [[111, 256], [520, 256], [520, 200]], "labelAt": [370, 242] },
-    { "id": "cel-ans", "from": "celery", "to": "ansible", "label": "adhoc / playbook", "variant": "emphasis", "labelAt": [400, 312] },
+    { "id": "cel-ssh", "from": "celery", "to": "sidecarRegion", "label": "SSH job", "variant": "emphasis", "fromSide": "bottom", "toSide": "left", "via": [[111, 256], [520, 256], [520, 200]], "labelAt": [370, 268] },
+    { "id": "cel-ans", "from": "celery", "to": "ansible", "label": "adhoc / playbook", "variant": "emphasis", "labelAt": [200, 288] },
     { "id": "cel-db", "from": "celery", "to": "db", "label": "finalize_execution", "variant": "emphasis", "labelAt": [250, 430] },
     { "id": "ans-db", "from": "ansible", "to": "db", "label": "NATS callback", "variant": "dashed" },
-    { "id": "star-remote", "from": "stargazer", "to": "remote", "label": "SNMP / API", "variant": "dashed" },
-    { "id": "ssh-remote", "from": "sidecarRegion", "to": "remote", "label": "SSH", "variant": "emphasis", "labelAt": [724, 238] },
-    { "id": "ans-remote", "from": "ansible", "to": "remote", "label": "SSH / WinRM", "variant": "emphasis" }
+    { "id": "ssh-remote", "from": "sidecarRegion", "to": "remote", "label": "SSH", "variant": "emphasis" },
+    { "id": "ans-remote", "from": "ansible", "to": "remote", "label": "WinRM / SSH", "variant": "emphasis" }
   ],
   "cards": [
     {
       "dot": "emerald",
-      "title": "Collect",
+      "title": "fusion-collector",
       "items": [
-        "fusion-collector: this host metrics/logs → VM / VL",
-        "stargazer: SNMP / WMI / cloud / DB → CMDB / Monitor"
+        "一个 compose 容器：本机 nats-executor + ansible-executor 进程",
+        "节点管理脚本走 local；Playbook / WinRM / driver=ansible 走里面的 Ansible"
       ]
     },
     {
       "dot": "cyan",
-      "title": "Celery",
+      "title": "独立 nats-executor",
       "items": [
-        "JobMgmt delay(id) then Celery dispatch; waits Sidecar RPC reply",
-        "Ansible is fire-and-forget: MANUAL driver=ansible (script or playbook)"
+        "compose 服务，NATS_INSTANCE_ID=default",
+        "只承担 MANUAL Linux SSH，不是 fusion 旁边第二个本机容器"
       ]
     },
     {
       "dot": "rose",
-      "title": "Return to DB",
+      "title": "回写",
       "items": [
-        "Sidecar: Celery RPC wait → finalize_execution → JobExecution",
-        "Ansible: ansible_task_callback → same JobExecution row"
+        "Sidecar：Celery 等 RPC → finalize_execution → JobExecution",
+        "Ansible：callback 进 server nats_listener，写同一行。Celery 不是独立容器"
       ]
     }
   ]
