@@ -2,7 +2,7 @@
   "schema_version": 1,
   "diagram_type": "architecture",
   "meta": {
-    "title": "Cloud region, host, container, remote",
+    "title": "Celery dispatch, Sidecar / Ansible return",
     "quality_profile": "showcase",
     "views": [
       {
@@ -14,37 +14,49 @@
       {
         "id": "sidecar-job",
         "label": "Sidecar job",
-        "focus": ["sidecarHost", "sidecarRegion", "remote"],
-        "note": "On-host nats-executor runs NODE_MGMT jobs locally. Region nats-executor SSH to MANUAL hosts."
+        "focus": ["celery", "sidecarHost", "sidecarRegion", "db"],
+        "note": "Celery waits nats-executor RPC reply, then finalize_execution writes JobExecution."
       },
       {
         "id": "ansible-job",
         "label": "Ansible job",
-        "focus": ["ansible", "remote"],
-        "note": "ansible-executor on a container node in the cloud region. Playbook, WinRM, MANUAL driver=ansible."
+        "focus": ["celery", "ansible", "db"],
+        "note": "Celery only submits. ansible-executor runs when MANUAL driver=ansible: script adhoc or playbook."
+      },
+      {
+        "id": "return",
+        "label": "Return",
+        "focus": ["celery", "db", "ansible"],
+        "note": "Sidecar RPC is waited in Celery then finalize_execution. Ansible NATS callback writes the same JobExecution row."
       }
     ]
   },
   "components": [
-    { "id": "server", "type": "frontend", "label": "Server", "sublabel": "NodeMgmt + JobMgmt", "pos": [36, 168], "size": [150, 96] },
+    { "id": "server", "type": "frontend", "label": "Server", "sublabel": "NodeMgmt + JobMgmt", "pos": [36, 88], "size": [150, 56], "tag": "API + nats_api" },
+    { "id": "celery", "type": "backend", "label": "Celery", "sublabel": "ScriptExecutionRunner", "pos": [36, 172], "size": [150, 56], "tag": "waits Sidecar RPC" },
+    { "id": "db", "type": "database", "label": "JobExecution", "sublabel": "execution_results", "pos": [36, 360], "size": [150, 56], "tag": "platform DB" },
     { "id": "fusion", "type": "cloud", "label": "fusion-collector", "sublabel": "telegraf / Vector", "pos": [260, 36], "size": [168, 56], "tag": "Node Sidecar" },
-    { "id": "sidecarHost", "type": "backend", "label": "Sidecar", "sublabel": "nats-executor local", "pos": [260, 168], "size": [168, 56], "tag": "Job on host" },
+    { "id": "sidecarHost", "type": "backend", "label": "Sidecar", "sublabel": "nats-executor local", "pos": [260, 172], "size": [168, 56], "tag": "Job on host" },
     { "id": "stargazer", "type": "cloud", "label": "stargazer", "sublabel": "protocol collect", "pos": [560, 36], "size": [168, 56], "tag": "region service" },
-    { "id": "sidecarRegion", "type": "backend", "label": "Sidecar", "sublabel": "nats-executor SSH", "pos": [560, 168], "size": [168, 56], "tag": "region service" },
+    { "id": "sidecarRegion", "type": "backend", "label": "Sidecar", "sublabel": "nats-executor SSH", "pos": [560, 172], "size": [168, 56], "tag": "region service" },
     { "id": "ansible", "type": "cloud", "label": "Ansible", "sublabel": "ansible-executor", "pos": [560, 300], "size": [168, 56], "tag": "container node" },
-    { "id": "remote", "type": "external", "label": "Remote host", "sublabel": "no Agent", "pos": [800, 168], "size": [160, 56], "tag": "MANUAL / SNMP" }
+    { "id": "remote", "type": "external", "label": "Remote host", "sublabel": "no Agent", "pos": [800, 172], "size": [160, 56], "tag": "MANUAL / SNMP" }
   ],
   "boundaries": [
+    { "kind": "region", "label": "Platform", "wraps": ["server", "celery", "db"] },
     { "kind": "region", "label": "Managed host", "wraps": ["fusion", "sidecarHost"] },
     { "kind": "region", "label": "Cloud region", "wraps": ["stargazer", "sidecarRegion", "ansible"] },
     { "kind": "region", "label": "Remote / no Agent", "wraps": ["remote"] }
   ],
   "connections": [
+    { "id": "srv-celery", "from": "server", "to": "celery", "label": "Job delay(id)", "variant": "emphasis", "labelDy": 24 },
     { "id": "srv-fusion", "from": "server", "to": "fusion", "label": "sidecar config", "variant": "dashed" },
-    { "id": "srv-local", "from": "server", "to": "sidecarHost", "variant": "emphasis" },
-    { "id": "srv-star", "from": "server", "to": "stargazer", "label": "collect", "variant": "dashed", "fromSide": "top", "toSide": "left", "via": [[111, 20], [520, 20], [520, 64]] },
-    { "id": "srv-ssh", "from": "server", "to": "sidecarRegion", "label": "SSH job", "variant": "emphasis", "fromSide": "bottom", "toSide": "left", "via": [[111, 280], [520, 280], [520, 196]], "labelAt": [400, 268] },
-    { "id": "srv-ans", "from": "server", "to": "ansible", "label": "Playbook / WinRM", "variant": "emphasis", "labelAt": [430, 330] },
+    { "id": "srv-star", "from": "server", "to": "stargazer", "label": "collect", "variant": "dashed" },
+    { "id": "cel-local", "from": "celery", "to": "sidecarHost", "label": "local job", "variant": "emphasis" },
+    { "id": "cel-ssh", "from": "celery", "to": "sidecarRegion", "label": "SSH job", "variant": "emphasis", "fromSide": "bottom", "toSide": "left", "via": [[111, 256], [520, 256], [520, 200]], "labelAt": [370, 242] },
+    { "id": "cel-ans", "from": "celery", "to": "ansible", "label": "adhoc / playbook", "variant": "emphasis", "labelAt": [400, 312] },
+    { "id": "cel-db", "from": "celery", "to": "db", "label": "finalize_execution", "variant": "emphasis", "labelAt": [250, 430] },
+    { "id": "ans-db", "from": "ansible", "to": "db", "label": "NATS callback", "variant": "dashed" },
     { "id": "star-remote", "from": "stargazer", "to": "remote", "label": "SNMP / API", "variant": "dashed" },
     { "id": "ssh-remote", "from": "sidecarRegion", "to": "remote", "label": "SSH", "variant": "emphasis", "labelAt": [724, 238] },
     { "id": "ans-remote", "from": "ansible", "to": "remote", "label": "SSH / WinRM", "variant": "emphasis" }
@@ -60,21 +72,18 @@
     },
     {
       "dot": "cyan",
-      "title": "Job",
+      "title": "Celery",
       "items": [
-        "Sidecar on host: NODE_MGMT script/file locally",
-        "Sidecar in region: SSH to MANUAL Linux",
-        "Ansible on container: Playbook / WinRM / driver=ansible"
+        "JobMgmt delay(id) then Celery dispatch; waits Sidecar RPC reply",
+        "Ansible is fire-and-forget: MANUAL driver=ansible (script or playbook)"
       ]
     },
     {
       "dot": "rose",
-      "title": "Places",
+      "title": "Return to DB",
       "items": [
-        "Server: NodeMgmt install/config + JobMgmt dispatch",
-        "Managed host: Agent (fusion + local Sidecar)",
-        "Cloud region: stargazer + region Sidecar + container Ansible",
-        "Remote host: target only, no Agent"
+        "Sidecar: Celery RPC wait → finalize_execution → JobExecution",
+        "Ansible: ansible_task_callback → same JobExecution row"
       ]
     }
   ]

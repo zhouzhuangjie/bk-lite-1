@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "Sidecar / Ansible result return",
+    "quality_profile": "showcase",
+    "viewBox": [1080, 560],
+    "views": [
+      {
+        "id": "sidecar-return",
+        "label": "Sidecar",
+        "focus": ["sidecar", "rpc", "celery", "db"],
+        "note": "Celery waits RPC reply; finalize_execution writes JobExecution."
+      },
+      {
+        "id": "ansible-return",
+        "label": "Ansible",
+        "focus": ["ansible", "cb", "handler", "db"],
+        "note": "Executor publishes NATS callback; ansible_task_callback writes JobExecution."
+      }
+    ]
+  },
+  "stages": [
+    { "label": "Executor" },
+    { "label": "Transit" },
+    { "label": "Server write" },
+    { "label": "Platform DB" },
+    { "label": "Notify" }
+  ],
+  "nodes": [
+    { "id": "sidecar", "type": "cloud", "label": "Sidecar", "sublabel": "nats-executor", "stage": 0, "row": 0, "tag": "sync RPC" },
+    { "id": "ansible", "type": "cloud", "label": "Ansible", "sublabel": "ansible-executor", "stage": 0, "row": 1, "tag": "async callback" },
+    { "id": "rpc", "type": "messagebus", "label": "NATS RPC", "sublabel": "reply inbox", "stage": 1, "row": 0, "tag": "stdout / exit" },
+    { "id": "cb", "type": "messagebus", "label": "NATS callback", "sublabel": "ansible_task_callback", "stage": 1, "row": 1, "tag": "per-host result" },
+    { "id": "celery", "type": "backend", "label": "Celery Runner", "sublabel": "finalize_execution", "stage": 2, "row": 0, "tag": "waits RPC" },
+    { "id": "handler", "type": "backend", "label": "NATS handler", "sublabel": "nats_api", "stage": 2, "row": 1, "tag": "saves JSON" },
+    { "id": "db", "type": "database", "label": "JobExecution", "sublabel": "execution_results", "stage": 3, "row": 0, "tag": "platform DB" },
+    { "id": "callback", "type": "messagebus", "label": "send_callback", "sublabel": "web / nats / both", "stage": 4, "row": 0 }
+  ],
+  "flows": [
+    { "from": "sidecar", "to": "rpc", "label": "RPC reply", "classification": "stdout / exit", "variant": "emphasis", "route": "straight" },
+    { "from": "ansible", "to": "cb", "label": "NATS publish", "classification": "per-host result", "variant": "emphasis", "route": "straight" },
+    { "from": "rpc", "to": "celery", "label": "same wait", "classification": "Celery blocked", "variant": "emphasis", "route": "straight" },
+    { "from": "cb", "to": "handler", "label": "subject match", "classification": "async", "variant": "emphasis", "route": "straight" },
+    { "from": "celery", "to": "db", "label": "finalize_execution", "classification": "status + results", "variant": "emphasis", "route": "straight", "labelDy": -28 },
+    { "from": "handler", "to": "db", "label": "save results", "classification": "status + results", "variant": "emphasis", "route": "vertical-channel" },
+    { "from": "db", "to": "callback", "label": "send_callback", "classification": "HTTP / NATS notify", "variant": "emphasis", "route": "straight" }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Sidecar → DB",
+      "items": ["Celery waits RPC reply, then finalize_execution writes JobExecution"]
+    },
+    {
+      "dot": "cyan",
+      "title": "Ansible → DB",
+      "items": ["Executor calls ansible_task_callback; handler saves execution_results"]
+    },
+    {
+      "dot": "rose",
+      "title": "Not the DB row",
+      "items": ["JOB_LOG_STREAM/SSE is live stdout; send_callback runs after the DB write"]
+    }
+  ]
+}
