@@ -83,6 +83,18 @@
     "batchEdit": "Batch Edit",
     "searchTitle": "Asset Search",
     "assetSearchTxt": "Please enter the keywords...",
+    "AssetOverview": {
+        "title": "Asset Overview",
+        "description": "Locate assets by category, then continue to filter, inspect, and maintain them in the asset list.",
+        "searchPlaceholder": "Search model name",
+        "classificationCount": "Categories",
+        "modelCount": "Models",
+        "assetCount": "Assets",
+        "emptyTitle": "No asset models to display",
+        "emptyDescription": "Adjust the search or create and categorize a model in Model Management.",
+        "errorTitle": "Failed to load asset overview",
+        "errorDescription": "Check the network or service status, then retry."
+    },
     "AssetSearch": {
         "heroTitle": "Search assets fast and locate issues",
         "heroPlaceholder": "Search IP, host name, business, application, service, database, owner",

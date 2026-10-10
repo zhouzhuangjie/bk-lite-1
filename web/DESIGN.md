@@ -232,3 +232,50 @@ BK-Lite Web 以边框和色阶分层为主，阴影为辅。默认面板不应�
 - **Don't** 给卡片、输入框、面板使用 `32px+` 大圆角。
 - **Don't** 在卡片上叠加 `1px border` 和大模糊阴影。
 - **Don't** 在新代码里继续扩大 `z-index: 9999/10000`、硬编码 `min-width`、全局覆盖 AntD 样式。
+
+## 7. Page Patterns
+
+跨 App 统一不等于把所有页面改成同一种卡片，而是让同类任务共享稳定骨架。新增或刷新页面时，先识别页面类型，再组合共享组件。
+
+### List / Table Page
+
+1. `PageHeader`：标题、任务说明、必要的统计 metadata、主操作。
+2. 筛选工具栏：搜索、常用筛选、刷新、视图切换；同组动作使用 `gap-2`。
+3. 数据主体：优先 `CustomTable`；卡片目录只用于对象需要视觉识别、状态扫描或快速进入详情的场景。
+4. 批量操作：仅在选中对象后出现，不与页面主 CTA 争夺层级。
+5. `DataViewState`：明确区分 initial / loading / empty / error / ready。
+
+### Detail Page
+
+1. 顶部展示对象名称、关键状态、返回路径和对象级动作。
+2. 二级导航使用 `sub-layout` / Tabs，不在正文重复造导航。
+3. 高风险动作显示影响对象和后果，并执行权限校验、确认与 loading 防重。
+4. 长内容使用 Drawer 或独立路由；不要把多个详情层继续嵌套成卡片墙。
+
+### Workspace / Builder Page
+
+编辑器、拓扑、流程编排和调试工具可以突破普通列表布局，但必须保留全局壳、token、操作反馈、键盘可达和错误恢复规则。画布工具栏与属性面板的动作词汇应与普通页面一致。
+
+## 8. Shared State Contract
+
+所有数据视图使用统一五态语义：
+
+| 状态 | 组件/表现 | 用户下一步 |
+|---|---|---|
+| `initial` | `DataViewState` + 引导式 Empty | 选择对象、配置条件或创建首条数据 |
+| `loading` | Skeleton，保留内容结构 | 等待；刷新按钮显示 loading |
+| `empty` | Empty + 原因说明 | 调整筛选或创建数据 |
+| `error` | Result/Alert + 可行动原因 | 重试、修配置或联系管理员 |
+| `ready` | 正常内容 | 查看、编辑或继续处置 |
+
+禁止用一个全屏 Spinner 同时表达首次加载、刷新、空数据和请求失败。刷新已有数据时可以保留旧内容并在触发按钮上显示 loading；首次加载应展示 Skeleton。
+
+## 9. Cross-App Consistency Gate
+
+每轮模块 UI/UE 刷新必须同时满足：
+
+- 只使用 `web/DESIGN.md` 与 `globals.css` token；模块级 `DESIGN.md` 只记录领域特例，不复制全局规则。
+- 同类页面使用 `PageHeader`、`DataViewState`、`CustomTable`、`OperateModal`、`PermissionWrapper`、`EllipsisWithTooltip` 等共享组件。
+- 逐页验收：默认态、加载、空、错误、无权限、只读、长中英文、键盘操作、亮/暗主题。
+- 视觉回归固定桌面基准为 `1440 × 900`；存在窄屏承诺的页面补充 `1280 × 720`。当前控制台全局 `min-width: 1280px`，在移除该约束前不得宣称移动优先。
+- 评分以 OpsPilot 为相对 100 分样板，但 OpsPilot 自身不豁免代码规范、可访问性和状态契约检查。

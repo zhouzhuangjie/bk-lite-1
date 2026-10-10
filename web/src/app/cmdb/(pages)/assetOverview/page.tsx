@@ -1,5 +1,5 @@
 'use client';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import Masonry from 'react-masonry-css';
 import assetsOverviewStyle from './index.module.scss';
 import useApiClient from '@/utils/request';
@@ -8,8 +8,11 @@ import { GroupItem, ModelItem } from '@/app/cmdb/types/assetManage';
 import { deepClone, getIconUrl } from '@/app/cmdb/utils/common';
 import { useRouter } from 'next/navigation';
 import Image from 'next/image';
-import { Spin, Input, Empty } from 'antd';
+import { Button, Input } from 'antd';
+import { ReloadOutlined } from '@ant-design/icons';
 import EllipsisWithTooltip from '@/components/ellipsis-with-tooltip';
+import DataViewState, { DataViewStatus } from '@/components/data-view-state';
+import PageHeader from '@/components/page-header';
 import { useClassificationApi, useInstanceApi } from '@/app/cmdb/api';
 import { useCommon } from '@/app/cmdb/context/common';
 
@@ -23,6 +26,7 @@ const AssetsOverview: React.FC = () => {
   const [overViewList, setOverViewList] = useState<GroupItem[]>([]);
   const [allOverViewList, setAllOverViewList] = useState<GroupItem[]>([]);
   const [searchText, setSearchText] = useState<string>('');
+  const [loadError, setLoadError] = useState<boolean>(false);
 
   const { getClassificationList } = useClassificationApi();
   const { getModelInstanceCount } = useInstanceApi();
@@ -33,9 +37,9 @@ const AssetsOverview: React.FC = () => {
   }, [isLoading, modelListFromContext]);
 
   const breakpointColumnsObj = {
-    default: 6,
-    1600: 5,
-    1300: 4,
+    default: 4,
+    1600: 4,
+    1300: 3,
     1000: 3,
     700: 2,
     500: 1,
@@ -69,6 +73,7 @@ const AssetsOverview: React.FC = () => {
 
   const fetchAssetsOverviewList = async () => {
     setLoading(true);
+    setLoadError(false);
     try {
       const [groupData, instCount] = await Promise.all([
         getClassificationList(),
@@ -93,26 +98,83 @@ const AssetsOverview: React.FC = () => {
 
       setOverViewList(groups);
       setAllOverViewList(groups);
-    } catch (error) {
-      console.error(error);
+    } catch {
+      setOverViewList([]);
+      setLoadError(true);
     } finally {
       setLoading(false);
     }
   };
 
+  const overviewStats = useMemo(() => {
+    const models = allOverViewList.flatMap((group) => group.list);
+    return {
+      classificationCount: allOverViewList.length,
+      modelCount: models.length,
+      assetCount: models.reduce((total, model) => total + (model.count || 0), 0),
+    };
+  }, [allOverViewList]);
+
+  const viewStatus: DataViewStatus = isLoading || loading
+    ? 'loading'
+    : loadError
+      ? 'error'
+      : overViewList.length > 0
+        ? 'ready'
+        : 'empty';
+
   return (
     <div className={assetsOverviewStyle.assetsOverview}>
-      <Spin spinning={loading}>
-        <Input
-          className="w-[320px]"
-          value={searchText}
-          allowClear
-          placeholder={t('common.search')}
-          onPressEnter={handleSearch}
-          onClear={handleClear}
-          onChange={handleTextChange}
-        />
-        {overViewList.length ? (
+      <PageHeader
+        title={t('AssetOverview.title')}
+        description={t('AssetOverview.description')}
+        meta={(
+          <>
+            <span className={assetsOverviewStyle.statItem}>
+              {t('AssetOverview.classificationCount')}
+              <strong>{overviewStats.classificationCount}</strong>
+            </span>
+            <span className={assetsOverviewStyle.statItem}>
+              {t('AssetOverview.modelCount')}
+              <strong>{overviewStats.modelCount}</strong>
+            </span>
+            <span className={assetsOverviewStyle.statItem}>
+              {t('AssetOverview.assetCount')}
+              <strong>{overviewStats.assetCount.toLocaleString()}</strong>
+            </span>
+          </>
+        )}
+        actions={(
+          <>
+            <Input.Search
+              className="w-80"
+              size="large"
+              value={searchText}
+              allowClear
+              placeholder={t('AssetOverview.searchPlaceholder')}
+              onSearch={handleSearch}
+              onClear={handleClear}
+              onChange={handleTextChange}
+            />
+            <Button
+              size="large"
+              icon={<ReloadOutlined aria-hidden="true" />}
+              loading={isLoading || loading}
+              onClick={fetchAssetsOverviewList}
+            >
+              {t('common.refresh')}
+            </Button>
+          </>
+        )}
+      />
+      <div className={assetsOverviewStyle.content}>
+        <DataViewState
+          status={viewStatus}
+          title={loadError ? t('AssetOverview.errorTitle') : t('AssetOverview.emptyTitle')}
+          description={loadError ? t('AssetOverview.errorDescription') : t('AssetOverview.emptyDescription')}
+          retryLabel={t('common.retry')}
+          onRetry={fetchAssetsOverviewList}
+        >
           <Masonry
             breakpointCols={breakpointColumnsObj}
             className={assetsOverviewStyle['my-masonry-grid']}
@@ -131,36 +193,38 @@ const AssetsOverview: React.FC = () => {
                 <ul className={assetsOverviewStyle.list}>
                   {item.list.map((sec) => (
                     <li
-                      className={assetsOverviewStyle.listItem}
                       key={sec.model_id}
-                      onClick={() => linkToDetial(sec)}
                     >
-                      <span className={assetsOverviewStyle.leftSide}>
-                        <Image
-                          src={getIconUrl(sec)}
-                          className="block w-auto h-10"
-                          alt={t('picture')}
-                          width={20}
-                          height={20}
-                        />
-                        <EllipsisWithTooltip
-                          text={sec.model_name}
-                          className="overflow-hidden text-ellipsis whitespace-nowrap"
-                        />
-                      </span>
-                      <span className={assetsOverviewStyle.rightSide}>
-                        {sec.count}
-                      </span>
+                      <button
+                        type="button"
+                        className={assetsOverviewStyle.listItem}
+                        onClick={() => linkToDetial(sec)}
+                      >
+                        <span className={assetsOverviewStyle.leftSide}>
+                          <Image
+                            src={getIconUrl(sec)}
+                            className="block w-auto h-10"
+                            alt=""
+                            width={20}
+                            height={20}
+                          />
+                          <EllipsisWithTooltip
+                            text={sec.model_name}
+                            className="overflow-hidden text-ellipsis whitespace-nowrap"
+                          />
+                        </span>
+                        <span className={assetsOverviewStyle.rightSide}>
+                          {sec.count}
+                        </span>
+                      </button>
                     </li>
                   ))}
                 </ul>
               </div>
             ))}
           </Masonry>
-        ) : (
-          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} />
-        )}
-      </Spin>
+        </DataViewState>
+      </div>
     </div>
   );
 };
