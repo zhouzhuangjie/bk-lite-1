@@ -1,0 +1,16 @@
+{
+  "zh": [
+    {"title": "服务目录", "icon": "caidan", "url": "/itsm/catalog", "name": "catalog"},
+    {"title": "我的工单", "icon": "gongdan", "url": "/itsm/tickets", "name": "ticket"},
+    {"title": "我的待办", "icon": "renwu", "url": "/itsm/todo", "name": "todo"},
+    {"title": "服务管理", "icon": "liuchengguanli1", "url": "/itsm/services", "name": "service_management"},
+    {"title": "ITSM 入口", "url": "/itsm", "name": "itsm_entry", "isNotMenuItem": true}
+  ],
+  "en": [
+    {"title": "Service Catalog", "icon": "caidan", "url": "/itsm/catalog", "name": "catalog"},
+    {"title": "My Tickets", "icon": "gongdan", "url": "/itsm/tickets", "name": "ticket"},
+    {"title": "My Tasks", "icon": "renwu", "url": "/itsm/todo", "name": "todo"},
+    {"title": "Service Management", "icon": "liuchengguanli1", "url": "/itsm/services", "name": "service_management"},
+    {"title": "ITSM Entry", "url": "/itsm", "name": "itsm_entry", "isNotMenuItem": true}
+  ]
+}

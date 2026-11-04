@@ -48,6 +48,10 @@ def _supervisor_conf_dir(tmp_path):
         "[program:workflow_worker]\n",
         encoding="utf-8",
     )
+    (supervisor_conf_dir / "itsm_dispatcher.conf").write_text(
+        "[program:itsm_dispatcher]\n",
+        encoding="utf-8",
+    )
     return supervisor_conf_dir
 
 
@@ -233,6 +237,36 @@ def test_release_startup_keeps_workflow_runtime_when_app_is_installed(tmp_path):
     assert result.returncode == 0
     assert commands[-1] == "supervisord:-n"
     assert (tmp_path / "supervisor/workflow_worker.conf").exists()
+
+
+def test_itsm_dispatcher_is_packaged_and_scoped_to_itsm_installation(tmp_path):
+    dockerfile = (RELEASE_DIR / "Dockerfile").read_text(encoding="utf-8")
+    startup = STARTUP_SCRIPT.read_text(encoding="utf-8")
+
+    assert "itsm_dispatcher.conf" in dockerfile
+    assert 'rm -f "$SUPERVISOR_CONF_DIR/itsm_dispatcher.conf"' in startup
+
+    without_itsm, commands = _run_startup(
+        tmp_path,
+        migrate_returncode=0,
+        install_apps="system_mgmt,workflow",
+    )
+
+    assert without_itsm.returncode == 0
+    assert commands[-1] == "supervisord:-n"
+    assert not (tmp_path / "supervisor/itsm_dispatcher.conf").exists()
+
+
+def test_release_startup_keeps_itsm_dispatcher_when_app_is_installed(tmp_path):
+    result, commands = _run_startup(
+        tmp_path,
+        migrate_returncode=0,
+        install_apps="system_mgmt,itsm",
+    )
+
+    assert result.returncode == 0
+    assert commands[-1] == "supervisord:-n"
+    assert (tmp_path / "supervisor/itsm_dispatcher.conf").exists()
 
 
 def test_release_startup_keeps_opspilot_celery_conf_when_opspilot_installed(tmp_path):

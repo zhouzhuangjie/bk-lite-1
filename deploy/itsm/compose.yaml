@@ -1,0 +1,43 @@
+name: bklite-itsm-flowable
+
+services:
+  postgres:
+    image: postgres:16.10
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 1.0
+    environment:
+      POSTGRES_DB: flowable
+      POSTGRES_USER: flowable
+      POSTGRES_PASSWORD: ${FLOWABLE_DB_PASSWORD:?FLOWABLE_DB_PASSWORD is required}
+    volumes:
+      - flowable-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flowable -d flowable"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  flowable-rest:
+    image: flowable/flowable-rest:8.0.0
+    restart: unless-stopped
+    mem_limit: 640m
+    cpus: 1.5
+    ports:
+      - "${FLOWABLE_BIND_ADDRESS:-127.0.0.1}:${FLOWABLE_PORT:-18091}:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/flowable
+      SPRING_DATASOURCE_USERNAME: flowable
+      SPRING_DATASOURCE_PASSWORD: ${FLOWABLE_DB_PASSWORD:?FLOWABLE_DB_PASSWORD is required}
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: org.postgresql.Driver
+      SERVER_SERVLET_CONTEXT_PATH: /flowable-rest
+      FLOWABLE_HISTORY_LEVEL: audit
+      FLOWABLE_REST_APP_ADMIN_USER_ID: ${FLOWABLE_REST_USER:-rest-admin}
+      FLOWABLE_REST_APP_ADMIN_PASSWORD: ${FLOWABLE_REST_PASSWORD:?FLOWABLE_REST_PASSWORD is required}
+      JAVA_TOOL_OPTIONS: ${FLOWABLE_JAVA_TOOL_OPTIONS:--Xms64m -Xmx384m -XX:+UseG1GC}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  flowable-pg:

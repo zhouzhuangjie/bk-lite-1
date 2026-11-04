@@ -26,6 +26,7 @@ ADD ./support-files/release/supervisor/opspilot_celery.conf  /etc/supervisor/con
 ADD ./support-files/release/supervisor/opspilot_wecom_aibot_long_connection.conf  /etc/supervisor/conf.d/opspilot_wecom_aibot_long_connection.conf
 ADD ./support-files/release/supervisor/opspilot_feishu_long_connection.conf  /etc/supervisor/conf.d/opspilot_feishu_long_connection.conf
 ADD ./support-files/release/supervisor/workflow_worker.conf  /etc/supervisor/conf.d/workflow_worker.conf
+ADD ./support-files/release/supervisor/itsm_dispatcher.conf  /etc/supervisor/conf.d/itsm_dispatcher.conf
 # 默认 release 容器启动时也要带上 SNMP Trap bridge，
 # 否则即使仓库里存在 conf 文件，supervisor 也不会实际加载它。
 ADD ./support-files/release/supervisor/snmp_trap_bridge.conf  /etc/supervisor/conf.d/snmp_trap_bridge.conf

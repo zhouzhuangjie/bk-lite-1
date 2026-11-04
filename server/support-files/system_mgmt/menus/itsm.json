@@ -1,0 +1,39 @@
+{
+  "client_id": "itsm",
+  "name": "ITSM",
+  "url": "/itsm",
+  "icon": "gongdan",
+  "tags": ["tag.itsm", "tag.ticket", "tag.approval", "tag.service_desk"],
+  "description": "app.itsm",
+  "menus": [
+    {
+      "name": "Workspace",
+      "children": [
+        {"id": "catalog", "name": "Service Catalog", "operation": ["View"]},
+        {"id": "ticket", "name": "My Tickets", "operation": ["View", "Add", "Close"]},
+        {"id": "todo", "name": "My Tasks", "operation": ["View", "Act"]}
+      ]
+    },
+    {
+      "name": "Configuration",
+      "children": [
+        {"id": "service_management", "name": "Service Management", "operation": ["View", "Add", "Edit", "Publish"]}
+      ]
+    }
+  ],
+  "roles": [
+    {"name": "admin", "role_name": "itsm_admin", "menus": []},
+    {
+      "name": "normal",
+      "role_name": "itsm_normal",
+      "menus": [
+        "catalog-View",
+        "ticket-View",
+        "ticket-Add",
+        "ticket-Close",
+        "todo-View",
+        "todo-Act"
+      ]
+    }
+  ]
+}

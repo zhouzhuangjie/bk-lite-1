@@ -25,16 +25,21 @@ fi
 # 检查是否包含 opspilot 模块
 opspilot_installed=false
 workflow_installed=false
+itsm_installed=false
 if [ -z "$INSTALL_APPS" ]; then
     # 空表示安装所有模块
     opspilot_installed=true
     workflow_installed=true
+    itsm_installed=true
 else
     case ",$INSTALL_APPS," in
         *,opspilot,*) opspilot_installed=true ;;
     esac
     case ",$INSTALL_APPS," in
         *,workflow,*) workflow_installed=true ;;
+    esac
+    case ",$INSTALL_APPS," in
+        *,itsm,*) itsm_installed=true ;;
     esac
 fi
 
@@ -52,6 +57,12 @@ fi
 if [ "$workflow_installed" = false ]; then
     echo "未安装 workflow 模块，删除编排中心 supervisor 配置..."
     rm -f "$SUPERVISOR_CONF_DIR/workflow_worker.conf"
+fi
+
+# ITSM 使用独立、低常驻开销的数据库命令投递进程，不复用 Celery worker。
+if [ "$itsm_installed" = false ]; then
+    echo "未安装 itsm 模块，删除 ITSM dispatcher supervisor 配置..."
+    rm -f "$SUPERVISOR_CONF_DIR/itsm_dispatcher.conf"
 fi
 
 
