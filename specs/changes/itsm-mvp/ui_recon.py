@@ -61,6 +61,35 @@ USERS = [
     {"id": 102, "username": "manager-b", "display_name": "主管 B"},
     {"id": 901, "username": "signer", "display_name": "加签人"},
 ]
+TICKET = {
+    "id": "ticket-1",
+    "number": "ITSM-20261103-0001",
+    "service_id": 1,
+    "service_name": SERVICE["name"],
+    "service_version_number": 2,
+    "form_schema": SCHEMA,
+    "requester_user_id": 88,
+    "requester_username": "alice",
+    "form_data": {"summary": "生产订单库扩容", "description": "容量提升至 500 GB"},
+    "status": "APPROVING",
+    "resolved_at": None,
+    "closed_at": None,
+    "created_at": "2026-11-03T09:00:00Z",
+    "updated_at": "2026-11-03T09:05:00Z",
+    "audit_events": [
+        {
+            "id": 1,
+            "actor_user_id": 88,
+            "actor_username": "alice",
+            "action": "工单已提交",
+            "from_status": "",
+            "to_status": "APPROVING",
+            "reason": "",
+            "detail": {},
+            "created_at": "2026-11-03T09:00:00Z",
+        }
+    ],
+}
 
 
 def envelope(data):
@@ -143,6 +172,10 @@ def respond(route: Route) -> None:
                 ],
             }
         )
+    elif path.endswith("/itsm/api/tickets/ticket-1/"):
+        payload = envelope(TICKET)
+    elif path.endswith("/itsm/api/tickets/"):
+        payload = envelope({"count": 1, "items": [TICKET]})
     elif path.endswith("/itsm/api/catalog/1/"):
         payload = envelope({key: SERVICE[key] for key in ("id", "name", "description", "team_id", "current_version", "form_schema", "updated_at")})
     elif path.endswith("/itsm/api/catalog/"):
@@ -170,8 +203,29 @@ with sync_playwright() as playwright:
     page = browser.new_page(viewport={"width": 1440, "height": 1000})
     page.add_init_script("localStorage.setItem('locale', 'zh-Hans')")
     page.route("**/api/proxy/**", respond)
+    page.route(
+        "**/api/auth/recovery-check",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "authenticated": True,
+                    "user": {
+                        "id": "101",
+                        "username": "manager-a",
+                        "token": "ui-verification-token",
+                        "locale": "zh-Hans",
+                        "timezone": "Asia/Shanghai",
+                    },
+                }
+            ),
+        ),
+    )
     console_errors: list[str] = []
+    response_errors: list[str] = []
     page.on("console", lambda message: console_errors.append(message.text) if message.type == "error" else None)
+    page.on("response", lambda response: response_errors.append(f"{response.status} {response.url}") if response.status >= 400 else None)
 
     csrf_response = page.request.get("http://127.0.0.1:13000/api/auth/csrf", timeout=30_000)
     csrf_token = csrf_response.json()["csrfToken"]
@@ -202,28 +256,53 @@ with sync_playwright() as playwright:
         raise AssertionError(f"NextAuth session failed: {session_response.status}")
 
     navigate(page, "http://127.0.0.1:13000/itsm/services")
+    try:
+        page.get_by_text("数据库资源申请").first.wait_for(timeout=8_000)
+    except PlaywrightTimeoutError:
+        page.screenshot(path=str(OUTPUT / "itsm-ui-debug.png"), full_page=True)
+        raise AssertionError(f"Service page did not render. URL={page.url}; responses={response_errors}; console={console_errors}")
+    page.screenshot(path=str(OUTPUT / "itsm-ui-services.png"), full_page=True)
+
+    navigate(page, "http://127.0.0.1:13000/itsm/catalog")
     page.get_by_text("数据库资源申请").first.wait_for(timeout=30_000)
-    page.screenshot(path=str(OUTPUT / "itsm-services.png"), full_page=True)
+    page.screenshot(path=str(OUTPUT / "itsm-ui-catalog.png"), full_page=True)
 
     navigate(page, "http://127.0.0.1:13000/itsm/services/1")
     page.get_by_text("流程设计").click()
     page.get_by_text("允许前加签").first.wait_for(timeout=30_000)
     page.get_by_role("button", name="添加审批节点").wait_for()
-    page.screenshot(path=str(OUTPUT / "itsm-service-editor.png"), full_page=True)
+    page.screenshot(path=str(OUTPUT / "itsm-ui-service-editor.png"), full_page=True)
 
     navigate(page, "http://127.0.0.1:13000/itsm/todo")
-    page.get_by_role("button", name="前加签").click()
-    page.get_by_text("生产订单库扩容").wait_for(timeout=30_000)
+    page.get_by_text("ITSM-20261103-0001").wait_for(timeout=30_000)
+    page.screenshot(path=str(OUTPUT / "itsm-ui-todo.png"), full_page=True)
+    page.get_by_role("button", name="加签").click()
+    page.get_by_text("前加签", exact=True).last.click()
+    page.get_by_role("dialog").get_by_text("生产订单库扩容").wait_for(timeout=30_000)
     page.get_by_text("加签人员").wait_for()
-    page.screenshot(path=str(OUTPUT / "itsm-before-sign.png"), full_page=True)
+    page.wait_for_timeout(600)
+    page.screenshot(path=str(OUTPUT / "itsm-ui-before-sign.png"), full_page=True)
 
     navigate(page, "http://127.0.0.1:13000/itsm/catalog/1")
     page.get_by_label("申请摘要").fill("申请新的生产数据库")
     page.get_by_label("申请说明").fill("用于订单服务灰度发布")
-    page.screenshot(path=str(OUTPUT / "itsm-ticket-submit.png"), full_page=True)
+    page.screenshot(path=str(OUTPUT / "itsm-ui-ticket-submit.png"), full_page=True)
+
+    navigate(page, "http://127.0.0.1:13000/itsm/tickets/ticket-1")
+    page.get_by_text("申请内容").first.wait_for(timeout=30_000)
+    page.screenshot(path=str(OUTPUT / "itsm-ui-ticket-detail.png"), full_page=True)
+
+    navigate(page, "http://127.0.0.1:13000/itsm/tickets")
+    page.get_by_text("ITSM-20261103-0001").wait_for(timeout=30_000)
+    page.screenshot(path=str(OUTPUT / "itsm-ui-tickets.png"), full_page=True)
+
+    page.evaluate("localStorage.setItem('theme', 'dark')")
+    navigate(page, "http://127.0.0.1:13000/itsm/tickets/ticket-1")
+    page.get_by_text("申请内容").first.wait_for(timeout=30_000)
+    page.screenshot(path=str(OUTPUT / "itsm-ui-ticket-detail-dark.png"), full_page=True)
 
     relevant_errors = [item for item in console_errors if "<path> attribute d" not in item and "favicon" not in item]
     if relevant_errors:
         raise AssertionError(f"Browser console errors: {relevant_errors}")
-    print("UI verification passed: services, editor, before-sign modal, ticket submission")
+    print("UI verification passed: catalog, services, editor, todo, before-sign drawer, ticket submission, ticket list/detail")
     browser.close()

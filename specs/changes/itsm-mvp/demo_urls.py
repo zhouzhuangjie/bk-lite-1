@@ -108,6 +108,7 @@ urlpatterns = [
     path("api/v1/itsm/", include("apps.itsm.urls")),
     path("api/v1/core/api/login_info/", login_info),
     path("api/v1/core/api/login/", login),
+    path("api/v1/core/api/get_login_auth_bindings/", lambda request: success([])),
     path("api/v1/core/api/get_client/", clients),
     path("api/v1/core/api/get_user_menus/", menus),
     path("api/v1/core/api/user_group/user_list/", user_list),
