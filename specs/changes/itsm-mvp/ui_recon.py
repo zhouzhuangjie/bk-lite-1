@@ -68,6 +68,7 @@ TICKET = {
     "service_name": SERVICE["name"],
     "service_version_number": 2,
     "form_schema": SCHEMA,
+    "workflow_config": WORKFLOW,
     "requester_user_id": 88,
     "requester_username": "alice",
     "form_data": {"summary": "生产订单库扩容", "description": "容量提升至 500 GB"},
@@ -81,7 +82,7 @@ TICKET = {
             "id": 1,
             "actor_user_id": 88,
             "actor_username": "alice",
-            "action": "工单已提交",
+            "action": "SUBMIT_REQUESTED",
             "from_status": "",
             "to_status": "APPROVING",
             "reason": "",
@@ -177,9 +178,9 @@ def respond(route: Route) -> None:
     elif path.endswith("/itsm/api/tickets/"):
         payload = envelope({"count": 1, "items": [TICKET]})
     elif path.endswith("/itsm/api/catalog/1/"):
-        payload = envelope({key: SERVICE[key] for key in ("id", "name", "description", "team_id", "current_version", "form_schema", "updated_at")})
+        payload = envelope({key: SERVICE[key] for key in ("id", "name", "description", "team_id", "current_version", "form_schema", "workflow_config", "updated_at")})
     elif path.endswith("/itsm/api/catalog/"):
-        catalog = {key: SERVICE[key] for key in ("id", "name", "description", "team_id", "current_version", "form_schema", "updated_at")}
+        catalog = {key: SERVICE[key] for key in ("id", "name", "description", "team_id", "current_version", "form_schema", "workflow_config", "updated_at")}
         payload = envelope({"count": 1, "items": [catalog]})
     else:
         payload = envelope({})
@@ -273,15 +274,9 @@ with sync_playwright() as playwright:
     page.get_by_role("button", name="添加审批节点").wait_for()
     page.screenshot(path=str(OUTPUT / "itsm-ui-service-editor.png"), full_page=True)
 
-    navigate(page, "http://127.0.0.1:13000/itsm/todo")
+    navigate(page, "http://127.0.0.1:13000/itsm/tickets?view=todo")
     page.get_by_text("ITSM-20261103-0001").wait_for(timeout=30_000)
     page.screenshot(path=str(OUTPUT / "itsm-ui-todo.png"), full_page=True)
-    page.get_by_role("button", name="加签").click()
-    page.get_by_text("前加签", exact=True).last.click()
-    page.get_by_role("dialog").get_by_text("生产订单库扩容").wait_for(timeout=30_000)
-    page.get_by_text("加签人员").wait_for()
-    page.wait_for_timeout(600)
-    page.screenshot(path=str(OUTPUT / "itsm-ui-before-sign.png"), full_page=True)
 
     navigate(page, "http://127.0.0.1:13000/itsm/catalog/1")
     page.get_by_label("申请摘要").fill("申请新的生产数据库")
@@ -291,6 +286,10 @@ with sync_playwright() as playwright:
     navigate(page, "http://127.0.0.1:13000/itsm/tickets/ticket-1")
     page.get_by_text("申请内容").first.wait_for(timeout=30_000)
     page.screenshot(path=str(OUTPUT / "itsm-ui-ticket-detail.png"), full_page=True)
+    page.get_by_role("button", name="查看流程图").first.click()
+    page.get_by_text("流程图画布").wait_for(timeout=10_000)
+    page.wait_for_timeout(400)
+    page.screenshot(path=str(OUTPUT / "itsm-ui-ticket-flow-drawer.png"), full_page=True)
 
     navigate(page, "http://127.0.0.1:13000/itsm/tickets")
     page.get_by_text("ITSM-20261103-0001").wait_for(timeout=30_000)

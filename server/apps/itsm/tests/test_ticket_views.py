@@ -2,7 +2,7 @@ import pytest
 from django.contrib.auth import get_user_model
 from rest_framework.test import APIRequestFactory, force_authenticate
 
-from apps.itsm.models import Command, Service, ServiceVersion, Ticket
+from apps.itsm.models import Command, Service, ServiceVersion, TaskProjection, Ticket
 from apps.itsm.views import CatalogViewSet, TicketViewSet
 
 
@@ -308,3 +308,54 @@ def test_ticket_cannot_be_closed_early_or_by_another_requester(requester, publis
     assert forbidden.status_code == 404
     ticket.refresh_from_db()
     assert ticket.status == Ticket.Status.WAITING_CONFIRMATION
+
+
+@pytest.mark.django_db
+def test_task_assignee_can_retrieve_ticket_detail_with_workflow_config(requester, published_service):
+    version = published_service.versions.get(version=1)
+    ticket = Ticket.objects.create(
+        number="ITSM-ASSIGNEE-VIEW",
+        service=published_service,
+        service_version=version,
+        domain="example.com",
+        team_id=7,
+        requester_user_id=requester.id,
+        requester_username=requester.username,
+        request_key="assignee-view",
+        request_fingerprint="e" * 64,
+        form_data={"summary": "审批人查看详情"},
+        status=Ticket.Status.APPROVING,
+    )
+    approver = get_user_model().objects.create(
+        username="approver_user",
+        domain="example.com",
+        group_list=[{"id": 7, "name": "研发部"}],
+    )
+    approver.permission = {"itsm": {"ticket-View"}}
+    outsider = get_user_model().objects.create(
+        username="outsider_user",
+        domain="example.com",
+        group_list=[{"id": 7, "name": "研发部"}],
+    )
+    outsider.permission = {"itsm": {"ticket-View"}}
+    TaskProjection.objects.create(
+        ticket=ticket,
+        engine_task_id="task-view-1",
+        logical_key="manager:review",
+        task_type=TaskProjection.Type.APPROVAL,
+        title="主管审批",
+        stage_key="manager",
+        assignee_user_id=approver.id,
+        status=TaskProjection.Status.PENDING,
+        domain="example.com",
+        team_id=7,
+    )
+    retrieve = TicketViewSet.as_view({"get": "retrieve"})
+
+    allowed = retrieve(request("get", f"/tickets/{ticket.id}/", approver), pk=ticket.id)
+    denied = retrieve(request("get", f"/tickets/{ticket.id}/", outsider), pk=ticket.id)
+
+    assert allowed.status_code == 200
+    assert allowed.data["workflow_config"]["stages"][0]["key"] == "manager"
+    assert denied.status_code == 404
+

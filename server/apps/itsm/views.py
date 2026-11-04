@@ -251,18 +251,29 @@ class TicketViewSet(viewsets.GenericViewSet):
         status_filter = str(request.query_params.get("status") or "").strip()
         if status_filter:
             queryset = queryset.filter(status=status_filter)
+        search = str(request.query_params.get("search") or "").strip()[:120]
+        if search:
+            queryset = queryset.filter(Q(number__icontains=search) | Q(service__name__icontains=search))
         page = self.paginate_queryset(queryset.order_by("-created_at"))
         return self.get_paginated_response(self.get_serializer(page, many=True).data)
 
-    @HasPermission("ticket-View")
+    @HasPermission("ticket-View,todo-View")
     def retrieve(self, request, *args, **kwargs):
         scope = request_scope(request)
+        assigned_to_actor = TaskProjection.objects.filter(
+            ticket_id=OuterRef("pk"),
+            domain=scope.domain,
+            team_id=scope.team_id,
+            assignee_user_id=scope.user_id,
+        )
         ticket = get_object_or_404(
-            Ticket.objects.select_related("service", "service_version").prefetch_related("audit_events"),
+            Ticket.objects.select_related("service", "service_version")
+            .prefetch_related("audit_events")
+            .alias(has_actor_task=Exists(assigned_to_actor))
+            .filter(Q(requester_user_id=scope.user_id) | Q(has_actor_task=True)),
             pk=kwargs["pk"],
             domain=scope.domain,
             team_id=scope.team_id,
-            requester_user_id=scope.user_id,
         )
         return Response(self.get_serializer(ticket).data)
 
@@ -334,7 +345,7 @@ class TaskViewSet(viewsets.GenericViewSet):
     pagination_class = ITSMPagination
     queryset = TaskProjection.objects.none()
 
-    @HasPermission("todo-View")
+    @HasPermission("todo-View,ticket-View")
     def list(self, request, *args, **kwargs):
         scope = request_scope(request)
         queryset = TaskProjection.objects.filter(
@@ -343,6 +354,19 @@ class TaskViewSet(viewsets.GenericViewSet):
             assignee_user_id=scope.user_id,
             status__in=(TaskProjection.Status.PENDING, TaskProjection.Status.SUBMITTING),
         ).select_related("ticket__service", "ticket__service_version")
+        task_type = str(request.query_params.get("task_type") or "").strip()
+        if task_type in (TaskProjection.Type.APPROVAL, TaskProjection.Type.HANDLING):
+            queryset = queryset.filter(task_type=task_type)
+        ticket_id = str(request.query_params.get("ticket_id") or "").strip()[:64]
+        if ticket_id:
+            queryset = queryset.filter(ticket_id=ticket_id)
+        search = str(request.query_params.get("search") or "").strip()[:120]
+        if search:
+            queryset = queryset.filter(
+                Q(ticket__number__icontains=search)
+                | Q(ticket__service__name__icontains=search)
+                | Q(title__icontains=search)
+            )
         page = self.paginate_queryset(queryset.order_by("-created_at"))
         return self.get_paginated_response(self.get_serializer(page, many=True).data)
 

@@ -57,7 +57,22 @@ export interface CatalogService {
   team_id: number;
   current_version: number;
   form_schema: JsonSchema;
+  workflow_config?: WorkflowConfig;
   updated_at: string;
+}
+
+export interface ServiceVersionRecord {
+  id: number;
+  service_id: number;
+  version: number;
+  source_revision: number;
+  form_schema: JsonSchema;
+  workflow_config: WorkflowConfig;
+  content_hash: string;
+  publish_status: 'PENDING' | 'READY' | 'FAILED';
+  publish_error: string;
+  created_by: string;
+  created_at: string;
 }
 
 export type TicketStatus = 'SUBMITTING' | 'APPROVING' | 'PROCESSING' | 'WAITING_CONFIRMATION' | 'CLOSED' | 'REJECTED';
@@ -81,6 +96,7 @@ export interface TicketRecord {
   service_name: string;
   service_version_number: number;
   form_schema: JsonSchema;
+  workflow_config?: WorkflowConfig;
   requester_user_id: number;
   requester_username: string;
   form_data: Record<string, unknown>;

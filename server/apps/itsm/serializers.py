@@ -78,11 +78,17 @@ class ServiceVersionSerializer(serializers.ModelSerializer):
 
 class CatalogServiceSerializer(serializers.ModelSerializer):
     form_schema = serializers.SerializerMethodField()
+    workflow_config = serializers.SerializerMethodField()
 
     @staticmethod
     def get_form_schema(service: Service) -> dict:
         version = getattr(service, "current_published_version", None)
         return version.form_schema if version is not None else {}
+
+    @staticmethod
+    def get_workflow_config(service: Service) -> dict:
+        version = getattr(service, "current_published_version", None)
+        return version.workflow_config if version is not None else {"schemaVersion": 1, "stages": [], "handlerIds": []}
 
     class Meta:
         model = Service
@@ -93,6 +99,7 @@ class CatalogServiceSerializer(serializers.ModelSerializer):
             "team_id",
             "current_version",
             "form_schema",
+            "workflow_config",
             "updated_at",
         )
         read_only_fields = fields
@@ -125,6 +132,7 @@ class TicketSerializer(serializers.ModelSerializer):
     service_name = serializers.CharField(source="service.name", read_only=True)
     service_version_number = serializers.IntegerField(source="service_version.version", read_only=True)
     form_schema = serializers.JSONField(source="service_version.form_schema", read_only=True)
+    workflow_config = serializers.JSONField(source="service_version.workflow_config", read_only=True)
     audit_events = AuditEventSerializer(many=True, read_only=True)
 
     class Meta:
@@ -136,6 +144,7 @@ class TicketSerializer(serializers.ModelSerializer):
             "service_name",
             "service_version_number",
             "form_schema",
+            "workflow_config",
             "team_id",
             "requester_user_id",
             "requester_username",
